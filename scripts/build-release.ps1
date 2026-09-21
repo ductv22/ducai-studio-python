@@ -121,6 +121,7 @@ try {
     $engineHostRoot = Join-Path $releaseRoot "engine_hosts"
     New-Item -ItemType Directory -Path $engineHostRoot -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $projectRoot "src\ducai_studio\engine_hosts\ocr_engine_host.py") -Destination $engineHostRoot
+    Copy-Item -LiteralPath (Join-Path $projectRoot "src\ducai_studio\engine_hosts\whisper_engine_host.py") -Destination $engineHostRoot
     Copy-Item -LiteralPath (Join-Path $projectRoot "src\ducai_studio\engine_hosts\tts_engine_host.py") -Destination $engineHostRoot
     Copy-Item -LiteralPath (Join-Path $projectRoot "src\ducai_studio\engine_hosts\vieneu_v330_optimization.py") -Destination $engineHostRoot
 
@@ -145,6 +146,7 @@ Chạy Diagnostics trong tool trước khi sản xuất phim đầu tiên.
         external_data_root = "DUCAI_STUDIO_DATA"
         managed_engines = @(
             "PaddleOCR external Python runtime",
+            "Whisper external runtime and optional large-v3 model",
             "Piper 1.6 runtime and ONNX voices",
             "VieNeu 3.3 runtime and clone profiles",
             "FFmpeg/ffprobe",

@@ -19,6 +19,8 @@ Item {
     property string pendingReplacement: ""
     property int pendingReplaceCount: 0
     property int pendingReplaceCueCount: 0
+    readonly property bool whisperExtraction:
+        appModel.ocrExtractionMethod === "whisper_audio"
     property string contextCueId: ""
     property int contextCueIndex: 0
     property string contextCueStart: ""
@@ -113,6 +115,24 @@ Item {
         fileMode: FileDialog.OpenFile
         nameFilters: ["Phụ đề SRT (*.srt)", "Tất cả file (*)"]
         onAccepted: root.appModel.importTranslationPath(selectedFile.toString())
+    }
+
+    FileDialog {
+        id: sourceSrtExportDialog
+        title: "Xuất SRT nguồn"
+        fileMode: FileDialog.SaveFile
+        nameFilters: ["Phụ đề SRT (*.srt)"]
+        defaultSuffix: "srt"
+        onAccepted: root.appModel.exportSubtitleSrt("source", selectedFile.toString())
+    }
+
+    FileDialog {
+        id: translatedSrtExportDialog
+        title: "Xuất SRT tiếng Việt"
+        fileMode: FileDialog.SaveFile
+        nameFilters: ["Phụ đề SRT (*.srt)"]
+        defaultSuffix: "srt"
+        onAccepted: root.appModel.exportSubtitleSrt("translated", selectedFile.toString())
     }
 
     ColorDialog {
@@ -347,7 +367,7 @@ Item {
 
             Panel {
                 Layout.fillWidth: true
-                Layout.preferredHeight: 64
+                Layout.preferredHeight: 112
                 visible: root.workspaceMode === "transcribe"
                 ColumnLayout {
                     anchors.fill: parent
@@ -357,8 +377,42 @@ Item {
                         Layout.fillWidth: true
                         spacing: Theme.space8
                         Text {
+                            text: "Nguồn trích xuất"
+                            color: Theme.textSecondary
+                            font.family: Theme.fontFamily
+                            font.pixelSize: 11
+                        }
+                        ComboBox {
+                            id: extractionMethodBox
+                            Layout.preferredWidth: 184
+                            model: ["OCR khung hình", "Whisper âm thanh"]
+                            currentIndex: root.whisperExtraction ? 1 : 0
+                            enabled: !root.appModel.ocrBusy
+                            Accessible.name: "Phương thức trích xuất phụ đề"
+                            onActivated: root.appModel.setOcrExtractionMethod(
+                                currentIndex === 1 ? "whisper_audio" : "frame_ocr"
+                            )
+                        }
+                        Text {
                             Layout.fillWidth: true
-                            text: "Tốc độ quét"
+                            text: root.whisperExtraction
+                                ? root.appModel.whisperHealthText
+                                : "Đọc phụ đề cứng trực tiếp từ từng khung hình video"
+                            color: root.whisperExtraction && !root.appModel.whisperReady
+                                ? Theme.warning : Theme.textMuted
+                            elide: Text.ElideRight
+                            font.family: Theme.fontFamily
+                            font.pixelSize: 11
+                        }
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: Theme.space8
+                        Text {
+                            Layout.fillWidth: true
+                            text: root.whisperExtraction
+                                ? "large-v3 · tiếng Trung · beam 5 · timestamp theo từ"
+                                : "Tốc độ quét"
                             color: Theme.textSecondary
                             font.family: Theme.fontFamily
                             font.pixelSize: 11
@@ -389,6 +443,7 @@ Item {
                             }
 
                             Layout.preferredWidth: 64
+                            visible: !root.whisperExtraction
                             text: Number(root.appModel.ocrSampleFps).toFixed(2)
                             inputMethodHints: Qt.ImhFormattedNumbersOnly
                             validator: RegularExpressionValidator {
@@ -418,57 +473,90 @@ Item {
                             warning: ["running", "pause_requested"]
                                 .indexOf(root.appModel.ocrJobState) >= 0
                             text: root.appModel.ocrJobState === "running"
-                                ? "Tạm dừng OCR"
+                                ? (root.whisperExtraction
+                                    ? "Tạm dừng Whisper" : "Tạm dừng OCR")
                                 : (root.appModel.ocrJobState === "paused"
-                                    ? "Tiếp tục OCR"
+                                    ? (root.whisperExtraction
+                                        ? "Tiếp tục Whisper" : "Tiếp tục OCR")
                                     : (root.appModel.ocrJobState === "queued"
-                                        ? "Bắt đầu OCR"
+                                        ? (root.whisperExtraction
+                                            ? "Bắt đầu Whisper" : "Bắt đầu OCR")
                                         : (["failed", "interrupted"]
                                             .indexOf(root.appModel.ocrJobState) >= 0
-                                            ? "Tiếp tục OCR từ cache"
+                                            ? (root.whisperExtraction
+                                                ? "Tiếp tục Whisper từ cache"
+                                                : "Tiếp tục OCR từ cache")
                                             : (root.appModel.currentProject.subtitleCueModel.count > 0
-                                                ? "OCR lại · ghi đè SRT" : "Chạy OCR"))))
+                                                ? (root.whisperExtraction
+                                                    ? "Whisper lại · ghi đè SRT"
+                                                    : "OCR lại · ghi đè SRT")
+                                                : (root.whisperExtraction
+                                                    ? "Chạy Whisper" : "Chạy OCR")))))
                             operationState: ["succeeded", "cancelled", ""]
                                 .indexOf(root.appModel.ocrJobState) >= 0
                                 ? "idle" : root.appModel.ocrJobState
-                            runningText: "Tạm dừng OCR"
-                            queuedText: "Bắt đầu OCR"
-                            startingText: "Đang khởi động OCR…"
-                            pausingText: "Đang tạm dừng OCR…"
-                            pausedText: "Tiếp tục OCR"
-                            resumingText: "Đang tiếp tục OCR…"
-                            cancellingText: "Đang hủy OCR…"
+                            runningText: root.whisperExtraction
+                                ? "Tạm dừng Whisper" : "Tạm dừng OCR"
+                            queuedText: root.whisperExtraction
+                                ? "Bắt đầu Whisper" : "Bắt đầu OCR"
+                            startingText: root.whisperExtraction
+                                ? "Đang khởi động Whisper…" : "Đang khởi động OCR…"
+                            pausingText: root.whisperExtraction
+                                ? "Đang tạm dừng Whisper…" : "Đang tạm dừng OCR…"
+                            pausedText: root.whisperExtraction
+                                ? "Tiếp tục Whisper" : "Tiếp tục OCR"
+                            resumingText: root.whisperExtraction
+                                ? "Đang tiếp tục Whisper…" : "Đang tiếp tục OCR…"
+                            cancellingText: root.whisperExtraction
+                                ? "Đang hủy Whisper…" : "Đang hủy OCR…"
                             failedText: root.appModel.ocrJobState === "failed"
-                                ? "Tiếp tục OCR từ cache" : "Khôi phục OCR"
+                                ? (root.whisperExtraction
+                                    ? "Tiếp tục Whisper từ cache"
+                                    : "Tiếp tục OCR từ cache")
+                                : (root.whisperExtraction ? "Khôi phục Whisper" : "Khôi phục OCR")
                             feedbackText: root.appModel.ocrJobState === "running"
-                                ? "Đang yêu cầu tạm dừng OCR"
+                                ? (root.whisperExtraction
+                                    ? "Đang yêu cầu tạm dừng Whisper"
+                                    : "Đang yêu cầu tạm dừng OCR")
                                 : (root.appModel.ocrJobState === "paused"
-                                    ? "Đang tiếp tục OCR từ cache"
-                                    : "Đang bắt đầu OCR")
+                                    ? (root.whisperExtraction
+                                        ? "Đang tiếp tục Whisper từ cache"
+                                        : "Đang tiếp tục OCR từ cache")
+                                    : (root.whisperExtraction
+                                        ? "Đang bắt đầu Whisper"
+                                        : "Đang bắt đầu OCR"))
                             enabled: root.appModel.currentProject.hasVideo
+                                && (!root.whisperExtraction || root.appModel.whisperReady)
                                 && ["start_requested", "pause_requested",
                                     "resume_requested", "cancel_requested"]
                                     .indexOf(root.appModel.ocrJobState) < 0
                                 && (["", "succeeded", "cancelled"]
                                         .indexOf(root.appModel.ocrJobState) < 0
-                                    || ocrFps.valueIsValid)
+                                    || root.whisperExtraction || ocrFps.valueIsValid)
                             disabledReason: !root.appModel.currentProject.hasVideo
                                 ? "Hãy nhập video trước."
-                                : (!ocrFps.valueIsValid
+                                : (root.whisperExtraction && !root.appModel.whisperReady
+                                    ? "Hãy cài runtime và model Whisper large-v3 trước."
+                                : (!root.whisperExtraction && !ocrFps.valueIsValid
                                     ? "FPS OCR phải nằm trong khoảng 0,67–2,5."
-                                    : "OCR đang chuyển trạng thái; hãy chờ xác nhận.")
-                            onClicked: root.appModel.toggleOcr(ocrFps.numericValue)
+                                    : "Tác vụ trích xuất đang chuyển trạng thái; hãy chờ xác nhận."))
+                            onClicked: root.appModel.toggleOcr(
+                                ocrFps.valueIsValid
+                                    ? ocrFps.numericValue : root.appModel.ocrSampleFps
+                            )
                         }
                         DsButton {
                             text: "Hủy"
                             danger: true
                             operationState: root.appModel.ocrJobState === "cancel_requested"
                                 ? "cancel_requested" : "idle"
-                            cancellingText: "Đang hủy OCR…"
-                            feedbackText: "Đang yêu cầu hủy OCR"
+                            cancellingText: root.whisperExtraction
+                                ? "Đang hủy Whisper…" : "Đang hủy OCR…"
+                            feedbackText: root.whisperExtraction
+                                ? "Đang yêu cầu hủy Whisper" : "Đang yêu cầu hủy OCR"
                             enabled: ["queued", "running", "pause_requested", "paused",
                                 "resume_requested"].indexOf(root.appModel.ocrJobState) >= 0
-                            disabledReason: "Không có OCR đang hoạt động."
+                            disabledReason: "Không có tác vụ trích xuất đang hoạt động."
                             onClicked: root.appModel.cancelOcr()
                         }
                     }
@@ -707,6 +795,36 @@ Item {
             Flow {
                 Layout.fillWidth: true
                 Layout.preferredHeight: implicitHeight
+                visible: root.workspaceMode === "transcribe"
+                    || root.workspaceMode === "translate"
+                spacing: Theme.space8
+                DsButton {
+                    id: sourceSrtExportWorkflowButton
+                    visible: root.workspaceMode === "transcribe"
+                    text: "Xuất SRT nguồn"
+                    enabled: root.appModel.currentProject.subtitleCueModel.count > 0
+                        && !root.appModel.subtitleExportBusy
+                    disabledReason: root.appModel.subtitleExportBusy
+                        ? "Đang xuất một file SRT."
+                        : "Chưa có phụ đề nguồn để xuất."
+                    onClicked: sourceSrtExportDialog.open()
+                }
+                DsButton {
+                    id: translatedSrtExportWorkflowButton
+                    visible: root.workspaceMode === "translate"
+                    text: "Xuất SRT tiếng Việt"
+                    enabled: root.appModel.currentProject.hasTranslatedSubtitles
+                        && !root.appModel.subtitleExportBusy
+                    disabledReason: root.appModel.subtitleExportBusy
+                        ? "Đang xuất một file SRT."
+                        : "Chưa có phụ đề tiếng Việt để xuất."
+                    onClicked: translatedSrtExportDialog.open()
+                }
+            }
+
+            Flow {
+                Layout.fillWidth: true
+                Layout.preferredHeight: implicitHeight
                 visible: root.workspaceMode === "subtitles"
                 spacing: Theme.space8
                 DsButton {
@@ -763,6 +881,24 @@ Item {
                     enabled: root.appModel.currentProject.subtitleCueModel.count > 0
                     disabledReason: "Chưa có cue để tìm."
                     onClicked: root.findBarOpen = !root.findBarOpen
+                }
+                DsButton {
+                    text: "Xuất SRT nguồn"
+                    enabled: root.appModel.currentProject.subtitleCueModel.count > 0
+                        && !root.appModel.subtitleExportBusy
+                    disabledReason: root.appModel.subtitleExportBusy
+                        ? "Đang xuất một file SRT."
+                        : "Chưa có phụ đề nguồn để xuất."
+                    onClicked: sourceSrtExportDialog.open()
+                }
+                DsButton {
+                    text: "Xuất SRT tiếng Việt"
+                    enabled: root.appModel.currentProject.hasTranslatedSubtitles
+                        && !root.appModel.subtitleExportBusy
+                    disabledReason: root.appModel.subtitleExportBusy
+                        ? "Đang xuất một file SRT."
+                        : "Chưa có phụ đề tiếng Việt để xuất."
+                    onClicked: translatedSrtExportDialog.open()
                 }
             }
 

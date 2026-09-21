@@ -56,6 +56,7 @@ def _repair_managed_venv_homes(data_root: Path) -> None:
         (data_root / "paddle_runtime" / ".venv", data_root / "python_runtime_311"),
         (data_root / "piper_runtime" / ".venv", data_root / "python_runtime_312"),
         (data_root / "vieneu_3_3_runtime" / ".venv", data_root / "python_runtime_312"),
+        (data_root / "whisper_runtime" / ".venv", data_root / "python_runtime_312"),
     )
     for venv_root, python_home in mappings:
         config = venv_root / "pyvenv.cfg"

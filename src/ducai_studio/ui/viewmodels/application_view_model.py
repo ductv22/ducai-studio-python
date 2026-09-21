@@ -36,6 +36,12 @@ from ducai_studio.domain.jobs import redact_sensitive_text
 from ducai_studio.infrastructure.ipc.client import JobManagerClient
 from ducai_studio.infrastructure.process_tree import ProcessTreeGuard
 from ducai_studio.infrastructure.runtime_program import runtime_program_path
+from ducai_studio.infrastructure.whisper_runtime import (
+    WHISPER_MODEL_ID,
+    whisper_model_path,
+    whisper_runtime_is_ready,
+    whisper_runtime_python,
+)
 from ducai_studio.providers.preview import QtMultimediaPreviewProvider
 from ducai_studio.providers.translation.openai_compatible import (
     OPENAI_COMPATIBLE_PROVIDER_IDS,
@@ -693,6 +699,7 @@ class ApplicationViewModel(QObject):
     ocrSettingsChanged = Signal()
     selectedCueChanged = Signal()
     subtitleBusyChanged = Signal()
+    subtitleExportBusyChanged = Signal()
     subtitleHistoryChanged = Signal()
     translationBusyChanged = Signal()
     translationSettingsChanged = Signal()
@@ -779,6 +786,15 @@ class ApplicationViewModel(QObject):
         self._ocr_busy = False
         self._ocr_job_id = ""
         self._ocr_job_state = ""
+        self._ocr_job_method = "frame_ocr"
+        saved_extraction_method = self.settings.value(
+            "ocr/extractionMethod", "frame_ocr", type=str
+        ).strip().casefold()
+        self._ocr_extraction_method = (
+            saved_extraction_method
+            if saved_extraction_method in {"frame_ocr", "whisper_audio"}
+            else "frame_ocr"
+        )
         try:
             saved_ocr_fps = float(self.settings.value("ocr/sampleFps", 1.25))
         except (TypeError, ValueError):
@@ -902,6 +918,7 @@ class ApplicationViewModel(QObject):
         self._selected_voice_id = str(selected_voice.get("voice_id", ""))
         self._selected_cue_id = ""
         self._subtitle_busy = False
+        self._subtitle_export_busy = False
         self._can_undo_subtitle = False
         self._can_redo_subtitle = False
         self.runtime = JobRuntime(self)
@@ -1198,6 +1215,35 @@ class ApplicationViewModel(QObject):
     @Property(str, notify=ocrSettingsChanged)
     def ocrEnginePython(self) -> str:
         return self.settings.value("engines/paddlePython", _default_ocr_engine_python(), type=str)
+
+    @Property(str, notify=ocrSettingsChanged)
+    def ocrExtractionMethod(self) -> str:
+        return self._ocr_extraction_method
+
+    @Property(str, notify=ocrSettingsChanged)
+    def whisperRuntimePython(self) -> str:
+        return str(whisper_runtime_python())
+
+    @Property(str, notify=ocrSettingsChanged)
+    def whisperModelPath(self) -> str:
+        model = whisper_model_path()
+        return str(model) if model is not None else ""
+
+    @Property(bool, notify=ocrSettingsChanged)
+    def whisperReady(self) -> bool:
+        return whisper_runtime_is_ready() and whisper_model_path() is not None
+
+    @Property(str, notify=ocrSettingsChanged)
+    def whisperHealthText(self) -> str:
+        runtime_ready = whisper_runtime_is_ready()
+        model_ready = whisper_model_path() is not None
+        if runtime_ready and model_ready:
+            return "Whisper large-v3 sẵn sàng · ưu tiên CUDA, tự dự phòng CPU"
+        if not runtime_ready and not model_ready:
+            return "Chưa cài runtime và model Whisper large-v3"
+        if not runtime_ready:
+            return "Đã có model nhưng thiếu runtime Whisper"
+        return "Đã có runtime nhưng thiếu model Whisper large-v3"
 
     @Property(float, notify=ocrSettingsChanged)
     def ocrSampleFps(self) -> float:
@@ -1525,6 +1571,10 @@ class ApplicationViewModel(QObject):
     def subtitleBusy(self) -> bool:
         return self._subtitle_busy
 
+    @Property(bool, notify=subtitleExportBusyChanged)
+    def subtitleExportBusy(self) -> bool:
+        return self._subtitle_export_busy
+
     @Property(bool, notify=subtitleHistoryChanged)
     def canUndoSubtitle(self) -> bool:
         return self._can_undo_subtitle
@@ -1564,6 +1614,26 @@ class ApplicationViewModel(QObject):
             return
         self.settings.setValue("engines/paddlePython", str(path))
         self.ocrSettingsChanged.emit()
+
+    @Slot(str)
+    def setOcrExtractionMethod(self, value: str) -> None:
+        method = value.strip().casefold()
+        if method not in {"frame_ocr", "whisper_audio"}:
+            self._set_status("Phương thức trích xuất không hợp lệ")
+            return
+        if self._ocr_busy:
+            self._set_status("Hãy tạm dừng hoặc hoàn tất tác vụ trích xuất trước khi đổi chế độ")
+            return
+        if method == self._ocr_extraction_method:
+            return
+        self._ocr_extraction_method = method
+        self.settings.setValue("ocr/extractionMethod", method)
+        self.ocrSettingsChanged.emit()
+        self._set_status(
+            "Đã chọn Whisper âm thanh"
+            if method == "whisper_audio"
+            else "Đã chọn OCR khung hình"
+        )
 
     @Slot(float)
     def setOcrSampleFps(self, value: float) -> None:
@@ -1629,27 +1699,64 @@ class ApplicationViewModel(QObject):
         if self._ocr_busy:
             self._set_status("OCR đang chạy; có thể tạm dừng hoặc hủy tác vụ hiện tại")
             return
-        if not math.isfinite(sample_fps) or not 0.67 <= sample_fps <= 2.5:
+        method = self._ocr_extraction_method
+        if (
+            method == "frame_ocr"
+            and (not math.isfinite(sample_fps) or not 0.67 <= sample_fps <= 2.5)
+        ):
             self._set_status("FPS OCR phải nằm trong khoảng 0,67–2,5")
             return
-        self.setOcrSampleFps(sample_fps)
-        interval_us = int(round(1_000_000 / sample_fps))
+        if method == "frame_ocr":
+            self.setOcrSampleFps(sample_fps)
+        interval_us = int(round(1_000_000 / self._ocr_sample_fps))
+        runtime = (
+            whisper_runtime_python()
+            if method == "whisper_audio"
+            else Path(self.ocrEnginePython)
+        )
+        model = whisper_model_path() if method == "whisper_audio" else None
+        if method == "whisper_audio" and not whisper_runtime_is_ready(runtime):
+            self._set_status(
+                "Chưa cài runtime Whisper. Hãy chạy scripts/setup-whisper-runtime.ps1."
+            )
+            return
+        if method == "whisper_audio" and model is None:
+            self._set_status(
+                "Chưa có model Whisper large-v3. Hãy chạy scripts/setup-whisper-runtime.ps1."
+            )
+            return
         self._set_ocr_job_state("start_requested")
         self._set_ocr_busy(True)
+        self._ocr_job_method = method
         self.runtime.request(
             "create_ocr_job",
             {
                 "project_id": self.project_state.projectId,
                 "sample_interval_us": interval_us,
-                "engine_python": self.ocrEnginePython,
-                "device": "gpu:0",
+                "engine_python": str(runtime),
+                "device": "auto" if method == "whisper_audio" else "gpu:0",
+                "extraction_method": method,
+                "language": "zh",
+                "model_id": WHISPER_MODEL_ID,
+                "model_path": str(model) if model is not None else None,
             },
         )
-        self._set_status("Đang tạo tác vụ trích xuất phụ đề")
+        self._set_status(
+            "Đang tạo tác vụ Whisper âm thanh"
+            if method == "whisper_audio"
+            else "Đang tạo tác vụ OCR khung hình"
+        )
 
     @Slot(float)
     def toggleOcr(self, sample_fps: float = 1.25) -> None:
         """Dispatch the one primary OCR control from durable job state."""
+
+        if (
+            self._ocr_job_method != self._ocr_extraction_method
+            and self._ocr_job_state in {"paused", "interrupted", "failed", "cancelled", "succeeded"}
+        ):
+            self.startOcr(sample_fps)
+            return
 
         if self._ocr_job_state == "running":
             self.pauseOcr()
@@ -2061,6 +2168,34 @@ class ApplicationViewModel(QObject):
             },
         )
         self._set_status("Đang kiểm tra cue và timestamp của SRT Việt ngoài")
+
+    @Slot(str, str)
+    def exportSubtitleSrt(self, language: str, raw_path: str) -> None:
+        if not self._backend_ready or not self.project_state.hasProject:
+            self._set_status("Hãy mở dự án trước khi xuất SRT")
+            return
+        normalized_language = language.strip().casefold()
+        if normalized_language not in {"source", "translated"}:
+            self._set_status("Không xác định được loại phụ đề cần xuất")
+            return
+        if self._subtitle_export_busy:
+            self._set_status("Đang xuất một file SRT; hãy chờ hoàn tất")
+            return
+        path = _local_path_from_ui(raw_path)
+        if path.suffix.casefold() != ".srt":
+            self._set_status("File xuất phụ đề phải có đuôi .srt")
+            return
+        self._set_subtitle_export_busy(True)
+        self.runtime.request(
+            "export_subtitle_srt",
+            {
+                "project_id": self.project_state.projectId,
+                "language": normalized_language,
+                "output_path": str(path),
+            },
+            context={"language": normalized_language},
+        )
+        self._set_status("Đang xuất SRT từ nội dung mới nhất của dự án")
 
     @Slot(str)
     def selectVoice(self, voice_id: str) -> None:
@@ -3930,6 +4065,22 @@ class ApplicationViewModel(QObject):
         self.runtime.request("multi_restore_hidden")
 
     def _multi_settings_snapshot(self) -> dict[str, object]:
+        whisper_model = (
+            whisper_model_path()
+            if self._ocr_extraction_method == "whisper_audio"
+            else None
+        )
+        if self._ocr_extraction_method == "whisper_audio":
+            if not whisper_runtime_is_ready():
+                raise ValueError(
+                    "Multi Whisper chưa thể chạy vì thiếu runtime. "
+                    "Hãy chạy scripts/setup-whisper-runtime.ps1."
+                )
+            if whisper_model is None:
+                raise ValueError(
+                    "Multi Whisper chưa thể chạy vì thiếu model large-v3. "
+                    "Hãy chạy scripts/setup-whisper-runtime.ps1."
+                )
         provider_id = (
             self.settings.value("translation/provider", "gemini-web", type=str).strip().casefold()
         )
@@ -4014,8 +4165,20 @@ class ApplicationViewModel(QObject):
                 # single-video OCR screen instead of silently falling back to
                 # a hard-coded 1.25 FPS.
                 "sample_interval_us": int(round(1_000_000 / self._ocr_sample_fps)),
-                "engine_python": self.ocrEnginePython,
-                "device": "gpu:0",
+                "engine_python": (
+                    str(whisper_runtime_python())
+                    if self._ocr_extraction_method == "whisper_audio"
+                    else self.ocrEnginePython
+                ),
+                "device": (
+                    "auto" if self._ocr_extraction_method == "whisper_audio" else "gpu:0"
+                ),
+                "extraction_method": self._ocr_extraction_method,
+                "language": "zh",
+                "model_id": WHISPER_MODEL_ID,
+                "model_path": (
+                    str(whisper_model) if whisper_model is not None else None
+                ),
             },
             "translation": {
                 "provider_id": provider_id,
@@ -4495,7 +4658,11 @@ class ApplicationViewModel(QObject):
         config = spec.get("provider_config") if isinstance(spec, dict) else {}
         config = config if isinstance(config, dict) else {}
         if kind == "ocr":
-            return "OCR"
+            return (
+                "Whisper âm thanh"
+                if config.get("extraction_method") == "whisper_audio"
+                else "OCR khung hình"
+            )
         if kind == "translate":
             purpose = str(config.get("purpose", ""))
             return "Rút gọn cue dài" if purpose == "voice_timing_repair" else "Dịch thuật"
@@ -4583,6 +4750,38 @@ class ApplicationViewModel(QObject):
                 "Nhà cung cấp yêu cầu xác thực lại. Nếu dùng API, hãy kiểm tra "
                 "key và quyền model; nếu dùng Gemini Web, hãy thử lại từ cache "
                 "hoặc chuyển sang Gemini API/CLI."
+            ),
+            "whisper_engine_python_missing": (
+                "Không tìm thấy runtime Whisper. Hãy chạy "
+                "scripts/setup-whisper-runtime.ps1 rồi thử lại."
+            ),
+            "whisper_model_missing": (
+                "Không tìm thấy model Whisper large-v3 hoặc model chưa đầy đủ. "
+                "Hãy chạy scripts/setup-whisper-runtime.ps1 rồi thử lại."
+            ),
+            "whisper_audio_track_missing": (
+                "Video không có track âm thanh để Whisper nhận dạng. Hãy dùng OCR "
+                "khung hình hoặc nhập video có tiếng."
+            ),
+            "whisper_audio_extract_failed": (
+                "Không tách được audio 16 kHz từ video. Hãy kiểm tra file nguồn và "
+                "FFmpeg trong Cài đặt → Chẩn đoán runtime."
+            ),
+            "whisper_checkpoint_corrupt": (
+                "Checkpoint Whisper bị hỏng nên không thể tiếp tục an toàn. Hãy "
+                "chạy lại Whisper cho video này; SRT đã publish trước đó không bị đổi."
+            ),
+            "whisper_no_speech_detected": (
+                "Whisper không tìm thấy lời nói trong track âm thanh đã chọn. Hãy "
+                "kiểm tra audio nguồn hoặc chuyển sang OCR khung hình."
+            ),
+            "whisper_segment_invalid": (
+                "Whisper trả về timestamp không hợp lệ. Chưa có SRT dở dang nào "
+                "được đưa vào dự án; hãy thử lại hoặc dùng OCR khung hình."
+            ),
+            "whisper_cuda_failed": (
+                "Whisper không chạy được bằng CUDA và cũng không hoàn tất bằng CPU. "
+                "Hãy kiểm tra driver/GPU hoặc chọn lại video rồi thử tiếp từ cache."
             ),
         }
         translated = messages.get(normalized)
@@ -4858,6 +5057,18 @@ class ApplicationViewModel(QObject):
             ),
             None,
         )
+        if latest_ocr:
+            latest_spec = latest_ocr.get("spec")
+            latest_config = (
+                latest_spec.get("provider_config", {})
+                if isinstance(latest_spec, dict)
+                else {}
+            )
+            self._ocr_job_method = (
+                str(latest_config.get("extraction_method", "frame_ocr"))
+                if isinstance(latest_config, dict)
+                else "frame_ocr"
+            )
         next_state = str(latest_ocr.get("state", "")) if latest_ocr else ""
         if not active_id and latest_ocr and next_state in {"interrupted", "failed"}:
             self._ocr_job_id = str(latest_ocr.get("id", ""))
@@ -5485,6 +5696,17 @@ class ApplicationViewModel(QObject):
 
     @Slot(str, object, object)
     def _action_succeeded(self, action: str, result: object, context: object) -> None:
+        if action == "export_subtitle_srt":
+            self._set_subtitle_export_busy(False)
+            if not isinstance(result, dict):
+                self._set_status("Job Manager trả về kết quả xuất SRT không hợp lệ")
+                return
+            path = str(result.get("path", ""))
+            cue_count = int(result.get("cue_count", 0) or 0)
+            language = str(result.get("language", ""))
+            label = "nguồn" if language == "source" else "tiếng Việt"
+            self._set_status(f"Đã xuất {cue_count} cue SRT {label}: {path}")
+            return
         if action == "create_project_with_media":
             request_context = context if isinstance(context, dict) else {}
             if "multi_import_path" not in request_context:
@@ -6114,6 +6336,7 @@ class ApplicationViewModel(QObject):
         if action == "runtime_diagnostics" and isinstance(result, dict):
             self._runtime_diagnostics = result
             self.diagnosticsChanged.emit()
+            self.ocrSettingsChanged.emit()
             state = str(result.get("overall_status", "unknown"))
             self._set_status(f"Chẩn đoán runtime hoàn tất: {state}")
             return
@@ -6153,6 +6376,13 @@ class ApplicationViewModel(QObject):
                 self._set_status("Job Manager không trả về mã tác vụ OCR")
                 return
             self._ocr_job_id = job_id
+            spec = result.get("spec")
+            config = spec.get("provider_config", {}) if isinstance(spec, dict) else {}
+            self._ocr_job_method = (
+                str(config.get("extraction_method", "frame_ocr"))
+                if isinstance(config, dict)
+                else "frame_ocr"
+            )
             self.ocrBusyChanged.emit()
             self._start_ocr_worker(job_id)
             self._set_status(
@@ -6604,6 +6834,13 @@ class ApplicationViewModel(QObject):
 
     @Slot(str, object, object)
     def _action_failed(self, action: str, error: object, context: object) -> None:
+        if action == "export_subtitle_srt":
+            self._set_subtitle_export_busy(False)
+            self._set_status(
+                "Không thể xuất SRT; dự án và cache không bị thay đổi: "
+                + self._format_action_error(error)
+            )
+            return
         if action == "subtitle_command":
             request_context = context if isinstance(context, dict) else {}
             request_project_id = str(request_context.get("project_id", ""))
@@ -6929,6 +7166,7 @@ class ApplicationViewModel(QObject):
                 self._set_export_busy(False)
             elif action in {"create_ocr_job", "start_job"}:
                 self._set_ocr_busy(False)
+                self._set_ocr_job_state("failed")
             message = self._format_action_error(error)
             self._set_status(
                 f"Dịch thuật không thể tiếp tục: {message}"
@@ -7362,6 +7600,13 @@ class ApplicationViewModel(QObject):
             return
         self._subtitle_busy = value
         self.subtitleBusyChanged.emit()
+
+    def _set_subtitle_export_busy(self, value: bool) -> None:
+        value = bool(value)
+        if value == self._subtitle_export_busy:
+            return
+        self._subtitle_export_busy = value
+        self.subtitleExportBusyChanged.emit()
 
     def _send_subtitle_command(
         self,

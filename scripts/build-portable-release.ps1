@@ -4,6 +4,7 @@ param(
     [switch]$SkipBuild,
     [switch]$SkipTests,
     [switch]$Clean,
+    [switch]$IncludeWhisper,
     [switch]$CreateArchive
 )
 
@@ -194,7 +195,9 @@ foreach ($name in @("LICENSE", "README.txt")) {
     }
 }
 
-foreach ($runtime in @("paddle_runtime", "piper_runtime", "vieneu_3_3_runtime")) {
+$runtimeNames = @("paddle_runtime", "piper_runtime", "vieneu_3_3_runtime")
+if ($IncludeWhisper) { $runtimeNames += "whisper_runtime" }
+foreach ($runtime in $runtimeNames) {
     $source = Join-Path $sourceDataPath $runtime
     $destination = Join-Path $portableData $runtime
     Copy-Tree (Join-Path $source ".venv") (Join-Path $destination ".venv")
@@ -212,7 +215,8 @@ Copy-File (Join-Path $sourceDataPath "piper_voices\$piperVoice.json") `
 
 $huggingFace = Join-Path $sourceDataPath "model_cache\huggingface"
 Copy-Tree (Join-Path $huggingFace "hub") `
-    (Join-Path $portableData "model_cache\huggingface\hub") @(".locks")
+    (Join-Path $portableData "model_cache\huggingface\hub") `
+    @(".locks", "models--Systran--faster-whisper-large-v3")
 if (Test-Path -LiteralPath (Join-Path $huggingFace "modules") -PathType Container) {
     Copy-Tree (Join-Path $huggingFace "modules") `
         (Join-Path $portableData "model_cache\huggingface\modules")
@@ -236,7 +240,14 @@ Copy-SlimPythonHome $python312Source $python312Target
 Set-VenvHome (Join-Path $portableData "paddle_runtime\.venv") $python311Target
 Set-VenvHome (Join-Path $portableData "piper_runtime\.venv") $python312Target
 Set-VenvHome (Join-Path $portableData "vieneu_3_3_runtime\.venv") $python312Target
-foreach ($runtime in @("paddle_runtime", "piper_runtime", "vieneu_3_3_runtime")) {
+if ($IncludeWhisper) {
+    Set-VenvHome (Join-Path $portableData "whisper_runtime\.venv") $python312Target
+    $whisperModel = Join-Path $sourceDataPath `
+        "model_cache\whisper\Systran--faster-whisper-large-v3"
+    Copy-Tree $whisperModel (Join-Path $portableData `
+        "model_cache\whisper\Systran--faster-whisper-large-v3")
+}
+foreach ($runtime in $runtimeNames) {
     Remove-MachineBoundVenvArtifacts (Join-Path $portableData "$runtime\.venv")
     Rewrite-RuntimeMetadata (Join-Path $portableData "$runtime\ducai_runtime.json")
 }
@@ -254,6 +265,7 @@ DUCAI STUDIO $version PORTABLE
 1. Giải nén toàn bộ gói vào thư mục có quyền ghi trước khi chạy.
 2. Mở DucaiStudio2.exe trực tiếp; không di chuyển riêng file EXE.
 3. OCR, Piper, VieNeu và FFmpeg đã nằm trong gói.
+   Whisper chỉ có trong gói khi manifest ghi whisper_included=true.
 4. Máy nhận cần Windows 64-bit. GPU NVIDIA và driver tương thích CUDA 12.8
    được khuyến nghị cho VieNeu/Paddle GPU.
 5. Gemini Web dùng Chrome hoặc Edge đã cài trên máy; API cần key riêng của người nhận.
@@ -289,6 +301,11 @@ $criticalRoots = @(
     (Join-Path $portableData "model_cache"),
     (Join-Path $portableData "paddle_model_cache")
 )
+if ($IncludeWhisper) {
+    $criticalRoots += (Join-Path $portableData "whisper_runtime")
+    $criticalRoots += (Join-Path $portableData `
+        "model_cache\whisper\Systran--faster-whisper-large-v3")
+}
 $hashes = [ordered]@{}
 foreach ($root in $criticalRoots) {
     $files = if (Test-Path -LiteralPath $root -PathType Leaf) {
@@ -304,6 +321,13 @@ foreach ($root in $criticalRoots) {
 $allFiles = Get-ChildItem -LiteralPath $portableRoot -Recurse -File
 $totalBytes = ($allFiles | Measure-Object Length -Sum).Sum
 $portableManifestPath = Join-Path $portableRoot "portable-manifest.json"
+$components = @(
+    "DUCAI GUI", "PaddleOCR GPU", "Piper 1.6 + vi_VN-vais1000-medium",
+    "VieNeu 3.3 Turbo + model/tokenizer", "FFmpeg 8.1.1"
+)
+if ($IncludeWhisper) {
+    $components += "Whisper large-v3 + faster-whisper 1.2.1"
+}
 $manifest = [ordered]@{
     schema = "ducai-portable-manifest-v1"
     product = "DUCAI STUDIO 2"
@@ -311,10 +335,8 @@ $manifest = [ordered]@{
     platform = "windows-x86_64"
     package_bytes = [long]$totalBytes
     package_files = $allFiles.Count + 1
-    components = @(
-        "DUCAI GUI", "PaddleOCR GPU", "Piper 1.6 + vi_VN-vais1000-medium",
-        "VieNeu 3.3 Turbo + model/tokenizer", "FFmpeg 8.1.1"
-    )
+    components = $components
+    whisper_included = [bool]$IncludeWhisper
     privacy = [ordered]@{
         projects = $false
         media = $false

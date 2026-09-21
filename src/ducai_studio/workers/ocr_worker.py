@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import queue
 import shutil
@@ -10,6 +11,7 @@ import sys
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -30,6 +32,7 @@ from ducai_studio.application.subtitle_finalizer import (
     publish_final_srt,
     render_srt,
 )
+from ducai_studio.domain.project import SubtitleCue
 from ducai_studio.domain.subtitles import NormalizedBox, RescueWindow, SubtitleEvidence
 from ducai_studio.domain.timebase import TimeRange
 from ducai_studio.external_runtime import (
@@ -46,6 +49,10 @@ class EngineError(RuntimeError):
 
 
 class WorkerStopped(RuntimeError):
+    pass
+
+
+class WhisperRestart(RuntimeError):
     pass
 
 
@@ -165,6 +172,156 @@ class EngineHostClient:
         process.wait(timeout=5)
 
 
+class WhisperEngineClient:
+    """Read streamed host responses while keeping worker controls responsive."""
+
+    def __init__(self, python_path: Path, host_path: Path) -> None:
+        self.python_path = python_path
+        self.host_path = host_path
+        self.process: subprocess.Popen[str] | None = None
+        self._stdout: queue.Queue[str | None] = queue.Queue()
+        self._stderr: deque[str] = deque(maxlen=20)
+
+    def start(self) -> None:
+        if self.process is not None:
+            return
+        if not self.python_path.is_file():
+            raise EngineError("whisper_engine_python_missing")
+        if not self.host_path.is_file():
+            raise EngineError("whisper_engine_host_missing")
+        environment = isolated_python_environment(
+            {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}
+        )
+        creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        self.process = subprocess.Popen(
+            [str(self.python_path), "-u", str(self.host_path)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            creationflags=creation_flags,
+            env=environment,
+            cwd=isolated_python_working_directory(self.python_path),
+        )
+        threading.Thread(target=self._read_stdout, daemon=True).start()
+        threading.Thread(target=self._read_stderr, daemon=True).start()
+
+    def _read_stdout(self) -> None:
+        process = self.process
+        if process is None or process.stdout is None:
+            self._stdout.put(None)
+            return
+        for line in process.stdout:
+            self._stdout.put(line)
+        self._stdout.put(None)
+
+    def _read_stderr(self) -> None:
+        process = self.process
+        if process is None or process.stderr is None:
+            return
+        for line in process.stderr:
+            self._stderr.append(line.rstrip()[:500])
+
+    def stream(
+        self,
+        payload: dict[str, Any],
+        *,
+        poll_control: Callable[[], bool],
+    ):
+        self.start()
+        process = self.process
+        if process is None or process.stdin is None:
+            raise EngineError("whisper_engine_unavailable")
+        request_id = str(uuid4())
+        try:
+            process.stdin.write(
+                json.dumps(
+                    {
+                        "protocol_version": 1,
+                        "id": request_id,
+                        "action": "transcribe",
+                        "payload": payload,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+            process.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            raise EngineError("whisper_engine_pipe_failed") from exc
+        while True:
+            if poll_control():
+                self.terminate()
+                raise WhisperRestart
+            try:
+                line = self._stdout.get(timeout=0.1)
+            except queue.Empty:
+                if process.poll() is not None:
+                    raise EngineError("whisper_engine_exited") from None
+                continue
+            if line is None:
+                raise EngineError("whisper_engine_no_response")
+            try:
+                response = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise EngineError("whisper_engine_invalid_response") from exc
+            if response.get("id") != request_id:
+                raise EngineError("whisper_engine_response_mismatch")
+            if response.get("ok") is not True:
+                error = response.get("error", {})
+                code = error.get("code") if isinstance(error, dict) else None
+                raise EngineError(str(code or "whisper_engine_failed")[:80])
+            event = str(response.get("event", ""))
+            result = response.get("result", {})
+            if not isinstance(result, dict):
+                raise EngineError("whisper_engine_invalid_result")
+            yield event, result
+            if event == "complete":
+                return
+
+    def terminate(self) -> None:
+        process = self.process
+        self.process = None
+        if process is None:
+            return
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+
+    def close(self) -> None:
+        process = self.process
+        self.process = None
+        if process is None:
+            return
+        if process.poll() is None and process.stdin is not None:
+            try:
+                process.stdin.write(
+                    json.dumps(
+                        {
+                            "protocol_version": 1,
+                            "id": str(uuid4()),
+                            "action": "shutdown",
+                            "payload": {},
+                        }
+                    )
+                    + "\n"
+                )
+                process.stdin.flush()
+                process.wait(timeout=3)
+            except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+                process.kill()
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=3)
+
+
 class OcrWorker:
     def __init__(self, job_id: str) -> None:
         self.job_id = job_id
@@ -177,11 +334,16 @@ class OcrWorker:
         self.job_staging = self.staging_root / job_id
         self.job_staging.mkdir(parents=True, exist_ok=True)
         self.evidence_path = self.job_staging / "ocr-evidence-working.ndjson"
-        self.engine: EngineHostClient | None = None
+        self.whisper_segments_path = self.job_staging / "whisper-segments-working.ndjson"
+        self.whisper_audio_path = self.job_staging / "dialogue-16k-mono.wav"
+        self.engine: EngineHostClient | WhisperEngineClient | None = None
         self.spec: dict[str, Any] = {}
         self.config: dict[str, Any] = {}
         self.stage = "fast"
         self.cursor_us = 0
+        self._whisper_force_cpu = False
+        self._whisper_runtime: dict[str, Any] = {}
+        self._whisper_segment_total = 0
         self._reader = threading.Thread(target=self._read_commands, daemon=True)
 
     def send(
@@ -268,6 +430,9 @@ class OcrWorker:
         self._restore_checkpoint(start_payload.get("checkpoint"))
 
     def _restore_checkpoint(self, checkpoint: object) -> None:
+        if self.config.get("extraction_method") == "whisper_audio":
+            self._restore_whisper_checkpoint(checkpoint)
+            return
         if not isinstance(checkpoint, dict):
             self.evidence_path.unlink(missing_ok=True)
             return
@@ -305,6 +470,30 @@ class OcrWorker:
                 )
             )
             self.cursor_us = rewind
+
+    def _restore_whisper_checkpoint(self, checkpoint: object) -> None:
+        self.stage = "whisper"
+        self.cursor_us = 0
+        self._whisper_segment_total = 0
+        self.whisper_segments_path.unlink(missing_ok=True)
+        if not isinstance(checkpoint, dict):
+            return
+        payload = checkpoint.get("payload", {})
+        artifact = checkpoint.get("artifact")
+        if not isinstance(payload, dict) or not isinstance(artifact, dict):
+            return
+        uri = artifact.get("uri")
+        if artifact.get("kind") != "whisper_segments" or not isinstance(uri, str):
+            return
+        try:
+            source = Path(uri).expanduser().resolve(strict=True)
+        except OSError as exc:
+            raise ValueError("whisper_checkpoint_corrupt") from exc
+        shutil.copyfile(source, self.whisper_segments_path)
+        raw_cursor = payload.get("cursor_us", checkpoint.get("cursor_us", 0))
+        self.cursor_us = int(raw_cursor) if type(raw_cursor) is int else 0
+        self._whisper_force_cpu = payload.get("device") == "cpu"
+        self._rewind_whisper_segments()
 
     def _filter_working_evidence(self, keep) -> None:
         if not self.evidence_path.is_file():
@@ -380,6 +569,8 @@ class OcrWorker:
         )
 
     def _execute(self) -> int:
+        if self.config.get("extraction_method") == "whisper_audio":
+            return self._execute_whisper()
         duration_us = self._integer_config("duration_us", 0, 1)
         interval_us = self._integer_config("sample_interval_us", 800_000, 400_000)
         fast_interval_us, quality_interval_us = _sampling_intervals(interval_us)
@@ -570,6 +761,468 @@ class OcrWorker:
             "output_size": output_stat.st_size,
             "output_mtime_ns": output_stat.st_mtime_ns,
         }
+
+    def _execute_whisper(self) -> int:
+        duration_us = self._integer_config("duration_us", 0, 1)
+        self.stage = "extract_audio"
+        self._ensure_whisper_audio(duration_us)
+        self.stage = "whisper"
+        configured_device = str(self.config.get("device", "auto")).strip().casefold()
+        while self.cursor_us < duration_us:
+            device = (
+                "cpu"
+                if self._whisper_force_cpu or configured_device == "cpu"
+                else "cuda"
+            )
+            compute_type = "int8" if device == "cpu" else "float16"
+            self._whisper_runtime = {"device": device, "compute_type": compute_type}
+            self.send(
+                "progress",
+                {
+                    "phase": "load_model",
+                    "current": 0,
+                    "total": 1,
+                    "cursor_us": self.cursor_us,
+                    "device": device,
+                    "compute_type": compute_type,
+                },
+            )
+            self._open_whisper_engine()
+            try:
+                started = time.monotonic()
+                assert isinstance(self.engine, WhisperEngineClient)
+                stream = self.engine.stream(
+                    {
+                        "audio_path": str(self.whisper_audio_path),
+                        "model_path": str(self.config["model_path"]),
+                        "model_id": str(self.config.get("model_id", "large-v3")),
+                        "language": str(self.config.get("language", "zh")),
+                        "start_us": self.cursor_us,
+                        "duration_us": duration_us,
+                        "device": device,
+                        "compute_type": compute_type,
+                        "beam_size": int(self.config.get("beam_size", 5)),
+                        "temperature": float(self.config.get("temperature", 0.0)),
+                        "vad_parameters": dict(self.config.get("vad_parameters", {})),
+                    },
+                    poll_control=self._handle_whisper_controls,
+                )
+                for event, payload in stream:
+                    if event == "metadata":
+                        self._whisper_runtime.update(payload)
+                        continue
+                    if event != "segment":
+                        continue
+                    self._append_whisper_segment(payload, duration_us=duration_us)
+                    self.cursor_us = int(payload["end_us"])
+                    self._send_whisper_progress(duration_us, started)
+                    if self._whisper_segment_count() % 8 == 0:
+                        self._checkpoint_whisper()
+                break
+            except WhisperRestart:
+                continue
+            except EngineError as exc:
+                if (
+                    str(exc) == "whisper_cuda_failed"
+                    and device == "cuda"
+                    and self.config.get("allow_cpu_fallback", True) is True
+                ):
+                    self._whisper_force_cpu = True
+                    self._whisper_runtime = {"device": "cpu", "compute_type": "int8"}
+                    self._rewind_whisper_segments()
+                    self._checkpoint_whisper()
+                    self.send(
+                        "progress",
+                        {
+                            "phase": "cpu_fallback",
+                            "current": 0,
+                            "total": 1,
+                            "cursor_us": self.cursor_us,
+                            "device": "cpu",
+                            "compute_type": "int8",
+                        },
+                    )
+                    continue
+                raise
+            finally:
+                if self.engine is not None:
+                    self.engine.close()
+                    self.engine = None
+
+        cues, warnings = _whisper_cues(
+            self._load_whisper_segments(), video_duration_us=duration_us
+        )
+        if not cues:
+            raise RuntimeError("whisper_no_speech_detected")
+        output_path = Path(
+            str(
+                self.config.get(
+                    "staging_output_path",
+                    self.config.get("output_path", ""),
+                )
+            )
+        ).expanduser().resolve()
+        if not output_path.name.endswith("_ZH_FINAL.srt"):
+            raise ValueError("whisper_output_path_invalid")
+        _atomic_write_text(
+            output_path,
+            "\ufeff" + render_srt(cues),
+            encoding="utf-8",
+        )
+        output_stat = output_path.stat()
+        qa_path = output_path.with_name(output_path.stem + "_QA.json")
+        qa_payload = {
+            "schema_version": 1,
+            "kind": "whisper_asr",
+            "status": "PASS",
+            "job_id": self.job_id,
+            "input_fingerprint": self.spec.get("input_fingerprint", ""),
+            "settings_fingerprint": self.spec.get("settings_fingerprint", ""),
+            "extraction_method": "whisper_audio",
+            "provider_id": self.spec.get("provider_id", "faster-whisper-audio"),
+            "model_id": self.spec.get("model_id", "large-v3"),
+            "device": str(self._whisper_runtime.get("device", "")),
+            "compute_type": str(self._whisper_runtime.get("compute_type", "")),
+            "cue_count": len(cues),
+            "last_cue_end_us": cues[-1].range.end_us,
+            "warnings": warnings,
+            "output_path": str(output_path),
+            "output_sha256": _file_sha256(output_path),
+            "output_size": output_stat.st_size,
+            "output_mtime_ns": output_stat.st_mtime_ns,
+        }
+        _atomic_write_json(qa_path, qa_payload)
+        self.send(
+            "progress",
+            {
+                "phase": "finalize",
+                "current": 1,
+                "total": 1,
+                "cursor_us": duration_us,
+            },
+        )
+        self.send(
+            "succeeded",
+            {
+                "status": "PASS",
+                "output_path": str(output_path),
+                "qa_path": str(qa_path),
+                "cue_count": len(cues),
+                "warning_count": len(warnings),
+                "device": qa_payload["device"],
+                "compute_type": qa_payload["compute_type"],
+            },
+        )
+        return 0
+
+    def _open_whisper_engine(self) -> None:
+        if self.engine is not None:
+            self.engine.close()
+        python_path = Path(str(self.config.get("engine_python", sys.executable))).resolve()
+        runtime_host = os.environ.get("DUCAI_OCR_ENGINE_HOST_PATH", "").strip()
+        host_path = Path(
+            runtime_host
+            or str(
+                self.config.get(
+                    "engine_host_path",
+                    Path(__file__).parents[1]
+                    / "engine_hosts"
+                    / "whisper_engine_host.py",
+                )
+            )
+        ).expanduser().resolve()
+        runtime_hash = os.environ.get("DUCAI_OCR_ENGINE_HOST_SHA256", "").strip()
+        if runtime_hash and sha256(host_path.read_bytes()).hexdigest() != runtime_hash:
+            raise RuntimeError("whisper_engine_host_runtime_changed")
+        self.engine = WhisperEngineClient(python_path, host_path)
+
+    def _ensure_whisper_audio(self, duration_us: int) -> None:
+        while not (
+            self.whisper_audio_path.is_file()
+            and self.whisper_audio_path.stat().st_size >= 4_096
+        ):
+            if not self._extract_whisper_audio_once(duration_us):
+                return
+
+    def _extract_whisper_audio_once(self, duration_us: int) -> bool:
+        media_path = Path(str(self.config.get("media_path", ""))).expanduser().resolve(
+            strict=True
+        )
+        ffprobe = Path(str(self.config.get("ffprobe_path", ""))).expanduser().resolve(
+            strict=True
+        )
+        ffmpeg = Path(str(self.config.get("ffmpeg_path", ""))).expanduser().resolve(
+            strict=True
+        )
+        stream = _probe_dialogue_stream(ffprobe, media_path)
+        channels = int(stream.get("channels") or 2)
+        mix = (
+            "pan=mono|c0=0.18*c0+0.18*c1+0.64*c2"
+            if channels >= 3
+            else "pan=mono|c0=0.5*c0+0.5*c1"
+            if channels == 2
+            else "anull"
+        )
+        temporary = self.whisper_audio_path.with_name("dialogue-16k-mono.partial.wav")
+        temporary.unlink(missing_ok=True)
+        progress_lines: queue.Queue[str | None] = queue.Queue()
+        stderr_lines: deque[str] = deque(maxlen=40)
+        process = subprocess.Popen(
+            [
+                str(ffmpeg),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(media_path),
+                "-map",
+                f"0:{int(stream['index'])}",
+                "-af",
+                mix,
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                "-c:a",
+                "pcm_s16le",
+                "-progress",
+                "pipe:1",
+                "-nostats",
+                str(temporary),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+
+        def read_progress() -> None:
+            if process.stdout is not None:
+                for line in process.stdout:
+                    progress_lines.put(line)
+            progress_lines.put(None)
+
+        def read_errors() -> None:
+            if process.stderr is not None:
+                for line in process.stderr:
+                    stderr_lines.append(line.rstrip()[:500])
+
+        threading.Thread(target=read_progress, daemon=True).start()
+        threading.Thread(target=read_errors, daemon=True).start()
+        restart = False
+        try:
+            while process.poll() is None:
+                if self._handle_whisper_controls():
+                    restart = True
+                    process.terminate()
+                    break
+                try:
+                    line = progress_lines.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if line is None:
+                    continue
+                progress_us = _ffmpeg_progress_us(line)
+                if progress_us is not None:
+                    self.send(
+                        "progress",
+                        {
+                            "phase": "extract_audio",
+                            "current": min(duration_us, progress_us),
+                            "total": duration_us,
+                            "cursor_us": 0,
+                        },
+                    )
+            try:
+                return_code = process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                return_code = process.wait(timeout=5)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            if restart or process.returncode not in {0, None}:
+                temporary.unlink(missing_ok=True)
+        if restart:
+            return True
+        if return_code != 0 or not temporary.is_file() or temporary.stat().st_size < 4_096:
+            raise RuntimeError("whisper_audio_extract_failed")
+        os.replace(temporary, self.whisper_audio_path)
+        return False
+
+    def _handle_whisper_controls(self) -> bool:
+        while True:
+            try:
+                message = self.commands.get_nowait()
+            except queue.Empty:
+                return False
+            action = message.payload.get("action")
+            command_id = message.payload.get("command_id")
+            if isinstance(command_id, str) and command_id in self.acknowledgements:
+                cached = self.acknowledgements[command_id]
+                sys.stdout.buffer.write(cached.to_json_line())
+                sys.stdout.buffer.flush()
+                continue
+            if action == "pause" and isinstance(command_id, str):
+                if isinstance(self.engine, WhisperEngineClient):
+                    self.engine.terminate()
+                self._checkpoint_whisper()
+                self.acknowledge(command_id, "paused", {"status": "paused"})
+                while True:
+                    paused_message = self.commands.get()
+                    paused_action = paused_message.payload.get("action")
+                    paused_id = paused_message.payload.get("command_id")
+                    if not isinstance(paused_id, str):
+                        if paused_action == "stop":
+                            self.send("stopped", {"status": "stop"})
+                            raise WorkerStopped
+                        continue
+                    if paused_id in self.acknowledgements:
+                        cached = self.acknowledgements[paused_id]
+                        sys.stdout.buffer.write(cached.to_json_line())
+                        sys.stdout.buffer.flush()
+                        continue
+                    if paused_action == "resume":
+                        self._rewind_whisper_segments()
+                        self.acknowledge(paused_id, "resumed", {"status": "running"})
+                        return True
+                    if paused_action in {"cancel", "stop"}:
+                        self._checkpoint_whisper()
+                        self.send(
+                            "stopped",
+                            {"status": str(paused_action), "command_id": paused_id},
+                        )
+                        raise WorkerStopped
+            if action in {"cancel", "stop"}:
+                if isinstance(self.engine, WhisperEngineClient):
+                    self.engine.terminate()
+                self._checkpoint_whisper()
+                payload = {"status": str(action)}
+                if isinstance(command_id, str):
+                    payload["command_id"] = command_id
+                self.send("stopped", payload)
+                raise WorkerStopped
+
+    def _append_whisper_segment(
+        self,
+        raw: dict[str, Any],
+        *,
+        duration_us: int,
+    ) -> None:
+        start_us = raw.get("start_us")
+        end_us = raw.get("end_us")
+        text = str(raw.get("text", "")).strip()
+        if (
+            type(start_us) is not int
+            or type(end_us) is not int
+            or start_us < 0
+            or end_us <= start_us
+            or end_us > duration_us + 1_000
+            or not text
+        ):
+            raise ValueError("whisper_segment_invalid")
+        row = {
+            "start_us": start_us,
+            "end_us": min(duration_us, end_us),
+            "text": text,
+            "avg_logprob": float(raw.get("avg_logprob", -0.75) or -0.75),
+            "no_speech_prob": float(raw.get("no_speech_prob", 0.0) or 0.0),
+            "compression_ratio": float(raw.get("compression_ratio", 1.0) or 1.0),
+            "avg_word_probability": raw.get("avg_word_probability"),
+            "words": raw.get("words", []),
+        }
+        self.whisper_segments_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.whisper_segments_path.open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+        self._whisper_segment_total += 1
+
+    def _load_whisper_segments(self) -> list[dict[str, Any]]:
+        if not self.whisper_segments_path.is_file():
+            return []
+        rows: list[dict[str, Any]] = []
+        for line in self.whisper_segments_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError("whisper_checkpoint_corrupt") from exc
+            if not isinstance(row, dict):
+                raise ValueError("whisper_checkpoint_corrupt")
+            rows.append(row)
+        return rows
+
+    def _whisper_segment_count(self) -> int:
+        return self._whisper_segment_total
+
+    def _rewind_whisper_segments(self) -> None:
+        rewind_us = max(0, self.cursor_us - 5_000_000)
+        rows = [
+            row
+            for row in self._load_whisper_segments()
+            if type(row.get("end_us")) is int and int(row["end_us"]) <= rewind_us
+        ]
+        temporary = self.whisper_segments_path.with_suffix(".rewrite")
+        temporary.parent.mkdir(parents=True, exist_ok=True)
+        with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+            for row in rows:
+                stream.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+        os.replace(temporary, self.whisper_segments_path)
+        self._whisper_segment_total = len(rows)
+        # Resume only at a completed segment boundary. Starting at the raw
+        # five-second mark can cut through a spoken sentence and permanently
+        # drop its first words when the host slices decoded audio.
+        self.cursor_us = int(rows[-1]["end_us"]) if rows else 0
+
+    def _checkpoint_whisper(self) -> None:
+        if not self.whisper_segments_path.is_file():
+            self.whisper_segments_path.write_text("", encoding="utf-8")
+        source = self.job_staging / f"whisper-checkpoint-{uuid4().hex}.ndjson.partial"
+        shutil.copyfile(self.whisper_segments_path, source)
+        self.send(
+            "checkpoint",
+            {
+                "stage_key": "ocr",
+                "checkpoint_key": "latest",
+                "schema_version": 1,
+                "cursor_us": self.cursor_us,
+                "payload": {
+                    "stage": "whisper",
+                    "extraction_method": "whisper_audio",
+                    "cursor_us": self.cursor_us,
+                    "overlap_us": 5_000_000,
+                    "device": str(self._whisper_runtime.get("device", "")),
+                    "compute_type": str(self._whisper_runtime.get("compute_type", "")),
+                },
+                "artifact_path": str(source),
+                "artifact_kind": "whisper_segments",
+                "artifact_state": "technical",
+                "expected_sha256": _file_sha256(source),
+            },
+        )
+
+    def _send_whisper_progress(self, duration_us: int, started: float) -> None:
+        elapsed_ms = max(1, int((time.monotonic() - started) * 1_000))
+        processed = max(0, self.cursor_us)
+        rate = processed / max(0.001, elapsed_ms / 1_000)
+        remaining = max(0, duration_us - processed)
+        self.send(
+            "progress",
+            {
+                "phase": "transcribe",
+                "current": processed,
+                "total": duration_us,
+                "elapsed_ms": elapsed_ms,
+                "eta_ms": int(remaining / rate * 1_000) if rate > 0 else None,
+                "cursor_us": self.cursor_us,
+                "cue_count": self._whisper_segment_count(),
+                "device": str(self._whisper_runtime.get("device", "")),
+                "compute_type": str(self._whisper_runtime.get("compute_type", "")),
+            },
+        )
 
     def _scan_fast(
         self,
@@ -962,6 +1615,164 @@ class OcrWorker:
             "expected_sha256": digest,
         }
         self.send("checkpoint", payload)
+
+
+def _probe_dialogue_stream(ffprobe: Path, media_path: Path) -> dict[str, Any]:
+    completed = subprocess.run(
+        [
+            str(ffprobe),
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=index,codec_type,channels:stream_tags=language,title",
+            "-of",
+            "json",
+            str(media_path),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("whisper_media_probe_failed")
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("whisper_media_probe_invalid") from exc
+    streams = payload.get("streams", []) if isinstance(payload, dict) else []
+    audio = [
+        item
+        for item in streams
+        if isinstance(item, dict) and item.get("codec_type") == "audio"
+    ]
+    if not audio:
+        raise RuntimeError("whisper_audio_track_missing")
+
+    def score(stream: dict[str, Any]) -> tuple[int, int]:
+        tags = stream.get("tags", {})
+        language = str(tags.get("language", "")).casefold() if isinstance(tags, dict) else ""
+        return int(language in {"chi", "zho", "cmn", "zh", "und", ""}), int(
+            stream.get("channels") or 0
+        )
+
+    return max(audio, key=score)
+
+
+def _ffmpeg_progress_us(line: str) -> int | None:
+    key, _, value = line.strip().partition("=")
+    try:
+        if key in {"out_time_us", "out_time_ms"}:
+            return max(0, int(value))
+        if key == "out_time":
+            hours, minutes, seconds = value.split(":")
+            return max(
+                0,
+                int(
+                    round(
+                        (int(hours) * 3_600 + int(minutes) * 60 + float(seconds))
+                        * 1_000_000
+                    )
+                ),
+            )
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _whisper_cues(
+    raw_rows: list[dict[str, Any]],
+    *,
+    video_duration_us: int,
+) -> tuple[tuple[SubtitleCue, ...], list[str]]:
+    rows: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    leading_punctuation = "。！？?!，,；;：:、"
+    for source in sorted(
+        raw_rows,
+        key=lambda row: (int(row.get("start_us", 0)), int(row.get("end_us", 0))),
+    ):
+        start_us = source.get("start_us")
+        end_us = source.get("end_us")
+        text = str(source.get("text", "")).strip()
+        if (
+            type(start_us) is not int
+            or type(end_us) is not int
+            or not text
+            or start_us < 0
+            or end_us <= start_us
+        ):
+            warnings.append("whisper_invalid_segment_removed")
+            continue
+        start_us = min(video_duration_us - 1, start_us)
+        end_us = min(video_duration_us, max(start_us + 1, end_us))
+        leading = ""
+        while text and text[0] in leading_punctuation:
+            leading += text[0]
+            text = text[1:].lstrip()
+        if leading and rows:
+            rows[-1]["text"] = str(rows[-1]["text"]).rstrip() + leading
+            warnings.append("whisper_leading_punctuation_repaired")
+        if not text:
+            if rows:
+                rows[-1]["end_us"] = max(int(rows[-1]["end_us"]), end_us)
+            continue
+        compact = "".join(character for character in text.casefold() if character.isalnum())
+        if rows:
+            previous = rows[-1]
+            previous_compact = "".join(
+                character
+                for character in str(previous["text"]).casefold()
+                if character.isalnum()
+            )
+            gap_us = start_us - int(previous["end_us"])
+            if compact and compact == previous_compact and -100_000 <= gap_us <= 850_000:
+                previous["end_us"] = max(int(previous["end_us"]), end_us)
+                warnings.append("whisper_duplicate_segment_merged")
+                continue
+            if start_us < int(previous["end_us"]):
+                boundary = (start_us + int(previous["end_us"])) // 2
+                boundary = max(int(previous["start_us"]) + 1, min(end_us - 1, boundary))
+                if boundary <= int(previous["start_us"]) or boundary >= end_us:
+                    warnings.append("whisper_overlap_segment_removed")
+                    continue
+                previous["end_us"] = boundary
+                start_us = boundary
+                warnings.append("whisper_overlap_repaired")
+        probability = source.get("avg_word_probability")
+        if isinstance(probability, bool) or not isinstance(probability, (int, float)):
+            log_probability = source.get("avg_logprob", -0.75)
+            probability = (
+                math.exp(float(log_probability))
+                if isinstance(log_probability, (int, float))
+                and not isinstance(log_probability, bool)
+                else 0.5
+            )
+        rows.append(
+            {
+                **source,
+                "start_us": start_us,
+                "end_us": end_us,
+                "text": text,
+                "confidence": max(0.0, min(1.0, float(probability))),
+            }
+        )
+    cues = tuple(
+        SubtitleCue(
+            id=f"whisper-{index:06d}",
+            index=index,
+            range=TimeRange(int(row["start_us"]), int(row["end_us"])),
+            text=str(row["text"]),
+            language="zh",
+            source="whisper-large-v3",
+            confidence=float(row["confidence"]),
+        )
+        for index, row in enumerate(rows, start=1)
+    )
+    return cues, list(dict.fromkeys(warnings))
 
 
 def _evidence_from_row(raw: object) -> SubtitleEvidence:

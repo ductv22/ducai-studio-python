@@ -22,6 +22,7 @@ from ducai_studio.application.export_pipeline import (
 from ducai_studio.application.job_commands import decode_job_spec
 from ducai_studio.application.media_commands import MediaImportService, MediaProbe
 from ducai_studio.application.subtitle_commands import SubtitleEditor
+from ducai_studio.application.subtitle_finalizer import render_srt
 from ducai_studio.application.timeline_commands import TimelineEditor
 from ducai_studio.application.translation_pipeline import (
     ChunkState,
@@ -70,6 +71,13 @@ from ducai_studio.infrastructure.multi_video_repository import MultiVideoReposit
 from ducai_studio.infrastructure.project_repository import ProjectRepository
 from ducai_studio.infrastructure.runtime_diagnostics import run_runtime_diagnostics
 from ducai_studio.infrastructure.runtime_program import runtime_program_path
+from ducai_studio.infrastructure.whisper_runtime import (
+    WHISPER_MODEL_ID,
+    WHISPER_RUNTIME_VERSION,
+    whisper_model_fingerprint,
+    whisper_model_path,
+    whisper_runtime_is_ready,
+)
 from ducai_studio.providers.media_probe import FfprobeProvider
 from ducai_studio.providers.translation.openai_compatible import (
     OPENAI_COMPATIBLE_PROVIDER_IDS,
@@ -239,11 +247,15 @@ def _engine_host_path(filename: str) -> Path:
     return packaged_path.resolve(strict=True)
 
 
-def _external_runtime_fingerprint(runtime: Path) -> str:
+def _external_runtime_fingerprint(
+    runtime: Path,
+    *,
+    package_patterns: tuple[str, ...] | None = None,
+) -> str:
     site_packages = runtime.parents[1] / "Lib" / "site-packages"
     packages: list[dict[str, object]] = []
     if site_packages.is_dir():
-        patterns = (
+        patterns = package_patterns or (
             "paddleocr-*.dist-info",
             "paddlepaddle*-*.dist-info",
             "rapidocr-*.dist-info",
@@ -652,11 +664,20 @@ class JobManagerService:
         rescan_cue_id: str | None = None,
         engine_host_path: str | None = None,
         reuse_completed: bool = False,
+        extraction_method: str = "frame_ocr",
+        language: str = "zh",
+        model_id: str = WHISPER_MODEL_ID,
+        model_path: str | None = None,
     ) -> dict[str, Any]:
+        method = extraction_method.strip().casefold()
+        if method not in {"frame_ocr", "whisper_audio"}:
+            raise ValueError("Phương thức trích xuất phải là OCR khung hình hoặc Whisper âm thanh")
         if type(sample_interval_us) is not int or not 400_000 <= sample_interval_us <= 1_500_000:
             raise ValueError("OCR sample interval must be between 0.4 and 1.5 seconds")
         if not device.strip():
             raise ValueError("OCR device is required")
+        if method == "whisper_audio" and rescan_cue_id is not None:
+            raise ValueError("Whisper không hỗ trợ quét lại riêng một cue OCR")
         # A targeted rescan is an explicit repair operation and may coexist
         # with the original OCR job's durable record.  Generic OCR starts are
         # still guarded against duplicate active work.
@@ -665,6 +686,11 @@ class JobManagerService:
         runtime = Path(engine_python).expanduser().resolve(strict=True)
         if not runtime.is_file():
             raise ValueError("OCR engine Python must be a file")
+        if method == "whisper_audio" and not whisper_runtime_is_ready(runtime):
+            raise ValueError(
+                "Runtime Whisper chưa đầy đủ hoặc sai phiên bản. Hãy chạy "
+                "scripts/setup-whisper-runtime.ps1 rồi thử lại."
+            )
         snapshot = self.projects.load(project_id)
         videos = [item for item in snapshot.media if item.kind is MediaKind.VIDEO]
         if not videos:
@@ -691,20 +717,85 @@ class JobManagerService:
                 "scale": 0.75,
             },
         ]
-        provider_config = {
+        provider_config: dict[str, Any] = {
             "media_path": str(media_path),
             "duration_us": asset.duration_us,
             "sample_interval_us": sample_interval_us,
             "engine_python": str(runtime),
             "device": device,
+            "extraction_method": method,
             "engine_batch_size": 12,
             "window_frame_count": 12,
             "bands": bands,
             "output_path": str(output_path),
             "engine_runtime_fingerprint": _external_runtime_fingerprint(runtime),
-            "model_fingerprint": _paddle_model_fingerprint(),
         }
-        default_host = _engine_host_path("ocr_engine_host.py")
+        if method == "frame_ocr":
+            provider_config["model_fingerprint"] = _paddle_model_fingerprint()
+        else:
+            whisper_device = device.strip().casefold()
+            if whisper_device == "gpu:0":
+                whisper_device = "auto"
+            if whisper_device not in {"auto", "cuda", "cpu"}:
+                raise ValueError("Thiết bị Whisper phải là tự động, CUDA hoặc CPU")
+            normalized_language = language.strip().casefold() or "zh"
+            if normalized_language not in {"zh", "zh-cn", "zh-tw"}:
+                raise ValueError("Whisper hiện chỉ hỗ trợ nhận dạng tiếng Trung")
+            normalized_model = model_id.strip()
+            if normalized_model != WHISPER_MODEL_ID:
+                raise ValueError("Whisper hiện chỉ hỗ trợ model large-v3")
+            try:
+                resolved_model = (
+                    Path(model_path).expanduser().resolve(strict=True)
+                    if isinstance(model_path, str) and model_path.strip()
+                    else whisper_model_path(model_id=normalized_model)
+                )
+            except OSError as exc:
+                raise ValueError(
+                    "Không tìm thấy model Whisper large-v3 ở đường dẫn đã chọn."
+                ) from exc
+            if resolved_model is None:
+                raise ValueError(
+                    "Chưa cài model Whisper large-v3. Hãy chạy "
+                    "scripts/setup-whisper-runtime.ps1 rồi thử lại."
+                )
+            ffmpeg = Path(shutil.which("ffmpeg") or "").expanduser()
+            ffprobe = Path(shutil.which("ffprobe") or "").expanduser()
+            if not ffmpeg.is_file() or not ffprobe.is_file():
+                raise ValueError("Whisper cần FFmpeg và ffprobe để tách audio nguồn")
+            provider_config.update(
+                {
+                    "device": whisper_device,
+                    "language": normalized_language,
+                    "model_id": normalized_model,
+                    "model_path": str(resolved_model),
+                    "model_fingerprint": whisper_model_fingerprint(resolved_model),
+                    "ffmpeg_path": str(ffmpeg.resolve()),
+                    "ffprobe_path": str(ffprobe.resolve()),
+                    "beam_size": 5,
+                    "temperature": 0.0,
+                    "condition_on_previous_text": False,
+                    "word_timestamps": True,
+                    "vad_parameters": {
+                        "threshold": 0.18,
+                        "min_speech_duration_ms": 100,
+                        "min_silence_duration_ms": 600,
+                        "speech_pad_ms": 500,
+                    },
+                    "allow_cpu_fallback": True,
+                    "engine_runtime_fingerprint": _external_runtime_fingerprint(
+                        runtime,
+                        package_patterns=(
+                            "faster_whisper-*.dist-info",
+                            "ctranslate2-*.dist-info",
+                            "av-*.dist-info",
+                        ),
+                    ),
+                }
+            )
+        default_host = _engine_host_path(
+            "whisper_engine_host.py" if method == "whisper_audio" else "ocr_engine_host.py"
+        )
         provider_config["engine_host_path"] = str(default_host)
         provider_config["engine_host_sha256"] = _file_sha256(default_host)
         if engine_host_path is not None:
@@ -739,12 +830,24 @@ class JobManagerService:
             "project_id": project_id,
             "input_revision": snapshot.revision,
             "provider_id": (
-                "paddle-targeted-rescan"
-                if rescan_cue_id is not None
-                else "paddle-fast-quality-rapid"
+                "faster-whisper-audio"
+                if method == "whisper_audio"
+                else (
+                    "paddle-targeted-rescan"
+                    if rescan_cue_id is not None
+                    else "paddle-fast-quality-rapid"
+                )
             ),
-            "provider_version": "paddleocr-3.7.0",
-            "model_id": "PP-OCRv6-tiny-small+medium-rescue",
+            "provider_version": (
+                f"faster-whisper-{WHISPER_RUNTIME_VERSION}"
+                if method == "whisper_audio"
+                else "paddleocr-3.7.0"
+            ),
+            "model_id": (
+                WHISPER_MODEL_ID
+                if method == "whisper_audio"
+                else "PP-OCRv6-tiny-small+medium-rescue"
+            ),
             "input_fingerprint": stable_fingerprint(
                 {
                     "path": str(media_path),
@@ -3498,6 +3601,51 @@ class JobManagerService:
             self._effects_editors[project_id] = EffectsEditor(snapshot)
         return _json_value(asdict(snapshot))
 
+    def export_subtitle_srt(
+        self,
+        *,
+        project_id: str,
+        language: str,
+        output_path: str,
+    ) -> dict[str, Any]:
+        """Render the latest durable subtitle track without mutating the project."""
+
+        normalized_language = language.strip().casefold()
+        if normalized_language not in {"source", "translated"}:
+            raise ValueError("Ngôn ngữ xuất SRT phải là phụ đề nguồn hoặc tiếng Việt")
+        raw_target = output_path.strip()
+        if not raw_target:
+            raise ValueError("Hãy chọn vị trí lưu file SRT")
+        target = Path(raw_target).expanduser().resolve()
+        if target.suffix.casefold() != ".srt":
+            raise ValueError("File xuất phụ đề phải có đuôi .srt")
+
+        snapshot = self.projects.load(project_id)
+        cues = (
+            snapshot.source_cues
+            if normalized_language == "source"
+            else snapshot.translated_cues
+        )
+        if not cues:
+            label = "nguồn" if normalized_language == "source" else "tiếng Việt"
+            raise ValueError(f"Dự án chưa có phụ đề {label} để xuất")
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
+        try:
+            temporary.write_text("\ufeff" + render_srt(cues), encoding="utf-8", newline="\n")
+            os.replace(temporary, target)
+        finally:
+            with suppress(FileNotFoundError):
+                temporary.unlink()
+        return {
+            "project_id": snapshot.id,
+            "revision": snapshot.revision,
+            "language": normalized_language,
+            "path": str(target),
+            "cue_count": len(cues),
+        }
+
     def import_media(
         self,
         *,
@@ -4160,56 +4308,92 @@ class JobManagerService:
             qa = json.loads(qa_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError("OCR coverage QA report is unreadable") from exc
-        total = qa.get("subtitle_positive_timestamps") if isinstance(qa, dict) else None
-        covered = qa.get("covered_timestamps") if isinstance(qa, dict) else None
-        threshold = qa.get("coverage_threshold") if isinstance(qa, dict) else None
-        ratio = qa.get("coverage_ratio") if isinstance(qa, dict) else None
-        continuity_limit = qa.get("continuity_gap_limit_us") if isinstance(qa, dict) else None
-        maximum_gap = qa.get("maximum_positive_gap_us") if isinstance(qa, dict) else None
-        valid_counts = bool(
-            type(total) is int and type(covered) is int and total > 0 and 0 <= covered <= total
+        method = str(config.get("extraction_method", "frame_ocr"))
+        common_qa_valid = bool(
+            isinstance(qa, dict)
+            and qa.get("status") == "PASS"
+            and qa.get("job_id") == job_id
+            and qa.get("input_fingerprint") == job.spec.input_fingerprint
+            and qa.get("settings_fingerprint") == job.spec.settings_fingerprint
+            and qa.get("output_path") == str(target)
+            and qa.get("output_sha256") == _file_sha256(target)
         )
-        valid_ratio = bool(
-            valid_counts
-            and not isinstance(threshold, bool)
-            and isinstance(threshold, (int, float))
-            and float(threshold) >= 0.95
-            and not isinstance(ratio, bool)
-            and isinstance(ratio, (int, float))
-            and abs(float(ratio) - covered / total) <= 1e-9
-            and float(ratio) >= float(threshold)
-        )
-        valid_continuity = bool(
-            type(continuity_limit) is int
-            and continuity_limit > 0
-            and type(maximum_gap) is int
-            and 0 <= maximum_gap <= continuity_limit
-            and qa.get("timeline_continuity_passes") is True
-        )
-        if (
-            not isinstance(qa, dict)
-            or qa.get("schema_version") != 2
-            or qa.get("kind") != "ocr_hard_sub_coverage"
-            or qa.get("status") != "PASS"
-            or qa.get("job_id") != job_id
-            or qa.get("input_fingerprint") != job.spec.input_fingerprint
-            or qa.get("settings_fingerprint") != job.spec.settings_fingerprint
-            or qa.get("output_path") != str(target)
-            or qa.get("output_sha256") != _file_sha256(target)
-            or not valid_ratio
-            or not valid_continuity
-        ):
-            raise ValueError("OCR coverage QA report does not match the guarded final output")
+        if method == "whisper_audio":
+            if (
+                not common_qa_valid
+                or qa.get("schema_version") != 1
+                or qa.get("kind") != "whisper_asr"
+                or qa.get("extraction_method") != "whisper_audio"
+                or type(qa.get("cue_count")) is not int
+                or int(qa["cue_count"]) <= 0
+            ):
+                raise ValueError("Whisper QA report does not match the guarded final output")
+        else:
+            total = qa.get("subtitle_positive_timestamps") if isinstance(qa, dict) else None
+            covered = qa.get("covered_timestamps") if isinstance(qa, dict) else None
+            threshold = qa.get("coverage_threshold") if isinstance(qa, dict) else None
+            ratio = qa.get("coverage_ratio") if isinstance(qa, dict) else None
+            continuity_limit = (
+                qa.get("continuity_gap_limit_us") if isinstance(qa, dict) else None
+            )
+            maximum_gap = (
+                qa.get("maximum_positive_gap_us") if isinstance(qa, dict) else None
+            )
+            valid_counts = bool(
+                type(total) is int
+                and type(covered) is int
+                and total > 0
+                and 0 <= covered <= total
+            )
+            valid_ratio = bool(
+                valid_counts
+                and not isinstance(threshold, bool)
+                and isinstance(threshold, (int, float))
+                and float(threshold) >= 0.95
+                and not isinstance(ratio, bool)
+                and isinstance(ratio, (int, float))
+                and abs(float(ratio) - covered / total) <= 1e-9
+                and float(ratio) >= float(threshold)
+            )
+            valid_continuity = bool(
+                type(continuity_limit) is int
+                and continuity_limit > 0
+                and type(maximum_gap) is int
+                and 0 <= maximum_gap <= continuity_limit
+                and qa.get("timeline_continuity_passes") is True
+            )
+            if (
+                not common_qa_valid
+                or qa.get("schema_version") != 2
+                or qa.get("kind") != "ocr_hard_sub_coverage"
+                or not valid_ratio
+                or not valid_continuity
+            ):
+                raise ValueError(
+                    "OCR coverage QA report does not match the guarded final output"
+                )
         snapshot = self.projects.load(job.spec.project_id)
         videos = [item for item in snapshot.media if item.kind is MediaKind.VIDEO]
         if not videos:
             raise ValueError("OCR project no longer has a video")
         candidate_snapshot = self.media_imports.import_srt(snapshot, target, language="zh")
+        if method == "whisper_audio" and len(candidate_snapshot.source_cues) != int(
+            qa["cue_count"]
+        ):
+            raise ValueError("Whisper cue count does not match the guarded final output")
         if candidate_snapshot.source_cues[-1].range.end_us > videos[0].duration_us + 1_000:
             raise ValueError("OCR subtitle timeline exceeds the source video")
         active_qa = active.with_name(active.stem + "_QA.json")
         with _promote_output_files(((target, active), (qa_path, active_qa))):
             updated = self.media_imports.import_srt(snapshot, active, language="zh")
+            if method == "whisper_audio":
+                updated = replace(
+                    updated,
+                    source_cues=tuple(
+                        replace(cue, source="whisper-large-v3")
+                        for cue in updated.source_cues
+                    ),
+                )
             summary = self.projects.get_summary(snapshot.id)
             self.projects.save(project_path=summary["path"], snapshot=updated)
         self._cleanup_external_job_staging(job, remove_files=False)

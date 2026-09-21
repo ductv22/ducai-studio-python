@@ -20,6 +20,7 @@ from ducai_studio.domain.multi_video import (
     worker_progress_fraction,
 )
 from ducai_studio.infrastructure.runtime_program import runtime_program_path
+from ducai_studio.infrastructure.whisper_runtime import whisper_runtime_is_ready
 
 from .service import JobManagerService
 
@@ -902,6 +903,17 @@ class MultiVideoCoordinator(QObject):
                     sample_interval_us=int(options.get("sample_interval_us", 800_000)),
                     engine_python=str(options.get("engine_python", runtime_program_path())),
                     device=str(options.get("device", "gpu:0")),
+                    extraction_method=str(
+                        options.get("extraction_method", "frame_ocr")
+                    ),
+                    language=str(options.get("language", "zh")),
+                    model_id=str(options.get("model_id", "large-v3")),
+                    model_path=(
+                        str(options["model_path"])
+                        if isinstance(options.get("model_path"), str)
+                        and str(options["model_path"]).strip()
+                        else None
+                    ),
                     reuse_completed=True,
                 )
                 worker_module = "ducai_studio.workers.ocr_worker"
@@ -1562,11 +1574,33 @@ class MultiVideoCoordinator(QObject):
             if not isinstance(value, Mapping):
                 raise ValueError(f"Cấu hình {section} của Multi video không hợp lệ")
         ocr = dict(settings.get("ocr", {}))
+        extraction_method = str(ocr.get("extraction_method", "frame_ocr")).casefold()
+        if extraction_method not in {"frame_ocr", "whisper_audio"}:
+            raise ValueError("Phương thức trích xuất Multi video không hợp lệ.")
         engine_python = Path(str(ocr.get("engine_python", runtime_program_path()))).expanduser()
         if not engine_python.is_file():
             raise ValueError(
-                "Python Paddle OCR không tồn tại; hãy sửa cấu hình OCR trước khi chạy Multi."
+                "Runtime Whisper không tồn tại; hãy chạy "
+                "scripts/setup-whisper-runtime.ps1 trước khi chạy Multi."
+                if extraction_method == "whisper_audio"
+                else "Python Paddle OCR không tồn tại; hãy sửa cấu hình OCR "
+                "trước khi chạy Multi."
             )
+        if extraction_method == "whisper_audio":
+            if not whisper_runtime_is_ready(engine_python):
+                raise ValueError(
+                    "Runtime Whisper chưa đầy đủ hoặc sai phiên bản; hãy chạy "
+                    "scripts/setup-whisper-runtime.ps1 trước khi chạy Multi."
+                )
+            model_path = Path(str(ocr.get("model_path", ""))).expanduser()
+            if not (
+                model_path.is_dir()
+                and (model_path / "model.bin").is_file()
+                and (model_path / "config.json").is_file()
+            ):
+                raise ValueError(
+                    "Model Whisper large-v3 chưa được cài đầy đủ trước khi chạy Multi."
+                )
         translation = dict(settings.get("translation", {}))
         provider_id = str(translation.get("provider_id", "")).strip().casefold()
         model_id = str(translation.get("model_id", "")).strip()

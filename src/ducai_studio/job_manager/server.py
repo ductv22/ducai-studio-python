@@ -72,6 +72,19 @@ _MANAGED_ENGINE_HOSTS = {
 }
 
 
+def _managed_engine_host_contract(job: Any) -> tuple[str, str, str] | None:
+    if (
+        job.spec.kind is JobKind.OCR
+        and job.spec.provider_config.get("extraction_method") == "whisper_audio"
+    ):
+        return (
+            "whisper_engine_host.py",
+            "DUCAI_OCR_ENGINE_HOST_PATH",
+            "DUCAI_OCR_ENGINE_HOST_SHA256",
+        )
+    return _MANAGED_ENGINE_HOSTS.get(job.spec.kind)
+
+
 def _is_managed_release_engine_host(path: Path | None, filename: str) -> bool:
     """Distinguish packaged engine hosts from user-owned custom hosts."""
 
@@ -289,6 +302,14 @@ class JobManagerServer(QObject):
                 engine_python=_required_string(params, "engine_python"),
                 device=_required_string(params, "device"),
                 reuse_completed=bool(params.get("reuse_completed", False)),
+                extraction_method=str(params.get("extraction_method", "frame_ocr")),
+                language=str(params.get("language", "zh")),
+                model_id=str(params.get("model_id", "large-v3")),
+                model_path=(
+                    str(params["model_path"])
+                    if isinstance(params.get("model_path"), str)
+                    else None
+                ),
             )
         if action == "create_ocr_rescan_job":
             sample_interval_us = params.get("sample_interval_us")
@@ -515,6 +536,12 @@ class JobManagerServer(QObject):
             if data_root is not None and (not isinstance(data_root, str) or not data_root.strip()):
                 raise ValueError("data_root must be a non-empty string")
             return self.service.runtime_diagnostics(data_root=data_root)
+        if action == "export_subtitle_srt":
+            return self.service.export_subtitle_srt(
+                project_id=_required_string(params, "project_id"),
+                language=_required_string(params, "language"),
+                output_path=_required_string(params, "output_path"),
+            )
         if action == "get_project":
             snapshot = self.service.get_project(_required_string(params, "project_id"))
             return _project_transport_payload(
@@ -739,7 +766,7 @@ class JobManagerServer(QObject):
         if job.spec.kind is JobKind.TTS:
             # A stale system environment must never override a custom host.
             worker_environment["DUCAI_TTS_ENGINE_HOST_MANAGED"] = "0"
-        host_contract = _MANAGED_ENGINE_HOSTS.get(job.spec.kind)
+        host_contract = _managed_engine_host_contract(job)
         if host_contract is not None:
             filename, path_variable, hash_variable = host_contract
             configured_host = job.spec.provider_config.get("engine_host_path")

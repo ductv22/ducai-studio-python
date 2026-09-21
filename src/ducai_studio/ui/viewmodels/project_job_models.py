@@ -257,6 +257,19 @@ class MultiVideoListModel(QAbstractListModel):
         child_state = str(item.get("child_job_state", ""))
         child_phase = str(item.get("child_phase", ""))
         batch_state = str(item.get("batch_state", "idle"))
+        whisper_phases = {
+            "extract_audio": "Đang tách audio cho Whisper",
+            "load_model": "Đang nạp Whisper large-v3",
+            "transcribe": "Whisper đang nhận dạng",
+            "cpu_fallback": "Đang chuyển Whisper sang CPU",
+            "finalize": "Đang kiểm tra SRT Whisper",
+        }
+        if (
+            stage == "ocr"
+            and child_phase in whisper_phases
+            and state in {"running", "retrying"}
+        ):
+            return f"{whisper_phases[child_phase]} · {progress}%"
         if child_phase in {"cache_restore", "conform_cache_restore"} and state in {
             "running",
             "retrying",

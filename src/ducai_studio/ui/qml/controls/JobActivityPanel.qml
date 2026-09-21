@@ -91,6 +91,11 @@ Panel {
             "fast": "Quét phụ đề nhanh",
             "quality": "Rà soát vùng nghi vấn",
             "rapid_fallback": "Chuyển OCR tương thích",
+            "extract_audio": "Đang tách audio 16 kHz",
+            "load_model": "Đang nạp Whisper large-v3",
+            "transcribe": "Whisper đang nhận dạng lời nói",
+            "cpu_fallback": "CUDA lỗi · đang chuyển sang CPU",
+            "finalize": "Đang kiểm tra và xuất SRT",
             "film_bible": "Lập Film Bible",
             "translation": "Đang dịch",
             "translation_qa": "Kiểm tra bản dịch",
@@ -164,6 +169,15 @@ Panel {
                 + (model.chunkTotal > 0
                     ? " · lượt " + Math.min(model.chunkCurrent + 1, model.chunkTotal)
                         + "/" + model.chunkTotal : "")
+                + " · đã chạy " + durationLabel(model.elapsedMs)
+        }
+        if (model.kind === "ocr"
+                && ["extract_audio", "load_model", "transcribe", "cpu_fallback",
+                    "finalize"].indexOf(model.phase) >= 0
+                && model.phaseTotal > 0) {
+            return phaseLabel(model.phase) + " "
+                + percentLabel(model.phaseCurrent, model.phaseTotal) + "%"
+                + (model.phaseDetail ? " · " + model.phaseDetail : "")
                 + " · đã chạy " + durationLabel(model.elapsedMs)
         }
         if (model.kind === "export" && model.phaseTotal > 0) {

@@ -20,6 +20,12 @@ from ducai_studio.providers.tts import VoiceCatalog, discover_data_root
 from ducai_studio.providers.tts.vieneu import VieNeuTtsProvider
 
 from .runtime_program import runtime_program_path
+from .whisper_runtime import (
+    WHISPER_CTRANSLATE2_VERSION,
+    WHISPER_RUNTIME_VERSION,
+    whisper_model_path,
+    whisper_runtime_python,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +62,7 @@ def run_runtime_diagnostics(
         _check_gui_python(Path(gui_python) if gui_python else runtime_program_path()),
         _check_ffmpeg(executable_resolver),
         _check_paddle_runtime(root),
+        _check_whisper_runtime(root),
         _check_playwright(),
         _check_gemini_cli(executable_resolver),
         _check_piper(root),
@@ -139,6 +146,49 @@ def _check_paddle_runtime(data_root: Path) -> RuntimeCheck:
         "Paddle OCR runtime sẵn sàng" if ready else "Runtime thiếu paddleocr/PaddlePaddle",
         f"paddleocr={version or '?'}; paddle={paddle or '?'}",
         str(runtime),
+    )
+
+
+def _check_whisper_runtime(data_root: Path) -> RuntimeCheck:
+    runtime = whisper_runtime_python(data_root)
+    model = whisper_model_path(data_root)
+    if not runtime.is_file() and model is None:
+        return RuntimeCheck(
+            "whisper",
+            "missing",
+            "Whisper chưa cài; OCR khung hình vẫn hoạt động bình thường",
+        )
+    if not runtime.is_file():
+        return RuntimeCheck(
+            "whisper",
+            "blocked",
+            "Đã có model nhưng thiếu runtime Whisper",
+            path=str(model or ""),
+        )
+    version = _python_package_version(runtime, "faster-whisper")
+    ctranslate2 = _python_package_version(runtime, "ctranslate2")
+    ready = (
+        version == WHISPER_RUNTIME_VERSION
+        and ctranslate2 == WHISPER_CTRANSLATE2_VERSION
+        and model is not None
+    )
+    if ready:
+        summary = "Whisper large-v3 sẵn sàng"
+    elif model is None:
+        summary = "Runtime Whisper đã có nhưng thiếu model large-v3"
+    else:
+        summary = (
+            "Runtime Whisper phải dùng "
+            f"faster-whisper {WHISPER_RUNTIME_VERSION} và "
+            f"CTranslate2 {WHISPER_CTRANSLATE2_VERSION}"
+        )
+    return RuntimeCheck(
+        "whisper",
+        "ready" if ready else "blocked",
+        summary,
+        f"faster-whisper={version or '?'}; ctranslate2={ctranslate2 or '?'}",
+        str(runtime.resolve()),
+        {"model_path": str(model or ""), "model_ready": model is not None},
     )
 
 
