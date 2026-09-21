@@ -145,6 +145,75 @@ def test_ocr_sampling_rate_is_persisted_for_single_and_multi_runs(monkeypatch) -
     assert restored.ocrSampleFps == 2.0
 
 
+def test_whisper_extraction_method_persists_and_dispatches_external_runtime(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    runtime = tmp_path / "whisper_runtime" / ".venv" / "Scripts" / "python.exe"
+    runtime.parent.mkdir(parents=True)
+    runtime.touch()
+    model = tmp_path / "large-v3"
+    model.mkdir()
+    (model / "model.bin").write_bytes(b"model")
+    (model / "config.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(application_module, "whisper_runtime_python", lambda: runtime)
+    monkeypatch.setattr(application_module, "whisper_model_path", lambda: model)
+    monkeypatch.setattr(application_module, "whisper_runtime_is_ready", lambda *_args: True)
+    view_model = ApplicationViewModel()
+    view_model._set_backend_ready(True)
+    view_model.project_state.replace(
+        {"id": "project-whisper", "name": "Phim", "revision": 1}
+    )
+    requests: list[tuple[str, dict, object]] = []
+    monkeypatch.setattr(
+        view_model.runtime,
+        "request",
+        lambda action, payload=None, context=None: requests.append(
+            (action, payload or {}, context)
+        ),
+    )
+
+    view_model.setOcrExtractionMethod("whisper_audio")
+    view_model.startOcr(9.0)
+
+    assert MemorySettings.values["ocr/extractionMethod"] == "whisper_audio"
+    assert view_model.ocrExtractionMethod == "whisper_audio"
+    action, payload, _context = requests[-1]
+    assert action == "create_ocr_job"
+    assert payload["extraction_method"] == "whisper_audio"
+    assert payload["engine_python"] == str(runtime)
+    assert payload["model_path"] == str(model)
+    assert payload["device"] == "auto"
+    restored = ApplicationViewModel()
+    assert restored.ocrExtractionMethod == "whisper_audio"
+
+
+def test_switching_extraction_method_does_not_resume_other_method_cache(
+    monkeypatch,
+) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    view_model = ApplicationViewModel()
+    view_model._set_backend_ready(True)
+    view_model.project_state.replace({"id": "project-1", "name": "Phim", "revision": 1})
+    view_model._ocr_job_id = "old-whisper"
+    view_model._ocr_job_method = "whisper_audio"
+    view_model._set_ocr_job_state("failed")
+    started: list[float] = []
+    resumed: list[bool] = []
+    monkeypatch.setattr(view_model, "startOcr", lambda fps: started.append(fps))
+    monkeypatch.setattr(view_model, "resumeOcr", lambda: resumed.append(True))
+
+    view_model.toggleOcr(1.25)
+
+    assert started == [1.25]
+    assert resumed == []
+
+
 def _job(job_id: str, kind: str) -> dict:
     return {
         "id": job_id,
@@ -2265,6 +2334,76 @@ def test_start_ocr_rejects_an_out_of_range_fps_before_dispatch(monkeypatch) -> N
     assert view_model.statusMessage == "FPS OCR phải nằm trong khoảng 0,67–2,5"
 
 
+def test_export_subtitle_srt_dispatches_current_project_and_releases_busy_state(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    view_model = ApplicationViewModel()
+    view_model._set_backend_ready(True)
+    view_model.project_state.replace(
+        {"id": "project-export", "name": "Phim", "revision": 8}
+    )
+    requests: list[tuple[str, dict, object]] = []
+    monkeypatch.setattr(
+        view_model.runtime,
+        "request",
+        lambda action, payload=None, context=None: requests.append(
+            (action, payload or {}, context)
+        ),
+    )
+    output = tmp_path / "edited.srt"
+
+    view_model.exportSubtitleSrt(
+        "translated", QUrl.fromLocalFile(str(output)).toString()
+    )
+
+    assert requests == [
+        (
+            "export_subtitle_srt",
+            {
+                "project_id": "project-export",
+                "language": "translated",
+                "output_path": str(output.resolve()),
+            },
+            {"language": "translated"},
+        )
+    ]
+    assert view_model.subtitleExportBusy is True
+    view_model._action_succeeded(
+        "export_subtitle_srt",
+        {
+            "path": str(output),
+            "cue_count": 12,
+            "language": "translated",
+        },
+        {},
+    )
+    assert view_model.subtitleExportBusy is False
+    assert view_model.statusMessage == f"Đã xuất 12 cue SRT tiếng Việt: {output}"
+
+
+def test_export_subtitle_srt_failure_is_non_mutating_and_releases_busy(monkeypatch) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    view_model = ApplicationViewModel()
+    view_model._subtitle_export_busy = True
+
+    view_model._action_failed(
+        "export_subtitle_srt",
+        {"message": "ổ đĩa chỉ đọc"},
+        {},
+    )
+
+    assert view_model.subtitleExportBusy is False
+    assert view_model.statusMessage == (
+        "Không thể xuất SRT; dự án và cache không bị thay đổi: ổ đĩa chỉ đọc"
+    )
+
+
 def test_toggle_ocr_dispatches_start_pause_and_resume_from_current_state(
     monkeypatch,
 ) -> None:
@@ -4162,6 +4301,42 @@ def test_multi_gemini_web_snapshot_always_disables_floating_window(monkeypatch) 
     snapshot = view_model._multi_settings_snapshot()
 
     assert snapshot["translation"]["provider_options"]["headed"] is False
+
+
+def test_multi_snapshot_keeps_explicit_whisper_method(monkeypatch, tmp_path: Path) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {
+        "translation/provider": "gemini-web",
+        "translation/model": "selected-on-web",
+        "ocr/extractionMethod": "whisper_audio",
+    }
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    runtime = tmp_path / "whisper-runtime-python.exe"
+    runtime.touch()
+    model = tmp_path / "large-v3"
+    model.mkdir()
+    (model / "model.bin").write_bytes(b"model")
+    (model / "config.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(application_module, "whisper_runtime_python", lambda: runtime)
+    monkeypatch.setattr(application_module, "whisper_model_path", lambda: model)
+    monkeypatch.setattr(application_module, "whisper_runtime_is_ready", lambda *_args: True)
+    view_model = ApplicationViewModel()
+    view_model._selected_voice_id = "voice-ready"
+    monkeypatch.setattr(
+        view_model.voice_catalog,
+        "find",
+        lambda _voice_id: {
+            "id": "voice-ready",
+            "provider_id": "piper",
+            "installed": True,
+        },
+    )
+
+    snapshot = view_model._multi_settings_snapshot()
+
+    assert snapshot["ocr"]["extraction_method"] == "whisper_audio"
+    assert snapshot["ocr"]["engine_python"] == str(runtime)
+    assert snapshot["ocr"]["model_path"] == str(model)
 
 
 def test_selected_translation_cache_is_not_overwritten_by_another_active_job(

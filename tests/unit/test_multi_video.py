@@ -21,6 +21,7 @@ from ducai_studio.infrastructure.multi_video_repository import MultiVideoReposit
 from ducai_studio.job_manager.multi_video_coordinator import MultiVideoCoordinator
 from ducai_studio.job_manager.service import JobManagerService
 from ducai_studio.providers.media_probe import MediaProbeResult
+from ducai_studio.ui.viewmodels.project_job_models import MultiVideoListModel
 
 
 class MemoryMultiRepository:
@@ -195,6 +196,21 @@ def test_stage_local_progress_recovers_each_child_percentage() -> None:
     assert stage_local_progress("tts", 0.75) == pytest.approx(0.25)
     assert stage_local_progress("done", 0.0) == 1.0
     assert stage_local_progress("translate", stage_progress("translate", 0.0)) == 0.0
+
+
+def test_multi_card_shows_whisper_child_phase_with_stage_local_percent() -> None:
+    text = MultiVideoListModel._state_text(
+        {
+            "project_id": "project-1",
+            "stage": "ocr",
+            "state": "running",
+            "batch_state": "running",
+            "child_phase": "transcribe",
+            "progress": stage_progress("ocr", 0.42),
+        }
+    )
+
+    assert text == "Whisper đang nhận dạng · 42%"
 
 
 def test_multi_catalog_sync_keeps_auto_cards_unselected_and_remove_hidden(tmp_path: Path) -> None:
@@ -691,6 +707,56 @@ def test_multi_translation_job_receives_cjk_only_qa_policy() -> None:
     assert provider_options["cjk_is_blocker"] is True
     assert provider_options["auto_compact_overlong_once"] is True
     assert provider_options["max_overlong_compaction_passes"] == 1
+
+
+@pytest.mark.parametrize(
+    ("ocr_options", "expected_method"),
+    [
+        ({}, "frame_ocr"),
+        (
+            {
+                "extraction_method": "whisper_audio",
+                "engine_python": "whisper-python.exe",
+                "device": "auto",
+                "language": "zh",
+                "model_id": "large-v3",
+                "model_path": "large-v3-model",
+            },
+            "whisper_audio",
+        ),
+    ],
+)
+def test_multi_ocr_snapshot_defaults_legacy_to_frame_and_preserves_whisper(
+    ocr_options: dict[str, object],
+    expected_method: str,
+) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    item = {
+        "project_id": "project-1",
+        "selected": True,
+        "stage": MultiStage.OCR.value,
+        "state": MultiItemState.WAITING.value,
+        "child_job_id": "",
+        "retry_count": 0,
+        "final_pass": False,
+    }
+    server = FakeServer([item], {})
+    captured: dict[str, object] = {}
+
+    def create_ocr_job(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return {"id": "ocr-job", "reused": False}
+
+    server.service.create_ocr_job = create_ocr_job
+    coordinator = MultiVideoCoordinator(server)
+    coordinator._settings = {"ocr": ocr_options}
+
+    coordinator._start_child("project-1", MultiStage.OCR)
+
+    assert captured["extraction_method"] == expected_method
+    if expected_method == "whisper_audio":
+        assert captured["engine_python"] == "whisper-python.exe"
+        assert captured["model_path"] == "large-v3-model"
 
 
 def test_resume_replaces_paused_legacy_translation_child_without_retry_penalty() -> None:
@@ -1849,6 +1915,14 @@ def test_manual_translation_review_advances_without_restarting_provider() -> Non
     ("section", "value", "message"),
     [
         ("ocr", {"engine_python": "missing-python.exe"}, "Python Paddle OCR"),
+        (
+            "ocr",
+            {
+                "extraction_method": "whisper_audio",
+                "engine_python": "missing-whisper-python.exe",
+            },
+            "Runtime Whisper",
+        ),
         ("translation", {"provider_id": "unsupported", "model_id": "model"}, "không được hỗ trợ"),
         ("translation", {"provider_id": "gemini-api", "model_id": "model"}, "API key tham chiếu"),
         ("tts", {"provider_id": "unsupported", "voice_id": "voice"}, "bộ máy giọng"),

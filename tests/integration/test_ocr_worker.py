@@ -329,3 +329,205 @@ def test_quality_checkpoint_resume_rewinds_overlap_without_dropping_fast_evidenc
     ]
     assert worker.cursor_us == 800_000
     assert retained == ["fast", "quality-0"]
+
+
+def _start_fake_whisper_worker(
+    tmp_path: Path,
+    job_id: str,
+    *,
+    environment_overrides: dict[str, str] | None = None,
+) -> tuple[subprocess.Popen[bytes], Path]:
+    media = tmp_path / "fixture.mp4"
+    media.write_bytes(b"video fixture")
+    output = tmp_path / "fixture_ZH_FINAL.srt"
+    staging = tmp_path / "artifacts" / "staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    job_staging = staging / job_id
+    job_staging.mkdir()
+    (job_staging / "dialogue-16k-mono.wav").write_bytes(b"W" * 8_192)
+    model = tmp_path / "large-v3"
+    model.mkdir(exist_ok=True)
+    fake_host = Path(__file__).parents[1] / "fixtures" / "fake_whisper_engine_host.py"
+    environment = os.environ.copy()
+    environment["DUCAI_ARTIFACT_STAGING_ROOT"] = str(staging)
+    environment.update(environment_overrides or {})
+    process = subprocess.Popen(
+        [sys.executable, "-m", "ducai_studio.workers.ocr_worker", job_id],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=environment,
+    )
+    assert process.stdin is not None and process.stdout is not None
+    assert WorkerMessage.from_json_line(process.stdout.readline()).kind == "ready"
+    process.stdin.write(
+        WorkerMessage(
+            PROTOCOL_VERSION,
+            job_id,
+            "start-request",
+            "control",
+            {
+                "action": "start",
+                "command_id": "start-command",
+                "job": {
+                    "kind": "ocr",
+                    "provider_id": "faster-whisper-audio",
+                    "model_id": "large-v3",
+                    "input_fingerprint": "input",
+                    "settings_fingerprint": "settings",
+                    "provider_config": {
+                        "extraction_method": "whisper_audio",
+                        "media_path": str(media),
+                        "duration_us": 9_000_000,
+                        "sample_interval_us": 800_000,
+                        "engine_python": sys.executable,
+                        "engine_host_path": str(fake_host),
+                        "model_path": str(model),
+                        "model_id": "large-v3",
+                        "language": "zh",
+                        "device": "auto",
+                        "output_path": str(output),
+                    },
+                },
+            },
+        ).to_json_line()
+    )
+    process.stdin.flush()
+    return process, output
+
+
+def _read_until_terminal(process: subprocess.Popen[bytes]) -> tuple[list[str], WorkerMessage]:
+    assert process.stdout is not None
+    kinds: list[str] = []
+    while True:
+        message = WorkerMessage.from_json_line(process.stdout.readline())
+        kinds.append(message.kind)
+        if message.kind in {"succeeded", "failed", "stopped"}:
+            return kinds, message
+
+
+def test_whisper_worker_streams_segments_and_publishes_guarded_srt(tmp_path: Path) -> None:
+    process, output = _start_fake_whisper_worker(tmp_path, "whisper-success")
+
+    kinds, terminal = _read_until_terminal(process)
+
+    assert terminal.kind == "succeeded", terminal.payload
+    assert terminal.payload["cue_count"] == 3
+    assert process.wait(timeout=10) == 0
+    assert output.read_text(encoding="utf-8-sig").count("-->") == 3
+    qa = json.loads(output.with_name(output.stem + "_QA.json").read_text(encoding="utf-8"))
+    assert qa["kind"] == "whisper_asr"
+    assert qa["output_sha256"] == sha256(output.read_bytes()).hexdigest()
+    assert "progress" in kinds
+
+
+def test_whisper_worker_pause_resume_rewinds_without_duplicate_cues(tmp_path: Path) -> None:
+    process, output = _start_fake_whisper_worker(
+        tmp_path,
+        "whisper-resume",
+        environment_overrides={"DUCAI_FAKE_WHISPER_DELAY_MS": "120"},
+    )
+    assert process.stdin is not None and process.stdout is not None
+    while WorkerMessage.from_json_line(process.stdout.readline()).kind != "progress":
+        pass
+    process.stdin.write(
+        WorkerMessage(
+            PROTOCOL_VERSION,
+            "whisper-resume",
+            "pause-request",
+            "control",
+            {"action": "pause", "command_id": "pause-command"},
+        ).to_json_line()
+    )
+    process.stdin.flush()
+    seen: list[str] = []
+    while "paused" not in seen:
+        seen.append(WorkerMessage.from_json_line(process.stdout.readline()).kind)
+    assert "checkpoint" in seen
+    process.stdin.write(
+        WorkerMessage(
+            PROTOCOL_VERSION,
+            "whisper-resume",
+            "resume-request",
+            "control",
+            {"action": "resume", "command_id": "resume-command"},
+        ).to_json_line()
+    )
+    process.stdin.flush()
+
+    _kinds, terminal = _read_until_terminal(process)
+
+    assert terminal.kind == "succeeded", terminal.payload
+    assert process.wait(timeout=10) == 0
+    assert output.read_text(encoding="utf-8-sig").count("-->") == 3
+
+
+def test_whisper_worker_cancel_never_publishes_partial_s1(tmp_path: Path) -> None:
+    process, output = _start_fake_whisper_worker(
+        tmp_path,
+        "whisper-cancel",
+        environment_overrides={"DUCAI_FAKE_WHISPER_DELAY_MS": "120"},
+    )
+    assert process.stdin is not None and process.stdout is not None
+    while WorkerMessage.from_json_line(process.stdout.readline()).kind != "progress":
+        pass
+    process.stdin.write(
+        WorkerMessage(
+            PROTOCOL_VERSION,
+            "whisper-cancel",
+            "cancel-request",
+            "control",
+            {"action": "cancel", "command_id": "cancel-command"},
+        ).to_json_line()
+    )
+    process.stdin.flush()
+
+    _kinds, terminal = _read_until_terminal(process)
+
+    assert terminal.kind == "stopped"
+    assert process.wait(timeout=10) == 0
+    assert not output.exists()
+    assert not output.with_name(output.stem + "_QA.json").exists()
+
+
+def test_whisper_worker_falls_back_from_cuda_to_cpu_once(tmp_path: Path) -> None:
+    process, output = _start_fake_whisper_worker(
+        tmp_path,
+        "whisper-fallback",
+        environment_overrides={"DUCAI_FAKE_WHISPER_CUDA_FAIL": "1"},
+    )
+
+    _kinds, terminal = _read_until_terminal(process)
+
+    assert terminal.kind == "succeeded", terminal.payload
+    assert terminal.payload["device"] == "cpu"
+    assert terminal.payload["compute_type"] == "int8"
+    assert process.wait(timeout=10) == 0
+    assert output.is_file()
+
+
+def test_whisper_checkpoint_rewind_uses_a_complete_segment_boundary(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    staging = tmp_path / "artifacts" / "staging"
+    staging.mkdir(parents=True)
+    monkeypatch.setenv("DUCAI_ARTIFACT_STAGING_ROOT", str(staging))
+    worker = OcrWorker("whisper-boundary")
+    worker.whisper_segments_path.write_text(
+        "".join(
+            json.dumps(row, ensure_ascii=False) + "\n"
+            for row in (
+                {"start_us": 0, "end_us": 3_000_000, "text": "第一句"},
+                {"start_us": 3_000_000, "end_us": 6_000_000, "text": "第二句"},
+                {"start_us": 6_000_000, "end_us": 9_000_000, "text": "第三句"},
+            )
+        ),
+        encoding="utf-8",
+    )
+    worker.cursor_us = 9_000_000
+
+    worker._rewind_whisper_segments()
+
+    assert worker.cursor_us == 3_000_000
+    assert [row["text"] for row in worker._load_whisper_segments()] == ["第一句"]

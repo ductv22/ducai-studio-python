@@ -26,6 +26,7 @@ def test_release_packages_vieneu_cuda_optimization_beside_engine_host() -> None:
     )
 
     assert "vieneu_v330_optimization.py" in build_script
+    assert "whisper_engine_host.py" in build_script
 
 
 def test_portable_manifest_hashes_bundled_engine_runtimes() -> None:
@@ -42,3 +43,14 @@ def test_portable_manifest_hashes_bundled_engine_runtimes() -> None:
         '"python_runtime_312"',
     ):
         assert critical_root in build_script
+
+
+def test_portable_whisper_runtime_and_model_are_explicitly_opt_in() -> None:
+    build_script = (
+        PROJECT_ROOT / "scripts" / "build-portable-release.ps1"
+    ).read_text(encoding="utf-8")
+
+    assert "[switch]$IncludeWhisper" in build_script
+    assert "if ($IncludeWhisper)" in build_script
+    assert 'whisper_included = [bool]$IncludeWhisper' in build_script
+    assert '"models--Systran--faster-whisper-large-v3"' in build_script

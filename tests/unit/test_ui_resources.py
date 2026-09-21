@@ -150,6 +150,23 @@ def test_voice_studio_exposes_finished_voice_player_and_detailed_tts_phases() ->
     assert '"Đã kiểm tra cache " + model.phaseCurrent + "/" + model.phaseTotal' in panel
     assert '"Đã tổng hợp " + model.phaseCurrent + "/" + model.phaseTotal' in panel
     assert '"Đã ghép " + model.phaseCurrent + "/" + model.phaseTotal' in panel
+
+
+def test_job_activity_panel_localizes_whisper_phases() -> None:
+    panel = (
+        Path(__file__).parents[2]
+        / "src"
+        / "ducai_studio"
+        / "ui"
+        / "qml"
+        / "controls"
+        / "JobActivityPanel.qml"
+    ).read_text(encoding="utf-8")
+
+    assert '"extract_audio": "Đang tách audio 16 kHz"' in panel
+    assert '"load_model": "Đang nạp Whisper large-v3"' in panel
+    assert '"transcribe": "Whisper đang nhận dạng lời nói"' in panel
+    assert '"cpu_fallback": "CUDA lỗi · đang chuyển sang CPU"' in panel
     assert "function percentLabel(current, total)" in panel
     assert ".toFixed(1)" in panel
     assert '"Đang nạp VieNeu và chuẩn bị dò cache"' in panel
@@ -195,7 +212,24 @@ def test_ocr_fps_field_blocks_invalid_input_and_restores_the_last_valid_value() 
     assert "id: invalidOcrFpsReset" in qml
     assert "invalidOcrFpsReset.restart()" in qml
     assert "ocrFps.valueIsValid" in qml
-    assert 'text: "Tốc độ quét"' in qml
+    assert '"Tốc độ quét"' in qml
+
+
+def test_srt_export_actions_are_available_in_matching_workflows() -> None:
+    qml = (
+        Path(__file__).parents[2]
+        / "src"
+        / "ducai_studio"
+        / "ui"
+        / "qml"
+        / "screens"
+        / "SubtitleEditorScreen.qml"
+    ).read_text(encoding="utf-8")
+
+    assert "id: sourceSrtExportWorkflowButton" in qml
+    assert "id: translatedSrtExportWorkflowButton" in qml
+    assert 'visible: root.workspaceMode === "transcribe"' in qml
+    assert 'visible: root.workspaceMode === "translate"' in qml
 
 
 def test_export_settings_keep_critical_controls_visible_in_a_narrow_pane() -> None:
@@ -320,9 +354,9 @@ def test_shared_buttons_expose_text_states_and_top_center_feedback() -> None:
     assert "ParallelAnimation" in toast
     assert "anchors.horizontalCenter: parent.horizontalCenter" in toast
     assert "ActionToast" in main
-    assert 'runningText: "Tạm dừng OCR"' in subtitle
-    assert 'pausedText: "Tiếp tục OCR"' in subtitle
-    assert "root.appModel.toggleOcr(ocrFps.numericValue)" in subtitle
+    assert "root.appModel.setOcrExtractionMethod" in subtitle
+    assert '"OCR khung hình", "Whisper âm thanh"' in subtitle
+    assert "root.appModel.toggleOcr(" in subtitle
     assert 'runningText: "Tạm dừng dịch"' in subtitle
     assert "warning: true" in subtitle
     assert subtitle.count("danger: true") >= 2
@@ -505,7 +539,7 @@ def test_subtitle_workspace_hides_engine_notes_and_web_session_switches() -> Non
         / "SubtitleEditorScreen.qml"
     ).read_text(encoding="utf-8")
 
-    assert 'text: "Tốc độ quét"' in qml
+    assert '"Tốc độ quét"' in qml
     assert "Paddle Fast · Quality cứu lỗi · Rapid dự phòng" not in qml
     assert "checkpoint an toàn" not in qml
     assert "Web nổi:" not in qml
@@ -569,7 +603,7 @@ def test_voice_studio_uses_automatic_timing_repair_and_exposes_speed_controls() 
     assert 'text: "Bỏ qua cảnh báo · giữ nguyên voice"' in editor
     assert "root.appModel.addCurrentVoiceToTimeline()" in editor
     assert 'text: "Cue dài"' in editor
-    assert "root.appModel.toggleOcr(ocrFps.numericValue)" in editor
+    assert "root.appModel.toggleOcr(" in editor
 
 
 def test_voice_studio_exposes_post_dubbing_conform_controls() -> None:

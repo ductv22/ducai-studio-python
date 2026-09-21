@@ -14,7 +14,8 @@ from PySide6.QtCore import QCoreApplication, QTimer
 from PySide6.QtNetwork import QLocalSocket
 
 from ducai_studio.domain.jobs import JobKind, JobSpec, JobState
-from ducai_studio.domain.project import MediaAsset, MediaKind, ProjectSnapshot
+from ducai_studio.domain.project import MediaAsset, MediaKind, ProjectSnapshot, SubtitleCue
+from ducai_studio.domain.timebase import TimeRange
 from ducai_studio.infrastructure.checkpoint_repository import CheckpointRepository
 from ducai_studio.infrastructure.database import Database
 from ducai_studio.infrastructure.ipc.messages import (
@@ -37,6 +38,124 @@ from ducai_studio.workers.protocol import WorkerMessage
 class StaticMediaProbe:
     def probe(self, _media_path):
         return MediaProbeResult(5_000_000, True, True, 1280, 720, "mp4")
+
+
+def test_export_subtitle_srt_uses_latest_snapshot_and_does_not_mutate_project(
+    tmp_path: Path,
+) -> None:
+    service = JobManagerService(
+        database_path=tmp_path / "state.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+    source = SubtitleCue(
+        "source-1",
+        7,
+        TimeRange(1_234_000, 3_456_000),
+        "第一行\n第二行",
+        "zh",
+    )
+    translated = SubtitleCue(
+        "translated-1",
+        7,
+        TimeRange(1_234_000, 3_456_000),
+        "Dòng một\nDòng hai đã sửa",
+        "vi",
+        revision=2,
+    )
+    snapshot = ProjectSnapshot(
+        "project-srt-export",
+        "SRT export",
+        4,
+        source_cues=(source,),
+        translated_cues=(translated,),
+    )
+    project_path = tmp_path / "project.ducai"
+    service.projects.save(project_path=project_path, snapshot=snapshot)
+    before = service.projects.load(snapshot.id)
+    output = tmp_path / "edited-vi.srt"
+    output.write_text("stale", encoding="utf-8")
+
+    result = service.export_subtitle_srt(
+        project_id=snapshot.id,
+        language="translated",
+        output_path=str(output),
+    )
+
+    assert result == {
+        "project_id": snapshot.id,
+        "revision": 4,
+        "language": "translated",
+        "path": str(output.resolve()),
+        "cue_count": 1,
+    }
+    assert output.read_bytes().startswith(b"\xef\xbb\xbf")
+    assert output.read_text(encoding="utf-8-sig") == (
+        "7\n00:00:01,234 --> 00:00:03,456\nDòng một\nDòng hai đã sửa\n"
+    )
+    assert service.projects.load(snapshot.id) == before
+    assert service.projects.get_summary(snapshot.id)["head_revision"] == 4
+
+
+def test_export_subtitle_srt_validates_language_extension_and_empty_track(
+    tmp_path: Path,
+) -> None:
+    service = JobManagerService(
+        database_path=tmp_path / "state.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+    snapshot = ProjectSnapshot("project-empty-srt", "Empty SRT", 1)
+    service.projects.save(project_path=tmp_path / "empty.ducai", snapshot=snapshot)
+
+    with pytest.raises(ValueError, match="phụ đề nguồn"):
+        service.export_subtitle_srt(
+            project_id=snapshot.id,
+            language="source",
+            output_path=str(tmp_path / "source.srt"),
+        )
+    with pytest.raises(ValueError, match="đuôi .srt"):
+        service.export_subtitle_srt(
+            project_id=snapshot.id,
+            language="source",
+            output_path=str(tmp_path / "source.txt"),
+        )
+    with pytest.raises(ValueError, match="phụ đề nguồn hoặc tiếng Việt"):
+        service.export_subtitle_srt(
+            project_id=snapshot.id,
+            language="english",
+            output_path=str(tmp_path / "source.srt"),
+        )
+
+
+def test_server_dispatches_live_srt_export(tmp_path: Path) -> None:
+    service = JobManagerService(
+        database_path=tmp_path / "state.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+    snapshot = ProjectSnapshot(
+        "project-server-export",
+        "Server export",
+        1,
+        source_cues=(
+            SubtitleCue("source", 1, TimeRange(0, 1_000_000), "你好", "zh"),
+        ),
+    )
+    service.projects.save(project_path=tmp_path / "server.ducai", snapshot=snapshot)
+    server = JobManagerServer(name=f"unused-srt-export-{uuid4()}", service=service)
+    output = tmp_path / "source.srt"
+    try:
+        result = server._dispatch(
+            "export_subtitle_srt",
+            {
+                "project_id": snapshot.id,
+                "language": "source",
+                "output_path": str(output),
+            },
+        )
+    finally:
+        server.close()
+
+    assert result["cue_count"] == 1
+    assert output.read_text(encoding="utf-8-sig").endswith("你好\n")
 
 
 def test_start_tts_job_rebases_packaged_release_host_without_changing_checkpoint(
@@ -1940,6 +2059,88 @@ def test_ocr_job_uses_external_runtime_and_imports_only_guarded_final_srt(
         server.close()
 
 
+def test_whisper_job_has_separate_fingerprint_and_imports_method_aware_qa(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = JobManagerService(
+        database_path=tmp_path / "state.db",
+        artifact_root=tmp_path / "artifacts",
+        media_probe=StaticMediaProbe(),
+    )
+    video = tmp_path / "phim.mp4"
+    video.write_bytes(b"fixture")
+    model = tmp_path / "large-v3"
+    model.mkdir()
+    (model / "model.bin").write_bytes(b"model")
+    (model / "config.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(service_module, "whisper_model_path", lambda **_kwargs: model)
+    monkeypatch.setattr(service_module, "whisper_runtime_is_ready", lambda _runtime: True)
+    original_which = service_module.shutil.which
+    monkeypatch.setattr(
+        service_module.shutil,
+        "which",
+        lambda name: sys.executable if name in {"ffmpeg", "ffprobe"} else original_which(name),
+    )
+    project = service.create_project(
+        project_path=str(tmp_path / "project.ducai"), name="Phim thử"
+    )
+    service.import_media(project_id=project["id"], media_path=str(video))
+    frame_job = service.create_ocr_job(
+        project_id=project["id"],
+        sample_interval_us=800_000,
+        engine_python=sys.executable,
+    )
+    service.jobs.transition(frame_job["id"], JobState.START_REQUESTED)
+    service.jobs.transition(frame_job["id"], JobState.RUNNING)
+    service.jobs.transition(frame_job["id"], JobState.SUCCEEDED)
+
+    whisper_job = service.create_ocr_job(
+        project_id=project["id"],
+        sample_interval_us=800_000,
+        engine_python=sys.executable,
+        extraction_method="whisper_audio",
+        device="auto",
+    )
+
+    assert whisper_job["spec"]["provider_id"] == "faster-whisper-audio"
+    assert whisper_job["spec"]["provider_config"]["extraction_method"] == "whisper_audio"
+    assert (
+        service.jobs.get(whisper_job["id"]).spec.resume_fingerprint
+        != service.jobs.get(frame_job["id"]).spec.resume_fingerprint
+    )
+    candidate = Path(whisper_job["spec"]["provider_config"]["staging_output_path"])
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    candidate.write_text(
+        "1\n00:00:00,000 --> 00:00:02,000\n我要修炼成仙\n",
+        encoding="utf-8-sig",
+    )
+    qa = candidate.with_name(candidate.stem + "_QA.json")
+    qa.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "whisper_asr",
+                "status": "PASS",
+                "job_id": whisper_job["id"],
+                "input_fingerprint": whisper_job["spec"]["input_fingerprint"],
+                "settings_fingerprint": whisper_job["spec"]["settings_fingerprint"],
+                "extraction_method": "whisper_audio",
+                "cue_count": 1,
+                "output_path": str(candidate),
+                "output_sha256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    imported = service.import_final_ocr_srt(whisper_job["id"], str(candidate))
+
+    assert imported["source_cues"][0]["source"] == "whisper-large-v3"
+    assert imported["source_cues"][0]["text"] == "我要修炼成仙"
+
+
 def test_ocr_rerun_promotes_candidate_over_existing_s1_without_duplicate_track(
     tmp_path: Path,
 ) -> None:
@@ -2330,6 +2531,76 @@ def test_job_manager_runs_ocr_worker_and_auto_imports_pass_result(tmp_path: Path
         )
         assert checkpoint is not None
         assert Path(checkpoint["artifact"]["uri"]).is_file()
+    finally:
+        server.close()
+
+
+def test_job_manager_runs_whisper_worker_and_auto_imports_pass_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    application = QCoreApplication.instance() or QCoreApplication([])
+    service = JobManagerService(
+        database_path=tmp_path / "state.db",
+        artifact_root=tmp_path / "artifacts",
+        media_probe=StaticMediaProbe(),
+    )
+    server = JobManagerServer(name=f"unused-whisper-worker-{uuid4()}", service=service)
+    video = tmp_path / "fixture.mp4"
+    video.write_bytes(b"fixture")
+    model = tmp_path / "large-v3"
+    model.mkdir()
+    (model / "model.bin").write_bytes(b"model")
+    (model / "config.json").write_text("{}", encoding="utf-8")
+    fake_host = Path(__file__).parents[1] / "fixtures" / "fake_whisper_engine_host.py"
+    monkeypatch.setattr(service_module, "whisper_model_path", lambda **_kwargs: model)
+    monkeypatch.setattr(service_module, "whisper_runtime_is_ready", lambda _runtime: True)
+    original_which = service_module.shutil.which
+    monkeypatch.setattr(
+        service_module.shutil,
+        "which",
+        lambda name: sys.executable if name in {"ffmpeg", "ffprobe"} else original_which(name),
+    )
+    try:
+        project = service.create_project(
+            project_path=str(tmp_path / "project.ducai"), name="Phim thử"
+        )
+        service.import_media(project_id=project["id"], media_path=str(video))
+        job = service.create_ocr_job(
+            project_id=project["id"],
+            sample_interval_us=800_000,
+            engine_python=sys.executable,
+            extraction_method="whisper_audio",
+            device="auto",
+            engine_host_path=str(fake_host),
+        )
+        job_staging = service.checkpoints.staging_root / job["id"]
+        job_staging.mkdir(parents=True, exist_ok=True)
+        (job_staging / "dialogue-16k-mono.wav").write_bytes(b"W" * 8_192)
+        server._dispatch(
+            "start_job",
+            {
+                "job_id": job["id"],
+                "program": sys.executable,
+                "arguments": ["-m", "ducai_studio.workers.ocr_worker", job["id"]],
+                "resume_stage_key": "ocr",
+            },
+        )
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            application.processEvents()
+            state = service.jobs.get(job["id"]).state
+            if state in {JobState.SUCCEEDED, JobState.FAILED}:
+                break
+            time.sleep(0.01)
+
+        assert service.jobs.get(job["id"]).state is JobState.SUCCEEDED
+        loaded = service.get_project(project["id"])
+        assert len(loaded["source_cues"]) == 2
+        assert {cue["source"] for cue in loaded["source_cues"]} == {
+            "whisper-large-v3"
+        }
+        assert (tmp_path / "fixture_ZH_FINAL.srt").is_file()
     finally:
         server.close()
 

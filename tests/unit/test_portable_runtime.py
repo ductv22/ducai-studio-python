@@ -46,6 +46,7 @@ def test_portable_environment_repairs_relocated_managed_venvs(
         "paddle_runtime": data_root / "python_runtime_311",
         "piper_runtime": data_root / "python_runtime_312",
         "vieneu_3_3_runtime": data_root / "python_runtime_312",
+        "whisper_runtime": data_root / "python_runtime_312",
     }
     for python_home in set(python_homes.values()):
         python_home.mkdir(parents=True)
