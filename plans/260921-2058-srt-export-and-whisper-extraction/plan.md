@@ -1,7 +1,7 @@
 ---
 title: "SRT export and Whisper extraction"
 description: "Xuất SRT từ cue hiện hành và port Whisper cục bộ từ DUCAI 0.1.99 vào kiến trúc Python/PySide6."
-status: in-progress
+status: completed
 priority: P1
 effort: "3-5d"
 tags: [subtitles, whisper, asr, export, windows]
@@ -98,7 +98,7 @@ checkpoint regression tests, and a no-data-mutation rollback.
 | 1 | [Live SRT export contract](./phase-01-live-srt-export.md) | Completed |
 | 2 | [Whisper runtime and extraction worker](./phase-02-whisper-runtime-worker.md) | Completed |
 | 3 | [UI, settings and Multi integration](./phase-03-ui-and-multi.md) | Completed |
-| 4 | [Verification, docs and release](./phase-04-verification-release.md) | In progress |
+| 4 | [Verification, docs and release](./phase-04-verification-release.md) | Completed |
 
 ## Success Criteria
 

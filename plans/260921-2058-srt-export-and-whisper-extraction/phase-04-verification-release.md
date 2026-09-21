@@ -1,7 +1,7 @@
 ---
 phase: 4
 title: "Verification, docs and release"
-status: in-progress
+status: completed
 priority: P1
 effort: "1d"
 dependencies: [1, 2, 3]
@@ -51,7 +51,7 @@ metadata/hashes and document standard versus portable runtime contents.
 - [x] Standard GUI remains small and starts when Whisper is not installed.
 - [x] Missing runtime/model gives an actionable Vietnamese message.
 - [x] Portable manifest accurately states whether Whisper runtime/model is included.
-- [ ] Private remote contains source/tests/docs only, no user project or cache.
+- [x] Private remote contains source/tests/docs only, no user project or cache.
 
 ## Risk Assessment
 
