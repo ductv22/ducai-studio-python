@@ -19,9 +19,11 @@ thêm cửa sổ CMD.
 
 1. **Nhập video:** video vào V1, âm thanh gốc tách logic sang A1; blur và logo
    được gieo trên toàn timeline theo preset đã lưu.
-2. **Trích xuất:** đặt **Tốc độ quét** rồi bấm **Chạy OCR**. Tool tự chọn luồng
-   nhận diện và kiểm tra phù hợp; giao diện không yêu cầu người dùng chọn engine
-   hoặc chế độ cứu lỗi kỹ thuật.
+2. **Trích xuất:** chọn rõ **OCR khung hình** hoặc **Whisper âm thanh**. OCR dùng
+   **Tốc độ quét** hiện có. Whisper dùng audio tiếng Trung, model `large-v3`, ưu
+   tiên CUDA và tự chạy lại bằng CPU khi CUDA lỗi. Cài Whisper một lần bằng
+   `scripts/setup-whisper-runtime.ps1`; tool không tự tải model ngầm. Nút chính,
+   tiến độ, tạm dừng, tiếp tục từ checkpoint và hủy dùng chung một luồng điều khiển.
 3. **QA SRT Trung:** `_ZH_FINAL.srt` chỉ xuất khi PASS, không cue rỗng, không
    overlap và ít nhất 95% timestamp có chữ được cue cuối che phủ đúng nội dung.
    File `_ZH_FINAL_QA.json` phải khớp job, fingerprint và SHA-256 của SRT;
@@ -29,6 +31,11 @@ thêm cửa sổ CMD.
    Khi QA dừng ở **Cần rà soát**, nút **Xử lý lại từ cache** chạy lại hợp nhất,
    finalization và QA trên checkpoint cùng fingerprint; không quét lại toàn bộ
    video chỉ để áp dụng bản sửa pipeline mới.
+   Kết quả Whisper dùng QA riêng theo hash/fingerprint/cue count và không bị ép
+   qua coverage khung hình. Hai phương thức có fingerprint/cache tách biệt.
+   Sau khi có S1 hoặc bản dịch Việt, dùng **Xuất SRT nguồn** hoặc
+   **Xuất SRT tiếng Việt** để lưu đúng cue/timestamp đã sửa gần nhất dưới dạng
+   UTF-8 BOM. Xuất SRT không sửa project, job hoặc cache.
 4. **Dịch:** cấu hình miễn phí mặc định dùng Gemini Web chạy ẩn. Điều khiển Web
    nổi và đăng nhập/khách được ẩn để giao diện gọn và nhất quán. Mỗi
    request mở một chat mới, tối đa 150 cue dịch (và 8.000 ký tự nguồn); sau năm
@@ -523,6 +530,10 @@ và `bin/ffmpeg.exe`; không cần sửa đường dẫn theo tên tài khoản 
 đóng gói. Launcher và DLL Python của từng runtime được lấy từ Python home đi kèm;
 tool sẽ tự đồng bộ lại các file này sau khi chuyển thư mục. Hãy giải nén toàn bộ
 gói vào thư mục có quyền ghi rồi mới chạy, không chép riêng file EXE.
+
+Whisper không nằm trong gói portable mặc định để tránh tăng thêm vài GB. Chỉ bản
+được tạo bằng `build-portable-release.ps1 -IncludeWhisper` mới chứa runtime và
+model `large-v3`; kiểm tra `whisper_included=true` trong manifest trước khi gửi.
 
 Gói phát hành không chứa project, video, SRT, cache voice, cookie Gemini, API key,
 profile đăng nhập hoặc profile clone giọng. Người nhận phải tự nhập key và tự tạo

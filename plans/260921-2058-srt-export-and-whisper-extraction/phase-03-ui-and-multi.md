@@ -1,7 +1,7 @@
 ---
 phase: 3
 title: "UI, settings and Multi integration"
-status: pending
+status: completed
 priority: P1
 effort: "1d"
 dependencies: [2]
@@ -51,10 +51,10 @@ legacy snapshots without them resolve to `frame_ocr`.
 
 ## Success Criteria
 
-- [ ] Users can distinguish which evidence source will run before clicking.
-- [ ] Switching method cannot resume a cache from the other method.
-- [ ] Old projects and old Multi batches continue with OCR.
-- [ ] Progress shown is worker-derived rather than a UI timer.
+- [x] Users can distinguish which evidence source will run before clicking.
+- [x] Switching method cannot resume a cache from the other method.
+- [x] Old projects and old Multi batches continue with OCR.
+- [x] Progress shown is worker-derived rather than a UI timer.
 
 ## Risk Assessment
 

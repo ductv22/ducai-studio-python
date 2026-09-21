@@ -1,7 +1,7 @@
 ---
 phase: 2
 title: "Whisper runtime and extraction worker"
-status: pending
+status: completed
 priority: P1
 effort: "2d"
 dependencies: []
@@ -62,12 +62,12 @@ monotonic non-empty cues, render SRT and publish through a method-aware QA recei
 
 ## Success Criteria
 
-- [ ] A fixture produces deterministic monotonic Chinese cues and SRT.
-- [ ] CUDA failure retries once on CPU int8 without corrupting the job.
-- [ ] Pause acknowledges at a safe segment boundary; resume does not duplicate
+- [x] A fixture produces deterministic monotonic Chinese cues and SRT.
+- [x] CUDA failure retries once on CPU int8 without corrupting the job.
+- [x] Pause acknowledges at a safe segment boundary; resume does not duplicate
       or omit boundary speech.
-- [ ] Cancel leaves checkpoint/cache only and never publishes partial S1.
-- [ ] OCR and Whisper jobs for one media have different resume fingerprints.
+- [x] Cancel leaves checkpoint/cache only and never publishes partial S1.
+- [x] OCR and Whisper jobs for one media have different resume fingerprints.
 
 ## Risk Assessment
 

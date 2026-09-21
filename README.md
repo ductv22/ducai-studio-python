@@ -17,7 +17,10 @@ Video, audio and SRT import now create real timeline tracks; clip/track editing,
 viewport virtualization and synchronized Qt Multimedia preview are operational.
 Paddle Fast OCR, targeted Paddle Quality rescue and Rapid compatibility fallback
 now run in a separate managed runtime with pause/resume checkpoints, sampled-frame
-coverage QA, guarded final SRT import and a virtualized subtitle editor. Gemini Web, Gemini CLI/OAuth,
+coverage QA, guarded final SRT import and a virtualized subtitle editor. The same
+screen can explicitly use local Whisper large-v3 audio transcription with streamed
+progress, checkpoint resume and CUDA-to-CPU fallback. Source and Vietnamese subtitle
+tracks can be exported from the latest persisted manual edits. Gemini Web, Gemini CLI/OAuth,
 direct Gemini API and OpenAI-compatible DeepSeek, Hy3/TokenHub, Qwen, GLM and
 custom endpoint translation are operational behind one cue-integrity pipeline.
 Piper 1.6 and VieNeu 3.3 Turbo now run through isolated persistent
@@ -63,6 +66,16 @@ Install or repair the isolated Piper runtime with:
 ```powershell
 ./scripts/setup-piper-runtime.ps1
 ```
+
+Whisper is optional and is never downloaded during normal application startup.
+Install its pinned external runtime and the large-v3 model explicitly with:
+
+```powershell
+./scripts/setup-whisper-runtime.ps1
+```
+
+This writes the runtime and model under `DUCAI_STUDIO_DATA`; neither is included
+in Git or the standard GUI release.
 
 The voice catalog reuses installed ONNX/JSON pairs from
 `DUCAI_STUDIO_DATA/piper_voices`. Community and real-person-labelled models keep

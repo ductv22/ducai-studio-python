@@ -1,7 +1,7 @@
 ---
 phase: 4
 title: "Verification, docs and release"
-status: pending
+status: in-progress
 priority: P1
 effort: "1d"
 dependencies: [1, 2, 3]
@@ -47,10 +47,10 @@ metadata/hashes and document standard versus portable runtime contents.
 
 ## Success Criteria
 
-- [ ] All repository quality gates pass without exclusions.
-- [ ] Standard GUI remains small and starts when Whisper is not installed.
-- [ ] Missing runtime/model gives an actionable Vietnamese message.
-- [ ] Portable manifest accurately states whether Whisper runtime/model is included.
+- [x] All repository quality gates pass without exclusions.
+- [x] Standard GUI remains small and starts when Whisper is not installed.
+- [x] Missing runtime/model gives an actionable Vietnamese message.
+- [x] Portable manifest accurately states whether Whisper runtime/model is included.
 - [ ] Private remote contains source/tests/docs only, no user project or cache.
 
 ## Risk Assessment

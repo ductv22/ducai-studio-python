@@ -1,7 +1,7 @@
 ---
 title: "SRT export and Whisper extraction"
 description: "Xuất SRT từ cue hiện hành và port Whisper cục bộ từ DUCAI 0.1.99 vào kiến trúc Python/PySide6."
-status: pending
+status: in-progress
 priority: P1
 effort: "3-5d"
 tags: [subtitles, whisper, asr, export, windows]
@@ -95,24 +95,24 @@ checkpoint regression tests, and a no-data-mutation rollback.
 
 | # | Phase | Status |
 |---|-------|--------|
-| 1 | [Live SRT export contract](./phase-01-live-srt-export.md) | Pending |
-| 2 | [Whisper runtime and extraction worker](./phase-02-whisper-runtime-worker.md) | Pending |
-| 3 | [UI, settings and Multi integration](./phase-03-ui-and-multi.md) | Pending |
-| 4 | [Verification, docs and release](./phase-04-verification-release.md) | Pending |
+| 1 | [Live SRT export contract](./phase-01-live-srt-export.md) | Completed |
+| 2 | [Whisper runtime and extraction worker](./phase-02-whisper-runtime-worker.md) | Completed |
+| 3 | [UI, settings and Multi integration](./phase-03-ui-and-multi.md) | Completed |
+| 4 | [Verification, docs and release](./phase-04-verification-release.md) | In progress |
 
 ## Success Criteria
 
-- [ ] Source SRT and Vietnamese SRT export use the latest persisted cue text,
+- [x] Source SRT and Vietnamese SRT export use the latest persisted cue text,
       order and timestamp after manual edits.
-- [ ] Exports are UTF-8 BOM, valid SRT, atomic, and report Vietnamese
+- [x] Exports are UTF-8 BOM, valid SRT, atomic, and report Vietnamese
       success/failure without mutating the project.
-- [ ] Whisper defaults to Chinese `large-v3`, uses CUDA float16 when available,
+- [x] Whisper defaults to Chinese `large-v3`, uses CUDA float16 when available,
       falls back to CPU int8, and stores no model in the repository.
-- [ ] Whisper progress is real; pause/cancel are acknowledged promptly; resume
+- [x] Whisper progress is real; pause/cancel are acknowledged promptly; resume
       reuses the compatible checkpoint without duplicating or dropping cues.
-- [ ] OCR and Whisper caches cannot be confused; rerun overwrite semantics remain intact.
-- [ ] Existing projects/batches without the new option keep OCR behavior.
-- [ ] Focused and full quality gates pass and a new release is built/smoke-tested.
+- [x] OCR and Whisper caches cannot be confused; rerun overwrite semantics remain intact.
+- [x] Existing projects/batches without the new option keep OCR behavior.
+- [x] Focused and full quality gates pass and a new release is built/smoke-tested.
 
 ## Rollback
 

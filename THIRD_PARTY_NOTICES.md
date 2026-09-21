@@ -36,6 +36,17 @@ otherwise unchanged.
   PP-OCRv6 detection/recognition model directories.
 - The runtime, CUDA dependencies and model files retain their upstream licenses.
 
+## faster-whisper / CTranslate2
+
+- Upstream: `https://github.com/SYSTRAN/faster-whisper` and
+  `https://github.com/OpenNMT/CTranslate2`
+- Optional external runtime: `faster-whisper` 1.2.1 and CTranslate2 4.8.1.
+- Optional model: `Systran/faster-whisper-large-v3`, installed only by the
+  explicit Whisper setup script or an opt-in portable build.
+- The engine, converted model and optional NVIDIA CUDA runtime packages retain
+  their upstream licenses and notices; none are stored in this source repository
+  or bundled in the standard GUI release.
+
 ## VieNeu-TTS runtime
 
 - Upstream: `https://github.com/pnnbao97/VieNeu-TTS`

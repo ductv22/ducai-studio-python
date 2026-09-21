@@ -351,6 +351,30 @@ exposes the batched API, while retaining the per-band fallback for compatible
 external engines. These optimizations change only inference batching, not
 timestamps, evidence IDs, consensus, or the OCR QA contract.
 
+### Whisper audio extraction boundary
+
+Whisper is an explicit alternative evidence source under the durable `ocr` job
+kind. Jobs persist `extraction_method=whisper_audio`, a separate provider/model/
+runtime fingerprint and the immutable `large-v3` path, so neither OCR nor Multi
+can reuse a frame-OCR checkpoint by mistake. Old jobs and Multi snapshots without
+the field resolve to `frame_ocr`.
+
+The GUI never imports `faster-whisper`. A pinned external Python runtime launches
+`whisper_engine_host.py`, which emits one metadata/segment/complete JSON event at
+a time. The worker first creates one atomic 16 kHz mono dialogue WAV, then writes
+segments to an NDJSON ledger. Pause/cancel terminates the host, checkpoints the
+ledger and never publishes partial S1. Resume rewinds five seconds to the nearest
+completed segment boundary, streams again, then deterministically repairs overlap
+and duplicates before publishing. CUDA float16 is attempted first; a verified
+CUDA host failure rewinds the same ledger and retries once with CPU int8.
+
+Whisper publication has its own QA receipt (`kind=whisper_asr`) covering job and
+settings fingerprints, output hash and cue count. It does not claim hard-sub
+frame coverage. The Job Manager verifies that receipt and the final cue timeline
+before atomically replacing S1. The standard release includes only the small host
+script; runtime/model installation is explicit, and portable packaging includes
+them only with `-IncludeWhisper`.
+
 ## Translation runtime boundary
 
 The translation worker owns exactly one transport instance at a time. Gemini

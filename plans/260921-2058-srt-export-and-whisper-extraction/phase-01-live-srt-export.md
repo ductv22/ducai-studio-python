@@ -1,7 +1,7 @@
 ---
 phase: 1
 title: "Live SRT export contract"
-status: pending
+status: completed
 priority: P1
 effort: "0.5d"
 dependencies: []
@@ -49,10 +49,10 @@ returns path/cue count/language. The ViewModel shows a Vietnamese toast/status.
 
 ## Success Criteria
 
-- [ ] Editing a cue then exporting writes the edited value, not an old job file.
-- [ ] Source and Vietnamese exports cannot be swapped.
-- [ ] Export does not change revision, track, cache or job state.
-- [ ] UI reports the saved path and cue count in Vietnamese.
+- [x] Editing a cue then exporting writes the edited value, not an old job file.
+- [x] Source and Vietnamese exports cannot be swapped.
+- [x] Export does not change revision, track, cache or job state.
+- [x] UI reports the saved path and cue count in Vietnamese.
 
 ## Risk Assessment
 
