@@ -1,0 +1,7543 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import math
+import os
+import re
+import zlib
+from contextlib import suppress
+from dataclasses import dataclass
+from pathlib import Path
+from uuid import uuid4
+
+from PySide6.QtCore import (
+    Property,
+    QAbstractListModel,
+    QModelIndex,
+    QObject,
+    QProcess,
+    QRunnable,
+    QSettings,
+    QStandardPaths,
+    Qt,
+    QThreadPool,
+    QTimer,
+    QUrl,
+    Signal,
+    Slot,
+)
+from PySide6.QtNetwork import QLocalSocket
+
+from ducai_studio import __version__
+from ducai_studio.application.translation_pipeline import contains_cjk
+from ducai_studio.domain.jobs import redact_sensitive_text
+from ducai_studio.infrastructure.ipc.client import JobManagerClient
+from ducai_studio.infrastructure.process_tree import ProcessTreeGuard
+from ducai_studio.infrastructure.runtime_program import runtime_program_path
+from ducai_studio.providers.preview import QtMultimediaPreviewProvider
+from ducai_studio.providers.translation.openai_compatible import (
+    OPENAI_COMPATIBLE_PROVIDER_IDS,
+)
+from ducai_studio.providers.tts import discover_data_root
+
+from .project_job_models import (
+    JobListModel,
+    MultiVideoListModel,
+    ProjectListModel,
+    ProjectStateModel,
+)
+from .voice_models import VoiceCatalogModel
+
+
+@dataclass(frozen=True, slots=True)
+class NavigationItem:
+    workspace_id: str
+    title: str
+    short_code: str
+    icon_name: str
+
+
+NAVIGATION = (
+    NavigationItem("dashboard", "Tổng quan", "TG", "house"),
+    NavigationItem("projects", "Dự án", "DA", "folder"),
+    NavigationItem("import", "Nhập media", "NM", "file-down"),
+    NavigationItem("transcribe", "Trích xuất", "TX", "scan-text"),
+    NavigationItem("translate", "Dịch thuật", "DT", "languages"),
+    NavigationItem("subtitles", "Biên tập phụ đề", "PD", "captions"),
+    NavigationItem("voice", "Phòng thu giọng", "GV", "mic-vocal"),
+    NavigationItem("multi", "Multi video", "MV", "list-todo"),
+    NavigationItem("timeline", "Timeline", "TL", "panels-top-left"),
+    NavigationItem("effects", "Hiệu ứng", "HU", "wand-sparkles"),
+    NavigationItem("mixer", "Trộn âm", "TA", "sliders-horizontal"),
+    NavigationItem("export", "Xuất video", "XV", "upload"),
+    NavigationItem("queue", "Hàng đợi", "HD", "list-todo"),
+    NavigationItem("settings", "Cài đặt", "CD", "settings"),
+)
+
+_INVALID_MODEL_INDEX = QModelIndex()
+
+
+class _ProjectSnapshotDecodeTask(QRunnable):
+    """Decode a large project-snapshot transport envelope off the UI thread."""
+
+    def __init__(
+        self,
+        runtime: JobRuntime,
+        result: object,
+        context: object,
+        *,
+        action: str = "get_project",
+        artifact_root: Path,
+    ) -> None:
+        super().__init__()
+        self.runtime = runtime
+        self.result = result
+        self.context = context
+        self.action = action
+        self.artifact_root = artifact_root
+
+    def run(self) -> None:  # pragma: no cover - exercised through Qt signal tests
+        try:
+            snapshot = self._decode(self.result)
+        except Exception as exc:
+            self.runtime.projectPayloadDecoded.emit(
+                self.action,
+                False,
+                {"message": str(exc)},
+                self.context,
+            )
+            return
+        self.runtime.projectPayloadDecoded.emit(
+            self.action,
+            True,
+            snapshot,
+            self.context,
+        )
+
+    def _decode(self, result: object) -> dict:
+        if not isinstance(result, dict) or "__project_transport__" not in result:
+            if not isinstance(result, dict):
+                raise ValueError("Project snapshot response is not an object")
+            return result
+        envelope = result.get("__project_transport__")
+        if not isinstance(envelope, dict):
+            raise ValueError("Project snapshot transport envelope is invalid")
+        encoding = str(envelope.get("encoding", ""))
+        expected_size = envelope.get("uncompressed_bytes")
+        if (
+            type(expected_size) is not int
+            or expected_size <= 0
+            or expected_size > 256 * 1024 * 1024
+        ):
+            raise ValueError("Project snapshot size is invalid")
+        expected_sha = str(envelope.get("sha256", "")).strip().casefold()
+        if len(expected_sha) != 64:
+            raise ValueError("Project snapshot checksum is invalid")
+        if encoding == "zlib+base64+json":
+            encoded = envelope.get("data")
+            if not isinstance(encoded, str) or not encoded:
+                raise ValueError("Project snapshot data is missing")
+            compressed = base64.b64decode(encoded, validate=True)
+        elif encoding == "file+zlib+json":
+            path = Path(str(envelope.get("path", ""))).expanduser().resolve(strict=True)
+            if not path.is_relative_to(self.artifact_root):
+                raise ValueError("Project snapshot file is outside the application cache")
+            compressed = path.read_bytes()
+            with suppress(OSError):
+                path.unlink(missing_ok=True)
+        else:
+            raise ValueError("Project snapshot encoding is unsupported")
+        decoded = zlib.decompress(compressed)
+        if len(decoded) != expected_size:
+            raise ValueError("Project snapshot size changed during transport")
+        if hashlib.sha256(decoded).hexdigest().casefold() != expected_sha:
+            raise ValueError("Project snapshot checksum mismatch")
+        snapshot = json.loads(decoded.decode("utf-8"))
+        if not isinstance(snapshot, dict):
+            raise ValueError("Project snapshot JSON is invalid")
+        project_id = str(envelope.get("project_id", ""))
+        revision = envelope.get("revision")
+        if project_id and snapshot.get("id") != project_id:
+            raise ValueError("Project snapshot belongs to another project")
+        if type(revision) is int and snapshot.get("revision") != revision:
+            raise ValueError("Project snapshot revision changed during transport")
+        return snapshot
+
+
+def _default_ocr_engine_python() -> str:
+    configured = os.environ.get("DUCAI_PADDLE_PYTHON")
+    if configured and Path(configured).expanduser().is_file():
+        return str(Path(configured).expanduser().resolve())
+    shared_data = discover_data_root()
+    local_data = Path(
+        QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppLocalDataLocation)
+    )
+    candidates = [
+        shared_data / "paddle_runtime" / ".venv" / "Scripts" / "python.exe",
+        shared_data.parent / ".bench-paddle-rapid" / "venv" / "Scripts" / "python.exe",
+        local_data / "engines" / "paddle" / "venv" / "Scripts" / "python.exe",
+    ]
+    for ancestor in Path(__file__).resolve().parents:
+        candidates.append(
+            ancestor / "outputs" / ".bench-paddle-rapid" / "venv" / "Scripts" / "python.exe"
+        )
+    runtime = next((candidate for candidate in candidates if candidate.is_file()), None)
+    return str(runtime.resolve()) if runtime is not None else str(runtime_program_path())
+
+
+def _local_path_from_ui(value: str) -> Path:
+    """Normalize either a native Windows path or a QML file URL."""
+    raw = value.strip()
+    if raw.casefold().startswith("file:"):
+        raw = QUrl(raw).toLocalFile()
+    return Path(raw).expanduser().resolve()
+
+
+def _stable_credential_references(values: object) -> list[str]:
+    raw_values = [values] if isinstance(values, str) else values
+    if not isinstance(raw_values, (tuple, list)):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_values:
+        value = str(raw).strip()
+        folded = value.casefold()
+        if not value or folded in seen:
+            continue
+        seen.add(folded)
+        result.append(value)
+    return result
+
+
+def _normalized_hex_color(value: str) -> str | None:
+    candidate = value.strip().upper()
+    if len(candidate) != 7 or not candidate.startswith("#"):
+        return None
+    try:
+        int(candidate[1:], 16)
+    except ValueError:
+        return None
+    return candidate
+
+
+def _credential_setting_key(provider_id: str) -> str:
+    normalized = provider_id.strip().casefold()
+    if normalized == "gemini-api":
+        return "translation/geminiApiCredentialReferences"
+    return f"translation/{normalized}/credentialReferences"
+
+
+def _credential_prefix(provider_id: str) -> str:
+    return {
+        "gemini-api": "gemini",
+        "deepseek-api": "deepseek",
+        "tokenhub-api": "hy3",
+        "qwen-api": "qwen",
+        "glm-api": "glm",
+        "openai-compatible": "openai",
+    }.get(provider_id.strip().casefold(), "api")
+
+
+def _parse_translation_api_credentials(
+    raw: str,
+    *,
+    provider_id: str,
+    existing_references: tuple[str, ...] = (),
+) -> list[dict[str, str]]:
+    lines = [line.strip() for line in raw.replace(";", "\n").splitlines() if line.strip()]
+    if not lines:
+        return []
+    if len(lines) > 32:
+        raise ValueError("Chỉ có thể lưu tối đa 32 API key trong một lần")
+    used = {value.casefold() for value in existing_references if value.strip()}
+    batch_names: set[str] = set()
+    generated_index = 1
+    credentials: list[dict[str, str]] = []
+    for line in lines:
+        if "=" in line:
+            reference, secret = (value.strip() for value in line.split("=", 1))
+            if not reference or not secret:
+                raise ValueError("Mỗi dòng có tên phải dùng định dạng ten=API_KEY")
+        else:
+            secret = line
+            prefix = _credential_prefix(provider_id)
+            while f"{prefix}-{generated_index}".casefold() in used | batch_names:
+                generated_index += 1
+            reference = f"{prefix}-{generated_index}"
+            generated_index += 1
+        if any(character in reference for character in "\r\n\0="):
+            raise ValueError("Tên API key chứa ký tự không hợp lệ")
+        if len(reference) > 80:
+            raise ValueError("Tên API key không được dài quá 80 ký tự")
+        if redact_sensitive_text(reference) != reference:
+            raise ValueError("Tên API key phải là nhãn mô tả, không được chứa khóa bí mật")
+        folded = reference.casefold()
+        if folded in batch_names:
+            raise ValueError(f"Tên API key bị lặp trong danh sách: {reference}")
+        batch_names.add(folded)
+        credentials.append({"reference": reference, "secret": secret})
+    return credentials
+
+
+def _parse_gemini_api_credentials(
+    raw: str,
+    *,
+    existing_references: tuple[str, ...] = (),
+) -> list[dict[str, str]]:
+    """Backward-compatible parser for the existing Gemini settings/tests."""
+
+    return _parse_translation_api_credentials(
+        raw,
+        provider_id="gemini-api",
+        existing_references=existing_references,
+    )
+
+
+def _legacy_qsettings_values(settings: dict[str, object], project_id: str) -> dict[str, object]:
+    migrated = {
+        f"migration/legacy/{key}": value
+        for key, value in settings.items()
+        if isinstance(value, (bool, int, float, str, list))
+    }
+    font = settings.get("font_file")
+    if isinstance(font, str) and font.strip():
+        candidate = Path(font.strip())
+        migrated["export/fontFamily"] = candidate.stem if candidate.suffix else font.strip()
+    preset = settings.get("export_preset")
+    if isinstance(preset, str) and preset in {"source-quality", "1080p", "720p", "480p"}:
+        migrated["export/presetId"] = preset
+    output = settings.get("export_output")
+    if isinstance(output, str) and output.strip() and project_id:
+        migrated[f"export/outputPath/{project_id}"] = output.strip()
+    font_size = settings.get("sub_font_size")
+    if type(font_size) is int:
+        migrated["export/fontSize"] = max(12, min(120, font_size))
+    margin = settings.get("sub_margin_bottom")
+    if type(margin) is int:
+        migrated["export/subtitleMarginBottom"] = max(0, min(500, margin))
+    return migrated
+
+
+class NavigationModel(QAbstractListModel):
+    WorkspaceIdRole = Qt.ItemDataRole.UserRole + 1
+    TitleRole = Qt.ItemDataRole.UserRole + 2
+    ShortCodeRole = Qt.ItemDataRole.UserRole + 3
+    IconNameRole = Qt.ItemDataRole.UserRole + 4
+
+    def rowCount(self, parent: QModelIndex = _INVALID_MODEL_INDEX) -> int:
+        return 0 if parent.isValid() else len(NAVIGATION)
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or not 0 <= index.row() < len(NAVIGATION):
+            return None
+        item = NAVIGATION[index.row()]
+        if role == self.WorkspaceIdRole:
+            return item.workspace_id
+        if role in {self.TitleRole, Qt.ItemDataRole.DisplayRole}:
+            return item.title
+        if role == self.ShortCodeRole:
+            return item.short_code
+        if role == self.IconNameRole:
+            return item.icon_name
+        return None
+
+    def roleNames(self) -> dict[int, bytes]:
+        return {
+            self.WorkspaceIdRole: b"workspaceId",
+            self.TitleRole: b"title",
+            self.ShortCodeRole: b"shortCode",
+            self.IconNameRole: b"iconName",
+        }
+
+
+class JobRuntime(QObject):
+    statusChanged = Signal(str)
+    stateChanged = Signal(str)
+    readyChanged = Signal(bool)
+    shutdownComplete = Signal()
+    projectsReceived = Signal(object)
+    jobsReceived = Signal(object)
+    multiVideosReceived = Signal(object)
+    actionSucceeded = Signal(str, object, object)
+    actionFailed = Signal(str, object, object)
+    projectPayloadDecoded = Signal(str, bool, object, object)
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self.server_name = f"ducai-studio-{os.getpid()}-{uuid4().hex[:8]}"
+        configured_root = os.environ.get("DUCAI_APP_DATA_ROOT")
+        root = (
+            Path(
+                configured_root
+                or QStandardPaths.writableLocation(
+                    QStandardPaths.StandardLocation.AppLocalDataLocation
+                )
+            )
+            .expanduser()
+            .resolve()
+        )
+        self.database_path = root / "state.db"
+        self.artifact_root = root / "artifacts"
+        self.process = QProcess(self)
+        self.client = JobManagerClient(self)
+        self.process_tree = ProcessTreeGuard()
+        self._ready = False
+        self._state = "stopped"
+        self._attempts = 0
+        self._shutting_down = False
+        self._pending_requests: dict[str, tuple[str, object]] = {}
+        self._decode_pool = QThreadPool(self)
+        self._decode_pool.setMaxThreadCount(1)
+        self._job_poll_timer = QTimer(self)
+        self._job_poll_timer.setInterval(750)
+        self._job_poll_timer.timeout.connect(self._poll_jobs)
+        self.process.started.connect(self._process_started)
+        self.process.errorOccurred.connect(self._process_error)
+        self.process.finished.connect(self._process_finished)
+        self.client.connectedChanged.connect(self._connected)
+        self.client.responseReceived.connect(self._response)
+        self.client.errorOccurred.connect(self._client_error)
+        self.projectPayloadDecoded.connect(self._project_payload_decoded)
+
+    def start(self) -> None:
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        self.artifact_root.mkdir(parents=True, exist_ok=True)
+        self._set_state("starting")
+        self.statusChanged.emit("Đang khởi động Job Manager")
+        self.process.setProgram(str(runtime_program_path()))
+        self.process.setArguments(
+            [
+                "-m",
+                "ducai_studio.job_manager",
+                "--server-name",
+                self.server_name,
+                "--database",
+                str(self.database_path),
+                "--artifacts",
+                str(self.artifact_root),
+            ]
+        )
+        self.process.start()
+
+    def request_shutdown(self) -> None:
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        self._job_poll_timer.stop()
+        self._set_state("shutting_down")
+        self.statusChanged.emit("Đang lưu checkpoint và dừng worker")
+        if self.process.state() is QProcess.ProcessState.NotRunning:
+            self._complete_shutdown()
+            return
+        if self.client.socket.state() is QLocalSocket.LocalSocketState.ConnectedState:
+            try:
+                self.client.request("shutdown")
+            except Exception:
+                self.process.terminate()
+        else:
+            self.process.terminate()
+        QTimer.singleShot(15_000, self.force_shutdown)
+
+    def force_shutdown(self) -> None:
+        if self.process.state() is not QProcess.ProcessState.NotRunning:
+            self.process_tree.close()
+            self.process.kill()
+        self.client.disconnect()
+
+    @Slot()
+    def _process_started(self) -> None:
+        try:
+            self.process_tree.assign_pid(int(self.process.processId()))
+        except OSError as exc:
+            self.statusChanged.emit(f"Không thể sở hữu Job Manager: {exc}")
+            self.process.kill()
+            return
+        self._connect()
+
+    @Slot()
+    def _connect(self) -> None:
+        self._attempts += 1
+        self.client.connect_to(self.server_name)
+        if not self._ready and self._attempts < 20:
+            QTimer.singleShot(100, self._connect)
+
+    @Slot(bool)
+    def _connected(self, connected: bool) -> None:
+        if connected:
+            self._request("ping")
+            return
+        # A socket can disappear while the Job Manager process is still
+        # alive (for example after an oversized/invalid frame).  Publish the
+        # loss immediately so ApplicationViewModel releases transient busy
+        # gates such as Multi detail loading instead of waiting for the
+        # process-finished signal or a 30-second timeout.
+        if self._ready:
+            self._ready = False
+            self.readyChanged.emit(False)
+            self._set_state("error")
+            self.statusChanged.emit(
+                "Kết nối Job Manager bị gián đoạn; dữ liệu hiện tại vẫn được giữ nguyên."
+            )
+
+    @Slot(object)
+    def _response(self, message) -> None:
+        if message.kind == "event":
+            if message.payload.get("event") == "multi_status":
+                result = message.payload.get("result", {})
+                if isinstance(result, dict):
+                    result = {
+                        **result,
+                        "partial": message.payload.get("partial") is not False,
+                    }
+                self.multiVideosReceived.emit(result)
+            return
+        if message.kind != "response":
+            return
+        request_id = str(message.payload.get("request_id", ""))
+        action, context = self._pending_requests.pop(request_id, ("", {}))
+        if not message.payload.get("ok"):
+            raw_error = message.payload.get("error", {})
+            error = (
+                dict(raw_error)
+                if isinstance(raw_error, dict)
+                else {"message": str(raw_error or "không thành công")}
+            )
+            if action != "list_events":
+                action_label = action or "Yêu cầu"
+                raw_message = str(error.get("message") or error.get("reason") or "không thành công")
+                code = str(error.get("code", error.get("error_code", ""))).strip()
+                message_text = self._localized_error_message(code, raw_message)
+                self.statusChanged.emit(f"{action_label}: {message_text}")
+            self.actionFailed.emit(action, error, context)
+            return
+        result = message.payload.get("result", {})
+        if isinstance(result, dict) and "__project_transport__" in result:
+            self._decode_pool.start(
+                _ProjectSnapshotDecodeTask(
+                    self,
+                    result,
+                    context,
+                    action=action,
+                    artifact_root=self.artifact_root,
+                )
+            )
+            return
+        if action == "ping" and isinstance(result, dict) and result.get("status") == "ready":
+            self._ready = True
+            self._set_state("ready")
+            self.readyChanged.emit(True)
+            self.statusChanged.emit("Sẵn sàng")
+            self._job_poll_timer.start()
+            self._request("list_projects")
+            self._request("list_jobs")
+            self._request("multi_list")
+            self._request("list_credentials")
+        elif action == "list_projects":
+            self.projectsReceived.emit(result)
+        elif action == "list_jobs":
+            self.jobsReceived.emit(result)
+        elif action in {
+            "multi_list",
+            "multi_status",
+            "multi_add",
+            "multi_remove",
+            "multi_reorder",
+            "multi_select",
+            "multi_select_all",
+            "multi_start",
+            "multi_pause",
+            "multi_resume",
+            "multi_restore_hidden",
+        }:
+            if action in {"multi_select", "multi_select_all"}:
+                # The view model already applied this selection locally. An
+                # older response must not overwrite a newer rapid click.
+                pass
+            elif action != "multi_list" and isinstance(result, dict):
+                # Mutations and control actions usually retain card identity.
+                # Merge them in place; the model falls back to a reset only
+                # when membership or order truly changed.
+                result = {**result, "partial": True}
+                self.multiVideosReceived.emit(result)
+            else:
+                self.multiVideosReceived.emit(result)
+        self.actionSucceeded.emit(action, result, context)
+
+    @Slot(str, bool, object, object)
+    def _project_payload_decoded(
+        self,
+        action: str,
+        succeeded: bool,
+        result: object,
+        context: object,
+    ) -> None:
+        if succeeded:
+            self.actionSucceeded.emit(action, result, context)
+            return
+        error = dict(result) if isinstance(result, dict) else {"message": str(result)}
+        self.statusChanged.emit(
+            "Không thể đọc dữ liệu Timeline: "
+            + str(error.get("message", "dữ liệu project không hợp lệ"))
+        )
+        self.actionFailed.emit(action, error, context)
+
+    @Slot(str)
+    def _client_error(self, error: str) -> None:
+        if not self._ready and self._attempts < 20:
+            return
+        self._set_state("error")
+        self.statusChanged.emit(f"Job Manager: {error}")
+
+    @Slot(QProcess.ProcessError)
+    def _process_error(self, _error: QProcess.ProcessError) -> None:
+        self._set_state("error")
+        self.statusChanged.emit(self.process.errorString())
+
+    @Slot(int, QProcess.ExitStatus)
+    def _process_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
+        self._job_poll_timer.stop()
+        self.process_tree.close()
+        was_ready = self._ready
+        self._ready = False
+        if was_ready:
+            self.readyChanged.emit(False)
+        if self._shutting_down:
+            self._complete_shutdown()
+        else:
+            # Set the error state before publishing the human-readable reason
+            # so the view model promotes the unexpected stop to the same
+            # persistent top-center error toast as other backend failures.
+            self._set_state("error")
+            if exit_code != 0:
+                self.statusChanged.emit(
+                    "Bộ quản lý tác vụ đã dừng bất ngờ; hãy mở lại ứng dụng và tiếp tục từ cache."
+                )
+            else:
+                self.statusChanged.emit("Job Manager đã dừng ngoài dự kiến")
+
+    def _complete_shutdown(self) -> None:
+        self.client.disconnect()
+        self._set_state("stopped")
+        self.shutdownComplete.emit()
+
+    def _set_state(self, value: str) -> None:
+        if value == self._state:
+            return
+        self._state = value
+        self.stateChanged.emit(value)
+
+    @Slot()
+    def _poll_jobs(self) -> None:
+        if not self._ready or self._shutting_down:
+            return
+        if any(action == "list_jobs" for action, _context in self._pending_requests.values()):
+            return
+        self._request("list_jobs")
+
+    def request(
+        self,
+        action: str,
+        params: dict | None = None,
+        *,
+        context: object = None,
+    ) -> str:
+        if not self._ready:
+            raise RuntimeError("Job Manager is not ready")
+        return self._request(action, params, context=context)
+
+    def _request(
+        self,
+        action: str,
+        params: dict | None = None,
+        *,
+        context: object = None,
+    ) -> str:
+        if action == "list_jobs":
+            for request_id, (pending_action, _pending_context) in self._pending_requests.items():
+                if pending_action == "list_jobs":
+                    return request_id
+        request_id = self.client.request(action, params)
+        self._pending_requests[request_id] = (action, context if context is not None else {})
+        return request_id
+
+
+class ApplicationViewModel(QObject):
+    currentWorkspaceChanged = Signal()
+    currentIndexChanged = Signal()
+    statusMessageChanged = Signal()
+    statusNotificationRequested = Signal(str, str, int)
+    backendReadyChanged = Signal()
+    runtimeStateChanged = Signal()
+    projectNameChanged = Signal()
+    saveStateChanged = Signal()
+    shuttingDownChanged = Signal()
+    quitReady = Signal()
+    importDialogRequested = Signal()
+    multiImportDialogRequested = Signal()
+    newProjectDialogRequested = Signal()
+    legacyImportDialogRequested = Signal()
+    duplicateMediaDialogRequested = Signal()
+    duplicateMediaChanged = Signal()
+    importBusyChanged = Signal()
+    jobHistoryBusyChanged = Signal()
+    projectDeleteChanged = Signal()
+    selectedClipChanged = Signal()
+    selectedTrackChanged = Signal()
+    playheadChanged = Signal()
+    previewMasterVolumeChanged = Signal()
+    timelineBusyChanged = Signal()
+    timelineHistoryChanged = Signal()
+    ocrBusyChanged = Signal()
+    ocrSettingsChanged = Signal()
+    selectedCueChanged = Signal()
+    subtitleBusyChanged = Signal()
+    subtitleHistoryChanged = Signal()
+    translationBusyChanged = Signal()
+    translationSettingsChanged = Signal()
+    translationCachesChanged = Signal()
+    translationQaChanged = Signal()
+    translationQaNavigationRequested = Signal(int)
+    voiceTimingQaChanged = Signal()
+    voiceConformChanged = Signal()
+    geminiApiCredentialsStored = Signal()
+    voiceSettingsChanged = Signal()
+    ttsBusyChanged = Signal()
+    voicePreviewChanged = Signal()
+    voicePlaybackEnabledChanged = Signal()
+    exportSettingsChanged = Signal()
+    exportBusyChanged = Signal()
+    exportPreviewChanged = Signal()
+    diagnosticsChanged = Signal()
+    legacyMigrationChanged = Signal()
+    overlaySelectionRequested = Signal(str)
+    overlayGeometrySettled = Signal(str, bool)
+    multiVideoChanged = Signal()
+    multiPreviewReady = Signal(object, bool)
+    parallelJobWarningRequested = Signal(str)
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self.navigation = NavigationModel(self)
+        self.projects = ProjectListModel(self)
+        self.multi_videos = MultiVideoListModel(self)
+        self.jobs = JobListModel(self)
+        self.subtitle_jobs = JobListModel(self, accepted_kinds=frozenset({"ocr", "translate"}))
+        self.voice_jobs = JobListModel(self, accepted_kinds=frozenset({"tts"}))
+        self.export_jobs = JobListModel(self, accepted_kinds=frozenset({"export"}))
+        self.project_state = ProjectStateModel(self)
+        self.voice_catalog = VoiceCatalogModel(self)
+        self.preview_provider = QtMultimediaPreviewProvider()
+        self.settings = QSettings(self)
+        saved_workspace = self.settings.value("ui/currentWorkspace", "dashboard", type=str)
+        valid_workspaces = {item.workspace_id for item in NAVIGATION}
+        self._current_workspace = (
+            saved_workspace if saved_workspace in valid_workspaces else "dashboard"
+        )
+        self._current_index = self._screen_index(self._current_workspace)
+        self._status_message = "Đang chuẩn bị nền tảng"
+        self._backend_ready = False
+        self._runtime_state = "stopped"
+        self._shutting_down = False
+        self._project_name = "Chưa mở dự án"
+        self._save_state = "Không có thay đổi"
+        self._import_busy = False
+        self._job_history_busy = False
+        self._deleting_job_id = ""
+        self._pending_history_deletion_ids: set[str] = set()
+        self._project_delete_busy = False
+        self._deleting_project_id = ""
+        self._deleting_project_name = ""
+        self._duplicate_media_info: dict[str, object] = {}
+        self._multi_batch: dict[str, object] = {"state": "idle"}
+        self._multi_items: list[dict[str, object]] = []
+        self._multi_hidden_count = 0
+        self._multi_selection_generation = 0
+        self._multi_import_paths: list[Path] = []
+        self._multi_import_project_ids: list[str] = []
+        self._multi_detail_busy = False
+        self._multi_detail_generation = 0
+        self._pending_multi_detail_project_id = ""
+        self._multi_control_snapshot: dict[str, object] | None = None
+        self._pending_parallel_action: tuple[str, tuple[object, ...]] | None = None
+        self._parallel_warning_approved_once = False
+        self._pending_media_path = ""
+        self._pending_media_intent = ""
+        self._selected_clip_id = ""
+        self._selected_track_id = ""
+        self._selected_track_ids: set[str] = set()
+        self._playhead_us = 0
+        self._preview_master_volume_percent = max(
+            0,
+            min(100, self.settings.value("preview/masterVolumePercent", 90, type=int)),
+        )
+        self._timeline_busy = False
+        self._pending_effect_commands: list[dict[str, object]] = []
+        self._can_undo_timeline = False
+        self._can_redo_timeline = False
+        self._ocr_busy = False
+        self._ocr_job_id = ""
+        self._ocr_job_state = ""
+        try:
+            saved_ocr_fps = float(self.settings.value("ocr/sampleFps", 1.25))
+        except (TypeError, ValueError):
+            saved_ocr_fps = 1.25
+        self._ocr_sample_fps = round(max(0.67, min(2.5, saved_ocr_fps)), 2)
+        self._reloaded_ocr_jobs: set[str] = set()
+        self._translation_busy = False
+        self._translation_job_id = ""
+        self._translation_job_state = ""
+        self._translation_provider_id = ""
+        self._translation_caches: list[dict[str, object]] = []
+        self._selected_translation_cache_id = ""
+        self._translation_cache_refresh_pending = False
+        self._translation_cache_refresh_marker: tuple[str, str, str, str] = (
+            "",
+            "",
+            "",
+            "",
+        )
+        self._reloaded_translation_jobs: set[str] = set()
+        self._pending_translation_start: dict[str, object] | None = None
+        self._translation_event_sequences: dict[str, int] = {}
+        self._translation_event_requests: set[str] = set()
+        self._translation_qa_event_sequences: dict[str, int] = {}
+        self._translation_qa_event_requests: set[str] = set()
+        self._translation_terminal_event_jobs: set[str] = set()
+        # Terminal job records are polled repeatedly. Keep the last observed
+        # marker so a failure/completion notice is emitted once per transition
+        # instead of either spamming every poll or silently disappearing.
+        self._terminal_job_notification_markers: dict[str, tuple[object, ...]] = {}
+        self._jobs_snapshot_initialized = False
+        self._translation_qa: dict[str, object] = {
+            "status": "NONE",
+            "completed_cues": 0,
+            "checked_cues": 0,
+            "cue_total": 0,
+            "blocking_count": 0,
+            "blocking_issue_count": 0,
+            "warning_count": 0,
+            "issues": [],
+            "content_warnings": [],
+        }
+        self._tts_busy = False
+        self._tts_job_id = ""
+        self._tts_job_state = ""
+        self._tts_job_purpose = ""
+        self._pending_tts_start: dict[str, object] | None = None
+        self._voice_playback_enabled = True
+        self._voice_timing_auto_repair_busy = False
+        self._reloaded_tts_jobs: set[str] = set()
+        try:
+            saved_read_speed = float(self.settings.value("voice/readSpeed", 1.3))
+        except (TypeError, ValueError):
+            saved_read_speed = 1.3
+        self._voice_read_speed = round(max(1.1, min(3.0, saved_read_speed)), 1)
+        try:
+            saved_cue_speed = float(
+                self.settings.value("voice/cueMaxTotalSpeed", max(self._voice_read_speed, 1.5))
+            )
+        except (TypeError, ValueError):
+            saved_cue_speed = max(self._voice_read_speed, 1.5)
+        self._voice_cue_max_speed = round(max(self._voice_read_speed, min(3.0, saved_cue_speed)), 1)
+        self._voice_timing_review_requests: set[str] = set()
+        self._voice_timing_repair_requests: set[str] = set()
+        self._voice_timing_retry_requests: set[str] = set()
+        self._voice_timing_override_requests: set[str] = set()
+        self._voice_timing_qa: dict[str, object] = {
+            "status": "NONE",
+            "job_id": "",
+            "issue_count": 0,
+            "issues": [],
+            "overflow_us": 0,
+            "maximum_delay_us": 0,
+            "repair_cycle": 0,
+            "max_repair_cycles": 3,
+            "repairable": False,
+            "message": "",
+        }
+        self._voice_conform_mode = (
+            str(self.settings.value("voice/conformMode", "hybrid", type=str)).strip().casefold()
+        )
+        if self._voice_conform_mode not in {"stretch_video", "speed_audio", "hybrid"}:
+            self._voice_conform_mode = "hybrid"
+        try:
+            saved_conform_speed = float(self.settings.value("voice/conformMaxAudioSpeed", 1.25))
+        except (TypeError, ValueError):
+            saved_conform_speed = 1.25
+        self._voice_conform_max_audio_speed = max(1.0, min(2.0, saved_conform_speed))
+        self._voice_conform_estimate: dict[str, object] = {}
+        # Keep the immutable production TTS parent separate from the cache-only
+        # conform job. Reusing one identifier for both makes the next estimate
+        # ask the service to treat a ``voice_conform`` job as a production D1.
+        self._voice_conform_parent_tts_job_id = ""
+        self._voice_conform_job_id = ""
+        self._voice_conform_job_state = ""
+        self._voice_conform_busy = False
+        self._voice_conform_applied = False
+        self._voice_conform_estimate_request_pending = False
+        self._voice_conform_estimate_generation = 0
+        self._voice_conform_estimate_refresh_queued = False
+        self._voice_preview_source = ""
+        self._export_busy = False
+        self._export_job_id = ""
+        self._export_job_state = ""
+        self._last_export_source = ""
+        self._last_export_qa_path = ""
+        self._runtime_diagnostics: dict[str, object] = {}
+        self._legacy_migration_report: dict[str, object] = {}
+        self._legacy_source_path = ""
+        saved_voice = self.settings.value("voice/selectedId", "", type=str)
+        selected_voice = self.voice_catalog.find(saved_voice)
+        if not selected_voice.get("installed"):
+            preferred = self.voice_catalog.find("nghitts-chieu-thanh")
+            selected_voice = (
+                preferred
+                if preferred.get("installed")
+                else self.voice_catalog.first_installed("piper")
+            )
+        if not selected_voice:
+            selected_voice = self.voice_catalog.first_installed()
+        self._selected_voice_id = str(selected_voice.get("voice_id", ""))
+        self._selected_cue_id = ""
+        self._subtitle_busy = False
+        self._can_undo_subtitle = False
+        self._can_redo_subtitle = False
+        self.runtime = JobRuntime(self)
+        self.runtime.statusChanged.connect(self._set_status)
+        self.runtime.stateChanged.connect(self._set_runtime_state)
+        self.runtime.readyChanged.connect(self._set_backend_ready)
+        self.runtime.shutdownComplete.connect(self.quitReady)
+        self.runtime.projectsReceived.connect(self.projects.replace)
+        self.runtime.jobsReceived.connect(self._replace_jobs)
+        self.runtime.multiVideosReceived.connect(self._replace_multi_videos)
+        self.runtime.actionSucceeded.connect(self._action_succeeded)
+        self.runtime.actionFailed.connect(self._action_failed)
+
+    @Property(QObject, constant=True)
+    def navigationModel(self) -> QObject:
+        return self.navigation
+
+    @Property(QObject, constant=True)
+    def projectModel(self) -> QObject:
+        return self.projects
+
+    @Property(QObject, constant=True)
+    def multiVideoModel(self) -> QObject:
+        return self.multi_videos
+
+    @Property("QVariantMap", notify=multiVideoChanged)
+    def multiBatch(self) -> dict[str, object]:
+        return dict(self._multi_batch)
+
+    @Property(str, notify=multiVideoChanged)
+    def multiBatchState(self) -> str:
+        return str(self._multi_batch.get("state", "idle"))
+
+    @Property(int, notify=multiVideoChanged)
+    def multiSelectedCount(self) -> int:
+        return sum(1 for item in self._multi_items if item.get("selected") is True)
+
+    @Property(int, notify=multiVideoChanged)
+    def multiHiddenCount(self) -> int:
+        return self._multi_hidden_count
+
+    @Property(bool, notify=multiVideoChanged)
+    def multiListLocked(self) -> bool:
+        return self.multiBatchState in {"running", "pause_requested"}
+
+    @Property(bool, notify=multiVideoChanged)
+    def multiDetailBusy(self) -> bool:
+        return self._multi_detail_busy
+
+    @Property(QObject, constant=True)
+    def jobModel(self) -> QObject:
+        return self.jobs
+
+    @Property(QObject, constant=True)
+    def subtitleJobModel(self) -> QObject:
+        return self.subtitle_jobs
+
+    @Property(QObject, constant=True)
+    def voiceJobModel(self) -> QObject:
+        return self.voice_jobs
+
+    @Property(QObject, constant=True)
+    def voiceCatalogModel(self) -> QObject:
+        return self.voice_catalog
+
+    @Property(QObject, constant=True)
+    def exportJobModel(self) -> QObject:
+        return self.export_jobs
+
+    @Property(QObject, constant=True)
+    def currentProject(self) -> QObject:
+        return self.project_state
+
+    @Property(str, constant=True)
+    def previewProviderId(self) -> str:
+        return self.preview_provider.provider_id
+
+    @Property(str, constant=True)
+    def previewProviderSummary(self) -> str:
+        return self.preview_provider.health().summary
+
+    @Property(str, notify=currentWorkspaceChanged)
+    def currentWorkspace(self) -> str:
+        return self._current_workspace
+
+    @Property(str, notify=currentWorkspaceChanged)
+    def currentWorkspaceTitle(self) -> str:
+        return next(
+            item.title for item in NAVIGATION if item.workspace_id == self._current_workspace
+        )
+
+    @Property(int, notify=currentIndexChanged)
+    def currentIndex(self) -> int:
+        return self._current_index
+
+    @Property(str, notify=projectNameChanged)
+    def projectName(self) -> str:
+        return self._project_name
+
+    @Property(str, notify=saveStateChanged)
+    def saveState(self) -> str:
+        return self._save_state
+
+    @Property(str, notify=statusMessageChanged)
+    def statusMessage(self) -> str:
+        return self._status_message
+
+    @Property(bool, notify=backendReadyChanged)
+    def backendReady(self) -> bool:
+        return self._backend_ready
+
+    @Property(str, notify=runtimeStateChanged)
+    def runtimeState(self) -> str:
+        return self._runtime_state
+
+    @Property(bool, notify=shuttingDownChanged)
+    def shuttingDown(self) -> bool:
+        return self._shutting_down
+
+    @Property(bool, notify=importBusyChanged)
+    def importBusy(self) -> bool:
+        return self._import_busy
+
+    @Property(bool, notify=jobHistoryBusyChanged)
+    def jobHistoryBusy(self) -> bool:
+        return self._job_history_busy
+
+    @Property(str, notify=jobHistoryBusyChanged)
+    def deletingJobId(self) -> str:
+        return self._deleting_job_id
+
+    @Property(bool, notify=projectDeleteChanged)
+    def projectDeleteBusy(self) -> bool:
+        return self._project_delete_busy
+
+    @Property(str, notify=projectDeleteChanged)
+    def deletingProjectId(self) -> str:
+        return self._deleting_project_id
+
+    @Property(str, notify=projectDeleteChanged)
+    def deletingProjectName(self) -> str:
+        return self._deleting_project_name
+
+    @Property("QVariantMap", notify=duplicateMediaChanged)
+    def duplicateMediaInfo(self) -> dict[str, object]:
+        return dict(self._duplicate_media_info)
+
+    @Property(str, notify=selectedClipChanged)
+    def selectedClipId(self) -> str:
+        return self._selected_clip_id
+
+    @Property(bool, notify=selectedClipChanged)
+    def hasSelectedClip(self) -> bool:
+        return bool(self._selected_clip_id)
+
+    @Property(str, notify=selectedTrackChanged)
+    def selectedTrackId(self) -> str:
+        return self._selected_track_id
+
+    @Property(bool, notify=selectedTrackChanged)
+    def hasSelectedTrack(self) -> bool:
+        return bool(self._selected_track_id)
+
+    @Property("QVariantList", notify=selectedTrackChanged)
+    def selectedTrackIds(self) -> list[str]:
+        return sorted(self._selected_track_ids)
+
+    @Property(bool, notify=selectedTrackChanged)
+    def hasMultipleSelectedTracks(self) -> bool:
+        return len(self._selected_track_ids) > 1
+
+    @Property(bool, notify=selectedTrackChanged)
+    def selectedTrackMuted(self) -> bool:
+        track = self.project_state.track_info(self._selected_track_id)
+        return track.get("muted") is True if track else False
+
+    @Property(bool, notify=selectedTrackChanged)
+    def selectedTrackLocked(self) -> bool:
+        track = self.project_state.track_info(self._selected_track_id)
+        return track.get("locked") is True if track else False
+
+    @Property(float, notify=selectedClipChanged)
+    def selectedClipSpeedPercent(self) -> float:
+        clip = self.project_state.clip_info(self._selected_clip_id)
+        speed = clip.get("speed", {}) if clip else {}
+        numerator = speed.get("numerator", 1)
+        denominator = speed.get("denominator", 1)
+        if type(numerator) is not int or type(denominator) is not int or denominator <= 0:
+            return 100.0
+        return numerator * 100.0 / denominator
+
+    @Property(float, notify=selectedClipChanged)
+    def selectedClipVolumePercent(self) -> float:
+        clip = self.project_state.clip_info(self._selected_clip_id)
+        volume = clip.get("volume", 1.0) if clip else 1.0
+        if isinstance(volume, bool) or not isinstance(volume, (int, float)):
+            return 100.0
+        return float(volume) * 100.0
+
+    @Property(str, notify=selectedClipChanged)
+    def selectedClipCueText(self) -> str:
+        clip = self.project_state.clip_info(self._selected_clip_id)
+        return str(clip.get("cue_text", "")) if clip else ""
+
+    @Property(str, notify=selectedClipChanged)
+    def selectedClipCueId(self) -> str:
+        clip = self.project_state.clip_info(self._selected_clip_id)
+        cue_id = clip.get("cue_id") if clip else ""
+        return cue_id if isinstance(cue_id, str) else ""
+
+    @Property(str, notify=selectedClipChanged)
+    def selectedClipTrackKind(self) -> str:
+        clip = self.project_state.clip_info(self._selected_clip_id)
+        if not clip:
+            return ""
+        track = self.project_state.track_info(str(clip.get("track_id", "")))
+        return str(track.get("kind", "")) if track else ""
+
+    @Property(bool, notify=selectedClipChanged)
+    def selectedClipTimingUnresolved(self) -> bool:
+        timing = self.project_state.clip_timing_info(self._selected_clip_id)
+        return timing.get("state") == "overflow"
+
+    @Property(str, notify=selectedClipChanged)
+    def selectedClipTimingState(self) -> str:
+        timing = self.project_state.clip_timing_info(self._selected_clip_id)
+        return str(timing.get("state", "unknown"))
+
+    @Property(bool, notify=selectedClipChanged)
+    def selectedClipContentWarning(self) -> bool:
+        clip = self.project_state.clip_info(self._selected_clip_id)
+        return bool(clip.get("content_warning", False)) if clip else False
+
+    @Property(str, notify=selectedClipChanged)
+    def selectedClipIssueCode(self) -> str:
+        clip = self.project_state.clip_info(self._selected_clip_id)
+        return str(clip.get("issue_code", "")) if clip else ""
+
+    @Property(str, notify=selectedClipChanged)
+    def selectedClipTimingText(self) -> str:
+        clip = self.project_state.clip_info(self._selected_clip_id)
+        if not clip:
+            return ""
+        timeline = clip.get("timeline_range", {})
+        slot = clip.get("timing_slot", {})
+        if not isinstance(timeline, dict):
+            return "Chưa có khoảng thời gian clip để kiểm tra"
+        if not isinstance(slot, dict):
+            return "Chưa có mốc SRT để đối chiếu; hãy tạo lại D1 từ cache nếu cần chỉnh cue"
+        try:
+            actual = (int(timeline["end_us"]) - int(timeline["start_us"])) / 1_000_000
+            expected = (int(slot["end_us"]) - int(slot["start_us"])) / 1_000_000
+        except (KeyError, TypeError, ValueError):
+            return ""
+        timing = self.project_state.clip_timing_info(self._selected_clip_id)
+        state = str(timing.get("state", "unknown"))
+        start_delta_ms = int(timing.get("start_delta_us", 0) or 0) / 1_000
+        duration_delta_ms = int(timing.get("duration_delta_us", 0) or 0) / 1_000
+        required_speed = float(timing.get("required_speed", 1.0) or 1.0)
+        state_text = {
+            "overflow": (
+                f"Dài hơn SRT {duration_delta_ms:.0f} ms; cần khoảng {required_speed:.2f}× để khớp"
+            ),
+            "underflow": f"Ngắn hơn SRT {abs(duration_delta_ms):.0f} ms",
+            "position_mismatch": (f"Thời lượng phù hợp nhưng lệch vị trí {start_delta_ms:+.0f} ms"),
+            "matched": "Đã khớp SRT trong sai số ±50 ms",
+            "unknown": "Chưa có mốc SRT để đối chiếu",
+        }.get(state, "Chưa xác định trạng thái timing")
+        return (
+            f"{state_text}\nSRT {expected:.3f}s · hiện tại {actual:.3f}s · "
+            f"độ lệch thời lượng {actual - expected:+.3f}s"
+        )
+
+    @Property(float, notify=playheadChanged)
+    def playheadUs(self) -> float:
+        return float(self._playhead_us)
+
+    @Property(bool, notify=timelineBusyChanged)
+    def timelineBusy(self) -> bool:
+        return self._timeline_busy
+
+    @Property(bool, notify=timelineHistoryChanged)
+    def canUndoTimeline(self) -> bool:
+        return self._can_undo_timeline
+
+    @Property(bool, notify=timelineHistoryChanged)
+    def canRedoTimeline(self) -> bool:
+        return self._can_redo_timeline
+
+    @Property(bool, notify=ocrBusyChanged)
+    def ocrBusy(self) -> bool:
+        return self._ocr_busy
+
+    @Property(str, notify=ocrSettingsChanged)
+    def ocrEnginePython(self) -> str:
+        return self.settings.value("engines/paddlePython", _default_ocr_engine_python(), type=str)
+
+    @Property(float, notify=ocrSettingsChanged)
+    def ocrSampleFps(self) -> float:
+        """The OCR sampling rate shared by single-video and Multi runs."""
+
+        return self._ocr_sample_fps
+
+    @Property(str, notify=ocrBusyChanged)
+    def ocrJobId(self) -> str:
+        return self._ocr_job_id
+
+    @Property(str, notify=ocrBusyChanged)
+    def ocrJobState(self) -> str:
+        return self._ocr_job_state
+
+    @Property(bool, notify=translationBusyChanged)
+    def translationBusy(self) -> bool:
+        return self._translation_busy
+
+    @Property(str, notify=translationBusyChanged)
+    def translationJobId(self) -> str:
+        return self._translation_job_id
+
+    @Property(str, notify=translationBusyChanged)
+    def translationJobState(self) -> str:
+        return self._translation_job_state
+
+    @Property("QVariantList", notify=translationCachesChanged)
+    def translationCaches(self) -> list[dict[str, object]]:
+        return [dict(item) for item in self._translation_caches]
+
+    @Property(str, notify=translationCachesChanged)
+    def selectedTranslationCacheId(self) -> str:
+        return self._selected_translation_cache_id
+
+    @Property("QVariantMap", notify=translationQaChanged)
+    def translationQa(self) -> dict[str, object]:
+        snapshot = dict(self._translation_qa)
+        snapshot["issues"] = [
+            dict(issue) for issue in snapshot.get("issues", []) if isinstance(issue, dict)
+        ]
+        return snapshot
+
+    @Property("QVariantMap", notify=voiceTimingQaChanged)
+    def voiceTimingQa(self) -> dict[str, object]:
+        snapshot = dict(self._voice_timing_qa)
+        snapshot["issues"] = [
+            dict(issue) for issue in snapshot.get("issues", []) if isinstance(issue, dict)
+        ]
+        return snapshot
+
+    @Property(str, notify=voiceConformChanged)
+    def voiceConformMode(self) -> str:
+        return self._voice_conform_mode
+
+    @Property(float, notify=voiceConformChanged)
+    def voiceConformMaxAudioSpeed(self) -> float:
+        return self._voice_conform_max_audio_speed
+
+    @Property("QVariantMap", notify=voiceConformChanged)
+    def voiceConformEstimate(self) -> dict[str, object]:
+        snapshot = dict(self._voice_conform_estimate)
+        raw_issues = snapshot.get("issues", [])
+        snapshot["issues"] = [dict(item) for item in raw_issues if isinstance(item, dict)]
+        return snapshot
+
+    @Property(bool, notify=voiceConformChanged)
+    def voiceConformCanApply(self) -> bool:
+        return bool(self._voice_conform_estimate.get("can_apply") is True)
+
+    @Property(bool, notify=voiceConformChanged)
+    def voiceConformApplied(self) -> bool:
+        return self._voice_conform_applied
+
+    @Property(bool, notify=voiceConformChanged)
+    def voiceConformBusy(self) -> bool:
+        return self._voice_conform_busy
+
+    @Property(str, notify=voiceConformChanged)
+    def voiceConformJobState(self) -> str:
+        return self._voice_conform_job_state
+
+    @Property(bool, notify=ttsBusyChanged)
+    def ttsBusy(self) -> bool:
+        return self._tts_busy
+
+    @Property(str, notify=ttsBusyChanged)
+    def ttsJobId(self) -> str:
+        return self._tts_job_id
+
+    @Property(str, notify=ttsBusyChanged)
+    def ttsJobState(self) -> str:
+        return self._tts_job_state
+
+    @Property(str, notify=ttsBusyChanged)
+    def ttsJobPurpose(self) -> str:
+        return self._tts_job_purpose
+
+    @Property(str, notify=voiceSettingsChanged)
+    def selectedVoiceId(self) -> str:
+        return self._selected_voice_id
+
+    @Property(str, notify=voiceSettingsChanged)
+    def selectedVoiceProvider(self) -> str:
+        return str(self.voice_catalog.find(self._selected_voice_id).get("provider_id", ""))
+
+    @Property("QVariantMap", notify=voiceSettingsChanged)
+    def selectedVoice(self) -> dict:
+        return self.voice_catalog.find(self._selected_voice_id)
+
+    @Property(str, notify=voicePreviewChanged)
+    def voicePreviewSource(self) -> str:
+        return self._voice_preview_source
+
+    @Property(bool, notify=voicePlaybackEnabledChanged)
+    def voicePlaybackEnabled(self) -> bool:
+        return self._voice_playback_enabled
+
+    @Property(bool, notify=exportBusyChanged)
+    def exportBusy(self) -> bool:
+        return self._export_busy
+
+    @Property(str, notify=exportBusyChanged)
+    def exportJobId(self) -> str:
+        return self._export_job_id
+
+    @Property(str, notify=exportBusyChanged)
+    def exportJobState(self) -> str:
+        return self._export_job_state
+
+    @Property(str, notify=exportSettingsChanged)
+    def exportOutputPath(self) -> str:
+        key = f"export/outputPath/{self.project_state.projectId or 'none'}"
+        configured = self.settings.value(key, "", type=str).strip()
+        if configured:
+            return configured
+        source = self.project_state.primaryVideoPath
+        if not source:
+            return ""
+        path = Path(source)
+        return str(path.with_name(path.stem + "_VI_FINAL.mp4"))
+
+    @Property(str, notify=exportSettingsChanged)
+    def exportPresetId(self) -> str:
+        return self.settings.value("export/presetId", "source-quality", type=str)
+
+    @Property(str, notify=exportSettingsChanged)
+    def exportBackend(self) -> str:
+        return self.settings.value("export/backend", "auto", type=str)
+
+    @Property(int, notify=exportSettingsChanged)
+    def exportChunkMinutes(self) -> int:
+        return self.settings.value("export/chunkMinutes", 10, type=int)
+
+    @Property(bool, notify=exportSettingsChanged)
+    def exportOverwrite(self) -> bool:
+        return self.settings.value("export/overwrite", False, type=bool)
+
+    @Property(bool, notify=exportSettingsChanged)
+    def exportSubtitleEnabled(self) -> bool:
+        return self.settings.value("export/subtitleEnabled", True, type=bool)
+
+    @Property(str, notify=exportSettingsChanged)
+    def exportFontFamily(self) -> str:
+        return self.settings.value("export/fontFamily", "Arial", type=str)
+
+    @Property(int, notify=exportSettingsChanged)
+    def exportFontSize(self) -> int:
+        return self.settings.value("export/fontSize", 42, type=int)
+
+    @Property(int, notify=exportSettingsChanged)
+    def exportSubtitleMarginBottom(self) -> int:
+        return self.settings.value("export/subtitleMarginBottom", 28, type=int)
+
+    @Property(str, notify=exportSettingsChanged)
+    def exportSubtitlePrimaryColor(self) -> str:
+        value = self.settings.value("export/subtitlePrimaryColor", "#FFFFFF", type=str)
+        return _normalized_hex_color(value) or "#FFFFFF"
+
+    @Property(str, notify=exportSettingsChanged)
+    def exportSubtitleOutlineColor(self) -> str:
+        value = self.settings.value("export/subtitleOutlineColor", "#000000", type=str)
+        return _normalized_hex_color(value) or "#000000"
+
+    @Property(int, notify=exportSettingsChanged)
+    def exportSubtitleOutlineWidth(self) -> int:
+        return max(
+            0,
+            min(12, self.settings.value("export/subtitleOutlineWidth", 3, type=int)),
+        )
+
+    @Property(int, notify=exportSettingsChanged)
+    def exportSubtitleAlignment(self) -> int:
+        value = self.settings.value("export/subtitleAlignment", 2, type=int)
+        return value if value in {1, 2, 3} else 2
+
+    @Property(int, notify=exportSettingsChanged)
+    def exportSubtitleOpacityPercent(self) -> int:
+        return max(
+            0,
+            min(100, self.settings.value("export/subtitleOpacityPercent", 100, type=int)),
+        )
+
+    @Property(str, notify=exportSettingsChanged)
+    def exportVideoFilterPreset(self) -> str:
+        value = self.settings.value("export/videoFilterPreset", "none", type=str)
+        return value if value in {"none", "cinematic-warm", "cool", "grayscale"} else "none"
+
+    @Property(int, notify=exportSettingsChanged)
+    def exportVideoFilterIntensity(self) -> int:
+        return max(
+            0,
+            min(100, self.settings.value("export/videoFilterIntensity", 100, type=int)),
+        )
+
+    @Property(int, notify=exportSettingsChanged)
+    def exportVideoBrightness(self) -> int:
+        return max(
+            -50,
+            min(50, self.settings.value("export/videoBrightness", 0, type=int)),
+        )
+
+    @Property(int, notify=exportSettingsChanged)
+    def exportVideoContrast(self) -> int:
+        return max(
+            50,
+            min(150, self.settings.value("export/videoContrast", 100, type=int)),
+        )
+
+    @Property(int, notify=exportSettingsChanged)
+    def exportVideoSaturation(self) -> int:
+        return max(
+            0,
+            min(200, self.settings.value("export/videoSaturation", 100, type=int)),
+        )
+
+    @Property(str, notify=exportPreviewChanged)
+    def lastExportSource(self) -> str:
+        return self._last_export_source
+
+    @Property(str, notify=exportPreviewChanged)
+    def lastExportQaPath(self) -> str:
+        return self._last_export_qa_path
+
+    @Property("QVariantMap", notify=diagnosticsChanged)
+    def runtimeDiagnostics(self) -> dict[str, object]:
+        return self._runtime_diagnostics
+
+    @Property("QVariantMap", notify=legacyMigrationChanged)
+    def legacyMigrationReport(self) -> dict[str, object]:
+        return self._legacy_migration_report
+
+    @Property(str, notify=voiceSettingsChanged)
+    def vieneuReferenceAudio(self) -> str:
+        return self.settings.value("voice/vieneuReferenceAudio", "", type=str)
+
+    @Property(str, notify=voiceSettingsChanged)
+    def vieneuReferenceText(self) -> str:
+        return self.settings.value("voice/vieneuReferenceText", "", type=str)
+
+    @Property(bool, notify=voiceSettingsChanged)
+    def vieneuReferenceDenoise(self) -> bool:
+        return self.settings.value("voice/vieneuReferenceDenoise", False, type=bool)
+
+    @Property(bool, notify=voiceSettingsChanged)
+    def voiceAdaptiveTimingEnabled(self) -> bool:
+        return True
+
+    @Property(bool, notify=voiceSettingsChanged)
+    def voiceAutoCondenseLongCuesEnabled(self) -> bool:
+        return True
+
+    @Property(bool, notify=ttsBusyChanged)
+    def voiceTimingAutoRepairBusy(self) -> bool:
+        """Whether automatic timing-repair translation is currently in flight."""
+
+        return self._voice_timing_auto_repair_busy
+
+    @Property(float, notify=voiceSettingsChanged)
+    def voiceReadSpeed(self) -> float:
+        return self._voice_read_speed
+
+    @Property(float, notify=voiceSettingsChanged)
+    def voiceCueMaxSpeed(self) -> float:
+        return self._voice_cue_max_speed
+
+    @Property("QStringList", notify=translationSettingsChanged)
+    def geminiApiCredentialReferences(self) -> list[str]:
+        raw = self.settings.value("translation/geminiApiCredentialReferences", [])
+        return _stable_credential_references(raw)
+
+    def _translation_api_references(self, provider_id: str) -> list[str]:
+        raw = self.settings.value(_credential_setting_key(provider_id), [])
+        return _stable_credential_references(raw)
+
+    @Property("QStringList", notify=translationSettingsChanged)
+    def deepseekApiCredentialReferences(self) -> list[str]:
+        return self._translation_api_references("deepseek-api")
+
+    @Property("QStringList", notify=translationSettingsChanged)
+    def tokenhubApiCredentialReferences(self) -> list[str]:
+        return self._translation_api_references("tokenhub-api")
+
+    @Property("QStringList", notify=translationSettingsChanged)
+    def qwenApiCredentialReferences(self) -> list[str]:
+        return self._translation_api_references("qwen-api")
+
+    @Property("QStringList", notify=translationSettingsChanged)
+    def glmApiCredentialReferences(self) -> list[str]:
+        return self._translation_api_references("glm-api")
+
+    @Property("QStringList", notify=translationSettingsChanged)
+    def openaiCompatibleCredentialReferences(self) -> list[str]:
+        return self._translation_api_references("openai-compatible")
+
+    @Property(str, notify=selectedCueChanged)
+    def selectedCueId(self) -> str:
+        return self._selected_cue_id
+
+    @Property("QVariantMap", notify=selectedCueChanged)
+    def selectedCue(self) -> dict:
+        return self.project_state.subtitle_cues.find(self._selected_cue_id)
+
+    @Property(bool, notify=subtitleBusyChanged)
+    def subtitleBusy(self) -> bool:
+        return self._subtitle_busy
+
+    @Property(bool, notify=subtitleHistoryChanged)
+    def canUndoSubtitle(self) -> bool:
+        return self._can_undo_subtitle
+
+    @Property(bool, notify=subtitleHistoryChanged)
+    def canRedoSubtitle(self) -> bool:
+        return self._can_redo_subtitle
+
+    @Property(str, constant=True)
+    def buildVersion(self) -> str:
+        return __version__
+
+    @Slot()
+    def start(self) -> None:
+        self.runtime.start()
+
+    @Slot()
+    def requestQuit(self) -> None:
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        self.shuttingDownChanged.emit()
+        self.runtime.request_shutdown()
+
+    @Slot()
+    def forceShutdown(self) -> None:
+        self.runtime.force_shutdown()
+
+    @Slot(str)
+    def setOcrEnginePython(self, value: str) -> None:
+        path = Path(value).expanduser().resolve()
+        if not path.is_file():
+            self._set_status(
+                "Bộ máy trích xuất phụ đề chưa sẵn sàng. "
+                "Hãy mở Cài đặt → Chẩn đoán runtime."
+            )
+            return
+        self.settings.setValue("engines/paddlePython", str(path))
+        self.ocrSettingsChanged.emit()
+
+    @Slot(float)
+    def setOcrSampleFps(self, value: float) -> None:
+        if not math.isfinite(value) or not 0.67 <= value <= 2.5:
+            self._set_status("FPS OCR phải nằm trong khoảng 0,67–2,5")
+            return
+        normalized = round(float(value), 2)
+        if abs(normalized - self._ocr_sample_fps) < 1e-9:
+            return
+        self._ocr_sample_fps = normalized
+        self.settings.setValue("ocr/sampleFps", normalized)
+        self.ocrSettingsChanged.emit()
+
+    @Slot()
+    def runRuntimeDiagnostics(self) -> None:
+        if not self._backend_ready:
+            self._set_status("Job Manager chưa sẵn sàng để chẩn đoán")
+            return
+        self.runtime.request("runtime_diagnostics")
+        self._set_status("Đang kiểm tra runtime và engine ở tiến trình nền")
+
+    @Slot()
+    def showLegacyImportDialog(self) -> None:
+        if not self._backend_ready:
+            self._set_status("Job Manager chưa sẵn sàng để đọc dự án cũ")
+            return
+        self.legacyImportDialogRequested.emit()
+
+    @Slot(str)
+    def inspectLegacyProjectPath(self, raw_path: str) -> None:
+        path = _local_path_from_ui(raw_path)
+        if not path.is_file():
+            self._set_status("File dự án 0.1.99 không tồn tại")
+            return
+        self._legacy_source_path = str(path)
+        self.runtime.request("inspect_legacy_project", {"source_path": str(path)})
+        self._set_status("Đang dry-run dự án cũ; file nguồn chỉ được đọc")
+
+    @Slot()
+    def importInspectedLegacyProject(self) -> None:
+        if not self._legacy_source_path or not self._legacy_migration_report:
+            self._set_status("Hãy dry-run một dự án 0.1.99 trước")
+            return
+        source = Path(self._legacy_source_path)
+        project_path = source.with_name(source.stem + "_DUCAI2.ducai")
+        self.runtime.request(
+            "import_legacy_project",
+            {
+                "source_path": str(source),
+                "project_path": str(project_path),
+                "name": source.stem,
+            },
+        )
+        self._set_status("Đang nhập một chiều; dữ liệu 0.1.99 không bị sửa")
+
+    @Slot(float)
+    def startOcr(self, sample_fps: float = 1.25) -> None:
+        if self._guard_manual_parallel("ocr", (sample_fps,)):
+            return
+        if not self._backend_ready or not self.project_state.hasProject:
+            self._set_status("Hãy nhập video trước khi chạy OCR")
+            return
+        if self._ocr_busy:
+            self._set_status("OCR đang chạy; có thể tạm dừng hoặc hủy tác vụ hiện tại")
+            return
+        if not math.isfinite(sample_fps) or not 0.67 <= sample_fps <= 2.5:
+            self._set_status("FPS OCR phải nằm trong khoảng 0,67–2,5")
+            return
+        self.setOcrSampleFps(sample_fps)
+        interval_us = int(round(1_000_000 / sample_fps))
+        self._set_ocr_job_state("start_requested")
+        self._set_ocr_busy(True)
+        self.runtime.request(
+            "create_ocr_job",
+            {
+                "project_id": self.project_state.projectId,
+                "sample_interval_us": interval_us,
+                "engine_python": self.ocrEnginePython,
+                "device": "gpu:0",
+            },
+        )
+        self._set_status("Đang tạo tác vụ trích xuất phụ đề")
+
+    @Slot(float)
+    def toggleOcr(self, sample_fps: float = 1.25) -> None:
+        """Dispatch the one primary OCR control from durable job state."""
+
+        if self._ocr_job_state == "running":
+            self.pauseOcr()
+            return
+        if self._ocr_job_state in {"paused", "interrupted", "failed", "queued"}:
+            self.resumeOcr()
+            return
+        if self._ocr_job_state in {
+            "start_requested",
+            "pause_requested",
+            "resume_requested",
+            "cancel_requested",
+        }:
+            self._set_status("OCR đang chuyển trạng thái; hãy chờ xác nhận")
+            return
+        self.startOcr(sample_fps)
+
+    @Slot()
+    def pauseOcr(self) -> None:
+        if self._ocr_job_id and self._ocr_job_state == "running":
+            self._set_ocr_job_state("pause_requested")
+            self.runtime.request(
+                "pause_job",
+                {"job_id": self._ocr_job_id},
+                context={"job_kind": "ocr"},
+            )
+
+    @Slot()
+    def resumeOcr(self) -> None:
+        if self._ocr_job_id and self._ocr_job_state == "paused":
+            self._set_ocr_job_state("resume_requested")
+            self.runtime.request(
+                "resume_job",
+                {"job_id": self._ocr_job_id},
+                context={"job_kind": "ocr"},
+            )
+        elif self._ocr_job_id and self._ocr_job_state == "queued":
+            self._set_ocr_job_state("start_requested")
+            self._start_ocr_worker(self._ocr_job_id)
+        elif self._ocr_job_id and self._ocr_job_state in {"interrupted", "failed"}:
+            self._set_ocr_job_state("resume_requested")
+            self.runtime.request(
+                "retry_job",
+                {"job_id": self._ocr_job_id},
+                context={"resume_ocr": True, "job_id": self._ocr_job_id},
+            )
+
+    @Slot()
+    def cancelOcr(self) -> None:
+        if self._ocr_job_id:
+            self._set_ocr_job_state("cancel_requested")
+            self.runtime.request(
+                "cancel_job",
+                {"job_id": self._ocr_job_id},
+                context={"job_kind": "ocr"},
+            )
+
+    @Slot(str, str, bool, bool, str)
+    @Slot(str, str, bool, bool, str, str)
+    def startTranslation(
+        self,
+        provider_id: str,
+        model_id: str,
+        headed: bool = False,
+        guest: bool = False,
+        credential_input: str = "",
+        base_url: str = "",
+    ) -> None:
+        if self._guard_manual_parallel(
+            "translate",
+            (provider_id, model_id, headed, guest, credential_input, base_url),
+        ):
+            return
+        if not self._backend_ready or not self.project_state.hasProject:
+            self._set_status("Hãy mở dự án và nhập SRT Trung trước khi dịch")
+            return
+        if self.project_state.subtitle_cues.rowCount() <= 0:
+            self._set_status("Project chưa có cue nguồn để dịch")
+            return
+        if self._translation_busy:
+            self._set_status("Dịch đang chạy; hãy dùng Tạm dừng hoặc Hủy")
+            return
+        # A stopped translation owns an immutable ledger checkpoint. Starting
+        # it again must resume that job instead of creating a fresh ledger and
+        # sending every cue to the provider again.
+        if self._translation_job_id and self._translation_job_state in {
+            "cancelled",
+            "failed",
+            "interrupted",
+            "review",
+        }:
+            self.resumeTranslation(headed=headed, guest=guest)
+            return
+        provider_id = provider_id.strip().casefold()
+        model_id = model_id.strip()
+        supported_provider_ids = {
+            "gemini-web",
+            "gemini-api",
+            "gemini-cli",
+            *OPENAI_COMPATIBLE_PROVIDER_IDS,
+        }
+        if provider_id not in supported_provider_ids:
+            self._set_status("Nguồn dịch API không được hỗ trợ")
+            return
+        if not model_id:
+            self._set_status("Hãy nhập model dịch")
+            return
+        if (
+            provider_id in {"gemini-api", *OPENAI_COMPATIBLE_PROVIDER_IDS}
+            and credential_input.strip()
+        ):
+            try:
+                credentials = _parse_translation_api_credentials(
+                    credential_input,
+                    provider_id=provider_id,
+                    existing_references=tuple(self._translation_api_references(provider_id)),
+                )
+            except ValueError as exc:
+                self._set_status(str(exc))
+                return
+            references = [item["reference"] for item in credentials]
+            self._pending_translation_start = {
+                "provider_id": provider_id,
+                "model_id": model_id,
+                "headed": headed,
+                "guest": guest,
+                "base_url": base_url.strip(),
+            }
+            self._set_translation_busy(True)
+            self.runtime.request(
+                "store_credentials",
+                {"credentials": credentials},
+                context={
+                    "credential_references": references,
+                    "credential_provider_id": provider_id,
+                    "start_translation": True,
+                },
+            )
+            self._set_status("Đang lưu danh sách API key trước khi bắt đầu dịch")
+            return
+        self._begin_translation(provider_id, model_id, headed, guest, base_url=base_url.strip())
+
+    @Slot(str, str, bool, bool, str)
+    @Slot(str, str, bool, bool, str, str)
+    def toggleTranslation(
+        self,
+        provider_id: str,
+        model_id: str,
+        headed: bool = False,
+        guest: bool = False,
+        credential_input: str = "",
+        base_url: str = "",
+    ) -> None:
+        """Dispatch one primary translation control from durable job state."""
+
+        if self._translation_job_state == "running":
+            self.pauseTranslation()
+            return
+        if self._translation_job_state in {
+            "paused",
+            "queued",
+            "cancelled",
+            "failed",
+            "interrupted",
+            "review",
+        }:
+            self.resumeTranslation(headed=headed, guest=guest)
+            return
+        if self._translation_job_state in {
+            "start_requested",
+            "pause_requested",
+            "resume_requested",
+            "cancel_requested",
+        }:
+            self._set_status("Dịch đang chuyển trạng thái; hãy chờ xác nhận")
+            return
+        self.startTranslation(
+            provider_id,
+            model_id,
+            headed,
+            guest,
+            credential_input,
+            base_url,
+        )
+
+    def _begin_translation(
+        self,
+        provider_id: str,
+        model_id: str,
+        headed: bool,
+        guest: bool,
+        *,
+        credential_references: list[str] | None = None,
+        base_url: str = "",
+    ) -> None:
+        options: dict[str, object] = {
+            "banned_latin_terms": [
+                "Daozhang",
+                "Renzong",
+                "yamen",
+            ],
+            "qa_mode": "integrated",
+        }
+        if provider_id == "gemini-web":
+            options.update(self._gemini_web_options(headed=headed, guest=guest))
+        elif provider_id in {"gemini-api", *OPENAI_COMPATIBLE_PROVIDER_IDS}:
+            references = credential_references or self._translation_api_references(provider_id)
+            if not references:
+                self._set_translation_busy(False)
+                self._set_status("Hãy thêm ít nhất một API key vào Windows Credential Manager")
+                return
+            options["credential_references"] = references
+            if provider_id == "openai-compatible":
+                options["base_url"] = base_url
+        else:
+            options["cli_executable"] = self.settings.value(
+                "translation/geminiCliExecutable", "gemini", type=str
+            )
+        self.settings.setValue("translation/provider", provider_id)
+        self.settings.setValue("translation/model", model_id)
+        if provider_id == "openai-compatible" and base_url:
+            self.settings.setValue("translation/openaiCompatibleBaseUrl", base_url)
+        self._set_translation_job_state("start_requested")
+        self._set_translation_busy(True)
+        self._set_translation_qa(
+            {
+                "status": "PENDING",
+                "completed_cues": 0,
+                "checked_cues": 0,
+                "cue_total": self.project_state.subtitle_cues.count,
+                "issues": [],
+            }
+        )
+        self.runtime.request(
+            "create_translation_job",
+            {
+                "project_id": self.project_state.projectId,
+                "provider_id": provider_id,
+                "model_id": model_id,
+                "provider_options": options,
+            },
+        )
+        self._set_status("Đang tạo tác vụ dịch có Film Bible, cache và QA tích hợp")
+
+    @Slot()
+    def pauseTranslation(self) -> None:
+        if self._translation_job_id and self._translation_job_state == "running":
+            self._set_translation_job_state("pause_requested")
+            self.runtime.request(
+                "pause_job",
+                {"job_id": self._translation_job_id},
+                context={"job_kind": "translate"},
+            )
+
+    @Slot()
+    @Slot(bool, bool)
+    def resumeTranslation(self, headed: bool = False, guest: bool = False) -> None:
+        if not self._translation_job_id or self._translation_job_state in {
+            "start_requested",
+            "resume_requested",
+        }:
+            return
+        if self._translation_job_state == "paused":
+            self._set_translation_busy(True)
+            self._set_translation_job_state("resume_requested")
+            self.runtime.request(
+                "resume_job",
+                {"job_id": self._translation_job_id},
+                context={"job_kind": "translate"},
+            )
+        elif self._translation_job_state == "queued":
+            self._set_translation_busy(True)
+            self._set_translation_job_state("start_requested")
+            self._start_translation_worker(self._translation_job_id)
+        elif self._translation_job_state in {
+            "cancelled",
+            "interrupted",
+            "failed",
+            "review",
+        }:
+            payload: dict[str, object] = {"job_id": self._translation_job_id}
+            if self._translation_provider_id in {"gemini-api", *OPENAI_COMPATIBLE_PROVIDER_IDS}:
+                references = self._translation_api_references(self._translation_provider_id)
+                if not references:
+                    self._set_status("Chưa có API key trong Windows Credential Manager")
+                    return
+                payload["credential_references"] = references
+            elif self._translation_provider_id == "gemini-web":
+                payload["provider_options"] = self._gemini_web_options(
+                    headed=headed,
+                    guest=guest,
+                )
+            self._set_translation_busy(True)
+            self._set_translation_job_state("resume_requested")
+            self.runtime.request(
+                "retry_job",
+                payload,
+                context={
+                    "resume_translation": True,
+                    "job_id": self._translation_job_id,
+                },
+            )
+
+    def _gemini_web_options(self, *, headed: bool, guest: bool) -> dict[str, object]:
+        return {
+            "profile_path": str(self.runtime.database_path.parent / "gemini-web-profile"),
+            "headed": headed,
+            "guest": guest,
+            "temporary_chat": True,
+            "web_session_retries": 1,
+            "web_first_response_timeout_seconds": 30.0,
+            "web_response_stall_timeout_seconds": 45.0,
+            "web_max_requests_per_session": 5,
+            "max_chunk_cues": 150,
+            "max_chunk_source_chars": 8_000,
+            "codex_fallback_enabled": False,
+            "qa_mode": "integrated",
+        }
+
+    @Slot()
+    def cancelTranslation(self) -> None:
+        if self._translation_job_id and self._translation_busy:
+            self._set_translation_job_state("cancel_requested")
+            self.runtime.request(
+                "cancel_job",
+                {"job_id": self._translation_job_id},
+                context={"job_kind": "translate"},
+            )
+
+    @Slot(str, str)
+    def saveGeminiApiCredential(self, reference: str, secret: str) -> None:
+        reference = reference.strip()
+        if not reference or not secret:
+            self._set_status("Nhập tên tham chiếu và API key trước khi lưu")
+            return
+        self.runtime.request(
+            "store_credential",
+            {"reference": reference, "secret": secret},
+            context={"credential_reference": reference, "credential_provider_id": "gemini-api"},
+        )
+        self._set_status("Đang lưu API key vào Windows Credential Manager")
+
+    @Slot(str)
+    def saveGeminiApiCredentials(self, raw: str) -> None:
+        self.saveTranslationApiCredentials("gemini-api", raw)
+
+    @Slot(str, str)
+    def saveTranslationApiCredentials(self, provider_id: str, raw: str) -> None:
+        provider_id = provider_id.strip().casefold()
+        if provider_id not in {"gemini-api", *OPENAI_COMPATIBLE_PROVIDER_IDS}:
+            self._set_status("Nguồn dịch API không được hỗ trợ")
+            return
+        try:
+            credentials = _parse_translation_api_credentials(
+                raw,
+                provider_id=provider_id,
+                existing_references=tuple(self._translation_api_references(provider_id)),
+            )
+        except ValueError as exc:
+            self._set_status(str(exc))
+            return
+        if not credentials:
+            self._set_status("Hãy dán ít nhất một API key")
+            return
+        self.runtime.request(
+            "store_credentials",
+            {"credentials": credentials},
+            context={
+                "credential_references": [item["reference"] for item in credentials],
+                "credential_provider_id": provider_id,
+                "start_translation": False,
+            },
+        )
+        self._set_status("Đang lưu danh sách API key vào Windows Credential Manager")
+
+    @Slot(str)
+    def deleteGeminiApiCredential(self, reference: str) -> None:
+        self.deleteTranslationApiCredential("gemini-api", reference)
+
+    @Slot(str, str)
+    def deleteTranslationApiCredential(self, provider_id: str, reference: str) -> None:
+        provider_id = provider_id.strip().casefold()
+        reference = reference.strip()
+        if provider_id not in {"gemini-api", *OPENAI_COMPATIBLE_PROVIDER_IDS} or not reference:
+            return
+        self.runtime.request(
+            "delete_credential",
+            {"reference": reference},
+            context={"credential_reference": reference, "credential_provider_id": provider_id},
+        )
+
+    @Slot(str)
+    def importTranslationPath(self, raw_path: str) -> None:
+        if not self._backend_ready or not self.project_state.hasProject:
+            self._set_status("Hãy mở dự án có SRT Trung trước khi nhập bản dịch")
+            return
+        if self._translation_busy:
+            self._set_status("Hãy tạm dừng hoặc hoàn tất tác vụ dịch trước khi nhập SRT ngoài")
+            return
+        path = _local_path_from_ui(raw_path)
+        if not path.is_file() or path.suffix.casefold() != ".srt":
+            self._set_status("File bản dịch ngoài phải là SRT tồn tại trên máy")
+            return
+        self.runtime.request(
+            "import_translation_srt",
+            {
+                "project_id": self.project_state.projectId,
+                "subtitle_path": str(path),
+            },
+        )
+        self._set_status("Đang kiểm tra cue và timestamp của SRT Việt ngoài")
+
+    @Slot(str)
+    def selectVoice(self, voice_id: str) -> None:
+        entry = self.voice_catalog.find(voice_id.strip())
+        if not entry or entry.get("installed") is not True:
+            self._set_status("Giọng được chọn chưa sẵn sàng trên máy")
+            return
+        if voice_id == self._selected_voice_id:
+            return
+        self._selected_voice_id = voice_id
+        self.settings.setValue("voice/selectedId", voice_id)
+        self.voiceSettingsChanged.emit()
+        self._set_status(f"Đã chọn {entry.get('voiceName', entry.get('name', voice_id))}")
+
+    @Slot()
+    def refreshVoiceCatalog(self) -> None:
+        self.voice_catalog.refresh()
+        if not self.voice_catalog.find(self._selected_voice_id).get("installed"):
+            fallback = self.voice_catalog.find("nghitts-chieu-thanh")
+            if not fallback.get("installed"):
+                fallback = self.voice_catalog.first_installed("piper")
+            self._selected_voice_id = str(fallback.get("voice_id", ""))
+        self.voiceSettingsChanged.emit()
+
+    @Slot(str)
+    def setVieNeuReferenceAudio(self, value: str) -> None:
+        raw = value.strip()
+        if raw.casefold().startswith("file:"):
+            raw = QUrl(raw).toLocalFile()
+        if raw:
+            path = Path(raw).expanduser().resolve()
+            if not path.is_file():
+                self._set_status("File mẫu VieNeu không tồn tại")
+                return
+            raw = str(path)
+        self.settings.setValue("voice/vieneuReferenceAudio", raw)
+        self.voiceSettingsChanged.emit()
+
+    @Slot(str)
+    def setVieNeuReferenceText(self, value: str) -> None:
+        self.settings.setValue("voice/vieneuReferenceText", value.strip())
+        self.voiceSettingsChanged.emit()
+
+    @Slot(bool)
+    def setVieNeuReferenceDenoise(self, value: bool) -> None:
+        self.settings.setValue("voice/vieneuReferenceDenoise", bool(value))
+        self.voiceSettingsChanged.emit()
+
+    @Slot(bool)
+    def setVoiceAdaptiveTimingEnabled(self, value: bool) -> None:
+        del value
+        self.settings.setValue("voice/adaptiveTimingEnabled", True)
+        self.voiceSettingsChanged.emit()
+        self._set_status(
+            f"Khớp cue tự động luôn bật; cue dài tăng đến tổng {self._voice_cue_max_speed:.1f}×"
+        )
+
+    @Slot(float)
+    def setVoiceReadSpeed(self, value: float) -> None:
+        if not math.isfinite(value):
+            return
+        speed = round(max(1.1, min(3.0, float(value))), 1)
+        changed = abs(speed - self._voice_read_speed) > 1e-9
+        cap_changed = self._voice_cue_max_speed < speed
+        if not changed and not cap_changed:
+            return
+        self._voice_read_speed = speed
+        self.settings.setValue("voice/readSpeed", speed)
+        if cap_changed:
+            self._voice_cue_max_speed = speed
+            self.settings.setValue("voice/cueMaxTotalSpeed", speed)
+        self.voiceSettingsChanged.emit()
+        self._set_status(f"Tốc độ giọng gốc: {speed:.1f}×; VieNeu vẫn tổng hợp ở 1,00×")
+
+    @Slot(float)
+    def setVoiceCueMaxSpeed(self, value: float) -> None:
+        if not math.isfinite(value):
+            return
+        speed = round(
+            max(self._voice_read_speed, min(3.0, float(value))),
+            1,
+        )
+        if abs(speed - self._voice_cue_max_speed) < 1e-9:
+            return
+        self._voice_cue_max_speed = speed
+        self.settings.setValue("voice/cueMaxTotalSpeed", speed)
+        self.voiceSettingsChanged.emit()
+        self._set_status(f"Giới hạn tổng cho cue dài: {speed:.1f}×")
+
+    @Slot(bool)
+    def setVoiceAutoCondenseLongCuesEnabled(self, value: bool) -> None:
+        del value
+        self.settings.setValue("voice/autoCondenseLongCuesEnabled", True)
+        self.voiceSettingsChanged.emit()
+        self._set_status("Tự rút gọn cue voice quá dài luôn được bật")
+        if self._voice_timing_qa.get("repairable") is True:
+            self.repairVoiceTimingCues()
+
+    @Slot()
+    def repairVoiceTimingCues(self) -> None:
+        job_id = str(self._voice_timing_qa.get("job_id", ""))
+        if not job_id or self._voice_timing_qa.get("repairable") is not True:
+            self._set_status("Không có cue dài có thể tự rút gọn lúc này")
+            return
+        self._request_voice_timing_repair(job_id)
+
+    @Slot()
+    def addCurrentVoiceToTimeline(self) -> None:
+        job_id = str(self._voice_timing_qa.get("job_id", ""))
+        if not job_id or not self.project_state.projectId:
+            self._set_status("Không có voice lỗi timing để thêm vào Timeline")
+            return
+        if self._translation_busy:
+            self._set_status(
+                "Chưa tạo override job: tác vụ tự rút gọn đang chạy; "
+                "hãy chờ tác vụ dịch/rút gọn kết thúc rồi thêm nguyên voice"
+            )
+            return
+        if job_id in self._voice_timing_override_requests:
+            self._set_status("Voice hiện tại đang được ghép vào Timeline")
+            return
+        self._voice_timing_override_requests.add(job_id)
+        self._set_tts_job_state("start_requested")
+        self._set_tts_busy(True)
+        self.runtime.request(
+            "create_tts_timing_override_job",
+            {
+                "project_id": self.project_state.projectId,
+                "parent_tts_job_id": job_id,
+            },
+            context={"voice_timing_override": True, "parent_tts_job_id": job_id},
+        )
+        self._set_status("Đang ghép nguyên voice vào Timeline; không cắt câu, có thể dài hơn video")
+
+    @Slot(str)
+    def setVoiceConformMode(self, value: str) -> None:
+        mode = value.strip().casefold()
+        if mode not in {"stretch_video", "speed_audio", "hybrid"}:
+            self._set_status("Chế độ đồng bộ voice không hợp lệ")
+            return
+        if self._voice_conform_busy:
+            self._set_status("Đang xử lý đồng bộ voice; hãy chờ tác vụ hiện tại")
+            return
+        if mode == self._voice_conform_mode:
+            return
+        self._voice_conform_mode = mode
+        self.settings.setValue("voice/conformMode", mode)
+        self._voice_conform_applied = False
+        self._voice_conform_estimate_generation += 1
+        self._voice_conform_estimate_refresh_queued = True
+        self._voice_conform_estimate = {
+            "status": "PENDING",
+            "project_id": self.project_state.projectId,
+            "parent_tts_job_id": self._voice_conform_parent_tts_job_id,
+            "mode": mode,
+            "max_audio_speed": self._voice_conform_max_audio_speed,
+            "unresolved_count": 0,
+            "issues": [],
+        }
+        self.voiceConformChanged.emit()
+        self.refreshVoiceConformEstimate()
+
+    @Slot(float)
+    def setVoiceConformMaxAudioSpeed(self, value: float) -> None:
+        if not math.isfinite(value):
+            return
+        speed = round(max(1.0, min(2.0, float(value))), 2)
+        # Keep the documented 0.05x increments even when called from a
+        # non-QML client.
+        speed = round(round((speed - 1.0) / 0.05) * 0.05 + 1.0, 2)
+        if self._voice_conform_busy or abs(speed - self._voice_conform_max_audio_speed) < 1e-9:
+            return
+        self._voice_conform_max_audio_speed = speed
+        self.settings.setValue("voice/conformMaxAudioSpeed", speed)
+        self._voice_conform_applied = False
+        self._voice_conform_estimate_generation += 1
+        self._voice_conform_estimate_refresh_queued = True
+        self._voice_conform_estimate = {
+            "status": "PENDING",
+            "project_id": self.project_state.projectId,
+            "parent_tts_job_id": self._voice_conform_parent_tts_job_id,
+            "mode": self._voice_conform_mode,
+            "max_audio_speed": speed,
+            "unresolved_count": 0,
+            "issues": [],
+        }
+        self.voiceConformChanged.emit()
+        self.refreshVoiceConformEstimate()
+
+    @Slot()
+    def refreshVoiceConformEstimate(self) -> None:
+        if not self._backend_ready or not self.project_state.hasProject:
+            return
+        if self._voice_conform_busy or self._voice_conform_estimate_request_pending:
+            self._voice_conform_estimate_refresh_queued = True
+            return
+        generation = self._voice_conform_estimate_generation
+        self._voice_conform_estimate_refresh_queued = False
+        self._voice_conform_estimate_request_pending = True
+        self.runtime.request(
+            "estimate_voice_conform",
+            {
+                "project_id": self.project_state.projectId,
+                "parent_tts_job_id": self._voice_conform_parent_tts_job_id,
+                "mode": self._voice_conform_mode,
+                "max_audio_speed": self._voice_conform_max_audio_speed,
+                "min_video_speed": 0.5,
+                "allow_duration_growth": True,
+            },
+            context={
+                "voice_conform_estimate": True,
+                "generation": generation,
+                "project_id": self.project_state.projectId,
+                "mode": self._voice_conform_mode,
+                "max_audio_speed": self._voice_conform_max_audio_speed,
+            },
+        )
+
+    @Slot()
+    def applyVoiceConform(self) -> None:
+        if self._voice_conform_busy:
+            return
+        if not self.voiceConformCanApply:
+            self._set_status("Đồng bộ chưa đạt QA hoặc chưa có D1 hoàn chỉnh")
+            return
+        parent_id = str(self._voice_conform_estimate.get("parent_tts_job_id", ""))
+        if not parent_id:
+            self._set_status("Không xác định được tác vụ TTS nền để đồng bộ")
+            return
+        self._voice_conform_job_state = "start_requested"
+        self._voice_conform_busy = True
+        self._voice_conform_applied = False
+        self.voiceConformChanged.emit()
+        self.runtime.request(
+            "create_voice_conform_job",
+            {
+                "project_id": self.project_state.projectId,
+                "parent_tts_job_id": parent_id,
+                "mode": self._voice_conform_mode,
+                "max_audio_speed": self._voice_conform_max_audio_speed,
+                "min_video_speed": 0.5,
+                "allow_duration_growth": True,
+            },
+            context={"voice_conform_create": True},
+        )
+        self._set_status("Đang tạo tác vụ đồng bộ từ cache WAV; VieNeu không được gọi")
+
+    @Slot()
+    def resetVoiceConform(self) -> None:
+        if self._voice_conform_busy:
+            self._set_status("Đang xử lý đồng bộ voice; chưa thể đặt lại")
+            return
+        self._voice_conform_busy = True
+        self._voice_conform_job_state = "reset_requested"
+        self.voiceConformChanged.emit()
+        self.runtime.request(
+            "reset_voice_conform",
+            {"project_id": self.project_state.projectId},
+            context={"voice_conform_reset": True},
+        )
+        self._set_status("Đang khôi phục D1 nền và xóa bản đồ đồng bộ")
+
+    @Slot(int)
+    def selectVoiceConformIssue(self, cue_index: int) -> None:
+        if cue_index <= 0:
+            return
+        model = self.project_state.subtitle_cues
+        target_row = -1
+        for row in range(model.count):
+            cue = model.get(row)
+            if cue.get("index") == cue_index:
+                cue_id = str(cue.get("cue_id", cue.get("id", "")))
+                if cue_id:
+                    self.selectCue(cue_id, float(cue.get("start_us", 0)))
+                    target_row = row
+                break
+        if target_row < 0:
+            self._set_status(f"Không tìm thấy cue {cue_index} trong phụ đề hiện tại")
+            return
+        self.navigate("translate")
+        # The editor's ListView is zero-based.  Emitting the cue number here
+        # used to scroll one row too far (and could land on a different cue
+        # when the issue was near the end of a long subtitle list).
+        self.translationQaNavigationRequested.emit(target_row)
+        self._set_status(f"Đã chọn cue {cue_index} cần xử lý đồng bộ")
+
+    @Slot(str, float, int)
+    def openCueInEditor(
+        self,
+        cue_id: str,
+        source_start_us: float = 0,
+        cue_index: int = 0,
+    ) -> None:
+        """Open a Timeline voice cue in the subtitle editor.
+
+        Timeline voice rows carry the original SRT timestamp, while the
+        playhead may be on a conformed output timeline.  Resolve the cue from
+        the subtitle model first so both the selected row and the seek use the
+        canonical source timestamp; the model then maps it to output time.
+        """
+
+        requested_id = str(cue_id or "").strip()
+        try:
+            requested_index = int(cue_index)
+        except (TypeError, ValueError):
+            requested_index = 0
+        model = self.project_state.subtitle_cues
+        target_row = -1
+        target: dict[str, object] = {}
+        for row in range(model.count):
+            cue = model.get(row)
+            if requested_id and str(cue.get("cue_id", "")) == requested_id:
+                target_row = row
+                target = cue
+                break
+            if requested_index > 0 and cue.get("index") == requested_index:
+                target_row = row
+                target = cue
+                break
+        if target_row < 0:
+            self._set_status("Không tìm thấy cue voice trong phụ đề hiện tại")
+            return
+
+        canonical_id = str(target.get("cue_id", requested_id))
+        canonical_start = target.get("start_us", source_start_us)
+        try:
+            canonical_start_us = float(canonical_start)
+        except (TypeError, ValueError):
+            canonical_start_us = float(source_start_us or 0)
+        self.selectCue(canonical_id, canonical_start_us)
+        self.navigate("translate")
+        self.translationQaNavigationRequested.emit(target_row)
+        shown_index = int(target.get("index", requested_index or target_row + 1))
+        self._set_status(f"Đã mở cue {shown_index} để chỉnh trong Biên tập dịch thuật")
+
+    @Slot()
+    def startVoicePreview(self) -> None:
+        self._start_voice_job("preview")
+
+    @Slot()
+    def startVoiceGeneration(self) -> None:
+        self._start_voice_job("production")
+
+    @Slot()
+    def regenerateSelectedVoiceCue(self) -> None:
+        if not self._selected_cue_id:
+            self._set_status("Hãy chọn cue trong Biên tập phụ đề trước")
+            return
+        self._start_voice_job("production", force_cue_ids=[self._selected_cue_id])
+
+    @Slot()
+    def pauseVoiceGeneration(self) -> None:
+        if self._tts_job_id and self._tts_job_state == "running":
+            self._set_tts_job_state("pause_requested")
+            self.runtime.request(
+                "pause_job",
+                {"job_id": self._tts_job_id},
+                context={"job_kind": "tts"},
+            )
+
+    @Slot()
+    def resumeVoiceGeneration(self) -> None:
+        if not self._tts_job_id:
+            return
+        if self._tts_job_state == "paused":
+            self._set_tts_job_state("resume_requested")
+            self.runtime.request(
+                "resume_job",
+                {"job_id": self._tts_job_id},
+                context={"job_kind": "tts"},
+            )
+        elif self._tts_job_state == "queued":
+            self._set_tts_job_state("start_requested")
+            self._start_tts_worker(self._tts_job_id)
+        elif self._tts_job_state in {"interrupted", "failed", "review"}:
+            self._set_tts_job_state("resume_requested")
+            self.runtime.request(
+                "retry_job",
+                {"job_id": self._tts_job_id},
+                context={"resume_tts": True, "job_id": self._tts_job_id},
+            )
+
+    @Slot()
+    def cancelVoiceGeneration(self) -> None:
+        if self._tts_job_id and self._tts_busy:
+            self._set_tts_job_state("cancel_requested")
+            self.runtime.request(
+                "cancel_job",
+                {"job_id": self._tts_job_id},
+                context={"job_kind": "tts"},
+            )
+
+    @Slot(str)
+    def setExportOutputPath(self, value: str) -> None:
+        path = QUrl(value).toLocalFile() if value.startswith("file:") else value
+        key = f"export/outputPath/{self.project_state.projectId or 'none'}"
+        self.settings.setValue(key, path.strip())
+        self.exportSettingsChanged.emit()
+
+    @Slot(str)
+    def setExportPresetId(self, value: str) -> None:
+        if value not in {"source-quality", "1080p", "720p", "480p"}:
+            return
+        self.settings.setValue("export/presetId", value)
+        self.exportSettingsChanged.emit()
+
+    @Slot(str)
+    def setExportBackend(self, value: str) -> None:
+        if value not in {"auto", "cpu", "nvenc"}:
+            return
+        self.settings.setValue("export/backend", value)
+        self.exportSettingsChanged.emit()
+
+    @Slot(int)
+    def setExportChunkMinutes(self, value: int) -> None:
+        self.settings.setValue("export/chunkMinutes", max(1, min(60, value)))
+        self.exportSettingsChanged.emit()
+
+    @Slot(bool)
+    def setExportOverwrite(self, value: bool) -> None:
+        self.settings.setValue("export/overwrite", bool(value))
+        self.exportSettingsChanged.emit()
+
+    @Slot(bool)
+    def setExportSubtitleEnabled(self, value: bool) -> None:
+        self.settings.setValue("export/subtitleEnabled", bool(value))
+        self.exportSettingsChanged.emit()
+
+    @Slot(str)
+    def setExportFontFamily(self, value: str) -> None:
+        if not value.strip():
+            return
+        self.settings.setValue("export/fontFamily", value.strip())
+        self.exportSettingsChanged.emit()
+
+    @Slot(int)
+    def setExportFontSize(self, value: int) -> None:
+        self.settings.setValue("export/fontSize", max(12, min(120, value)))
+        self.exportSettingsChanged.emit()
+
+    @Slot(int)
+    def setExportSubtitleMarginBottom(self, value: int) -> None:
+        self.settings.setValue("export/subtitleMarginBottom", max(0, min(500, value)))
+        self.exportSettingsChanged.emit()
+
+    @Slot(str)
+    def setExportSubtitlePrimaryColor(self, value: str) -> None:
+        normalized = _normalized_hex_color(value)
+        if normalized is None:
+            return
+        self.settings.setValue("export/subtitlePrimaryColor", normalized)
+        self.exportSettingsChanged.emit()
+
+    @Slot(str)
+    def setExportSubtitleOutlineColor(self, value: str) -> None:
+        normalized = _normalized_hex_color(value)
+        if normalized is None:
+            return
+        self.settings.setValue("export/subtitleOutlineColor", normalized)
+        self.exportSettingsChanged.emit()
+
+    @Slot(int)
+    def setExportSubtitleOutlineWidth(self, value: int) -> None:
+        self.settings.setValue("export/subtitleOutlineWidth", max(0, min(12, value)))
+        self.exportSettingsChanged.emit()
+
+    @Slot(int)
+    def setExportSubtitleAlignment(self, value: int) -> None:
+        if value not in {1, 2, 3}:
+            return
+        self.settings.setValue("export/subtitleAlignment", value)
+        self.exportSettingsChanged.emit()
+
+    @Slot(int)
+    def setExportSubtitleOpacityPercent(self, value: int) -> None:
+        self.settings.setValue("export/subtitleOpacityPercent", max(0, min(100, value)))
+        self.exportSettingsChanged.emit()
+
+    @Slot(str)
+    def setExportVideoFilterPreset(self, value: str) -> None:
+        if value not in {"none", "cinematic-warm", "cool", "grayscale"}:
+            return
+        self.settings.setValue("export/videoFilterPreset", value)
+        self.exportSettingsChanged.emit()
+
+    @Slot(int)
+    def setExportVideoFilterIntensity(self, value: int) -> None:
+        self.settings.setValue("export/videoFilterIntensity", max(0, min(100, value)))
+        self.exportSettingsChanged.emit()
+
+    @Slot(int)
+    def setExportVideoBrightness(self, value: int) -> None:
+        self.settings.setValue("export/videoBrightness", max(-50, min(50, value)))
+        self.exportSettingsChanged.emit()
+
+    @Slot(int)
+    def setExportVideoContrast(self, value: int) -> None:
+        self.settings.setValue("export/videoContrast", max(50, min(150, value)))
+        self.exportSettingsChanged.emit()
+
+    @Slot(int)
+    def setExportVideoSaturation(self, value: int) -> None:
+        self.settings.setValue("export/videoSaturation", max(0, min(200, value)))
+        self.exportSettingsChanged.emit()
+
+    @Slot()
+    def resetExportSubtitleStyle(self) -> None:
+        defaults = {
+            "export/fontFamily": "Arial",
+            "export/fontSize": 42,
+            "export/subtitleMarginBottom": 28,
+            "export/subtitlePrimaryColor": "#FFFFFF",
+            "export/subtitleOutlineColor": "#000000",
+            "export/subtitleOutlineWidth": 3,
+            "export/subtitleAlignment": 2,
+            "export/subtitleOpacityPercent": 100,
+        }
+        for key, value in defaults.items():
+            self.settings.setValue(key, value)
+        self.exportSettingsChanged.emit()
+
+    @Slot()
+    def resetExportVideoFilter(self) -> None:
+        defaults = {
+            "export/videoFilterPreset": "none",
+            "export/videoFilterIntensity": 100,
+            "export/videoBrightness": 0,
+            "export/videoContrast": 100,
+            "export/videoSaturation": 100,
+        }
+        for key, value in defaults.items():
+            self.settings.setValue(key, value)
+        self.exportSettingsChanged.emit()
+
+    @Slot()
+    def startExport(self) -> None:
+        if not self._backend_ready or not self.project_state.hasVideo:
+            self._set_status("Hãy mở project có video trước khi xuất")
+            return
+        if self._export_busy:
+            self._set_status("Một tác vụ xuất đang chạy; hãy tạm dừng hoặc hủy trước")
+            return
+        output = self.exportOutputPath
+        if not output:
+            self._set_status("Hãy chọn đường dẫn MP4 đầu ra")
+            return
+        self._set_export_job_state("start_requested")
+        self._set_export_busy(True)
+        self.runtime.request(
+            "create_export_job",
+            {
+                "project_id": self.project_state.projectId,
+                "output_path": output,
+                "export_options": {
+                    "preset_id": self.exportPresetId,
+                    "backend": self.exportBackend,
+                    "chunk_minutes": self.exportChunkMinutes,
+                    "overwrite": self.exportOverwrite,
+                    "subtitle_style": {
+                        "enabled": self.exportSubtitleEnabled,
+                        "font_family": self.exportFontFamily,
+                        "font_size": self.exportFontSize,
+                        "margin_bottom": self.exportSubtitleMarginBottom,
+                        "primary_color": self.exportSubtitlePrimaryColor,
+                        "outline_color": self.exportSubtitleOutlineColor,
+                        "outline_width": self.exportSubtitleOutlineWidth,
+                        "alignment": self.exportSubtitleAlignment,
+                        "opacity_percent": self.exportSubtitleOpacityPercent,
+                    },
+                    "video_filter": {
+                        "preset_id": self.exportVideoFilterPreset,
+                        "intensity_percent": self.exportVideoFilterIntensity,
+                        "brightness_percent": self.exportVideoBrightness,
+                        "contrast_percent": self.exportVideoContrast,
+                        "saturation_percent": self.exportVideoSaturation,
+                    },
+                },
+            },
+            context={"export_output": output},
+        )
+        self._set_status("Đang khóa snapshot timeline bất biến để đưa vào hàng đợi")
+
+    @Slot()
+    def pauseExport(self) -> None:
+        if self._export_job_id and self._export_job_state == "running":
+            self._set_export_job_state("pause_requested")
+            self.runtime.request(
+                "pause_job",
+                {"job_id": self._export_job_id},
+                context={"job_kind": "export"},
+            )
+
+    @Slot()
+    def resumeExport(self) -> None:
+        if not self._export_job_id:
+            return
+        if self._export_job_state == "paused":
+            self._set_export_job_state("resume_requested")
+            self.runtime.request(
+                "resume_job",
+                {"job_id": self._export_job_id},
+                context={"job_kind": "export"},
+            )
+        elif self._export_job_state == "queued":
+            self._set_export_job_state("start_requested")
+            self._start_export_worker(self._export_job_id)
+        elif self._export_job_state in {"interrupted", "failed"}:
+            self._set_export_job_state("resume_requested")
+            self.runtime.request(
+                "retry_job",
+                {"job_id": self._export_job_id},
+                context={"resume_export": True, "job_id": self._export_job_id},
+            )
+
+    @Slot()
+    def cancelExport(self) -> None:
+        if self._export_job_id and self._export_busy:
+            self._set_export_job_state("cancel_requested")
+            self.runtime.request(
+                "cancel_job",
+                {"job_id": self._export_job_id},
+                context={"job_kind": "export"},
+            )
+
+    @Slot(str)
+    def setLogoPath(self, value: str) -> None:
+        path = QUrl(value).toLocalFile() if value.startswith("file:") else value
+        if not path or not Path(path).expanduser().is_file():
+            self._set_status("File logo không tồn tại")
+            return
+        self.settings.setValue("effects/logoPath", str(Path(path).expanduser().resolve()))
+        self.overlaySelectionRequested.emit("overlay-default-logo")
+        self._send_effect_command("set_logo_asset", values={"path": path})
+
+    @Slot(str, bool)
+    def setOverlayEnabled(self, overlay_id: str, enabled: bool) -> None:
+        self._save_overlay_preset_value(overlay_id, "enabled", enabled)
+        self._send_effect_command("update", overlay_id=overlay_id, values={"enabled": enabled})
+
+    @Slot(str, float, float, float, float)
+    def setOverlayGeometry(
+        self,
+        overlay_id: str,
+        x: float,
+        y: float,
+        width: float,
+        height: float,
+    ) -> None:
+        self._send_effect_command(
+            "update",
+            overlay_id=overlay_id,
+            values={"x": x, "y": y, "width": width, "height": height},
+        )
+
+    @Slot(str, float)
+    def setOverlayOpacity(self, overlay_id: str, opacity: float) -> None:
+        self._save_overlay_preset_value(overlay_id, "opacity", opacity)
+        self._send_effect_command("update", overlay_id=overlay_id, values={"opacity": opacity})
+
+    @Slot(str, float, float)
+    def setOverlayRange(self, overlay_id: str, start_seconds: float, end_seconds: float) -> None:
+        if not math.isfinite(start_seconds) or not math.isfinite(end_seconds):
+            return
+        self._send_effect_command(
+            "update",
+            overlay_id=overlay_id,
+            values={
+                "start_us": max(0, int(start_seconds * 1_000_000)),
+                "end_us": max(0, int(end_seconds * 1_000_000)),
+            },
+        )
+
+    @Slot(str, int)
+    def setOverlayBlurRadius(self, overlay_id: str, radius: int) -> None:
+        self._save_overlay_preset_value(overlay_id, "blur_radius", radius)
+        self._send_effect_command("update", overlay_id=overlay_id, values={"blur_radius": radius})
+
+    @Slot()
+    def addBlurRegion(self) -> None:
+        overlay_id = f"overlay-blur-{uuid4().hex[:12]}"
+        self.overlaySelectionRequested.emit(overlay_id)
+        self._send_effect_command("add_blur", overlay_id=overlay_id)
+
+    @Slot(str)
+    def deleteOverlay(self, overlay_id: str) -> None:
+        if overlay_id == "overlay-default-blur":
+            self._set_status("Vùng blur mặc định có thể tắt nhưng không xóa")
+            return
+        self._send_effect_command("delete_overlay", overlay_id=overlay_id)
+
+    def _send_effect_command(
+        self,
+        command: str,
+        *,
+        overlay_id: str | None = None,
+        values: dict[str, object] | None = None,
+    ) -> None:
+        if not self.project_state.hasProject:
+            return
+        is_geometry = (
+            command == "update"
+            and bool(overlay_id)
+            and isinstance(values, dict)
+            and bool(values)
+            and set(values).issubset({"x", "y", "width", "height"})
+        )
+        pending = {
+            "command": command,
+            "overlay_id": overlay_id or "",
+            "values": dict(values or {}),
+            "geometry": is_geometry,
+        }
+        if self._timeline_busy:
+            self._enqueue_effect_command(pending)
+            self._set_status("Đã xếp thay đổi logo/blur; sẽ lưu ngay sau thao tác hiện tại")
+            return
+        params: dict[str, object] = {
+            "project_id": self.project_state.projectId,
+            "command": command,
+            "values": values or {},
+        }
+        if overlay_id:
+            params["overlay_id"] = overlay_id
+        self._set_timeline_busy(True)
+        self.runtime.request(
+            "effect_command",
+            params,
+            context={
+                "command": command,
+                "overlay_id": overlay_id or "",
+                "geometry": is_geometry,
+                "values": dict(values or {}),
+            },
+        )
+        self._set_status("Đang lưu lớp logo/blur vào project")
+
+    def _save_overlay_preset_value(self, overlay_id: str, key: str, value: object) -> None:
+        if overlay_id not in {"overlay-default-logo", "overlay-default-blur"}:
+            return
+        kind = "blur" if overlay_id == "overlay-default-blur" else "logo"
+        self.settings.setValue(f"effects/{kind}/{key}", value)
+
+    def _enqueue_effect_command(self, command: dict[str, object]) -> None:
+        if command.get("geometry") is True:
+            overlay_id = str(command.get("overlay_id", ""))
+            for index in range(len(self._pending_effect_commands) - 1, -1, -1):
+                pending = self._pending_effect_commands[index]
+                if pending.get("geometry") is not True:
+                    break
+                if str(pending.get("overlay_id", "")) == overlay_id:
+                    self._pending_effect_commands[index] = command
+                    return
+        self._pending_effect_commands.append(command)
+
+    def _take_pending_effect_command(self) -> dict[str, object] | None:
+        if not self._pending_effect_commands:
+            return None
+        return self._pending_effect_commands.pop(0)
+
+    def _dispatch_pending_effect_command(self, pending: dict[str, object] | None = None) -> None:
+        command = pending if pending is not None else self._take_pending_effect_command()
+        if command is None:
+            return
+        self._send_effect_command(
+            str(command.get("command", "update")),
+            overlay_id=str(command.get("overlay_id", "")) or None,
+            values=(command.get("values") if isinstance(command.get("values"), dict) else {}),
+        )
+
+    def _default_overlay_import_options(self) -> dict[str, object]:
+        logo_path = self.settings.value("effects/logoPath", "", type=str).strip()
+        if logo_path and not Path(logo_path).expanduser().is_file():
+            logo_path = ""
+
+        def number(kind: str, key: str, default: float) -> float:
+            try:
+                return float(self.settings.value(f"effects/{kind}/{key}", default))
+            except (TypeError, ValueError):
+                return default
+
+        preset = {
+            "blur": {
+                "x": number("blur", "x", 0.04),
+                "y": number("blur", "y", 0.82),
+                "width": number("blur", "width", 0.92),
+                "height": number("blur", "height", 0.15),
+                "enabled": self.settings.value("effects/blur/enabled", True, type=bool),
+                "blur_radius": self.settings.value("effects/blur/blur_radius", 22, type=int),
+            },
+            "logo": {
+                "x": number("logo", "x", 0.82),
+                "y": number("logo", "y", 0.035),
+                "width": number("logo", "width", 0.15),
+                "height": number("logo", "height", 0.085),
+                "enabled": self.settings.value("effects/logo/enabled", True, type=bool),
+                "opacity": number("logo", "opacity", 0.9),
+            },
+        }
+        return {"default_logo_path": logo_path, "overlay_preset": preset}
+
+    def _start_voice_job(
+        self,
+        purpose: str,
+        *,
+        force_cue_ids: list[str] | None = None,
+    ) -> None:
+        if self._guard_manual_parallel("tts", (purpose, list(force_cue_ids or []))):
+            return
+        if not self._backend_ready or not self.project_state.hasProject:
+            self._set_status("Hãy mở project có video trước khi tạo giọng")
+            return
+        if self._tts_busy:
+            self._set_status("Một tác vụ giọng đang chạy; hãy tạm dừng hoặc hủy trước")
+            return
+        selected = self.voice_catalog.find(self._selected_voice_id)
+        if not selected or selected.get("installed") is not True:
+            self._set_status("Hãy chọn một giọng đã cài và sẵn sàng")
+            return
+        provider_id = str(selected.get("provider_id", ""))
+        options: dict[str, object] = {"purpose": purpose}
+        if force_cue_ids:
+            options["force_cue_ids"] = force_cue_ids
+        if provider_id == "vieneu-3.3":
+            if self.vieneuReferenceAudio:
+                options["reference_audio_path"] = self.vieneuReferenceAudio
+                options["reference_text"] = self.vieneuReferenceText
+                options["reference_denoise"] = self.vieneuReferenceDenoise
+            else:
+                profile_path = selected.get("profile_path")
+                if isinstance(profile_path, str) and profile_path:
+                    options["profile_path"] = profile_path
+            options["batch_size"] = 64
+        else:
+            options["batch_size"] = 16
+        adaptive_timing = purpose == "production"
+        options["adaptive_timing"] = adaptive_timing
+        options["voice_read_speed"] = self._voice_read_speed
+        options["max_absolute_speed"] = max(
+            self._voice_read_speed,
+            self._voice_cue_max_speed if adaptive_timing else self._voice_read_speed,
+        )
+        # Adaptive fitting must happen while D1 is created. When disabled, keep
+        # the complete base-speed voice for the post-conform workflow.
+        options["qa_non_blocking"] = True
+        options["defer_timing_conform"] = False
+        self._set_tts_job_purpose(purpose)
+        self._set_tts_job_state("start_requested")
+        self._set_tts_busy(True)
+        self._pending_tts_start = {
+            "params": {
+                "project_id": self.project_state.projectId,
+                "provider_id": provider_id,
+                "voice_id": self._selected_voice_id,
+                "provider_options": options,
+            },
+            "context": {"tts_purpose": purpose},
+            "force_cue_ids": list(force_cue_ids or []),
+        }
+        if purpose == "production" and self.project_state.hasVoiceTrack:
+            # Drop the QML sources before asking the service to remove D1.  Qt
+            # Multimedia otherwise keeps the stable WAV open on Windows and
+            # the final atomic promotion fails with PermissionError.
+            self._set_voice_playback_enabled(False)
+            self.runtime.request(
+                "prepare_tts_rerun",
+                {"project_id": self.project_state.projectId},
+                context={"tts_purpose": purpose},
+            )
+            self._set_status(
+                "Đang gỡ D1 cũ và giải phóng file WAV trước khi tạo lại; cache vẫn được giữ"
+            )
+            return
+        self._dispatch_pending_tts_start(force_cue_ids=force_cue_ids)
+
+    def _dispatch_pending_tts_start(
+        self,
+        *,
+        force_cue_ids: list[str] | None = None,
+    ) -> None:
+        pending = self._pending_tts_start
+        self._pending_tts_start = None
+        if not isinstance(pending, dict):
+            self._set_tts_busy(False)
+            self._set_tts_job_state("failed")
+            self._set_status("Không tìm thấy cấu hình tạo giọng đang chờ")
+            return
+        params = pending.get("params")
+        context = pending.get("context")
+        if not isinstance(params, dict) or not isinstance(context, dict):
+            self._set_tts_busy(False)
+            self._set_tts_job_state("failed")
+            self._set_status("Cấu hình tạo giọng đang chờ không hợp lệ")
+            return
+        pending_force_ids = pending.get("force_cue_ids")
+        if force_cue_ids is None and isinstance(pending_force_ids, list):
+            force_cue_ids = [str(value) for value in pending_force_ids if str(value)]
+        self.runtime.request("create_tts_job", params, context=context)
+        purpose = str(context.get("tts_purpose", ""))
+        self._set_status(
+            "Đang chuẩn bị nghe thử giọng"
+            if purpose == "preview"
+            else (
+                "Đang tạo lại cue đã chọn và ráp lại WAV đầy đủ"
+                if force_cue_ids
+                else (
+                    f"Đang tạo voice gốc {self._voice_read_speed:.1f}×"
+                    + (
+                        f", cue dài tối đa tổng {self._voice_cue_max_speed:.1f}×"
+                        if purpose == "production"
+                        else "; cue dài chuyển sang Đồng bộ sau lồng tiếng"
+                    )
+                )
+            )
+        )
+
+    @Slot(str, float)
+    def selectCue(self, cue_id: str, start_us: float) -> None:
+        if not self.project_state.subtitle_cues.find(cue_id):
+            return
+        if cue_id != self._selected_cue_id:
+            self._selected_cue_id = cue_id
+            self.selectedCueChanged.emit()
+        output_us = self.project_state.sourceToOutputUs(max(0.0, start_us))
+        self.setPlayheadMs(output_us / 1_000)
+
+    @Slot(int)
+    def selectTranslationQaIssue(self, cue_index: int) -> None:
+        """Select and seek the cue represented by a live translation QA row."""
+
+        if type(cue_index) is not int or cue_index <= 0:
+            return
+        model = self.project_state.subtitle_cues
+        for row in range(model.count):
+            cue = model.get(row)
+            if cue.get("index") != cue_index:
+                continue
+            cue_id = str(cue.get("cue_id", ""))
+            if cue_id:
+                self.selectCue(cue_id, float(cue.get("start_us", 0)))
+                self.translationQaNavigationRequested.emit(row)
+            return
+
+    @Slot(str, str, str)
+    def updateSubtitleText(self, cue_id: str, text: str, language: str = "source") -> None:
+        optimistic_changes = self.project_state.subtitle_cues.optimistic_update_text(
+            cue_id,
+            text.strip(),
+            language=language,
+        )
+        if optimistic_changes:
+            self._set_translation_qa(self._translation_qa)
+        self._send_subtitle_command(
+            "update_text",
+            cue_id=cue_id,
+            language=language,
+            values={"text": text},
+            optimistic_changes=optimistic_changes,
+        )
+
+    @Slot()
+    def addSubtitleCue(self) -> None:
+        self._send_subtitle_command("add", cue_id=self._selected_cue_id or None)
+
+    @Slot()
+    def splitSelectedCue(self) -> None:
+        cue = self.selectedCue
+        if not cue:
+            self._set_status("Hãy chọn cue cần tách")
+            return
+        start_us = int(cue.get("start_us", 0))
+        end_us = int(cue.get("end_us", 0))
+        split_us = self._playhead_us
+        values = {"split_us": split_us} if start_us < split_us < end_us else {}
+        self._send_subtitle_command("split", cue_id=self._selected_cue_id, values=values)
+
+    @Slot()
+    def mergeSelectedCue(self) -> None:
+        self._send_subtitle_command("merge_next", cue_id=self._selected_cue_id)
+
+    @Slot(float)
+    def shiftSelectedCue(self, milliseconds: float) -> None:
+        if not math.isfinite(milliseconds):
+            return
+        self._send_subtitle_command(
+            "shift",
+            cue_id=self._selected_cue_id,
+            values={"delta_us": int(round(milliseconds * 1_000))},
+        )
+
+    @Slot(bool)
+    def autoBreakSubtitles(self, selected_only: bool = False) -> None:
+        self._send_subtitle_command(
+            "auto_break",
+            cue_id=self._selected_cue_id if selected_only else None,
+            needs_selection=selected_only,
+        )
+
+    @Slot(str, result="QVariantMap")
+    def previewSubtitleReplacement(self, find: str) -> dict:
+        summary = self.project_state.subtitle_cues.match_summary(
+            find,
+            language="translated",
+        )
+        if not find:
+            self._set_status("Hãy nhập nội dung tiếng Việt cần tìm")
+        elif summary["match_count"] == 0:
+            self._set_status("Không tìm thấy nội dung này trong bản dịch Việt")
+        else:
+            self._set_status(
+                f"Tìm thấy {summary['match_count']} lần trong {summary['cue_count']} cue Việt"
+            )
+        return summary
+
+    @Slot(str, str, int)
+    def findReplaceSubtitles(
+        self,
+        find: str,
+        replacement: str,
+        expected_count: int,
+    ) -> None:
+        optimistic_changes = self.project_state.subtitle_cues.optimistic_find_replace(
+            find,
+            replacement,
+            language="translated",
+        )
+        if optimistic_changes:
+            self._set_translation_qa(self._translation_qa)
+        self._send_subtitle_command(
+            "find_replace",
+            language="translated",
+            values={
+                "find": find,
+                "replacement": replacement,
+                "expected_count": expected_count,
+            },
+            needs_selection=False,
+            optimistic_changes=optimistic_changes,
+            status_context={
+                "replacement_count": expected_count,
+                "replacement_cue_count": len(optimistic_changes),
+            },
+        )
+
+    @Slot(str)
+    def deleteSubtitleCue(self, cue_id: str) -> None:
+        cue = self.project_state.subtitle_cues.find(cue_id)
+        self._send_subtitle_command(
+            "delete",
+            cue_id=cue_id,
+            status_context={"deleted_cue_index": cue.get("index", 0)},
+        )
+
+    @Slot()
+    def undoSubtitle(self) -> None:
+        self._send_subtitle_command("undo", needs_selection=False)
+
+    @Slot()
+    def redoSubtitle(self) -> None:
+        self._send_subtitle_command("redo", needs_selection=False)
+
+    @Slot()
+    def rescanSelectedCue(self) -> None:
+        if self._ocr_busy or not self._selected_cue_id or not self.project_state.hasVideo:
+            return
+        self._set_ocr_busy(True)
+        self.runtime.request(
+            "create_ocr_rescan_job",
+            {
+                "project_id": self.project_state.projectId,
+                "cue_id": self._selected_cue_id,
+                "sample_interval_us": 400_000,
+                "engine_python": self.ocrEnginePython,
+                "device": "gpu:0",
+            },
+        )
+        self._set_status("Đang tạo tác vụ quét lại đúng vùng cue")
+
+    @Slot(str)
+    def navigate(self, workspace_id: str) -> None:
+        for item in NAVIGATION:
+            if item.workspace_id == workspace_id:
+                if workspace_id == "import":
+                    self.showImportDialog()
+                    return
+                if workspace_id == "multi" and self._backend_ready:
+                    self.runtime.request("multi_list")
+                if workspace_id == self._current_workspace:
+                    return
+                self._current_workspace = workspace_id
+                self._current_index = self._screen_index(workspace_id)
+                self.settings.setValue("ui/currentWorkspace", workspace_id)
+                self.currentWorkspaceChanged.emit()
+                self.currentIndexChanged.emit()
+                self._set_status(f"Đã mở {item.title}")
+                return
+
+    @Slot(str)
+    def openProject(self, project_id: str) -> None:
+        value = project_id.strip()
+        if not self._backend_ready:
+            self._set_status("Job Manager chưa sẵn sàng để mở dự án")
+            return
+        if not value:
+            self._set_status("Dự án được chọn không hợp lệ")
+            return
+        self.runtime.request("get_project", {"project_id": value})
+        self._set_status("Đang mở dự án")
+
+    @Slot(str, str)
+    def deleteProject(self, project_id: str, project_name: str = "") -> None:
+        value = project_id.strip()
+        if not self._backend_ready or not value:
+            self._set_status("Không thể xóa dự án lúc này")
+            return
+        if self._project_delete_busy:
+            self._set_status(f"Đang xoá: {self._deleting_project_name or value}")
+            return
+        self._project_delete_busy = True
+        self._deleting_project_id = value
+        self._deleting_project_name = project_name.strip() or value
+        self.projectDeleteChanged.emit()
+        self.runtime.request(
+            "delete_project",
+            {"project_id": value},
+            context={
+                "project_id": value,
+                "project_name": self._deleting_project_name,
+            },
+        )
+        self._set_status(f"Đang xoá: {self._deleting_project_name}")
+
+    def _set_job_history_busy(self, value: bool, *, job_id: str = "") -> None:
+        next_id = job_id if value else ""
+        if value == self._job_history_busy and next_id == self._deleting_job_id:
+            return
+        self._job_history_busy = value
+        self._deleting_job_id = next_id
+        self.jobHistoryBusyChanged.emit()
+
+    @Slot(str)
+    def deleteJobHistory(self, job_id: str) -> None:
+        value = job_id.strip()
+        if not self._backend_ready or not value:
+            return
+        if self._job_history_busy:
+            self._set_status("Đang xoá lịch sử tác vụ; hãy chờ hoàn tất")
+            return
+        self._set_job_history_busy(True, job_id=value)
+        self.runtime.request(
+            "delete_job_history",
+            {"job_id": value},
+            context={"job_history_delete": True, "job_id": value},
+        )
+        self._set_status("Đang xoá lịch sử tác vụ đã kết thúc")
+
+    @Slot()
+    def clearSubtitleJobHistory(self) -> None:
+        self.clearJobHistory("subtitle")
+
+    @Slot(str)
+    def clearJobHistory(self, scope: str) -> None:
+        project_id = self.project_state.projectId
+        if not self._backend_ready or not project_id:
+            self._set_status("Hãy mở dự án trước khi xoá lịch sử")
+            return
+        if self._job_history_busy:
+            self._set_status("Đang xoá lịch sử tác vụ; hãy chờ hoàn tất")
+            return
+        normalized = scope.strip().casefold()
+        kinds_by_scope = {
+            "subtitle": ["ocr", "translate"],
+            "voice": ["tts"],
+            "tts": ["tts"],
+        }
+        kinds = kinds_by_scope.get(normalized)
+        if kinds is None:
+            self._set_status("Nhóm lịch sử tác vụ không hợp lệ")
+            return
+        self._set_job_history_busy(True)
+        self.runtime.request(
+            "clear_project_job_history",
+            {"project_id": project_id, "kinds": kinds},
+            context={
+                "job_history_clear": True,
+                "project_id": project_id,
+                "history_scope": normalized,
+            },
+        )
+        self._set_status(
+            "Đang hủy tác vụ dở và xoá toàn bộ lịch sử tạo giọng"
+            if normalized in {"voice", "tts"}
+            else "Đang hủy tác vụ dở và xoá toàn bộ lịch sử OCR/dịch"
+        )
+
+    @Slot(str)
+    def selectTranslationCache(self, job_id: str) -> None:
+        value = job_id.strip()
+        if not self._backend_ready or not self.project_state.projectId or not value:
+            return
+        if self._translation_busy:
+            self._set_status("Dịch đang chạy; hãy tạm dừng hoặc hủy trước khi đổi cache")
+            return
+        selected = next(
+            (item for item in self._translation_caches if item.get("job_id") == value),
+            None,
+        )
+        if selected is None:
+            self._set_status("Cache không còn tương thích với phụ đề nguồn hiện tại")
+            return
+        if value != self._selected_translation_cache_id:
+            self._selected_translation_cache_id = value
+            self.translationCachesChanged.emit()
+        # The preview request is asynchronous. Set the selected cache as the
+        # resume target now so a quick click cannot retry a previous job.
+        self._bind_translation_cache_record(selected)
+        self.runtime.request(
+            "get_translation_preview",
+            {"project_id": self.project_state.projectId, "job_id": value},
+            context={
+                "project_id": self.project_state.projectId,
+                "cache_selection": True,
+                "cache_job_id": value,
+            },
+        )
+        self._set_status(
+            f"Đang nạp cache {selected.get('completed_cues', 0)}/{selected.get('cue_total', 0)} cue"
+        )
+
+    def _bind_translation_cache_record(self, cache: dict[str, object]) -> None:
+        """Make a cache selection actionable before its preview arrives.
+
+        Cache listing and preview are separate asynchronous requests.  If the
+        preview is delayed (or the previous job left the busy flag set), the
+        UI must still expose the selected ledger's exact state and resume
+        target immediately instead of leaving the primary control disabled.
+        """
+
+        job_id = str(cache.get("job_id", "")).strip()
+        if not job_id:
+            return
+        self._translation_job_id = job_id
+        self._translation_provider_id = str(cache.get("provider_id", ""))
+        display_state = str(cache.get("display_state", cache.get("state", "")))
+        self._set_translation_job_state(display_state)
+        self._set_translation_busy(
+            display_state
+            in {
+                "queued",
+                "start_requested",
+                "running",
+                "pause_requested",
+                "paused",
+                "resume_requested",
+                "cancel_requested",
+            }
+        )
+
+    @Slot()
+    def showImportDialog(self) -> None:
+        if not self._backend_ready:
+            self._set_status("Job Manager chưa sẵn sàng để nhập media")
+            return
+        if self._import_busy:
+            self._set_status("Một file đang được nhập")
+            return
+        self.importDialogRequested.emit()
+
+    @Slot()
+    def showMultiImportDialog(self) -> None:
+        if not self._backend_ready:
+            self._set_status("Job Manager chưa sẵn sàng để nhập video vào Multi")
+            return
+        if self._import_busy:
+            self._set_status("Một tác vụ nhập media đang được xử lý")
+            return
+        self.multiImportDialogRequested.emit()
+
+    @Slot()
+    def showNewProjectDialog(self) -> None:
+        if not self._backend_ready:
+            self._set_status("Job Manager chưa sẵn sàng để tạo dự án")
+            return
+        if self._import_busy:
+            self._set_status("Một file đang được nhập")
+            return
+        self.newProjectDialogRequested.emit()
+
+    @Slot(str)
+    def createProjectFromPath(self, raw_path: str) -> None:
+        if not self._backend_ready or self._import_busy:
+            return
+        path = _local_path_from_ui(raw_path)
+        if not path.is_file():
+            self._set_status("File tạo dự án không tồn tại")
+            return
+        self._set_import_busy(True)
+        self._save_state = "Đang kiểm tra media"
+        self.saveStateChanged.emit()
+        self._inspect_media_before_import(path, intent="new_project")
+
+    @Slot(str)
+    def importPath(self, raw_path: str) -> None:
+        if not self._backend_ready or self._import_busy:
+            return
+        path = _local_path_from_ui(raw_path)
+        if not path.is_file():
+            self._set_status("File nhập không tồn tại")
+            return
+        self._set_import_busy(True)
+        self._save_state = "Đang kiểm tra media"
+        self.saveStateChanged.emit()
+        intent = "append" if self.project_state.hasProject else "new_project"
+        self._inspect_media_before_import(path, intent=intent)
+
+    @Slot("QVariantList")
+    def importPaths(self, raw_paths: object) -> None:
+        if not self._backend_ready or self._import_busy:
+            return
+        if not isinstance(raw_paths, (list, tuple)):
+            self._set_status("Danh sách video nhập không hợp lệ")
+            return
+        paths: list[Path] = []
+        seen: set[str] = set()
+        video_suffixes = {".mp4", ".mkv", ".mov", ".avi", ".webm"}
+        for raw in raw_paths:
+            if not isinstance(raw, str):
+                continue
+            path = _local_path_from_ui(raw)
+            key = str(path).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            if not path.is_file() or path.suffix.casefold() not in video_suffixes:
+                self._set_status(
+                    "Multi video chỉ nhận file video hợp lệ; audio/SRT hãy nhập từng file."
+                )
+                return
+            paths.append(path)
+        if len(paths) == 1:
+            self.importPath(str(paths[0]))
+            return
+        if len(paths) < 2:
+            self._set_status("Hãy chọn ít nhất hai video để mở Multi video")
+            return
+        self._begin_multi_import(paths)
+
+    @Slot("QVariantList")
+    def importMultiPaths(self, raw_paths: object) -> None:
+        """Import one or many videos explicitly into the Multi catalog."""
+
+        if not self._backend_ready or self._import_busy:
+            return
+        if not isinstance(raw_paths, (list, tuple)):
+            self._set_status("Danh sách video nhập không hợp lệ")
+            return
+        paths: list[Path] = []
+        seen: set[str] = set()
+        video_suffixes = {".mp4", ".mkv", ".mov", ".avi", ".webm"}
+        for raw in raw_paths:
+            if not isinstance(raw, str):
+                continue
+            path = _local_path_from_ui(raw)
+            key = str(path).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            if not path.is_file() or path.suffix.casefold() not in video_suffixes:
+                self._set_status("Multi video chỉ nhận file video hợp lệ")
+                return
+            paths.append(path)
+        if not paths:
+            self._set_status("Hãy chọn ít nhất một video để nhập vào Multi video")
+            return
+        self._begin_multi_import(paths)
+
+    def _begin_multi_import(self, paths: list[Path]) -> None:
+        self._multi_import_paths = paths
+        self._multi_import_project_ids = []
+        self._set_import_busy(True)
+        self._save_state = f"Đang nhập 0/{len(paths)} video"
+        self.saveStateChanged.emit()
+        self._create_next_multi_project()
+
+    def _create_next_multi_project(self) -> None:
+        if not self._multi_import_paths:
+            project_ids = list(dict.fromkeys(self._multi_import_project_ids))
+            if not project_ids:
+                self._set_import_busy(False)
+                self._set_status("Không có video nào được thêm vào Multi video")
+                return
+            self.runtime.request(
+                "multi_add",
+                {"project_ids": project_ids},
+                context={"multi_import_complete": True, "count": len(project_ids)},
+            )
+            return
+        path = self._multi_import_paths[0]
+        project_root = self.runtime.database_path.parent / "projects"
+        project_root.mkdir(parents=True, exist_ok=True)
+        project_path = project_root / f"{path.stem[:80]}-{uuid4().hex[:8]}.ducai"
+        self.runtime.request(
+            "create_project_with_media",
+            {
+                "project_path": str(project_path),
+                "name": path.stem,
+                "media_path": str(path),
+                "excluded_project_ids": list(self._multi_import_project_ids),
+                **self._default_overlay_import_options(),
+            },
+            context={"multi_import_path": str(path)},
+        )
+        completed = len(self._multi_import_project_ids)
+        total = completed + len(self._multi_import_paths)
+        self._set_status(f"Đang tạo project Multi video {completed + 1}/{total}")
+
+    def _finish_failed_multi_import(self, message: str, failed_path: str = "") -> None:
+        """Commit successful imports before surfacing a later file failure."""
+
+        completed_ids = list(dict.fromkeys(self._multi_import_project_ids))
+        total = len(completed_ids) + len(self._multi_import_paths)
+        self._multi_import_paths = []
+        if completed_ids:
+            self._save_state = f"Đang lưu {len(completed_ids)}/{total} video đã nhập"
+            self.saveStateChanged.emit()
+            self.runtime.request(
+                "multi_add",
+                {"project_ids": completed_ids},
+                context={
+                    "multi_import_complete": True,
+                    "count": len(completed_ids),
+                    "total": total,
+                    "multi_import_partial_error": message,
+                    "failed_path": failed_path,
+                },
+            )
+            return
+        self._multi_import_project_ids = []
+        self._set_import_busy(False)
+        self._save_state = "Nhập Multi video thất bại"
+        self.saveStateChanged.emit()
+        self._set_status("Không thể nhập danh sách Multi video: " + message)
+
+    def _apply_multi_selection(self, values: dict[str, bool]) -> None:
+        """Update visible checkboxes without waiting for the database round-trip."""
+
+        if not values:
+            return
+        items: list[dict[str, object]] = []
+        changed = False
+        for item in self._multi_items:
+            project_id = str(item.get("project_id", ""))
+            if project_id not in values:
+                items.append(item)
+                continue
+            selected = bool(values[project_id])
+            if bool(item.get("selected", False)) == selected:
+                items.append(item)
+                continue
+            items.append({**item, "selected": selected})
+            changed = True
+        if not changed:
+            return
+        self._multi_items = items
+        self.multi_videos.merge(items)
+        self.multiVideoChanged.emit()
+
+    def _refresh_local_multi_translation_review(self) -> None:
+        """Project an edited CJK count onto its Multi card immediately."""
+
+        project_id = self.project_state.projectId
+        if not project_id:
+            return
+        current = next(
+            (
+                item
+                for item in self._multi_items
+                if str(item.get("project_id", "")) == project_id
+            ),
+            None,
+        )
+        if current is None or not (
+            current.get("manual_review_available") is True
+            or current.get("manual_review_ready") is True
+            or str(current.get("error_code", "")) == "translation_review_required"
+        ):
+            return
+        rows = [
+            self.project_state.subtitle_cues.get(row)
+            for row in range(self.project_state.subtitle_cues.count)
+        ]
+        if not rows:
+            return
+        cjk_ids = sorted(
+            int(row.get("index", index))
+            for index, row in enumerate(rows, start=1)
+            if contains_cjk(str(row.get("translated_text", "")))
+        )
+        complete = all(
+            str(row.get("translation_cue_id", "")).strip()
+            and str(row.get("translated_text", "")).strip()
+            for row in rows
+        )
+        ready = complete and not cjk_ids
+        payload = dict(current.get("error_payload", {})) if isinstance(
+            current.get("error_payload"), dict
+        ) else {}
+        payload.update(
+            {
+                "cjk_cue_ids": cjk_ids,
+                "cjk_blocker_count": len(cjk_ids),
+                "manual_review_remaining_cjk": len(cjk_ids),
+                "manual_review_ready": ready,
+            }
+        )
+        update: dict[str, object] = {
+            **current,
+            "stage": "translate",
+            "error_payload": payload,
+            "manual_review_available": True,
+            "manual_review_remaining_cjk": len(cjk_ids),
+            "manual_review_ready": ready,
+        }
+        if ready:
+            update.update(
+                state="completed",
+                progress=1.0,
+                error_code="",
+                project_status_override=True,
+                project_status_state="completed",
+                project_status_text="Đã sửa xong chữ Trung · sẵn sàng lồng tiếng",
+                project_status_stage="tts",
+                project_status_progress=1.0,
+                project_error_message="",
+            )
+        else:
+            update.update(
+                state="failed",
+                error_code="translation_review_required",
+                project_status_override=False,
+            )
+        items = [
+            update if str(item.get("project_id", "")) == project_id else item
+            for item in self._multi_items
+        ]
+        if items == self._multi_items:
+            return
+        self._multi_items = items
+        self.multi_videos.merge(items)
+        self.multiVideoChanged.emit()
+
+    @Slot(str, bool)
+    def selectMultiVideo(self, project_id: str, selected: bool) -> None:
+        if self.multiListLocked:
+            self._set_status("Hãy tạm dừng Multi video và chờ checkpoint trước khi đổi lựa chọn.")
+            return
+        value = project_id.strip()
+        item = next(
+            (
+                current
+                for current in self._multi_items
+                if str(current.get("project_id", "")) == value
+            ),
+            None,
+        )
+        if item is None:
+            self._set_status("Video không còn trong danh sách Multi")
+            return
+        selected_value = bool(selected)
+        previous = {value: bool(item.get("selected", False))}
+        self._multi_selection_generation += 1
+        generation = self._multi_selection_generation
+        self._apply_multi_selection({value: selected_value})
+        self.runtime.request(
+            "multi_select",
+            {"project_id": value, "selected": selected_value},
+            context={
+                "selection_generation": generation,
+                "previous_selection": previous,
+            },
+        )
+
+    @Slot(bool)
+    def selectAllMultiVideos(self, selected: bool) -> None:
+        if self.multiListLocked:
+            self._set_status("Hãy tạm dừng Multi video và chờ checkpoint trước khi đổi lựa chọn.")
+            return
+        previous = {
+            str(item.get("project_id", "")): bool(item.get("selected", False))
+            for item in self._multi_items
+        }
+        self._multi_selection_generation += 1
+        generation = self._multi_selection_generation
+        selected_value = bool(selected)
+        self._apply_multi_selection(
+            {project_id: selected_value for project_id in previous}
+        )
+        self.runtime.request(
+            "multi_select_all",
+            {"selected": selected_value},
+            context={
+                "selection_generation": generation,
+                "previous_selection": previous,
+            },
+        )
+
+    @Slot(str)
+    def removeMultiVideo(self, project_id: str) -> None:
+        if self.multiListLocked:
+            self._set_status("Hãy tạm dừng Multi video trước khi xóa video khỏi danh sách.")
+            return
+        value = project_id.strip()
+        self.runtime.request(
+            "multi_remove",
+            {"project_id": value},
+            context={"project_id": value},
+        )
+
+    @Slot("QVariantList")
+    def reorderMultiVideos(self, raw_project_ids: object) -> None:
+        if self.multiListLocked:
+            self._set_status("Hãy tạm dừng Multi video trước khi đổi thứ tự.")
+            return
+        if not isinstance(raw_project_ids, (list, tuple)) or not all(
+            isinstance(value, str) and value.strip() for value in raw_project_ids
+        ):
+            self._set_status("Thứ tự Multi video không hợp lệ")
+            return
+        self.runtime.request(
+            "multi_reorder",
+            {"project_ids": [value.strip() for value in raw_project_ids]},
+        )
+
+    @Slot(str)
+    def openMultiVideoDetail(self, project_id: str) -> None:
+        if self._multi_detail_busy:
+            self._set_status("Chỉ có thể mở chỉnh sửa chi tiết một video mỗi lần.")
+            return
+        value = project_id.strip()
+        if not value or not self._backend_ready:
+            if not self._backend_ready:
+                self._set_status("Job Manager chưa sẵn sàng để mở video vào Timeline.")
+            return
+        item = self.multi_videos.item(value)
+        review_job_id = str(item.get("child_job_id", ""))
+        is_translation_review = (
+            str(item.get("stage", "")) == "translate"
+            and str(item.get("error_code", "")) == "translation_review_required"
+        )
+        target_screen = "translate" if is_translation_review else "timeline"
+        self._multi_detail_generation += 1
+        generation = self._multi_detail_generation
+        self._pending_multi_detail_project_id = value
+        self._multi_detail_busy = True
+        self.multiVideoChanged.emit()
+        self.navigate(target_screen)
+        try:
+            self.runtime.request(
+                "get_project",
+                {"project_id": value},
+                context={
+                    "multi_detail": True,
+                    "project_id": value,
+                    "generation": generation,
+                    "multi_detail_target": target_screen,
+                    "translation_review_job_id": review_job_id
+                    if is_translation_review
+                    else "",
+                },
+            )
+        except Exception as exc:
+            self._multi_detail_generation += 1
+            self._finish_multi_detail()
+            self.navigate("multi")
+            self._set_status("Không thể mở video vào màn chỉnh sửa: " + str(exc))
+            return
+        self._set_status(
+            "Đang mở video vào Dịch để sửa các cue còn chữ Trung"
+            if is_translation_review
+            else "Đang mở video vào Timeline để chỉnh sửa chi tiết"
+        )
+        QTimer.singleShot(
+            30_000,
+            lambda current_generation=generation: self._multi_detail_timeout(
+                current_generation
+            ),
+        )
+
+    def _multi_detail_context_is_current(self, context: object) -> bool:
+        return bool(
+            isinstance(context, dict)
+            and context.get("multi_detail") is True
+            and int(context.get("generation", -1)) == self._multi_detail_generation
+            and str(context.get("project_id", "")) == self._pending_multi_detail_project_id
+        )
+
+    def _finish_multi_detail(self) -> None:
+        if not self._multi_detail_busy and not self._pending_multi_detail_project_id:
+            return
+        self._multi_detail_busy = False
+        self._pending_multi_detail_project_id = ""
+        self.multiVideoChanged.emit()
+
+    def _begin_multi_control(self, action: str) -> bool:
+        """Reserve one Multi control request and remember a rollback state."""
+
+        if self._multi_control_snapshot is not None:
+            self._set_status("Đang cập nhật Multi video; hãy đợi phản hồi gần nhất.")
+            return False
+        self._multi_control_snapshot = {
+            "action": action,
+            "batch": dict(self._multi_batch),
+            "items": [dict(item) for item in self._multi_items],
+        }
+        return True
+
+    def _finish_multi_control(self, action: str) -> None:
+        snapshot = self._multi_control_snapshot
+        if isinstance(snapshot, dict) and snapshot.get("action") == action:
+            self._multi_control_snapshot = None
+
+    def _rollback_multi_control(self, action: str) -> None:
+        snapshot = self._multi_control_snapshot
+        if not isinstance(snapshot, dict) or snapshot.get("action") != action:
+            return
+        self._multi_control_snapshot = None
+        self._replace_multi_videos(
+            {
+                "batch": snapshot.get("batch", {"state": "idle"}),
+                "items": snapshot.get("items", []),
+                "partial": False,
+            }
+        )
+
+    def _optimistic_multi_batch_state(
+        self,
+        state: str,
+        *,
+        retry: bool = False,
+        fresh_start: bool = False,
+    ) -> None:
+        """Reflect a control click before the IPC round trip completes."""
+
+        batch = {**self._multi_batch, "state": state}
+        items: list[dict[str, object]] = []
+        for raw in self._multi_items:
+            item = dict(raw)
+            item["batch_state"] = state
+            if retry and item.get("selected") is True:
+                # A completed card is already valid; only retry cards that did
+                # not finish in the previous pass.  Manual-ready translation
+                # cards jump directly to TTS in the optimistic projection.
+                if item.get("manual_review_ready") is True or item.get("state") != "completed":
+                    if item.get("manual_review_ready") is True:
+                        item["stage"] = "tts"
+                    item["state"] = "waiting"
+                    item["progress"] = {
+                        "ocr": 0.0,
+                        "translate": 1.0 / 3.0,
+                        "tts": 2.0 / 3.0,
+                    }.get(str(item.get("stage", "ocr")), 0.0)
+                    item["error_code"] = ""
+                    item["error_payload"] = {}
+            elif fresh_start and item.get("selected") is True:
+                item.update(
+                    {
+                        "stage": "ocr",
+                        "state": "waiting",
+                        "progress": 0.0,
+                        "child_job_id": "",
+                        "retry_count": 0,
+                        "final_pass": False,
+                        "error_code": "",
+                        "error_payload": {},
+                    }
+                )
+            items.append(item)
+        self._replace_multi_videos({"batch": batch, "items": items})
+
+    def _multi_detail_timeout(self, generation: int) -> None:
+        if generation != self._multi_detail_generation or not self._multi_detail_busy:
+            return
+        self._multi_detail_generation += 1
+        self._finish_multi_detail()
+        self.navigate("multi")
+        self._set_status(
+            "Mở video vào Timeline quá thời gian chờ; project hiện tại chưa bị thay đổi."
+        )
+
+    @Slot(str, bool)
+    def requestMultiVideoPreview(self, project_id: str, use_voice: bool = False) -> None:
+        value = project_id.strip()
+        if not self._backend_ready or not value:
+            return
+        self.runtime.request(
+            "multi_preview_descriptor",
+            {"project_id": value},
+            context={"use_voice": bool(use_voice)},
+        )
+
+    @Slot()
+    def startMultiVideo(self) -> None:
+        if not self._backend_ready or self.multiSelectedCount <= 0:
+            self._set_status("Hãy chọn ít nhất một video để chạy Multi video")
+            return
+        try:
+            settings = self._multi_settings_snapshot()
+        except ValueError as exc:
+            self._set_status(str(exc))
+            return
+        if not self._begin_multi_control("multi_start"):
+            return
+        retry = self.multiBatchState == "completed_with_errors"
+        self._optimistic_multi_batch_state(
+            "running",
+            retry=retry,
+            fresh_start=not retry,
+        )
+        try:
+            self.runtime.request("multi_start", {"settings": settings})
+        except Exception:
+            self._rollback_multi_control("multi_start")
+            raise
+        self._set_status(
+            "Đang chuẩn bị chạy lại các video lỗi từ stage hiện tại…"
+            if retry
+            else "Đang kiểm tra cấu hình và bắt đầu Multi video"
+        )
+
+    @Slot()
+    def pauseMultiVideo(self) -> None:
+        if self.multiBatchState != "running":
+            return
+        if not self._begin_multi_control("multi_pause"):
+            return
+        self._optimistic_multi_batch_state("pause_requested")
+        try:
+            self.runtime.request("multi_pause")
+        except Exception:
+            self._rollback_multi_control("multi_pause")
+            raise
+        self._set_status(
+            "Đã nhận lệnh tạm dừng; đang chốt checkpoint hoặc dừng worker trong vài giây…"
+        )
+
+    @Slot()
+    def resumeMultiVideo(self) -> None:
+        if self.multiBatchState not in {
+            "paused",
+            "interrupted",
+        }:
+            return
+        if not self._begin_multi_control("multi_resume"):
+            return
+        self._optimistic_multi_batch_state("running")
+        try:
+            self.runtime.request("multi_resume")
+        except Exception:
+            self._rollback_multi_control("multi_resume")
+            raise
+        self._set_status("Đang tiếp tục Multi video từ checkpoint/cache")
+
+    @Slot()
+    def restoreHiddenMultiVideos(self) -> None:
+        if self.multiListLocked:
+            self._set_status("Hãy tạm dừng Multi video trước khi khôi phục video đã ẩn.")
+            return
+        self.runtime.request("multi_restore_hidden")
+
+    def _multi_settings_snapshot(self) -> dict[str, object]:
+        provider_id = (
+            self.settings.value("translation/provider", "gemini-web", type=str).strip().casefold()
+        )
+        default_models = {
+            "gemini-web": "selected-on-web",
+            "gemini-api": "gemini-3.5-flash-lite",
+            "gemini-cli": "gemini-2.5-flash",
+            "deepseek-api": "deepseek-v4-flash",
+            "tokenhub-api": "hy3",
+            "qwen-api": "qwen3.7-flash",
+            "glm-api": "glm-5.2",
+            "openai-compatible": "",
+        }
+        model_id = self.settings.value(
+            "translation/model",
+            default_models.get(provider_id, ""),
+            type=str,
+        ).strip()
+        if not model_id:
+            raise ValueError("Hãy chọn model dịch trước khi chạy Multi video")
+        translation_options: dict[str, object] = {
+            "banned_latin_terms": ["Daozhang", "Renzong", "yamen"],
+            "qa_mode": "integrated",
+            "qa_non_blocking": True,
+            "qa_policy": "multi_auto",
+            "cjk_is_blocker": True,
+            "auto_compact_overlong_once": True,
+            "max_overlong_compaction_passes": 1,
+        }
+        if provider_id == "gemini-web":
+            # Multi is an unattended queue.  A visible browser would steal
+            # focus for every project and can leave the batch waiting behind a
+            # window, so its immutable snapshot always uses background Web.
+            translation_options.update(self._gemini_web_options(headed=False, guest=True))
+        elif provider_id in {"gemini-api", *OPENAI_COMPATIBLE_PROVIDER_IDS}:
+            references = self._translation_api_references(provider_id)
+            if not references:
+                raise ValueError(
+                    "Hãy lưu API key cho nguồn dịch đã chọn trước khi chạy Multi video"
+                )
+            translation_options["credential_references"] = references
+            if provider_id == "openai-compatible":
+                base_url = self.settings.value(
+                    "translation/openaiCompatibleBaseUrl", "", type=str
+                ).strip()
+                if not base_url:
+                    raise ValueError("Hãy nhập endpoint OpenAI-compatible trước khi chạy Multi")
+                translation_options["base_url"] = base_url
+        else:
+            translation_options["cli_executable"] = self.settings.value(
+                "translation/geminiCliExecutable", "gemini", type=str
+            )
+        selected_voice = self.voice_catalog.find(self._selected_voice_id)
+        if not selected_voice or selected_voice.get("installed") is not True:
+            raise ValueError("Hãy chọn một giọng đã cài trước khi chạy Multi video")
+        tts_provider = str(selected_voice.get("provider_id", ""))
+        tts_options: dict[str, object] = {
+            "purpose": "production",
+            "batch_size": 64 if tts_provider == "vieneu-3.3" else 16,
+            "adaptive_timing": True,
+            "voice_read_speed": self._voice_read_speed,
+            "max_absolute_speed": max(self._voice_read_speed, self._voice_cue_max_speed),
+            "qa_non_blocking": True,
+            "defer_timing_conform": False,
+        }
+        if tts_provider == "vieneu-3.3":
+            if self.vieneuReferenceAudio:
+                tts_options.update(
+                    {
+                        "reference_audio_path": self.vieneuReferenceAudio,
+                        "reference_text": self.vieneuReferenceText,
+                        "reference_denoise": self.vieneuReferenceDenoise,
+                    }
+                )
+            else:
+                profile_path = selected_voice.get("profile_path")
+                if isinstance(profile_path, str) and profile_path:
+                    tts_options["profile_path"] = profile_path
+        return {
+            "ocr": {
+                # Keep Multi on the exact sampling rate selected for the
+                # single-video OCR screen instead of silently falling back to
+                # a hard-coded 1.25 FPS.
+                "sample_interval_us": int(round(1_000_000 / self._ocr_sample_fps)),
+                "engine_python": self.ocrEnginePython,
+                "device": "gpu:0",
+            },
+            "translation": {
+                "provider_id": provider_id,
+                "model_id": model_id,
+                "provider_options": translation_options,
+            },
+            "tts": {
+                "provider_id": tts_provider,
+                "voice_id": self._selected_voice_id,
+                "provider_options": tts_options,
+            },
+        }
+
+    def _guard_manual_parallel(self, action: str, arguments: tuple[object, ...]) -> bool:
+        if self._parallel_warning_approved_once:
+            self._parallel_warning_approved_once = False
+            return False
+        if self.multiBatchState not in {"running", "pause_requested"}:
+            return False
+        current_project = str(self._multi_batch.get("current_project_id", ""))
+        if current_project and current_project == self.project_state.projectId:
+            current_item = next(
+                (
+                    item
+                    for item in self._multi_items
+                    if str(item.get("project_id", "")) == current_project
+                ),
+                {},
+            )
+            if str(current_item.get("stage", "")) == action:
+                self._set_status(
+                    "Project này đang được Multi video xử lý đúng bước đó; "
+                    "không thể khởi chạy tác vụ trùng."
+                )
+                return True
+        self._pending_parallel_action = (action, arguments)
+        self.parallelJobWarningRequested.emit(
+            "Multi video đang hoạt động. Tác vụ thủ công có thể tranh CPU, GPU, "
+            "VRAM và mạng; tốc độ của cả hai có thể giảm."
+        )
+        return True
+
+    @Slot(bool)
+    def resolveParallelJobWarning(self, run_anyway: bool) -> None:
+        pending = self._pending_parallel_action
+        self._pending_parallel_action = None
+        if not run_anyway or pending is None:
+            self._set_status("Đã quay lại; không khởi chạy tác vụ song song")
+            return
+        action, arguments = pending
+        self._parallel_warning_approved_once = True
+        if action == "ocr":
+            self.startOcr(float(arguments[0]))
+        elif action == "translate":
+            self.startTranslation(*arguments)
+        elif action == "tts":
+            purpose = str(arguments[0])
+            force_ids = arguments[1]
+            self._start_voice_job(
+                purpose,
+                force_cue_ids=(list(force_ids) if isinstance(force_ids, list) else None),
+            )
+
+    def _inspect_media_before_import(self, path: Path, *, intent: str) -> None:
+        self.runtime.request(
+            "inspect_media_usage",
+            {"media_path": str(path)},
+            context={"media_path": str(path), "intent": intent},
+        )
+        self._set_status("Đang kiểm tra media đã có trong dự án nào")
+
+    def _continue_media_import(
+        self,
+        path: Path,
+        *,
+        intent: str,
+        project_name: str | None = None,
+    ) -> None:
+        if intent == "new_project" or not self.project_state.hasProject:
+            self._request_project_creation(path, project_name=project_name)
+            return
+        self.runtime.request(
+            "import_media",
+            {
+                "project_id": self.project_state.projectId,
+                "media_path": str(path),
+                **self._default_overlay_import_options(),
+            },
+            context={"media_path": str(path)},
+        )
+        self._set_status("Đang đọc thông tin media")
+
+    def _request_project_creation(self, path: Path, *, project_name: str | None = None) -> None:
+        project_root = self.runtime.database_path.parent / "projects"
+        project_root.mkdir(parents=True, exist_ok=True)
+        project_path = project_root / f"{path.stem[:80]}-{uuid4().hex[:8]}.ducai"
+        name = (project_name or path.stem).strip()
+        if not name:
+            self._set_import_busy(False)
+            self._set_status("Tên dự án mới không được để trống")
+            return
+        self.runtime.request(
+            "create_project",
+            {"project_path": str(project_path), "name": name},
+            context={
+                "media_path": str(path),
+                **self._default_overlay_import_options(),
+            },
+        )
+        self._set_status("Đã tạo project mới, đang đọc media")
+
+    @Slot(str, str)
+    def resolveDuplicateMedia(self, action: str, project_name: str = "") -> None:
+        if not self._pending_media_path or not self._pending_media_intent:
+            return
+        path = Path(self._pending_media_path)
+        intent = self._pending_media_intent
+        usages = self._duplicate_media_info.get("usages", [])
+        if action == "use_existing":
+            project_id = ""
+            if isinstance(usages, list) and usages and isinstance(usages[0], dict):
+                value = usages[0].get("project_id", "")
+                project_id = value if isinstance(value, str) else ""
+            self._clear_duplicate_media(keep_busy=True)
+            if not project_id:
+                self._set_import_busy(False)
+                self._set_status("Không tìm thấy dự án đang chứa media")
+                return
+            if project_id == self.project_state.projectId:
+                self._set_import_busy(False)
+                self._save_state = "Đã lưu"
+                self.saveStateChanged.emit()
+                self._set_status("Media này đã nằm trong dự án hiện tại; không có gì bị thay đổi")
+                return
+            self.runtime.request("get_project", {"project_id": project_id})
+            self._save_state = "Đang mở dự án đã có"
+            self.saveStateChanged.emit()
+            self._set_status("Đang dùng lại dự án đã chứa media")
+            return
+        if action == "create_copy":
+            name = project_name.strip()
+            if intent == "new_project" and not name:
+                self._set_status("Hãy nhập tên cho dự án mới")
+                return
+            self._clear_duplicate_media(keep_busy=True)
+            self._continue_media_import(
+                path,
+                intent=intent,
+                project_name=name if intent == "new_project" else None,
+            )
+            return
+        self.cancelDuplicateMediaResolution()
+
+    @Slot()
+    def cancelDuplicateMediaResolution(self) -> None:
+        if not self._pending_media_path and not self._duplicate_media_info:
+            return
+        self._clear_duplicate_media(keep_busy=False)
+        self._save_state = "Không có thay đổi"
+        self.saveStateChanged.emit()
+        self._set_status("Đã đóng thông báo media trùng; dự án không thay đổi")
+
+    def _clear_duplicate_media(self, *, keep_busy: bool) -> None:
+        self._duplicate_media_info = {}
+        self._pending_media_path = ""
+        self._pending_media_intent = ""
+        self.duplicateMediaChanged.emit()
+        if not keep_busy:
+            self._set_import_busy(False)
+
+    @Slot(str)
+    def selectClip(self, clip_id: str) -> None:
+        value = clip_id if self.project_state.clip_info(clip_id) is not None else ""
+        track_selection_changed = bool(self._selected_track_id or self._selected_track_ids)
+        clip_selection_changed = value != self._selected_clip_id
+        if not track_selection_changed and not clip_selection_changed:
+            return
+        self._selected_clip_id = value
+        self._selected_track_id = ""
+        self._selected_track_ids.clear()
+        if clip_selection_changed:
+            self.selectedClipChanged.emit()
+        if track_selection_changed:
+            self.selectedTrackChanged.emit()
+
+    @Slot(str)
+    def selectTrack(self, track_id: str) -> None:
+        value = track_id if self.project_state.track_info(track_id) is not None else ""
+        next_ids = {value} if value else set()
+        track_selection_changed = (
+            value != self._selected_track_id or self._selected_track_ids != next_ids
+        )
+        clip_selection_changed = bool(self._selected_clip_id)
+        if not track_selection_changed and not clip_selection_changed:
+            return
+        self._selected_clip_id = ""
+        self._selected_track_id = value
+        self._selected_track_ids = next_ids
+        if clip_selection_changed:
+            self.selectedClipChanged.emit()
+        if track_selection_changed:
+            self.selectedTrackChanged.emit()
+
+    def _clear_clip_for_track_selection(self) -> None:
+        if not self._selected_clip_id:
+            return
+        self._selected_clip_id = ""
+        self.selectedClipChanged.emit()
+
+    @Slot(str)
+    def toggleTrackSelection(self, track_id: str) -> None:
+        if self.project_state.track_info(track_id) is None:
+            return
+        self._clear_clip_for_track_selection()
+        if track_id in self._selected_track_ids:
+            self._selected_track_ids.remove(track_id)
+        else:
+            self._selected_track_ids.add(track_id)
+        self._selected_track_id = (
+            track_id
+            if track_id in self._selected_track_ids
+            else (next(iter(self._selected_track_ids), ""))
+        )
+        self.selectedTrackChanged.emit()
+
+    @Slot()
+    def selectAllTracks(self) -> None:
+        self._clear_clip_for_track_selection()
+        ids = {
+            str(item.get("id"))
+            for item in self.project_state._track_by_id.values()
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        }
+        if ids != self._selected_track_ids:
+            self._selected_track_ids = ids
+            self._selected_track_id = next(iter(ids), "")
+            self.selectedTrackChanged.emit()
+
+    @Slot(float)
+    def setPlayheadMs(self, milliseconds: float) -> None:
+        value = max(0, int(milliseconds * 1_000))
+        if value == self._playhead_us:
+            return
+        self._playhead_us = value
+        self.playheadChanged.emit()
+
+    @Property(int, notify=previewMasterVolumeChanged)
+    def previewMasterVolumePercent(self) -> int:
+        return self._preview_master_volume_percent
+
+    @Slot(int)
+    def setPreviewMasterVolumePercent(self, percent: int) -> None:
+        value = max(0, min(100, int(percent)))
+        if value == self._preview_master_volume_percent:
+            return
+        self._preview_master_volume_percent = value
+        self.settings.setValue("preview/masterVolumePercent", value)
+        self.previewMasterVolumeChanged.emit()
+
+    @Slot(bool)
+    def splitSelected(self, apply_linked: bool = True) -> None:
+        self._send_timeline_command("split", apply_linked=apply_linked, use_playhead=True)
+
+    @Slot(bool)
+    def trimSelectedHead(self, apply_linked: bool = True) -> None:
+        self._send_timeline_command("trim_head", apply_linked=apply_linked, use_playhead=True)
+
+    @Slot(bool)
+    def trimSelectedTail(self, apply_linked: bool = True) -> None:
+        self._send_timeline_command("trim_tail", apply_linked=apply_linked, use_playhead=True)
+
+    @Slot(bool)
+    def deleteSelected(self, apply_linked: bool = True) -> None:
+        self._send_timeline_command("delete", apply_linked=apply_linked)
+
+    @Slot(float, bool)
+    def setSelectedSpeed(self, percent: float, apply_linked: bool = True) -> None:
+        self._send_timeline_command("speed", value=percent, apply_linked=apply_linked)
+
+    @Slot(float)
+    def setSelectedVolume(self, percent: float) -> None:
+        self._send_timeline_command("volume", value=percent / 100.0)
+
+    @Slot(float, float)
+    def resizeSelectedClip(self, start_us: float, end_us: float) -> None:
+        if not math.isfinite(start_us) or not math.isfinite(end_us):
+            return
+        if (
+            self._timeline_busy
+            or not self.project_state.hasProject
+            or not self._selected_clip_id
+            or end_us <= start_us
+        ):
+            return
+        self._set_timeline_busy(True)
+        self.runtime.request(
+            "timeline_command",
+            {
+                "project_id": self.project_state.projectId,
+                "command": "resize",
+                "clip_id": self._selected_clip_id,
+                "timeline_start_us": round(start_us),
+                "timeline_end_us": round(end_us),
+                "apply_linked": False,
+            },
+        )
+        self._set_status("Đang thay đổi tốc độ cue D1")
+
+    @Slot()
+    def autoFitVoiceTiming(self) -> None:
+        if not self.project_state.hasProject or self._timeline_busy:
+            return
+        self._set_timeline_busy(True)
+        self.runtime.request(
+            "timeline_command",
+            {
+                "project_id": self.project_state.projectId,
+                "command": "auto_fit_voice_timing",
+                "track_id": "D1",
+                "track_ids": [],
+            },
+        )
+        self._set_status("Đang tự khớp các cue D1 bị lệch")
+
+    @Slot()
+    def deleteSelectedTracks(self) -> None:
+        ids = tuple(
+            sorted(
+                self._selected_track_ids
+                or ({self._selected_track_id} if self._selected_track_id else set())
+            )
+        )
+        if not ids or self._timeline_busy or not self.project_state.hasProject:
+            return
+        self._set_timeline_busy(True)
+        self.runtime.request(
+            "timeline_command",
+            {
+                "project_id": self.project_state.projectId,
+                "command": "delete_tracks",
+                "track_ids": list(ids),
+            },
+        )
+        self._set_status("Đang xoá " + ", ".join(ids))
+
+    @Slot(bool)
+    def setSelectedTrackMuted(self, muted: bool) -> None:
+        self._send_track_command("track_mute", muted)
+
+    @Slot(bool)
+    def setSelectedTrackLocked(self, locked: bool) -> None:
+        self._send_track_command("track_lock", locked)
+
+    @Slot(str, float)
+    def setTrackVolumePercent(self, track_id: str, percent: float) -> None:
+        if not math.isfinite(percent):
+            return
+        self._send_track_command_by_id(
+            "track_volume", track_id, max(0.0, min(200.0, percent)) / 100.0
+        )
+
+    @Slot(str, bool)
+    def setTrackMuted(self, track_id: str, muted: bool) -> None:
+        self._send_track_command_by_id("track_mute", track_id, muted)
+
+    @Slot()
+    def undoTimeline(self) -> None:
+        self._send_timeline_command("undo", needs_selection=False)
+
+    @Slot()
+    def redoTimeline(self) -> None:
+        self._send_timeline_command("redo", needs_selection=False)
+
+    @Slot(str, int, result=int)
+    def uiIntValue(self, key: str, default_value: int) -> int:
+        return int(self.settings.value(f"ui/layout/{key}", default_value, type=int))
+
+    @Slot(str, int)
+    def setUiIntValue(self, key: str, value: int) -> None:
+        self.settings.setValue(f"ui/layout/{key}", int(value))
+
+    @Slot(str, float, result=float)
+    def uiRealValue(self, key: str, default_value: float) -> float:
+        try:
+            value = float(self.settings.value(f"ui/layout/{key}", default_value, type=float))
+        except (TypeError, ValueError):
+            value = default_value
+        if not math.isfinite(value):
+            value = default_value
+        return max(0.05, min(0.95, value))
+
+    @Slot(str, float)
+    def setUiRealValue(self, key: str, value: float) -> None:
+        if not math.isfinite(value):
+            return
+        self.settings.setValue(f"ui/layout/{key}", max(0.05, min(0.95, value)))
+
+    @Slot(str, str, result=str)
+    def uiStringValue(self, key: str, default_value: str) -> str:
+        return self.settings.value(f"ui/layout/{key}", default_value, type=str)
+
+    @Slot(str, str)
+    def setUiStringValue(self, key: str, value: str) -> None:
+        self.settings.setValue(f"ui/layout/{key}", value)
+
+    @staticmethod
+    def _screen_index(workspace_id: str) -> int:
+        return {
+            "dashboard": 0,
+            "projects": 1,
+            "transcribe": 2,
+            "translate": 2,
+            "subtitles": 2,
+            "voice": 3,
+            "multi": 4,
+            "timeline": 5,
+            "effects": 6,
+            "mixer": 6,
+            "export": 6,
+            "queue": 6,
+            "settings": 7,
+        }.get(workspace_id, 0)
+
+    @Slot(str)
+    def _set_status(self, value: str) -> None:
+        if value == self._status_message:
+            return
+        self._status_message = value
+        self.statusMessageChanged.emit()
+        # Keep the footer as the durable status surface, while promoting
+        # terminal failures and meaningful completions to a readable toast.
+        # Progress chatter ("Đang …") intentionally stays in the footer so a
+        # long-running job does not keep replacing the user's notification.
+        normalized = value.strip().casefold()
+        is_error = any(
+            marker in normalized
+            for marker in (
+                "không thể",
+                "không tạo được",
+                "không đọc được",
+                "không tìm thấy",
+                "không hợp lệ",
+                "chưa thể tiếp tục",
+                "thất bại",
+                "lỗi",
+            )
+        ) or (self._runtime_state == "error" and normalized not in {"sẵn sàng"})
+        is_success = (
+            normalized.startswith("đã ")
+            or "hoàn tất" in normalized
+            or "sẵn sàng" in normalized
+            or "đạt qa" in normalized
+        )
+        is_warning = any(
+            marker in normalized
+            for marker in (
+                "cần sửa",
+                "vượt timeline",
+                "chưa đạt",
+                "chưa thể",
+                "chưa tạo",
+                "bị gián đoạn",
+                "dừng ở bước qa",
+            )
+        )
+        if is_error:
+            self.statusNotificationRequested.emit(value, "error", 10_000)
+        elif is_success:
+            self.statusNotificationRequested.emit(value, "success", 10_000)
+        elif is_warning:
+            self.statusNotificationRequested.emit(value, "warning", 8_000)
+
+    @staticmethod
+    def _job_kind_label(item: dict[str, object]) -> str:
+        spec = item.get("spec")
+        kind = spec.get("kind") if isinstance(spec, dict) else ""
+        config = spec.get("provider_config") if isinstance(spec, dict) else {}
+        config = config if isinstance(config, dict) else {}
+        if kind == "ocr":
+            return "OCR"
+        if kind == "translate":
+            purpose = str(config.get("purpose", ""))
+            return "Rút gọn cue dài" if purpose == "voice_timing_repair" else "Dịch thuật"
+        if kind == "tts":
+            return "Đồng bộ voice" if config.get("job_mode") == "voice_conform" else "Tạo giọng"
+        if kind == "export":
+            return "Xuất video"
+        return str(kind or "Tác vụ")
+
+    @staticmethod
+    def _localized_error_message(code: str, fallback: str = "") -> str:
+        """Translate internal failure identifiers into user-facing guidance.
+
+        Error identifiers remain persisted for diagnostics, but the GUI must
+        not force users to interpret implementation names such as
+        ``tts_timeline_overlap_guard_failed``. Worker/provider messages that
+        are already human-readable are retained as a fallback.
+        """
+
+        normalized = code.strip().casefold()
+        messages = {
+            "tts_timeline_overlap_guard_failed": (
+                "Các đoạn voice đang chồng lên nhau khi ráp timeline. "
+                "Hãy chọn Bỏ qua cảnh báo để xếp câu tuần tự và kéo dài timeline, "
+                "hoặc rút gọn cue dài rồi tiếp tục từ cache."
+            ),
+            "voice_conform_timeline_overlap_guard_failed": (
+                "Các đoạn voice vẫn chồng sau khi đồng bộ. Hãy kiểm tra timestamp "
+                "nguồn hoặc chọn Giãn video/Kết hợp; WAV cache vẫn được giữ."
+            ),
+            "tts_review_required": (
+                "Tạo giọng đã dừng ở bước kiểm tra thời lượng. Hãy mở QA voice, "
+                "rút gọn cue dài hoặc chọn Bỏ qua cảnh báo để giữ nguyên voice."
+            ),
+            "cue_sync_limit_exceeded": (
+                "Một hoặc nhiều cue cần tốc độ vượt giới hạn. Hãy rút gọn câu, "
+                "kéo dài đoạn video hoặc chọn chế độ đồng bộ phù hợp."
+            ),
+            "cue_too_long": (
+                "Một hoặc nhiều cue có voice dài hơn khung phụ đề. Hãy rút gọn "
+                "các cue được đánh dấu hoặc chọn Bỏ qua cảnh báo."
+            ),
+            "worker_exit_without_ack": (
+                "Bộ máy tạo giọng đã dừng trước khi xác nhận checkpoint. Hãy "
+                "tiếp tục từ cache; dữ liệu đã xử lý không cần tạo lại."
+            ),
+            "child_interrupted": (
+                "Tác vụ Multi bị gián đoạn khi khởi động hoặc điều khiển worker. "
+                "Cache/checkpoint vẫn được giữ; bấm Tiếp tục Multi video để chạy lại "
+                "đúng công đoạn, không quay về OCR."
+            ),
+            "insufficient_disk_space": (
+                "Ổ đĩa không còn đủ chỗ để lưu checkpoint. Hãy dọn dung lượng trong "
+                "thư mục dữ liệu DUCAI rồi tiếp tục từ cache hiện có."
+            ),
+            "tts_audio_invalid": (
+                "Một WAV voice không hợp lệ hoặc không đọc được. Hãy tiếp tục từ "
+                "cache để tạo lại riêng cue lỗi."
+            ),
+            "tts_audio_quality_failed": (
+                "Một WAV voice không đạt kiểm tra chất lượng. Hãy tiếp tục từ "
+                "cache để xử lý lại riêng cue lỗi."
+            ),
+            "tts_missing_approved_clip": (
+                "Đang thiếu WAV đã kiểm tra của một hoặc nhiều cue. Hãy tiếp tục "
+                "từ cache để bổ sung các cue còn thiếu."
+            ),
+            "voice_clip_exceeds_timeline": (
+                "Voice vượt thời lượng timeline hiện tại. Hãy bật cho phép kéo "
+                "dài timeline hoặc dùng chế độ Giãn video/Kết hợp."
+            ),
+            "strict_voice_exceeds_media_duration": (
+                "Voice dài hơn video và chế độ hiện tại không cho phép kéo dài. "
+                "Hãy chọn Bỏ qua cảnh báo hoặc rút gọn cue dài."
+            ),
+            "adaptive_voice_exceeds_media_duration": (
+                "Voice vẫn dài hơn video sau khi tăng tốc trong giới hạn. Hãy "
+                "rút gọn cue còn lỗi hoặc cho phép kéo dài timeline."
+            ),
+            "provider_access_blocked": (
+                "Gateway hoặc CDN đang chặn kết nối từ ứng dụng. Hãy kiểm tra "
+                "endpoint, mạng và chính sách truy cập của nhà cung cấp."
+            ),
+            "authentication_required": (
+                "Nhà cung cấp yêu cầu xác thực lại. Nếu dùng API, hãy kiểm tra "
+                "key và quyền model; nếu dùng Gemini Web, hãy thử lại từ cache "
+                "hoặc chuyển sang Gemini API/CLI."
+            ),
+        }
+        translated = messages.get(normalized)
+        if translated:
+            return translated
+        raw_fallback = str(fallback or "").strip()
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+", raw_fallback):
+            return "Tác vụ không thể hoàn tất. Cache/checkpoint vẫn được giữ lại nếu có."
+        cleaned = ApplicationViewModel._sanitize_error_detail(raw_fallback, code)
+        # Do not echo a raw snake_case implementation identifier when no
+        # dedicated translation exists.
+        if cleaned and not (
+            normalized
+            and cleaned.casefold() == normalized
+            and all(character.isalnum() or character == "_" for character in cleaned)
+        ):
+            return cleaned[:500]
+        return "Tác vụ không thể hoàn tất. Cache/checkpoint vẫn được giữ lại nếu có."
+
+    @staticmethod
+    def _localized_issue_label(code: str) -> str:
+        """Return a short Vietnamese label for a QA issue identifier.
+
+        Issue identifiers are intentionally kept in the persisted QA payload so
+        workers and diagnostics retain a stable contract.  They are not useful
+        to an editor, however, so every identifier shown in the UI is converted
+        to a readable Vietnamese label here.  Unknown identifiers fall back to
+        a generic label rather than leaking an implementation name.
+        """
+
+        labels = {
+            "name_inconsistency": "Tên nhân vật không nhất quán",
+            "translation_error": "Lỗi nội dung bản dịch",
+            "context": "Sai ngữ cảnh",
+            "wrong": "Dịch sai nghĩa",
+            "style": "Lỗi văn phong",
+            "broken": "Câu dịch bị cụt",
+            "cjk": "Còn chữ Hán chưa dịch",
+            "cjk_remaining": "Còn chữ Hán chưa dịch",
+            "untranslated_latin_term": "Còn thuật ngữ chưa Việt hóa",
+            "possibly_untranslated_latin": "Có thể còn chữ chưa Việt hóa",
+            "overlong_translation": "Câu dịch quá dài",
+            "long_line": "Dòng phụ đề quá dài",
+            "film_bible_name_mismatch": "Tên riêng lệch Film Bible",
+            "film_bible_term_mismatch": "Thuật ngữ lệch Film Bible",
+            "cue_too_long": "Cue dài hơn khung thời gian",
+            "cue_sync_limit_exceeded": "Cue vượt giới hạn tốc độ",
+            "tts_review_required": "Cần rà soát thời lượng voice",
+            "tts_timeline_overlap_guard_failed": "Các đoạn voice bị chồng",
+            "voice_conform_timeline_overlap_guard_failed": ("Các đoạn voice bị chồng sau đồng bộ"),
+            "worker_exit_without_ack": "Bộ máy dừng trước khi lưu checkpoint",
+            "child_interrupted": "Tác vụ Multi bị gián đoạn",
+            "insufficient_disk_space": "Không đủ dung lượng lưu checkpoint",
+            "tts_audio_invalid": "WAV voice không hợp lệ",
+            "tts_audio_quality_failed": "WAV voice chưa đạt kiểm tra chất lượng",
+            "tts_missing_approved_clip": "Thiếu WAV voice đã kiểm tra",
+            "translation_review_required": "Cần rà soát bản dịch",
+            "ocr_review_required": "Cần rà soát kết quả OCR",
+        }
+        parts = [part.strip() for part in str(code or "").replace(",", " ").split()]
+        if not parts:
+            return "QA cần kiểm tra"
+        localized = []
+        for part in parts:
+            label = labels.get(part.casefold(), "Lỗi kiểm tra bản dịch")
+            if label not in localized:
+                localized.append(label)
+        return " / ".join(localized)
+
+    @Slot(str, result=str)
+    def localizedIssueLabel(self, code: str) -> str:
+        """Expose Vietnamese QA labels to QML without exposing internal codes."""
+
+        return self._localized_issue_label(code)
+
+    @staticmethod
+    def _sanitize_error_detail(value: object, code: str = "") -> str:
+        """Remove implementation-style identifiers from user-facing detail."""
+
+        cleaned = redact_sensitive_text(str(value or "").strip())
+        normalized = str(code or "").strip().casefold()
+
+        def replace_identifier(match: re.Match[str]) -> str:
+            token = match.group(0)
+            if token.casefold() == normalized:
+                return ApplicationViewModel._localized_issue_label(token)
+            known = ApplicationViewModel._localized_issue_label(token)
+            return known if known != "Lỗi kiểm tra bản dịch" else "chi tiết kỹ thuật"
+
+        # Error/QA codes use snake_case; replacing those tokens keeps provider
+        # diagnostics useful without exposing implementation names in a toast.
+        return re.sub(
+            r"(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+(?![A-Za-z0-9_])",
+            replace_identifier,
+            cleaned,
+        )
+
+    @classmethod
+    def _format_terminal_job_status(cls, item: dict[str, object]) -> str:
+        """Build a readable, recoverable status from a polled terminal job.
+
+        Workers persist only a bounded, redacted error payload.  Pick the
+        useful human-facing fields instead of dumping JSON (which can contain
+        paths or provider diagnostics that are too noisy for a toast).
+        """
+
+        label = cls._job_kind_label(item)
+        job_id = str(item.get("id", "")).strip()
+        short_id = job_id[:8] if job_id else "không rõ"
+        state = str(item.get("state", "")).strip().casefold()
+        code = str(item.get("error_code", "")).strip()
+        payload = item.get("error_payload")
+        payload = payload if isinstance(payload, dict) else {}
+        detail = ""
+        for key in ("message", "reason", "detail", "error", "stderr"):
+            value = payload.get(key)
+            if value is not None and str(value).strip():
+                detail = cls._sanitize_error_detail(value, code)
+                break
+        if detail:
+            detail = detail[:300]
+        task_suffix = f" (tác vụ {short_id})"
+        if state == "succeeded":
+            return f"Đã hoàn tất {label.lower()}{task_suffix} và lưu kết quả."
+        if state == "cancelled":
+            return f"Đã hủy {label.lower()}{task_suffix}; checkpoint/cache đã được giữ lại."
+        if state == "interrupted":
+            reason = f" Nguyên nhân: {detail}." if detail else ""
+            return (
+                f"{label} bị gián đoạn{task_suffix}; checkpoint/cache đã được giữ lại. "
+                f"Có thể tiếp tục từ cache.{reason}"
+            )
+
+        review_hint = {
+            "ocr_review_required": (
+                "OCR đã dừng ở bước QA; cần rà soát vùng lỗi trước khi nhập SRT."
+            ),
+            "translation_review_required": (
+                "Dịch đã dừng ở bước QA; hãy mở Biên tập dịch thuật để xử lý cue lỗi."
+            ),
+            "tts_review_required": (
+                "Tạo giọng đã dừng ở QA timing; hãy xử lý cue dài hoặc chọn cách đồng bộ voice."
+            ),
+            "tts_timeline_overlap_guard_failed": (
+                "Tạo giọng thất bại: các đoạn voice đang chồng lên nhau; hãy chọn "
+                "Bỏ qua cảnh báo để xếp tuần tự "
+                "và kéo dài timeline, hoặc rút gọn cue dài rồi tiếp tục từ cache."
+            ),
+            "voice_conform_timeline_overlap_guard_failed": (
+                "Đồng bộ voice thất bại: các đoạn voice vẫn chồng sau khi đồng bộ; "
+                "hãy kiểm tra timestamp nguồn "
+                "hoặc chọn Giãn video/Kết hợp."
+            ),
+        }.get(code)
+        if review_hint:
+            reason = (
+                f" Chi tiết: {detail}." if detail and detail.casefold() != code.casefold() else ""
+            )
+            return f"{review_hint}{reason} Cache/checkpoint vẫn được giữ lại.{task_suffix}"
+        translated = cls._localized_error_message(code, detail)
+        reason = f" Chi tiết: {detail}." if detail and detail.casefold() != code.casefold() else ""
+        return (
+            f"{label} thất bại{task_suffix}. {translated}{reason} "
+            "Cache/checkpoint vẫn được giữ lại nếu có."
+        )
+
+    def _notify_terminal_job_changes(self, raw_items: list[object]) -> None:
+        """Notify once when a current-project job reaches a terminal state."""
+
+        # Jobs are polled before the first project snapshot during startup. Do
+        # not treat that unscoped list as a transition for whichever project is
+        # opened later; otherwise old failures would appear as fresh errors.
+        if not self.project_state.projectId:
+            return
+        current_markers: dict[str, tuple[object, ...]] = {}
+        terminal_states = {"succeeded", "failed", "interrupted", "cancelled"}
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                continue
+            spec = raw_item.get("spec")
+            if not isinstance(spec, dict):
+                continue
+            if str(spec.get("project_id", "")) != self.project_state.projectId:
+                continue
+            job_id = str(raw_item.get("id", "")).strip()
+            if not job_id:
+                continue
+            state = str(raw_item.get("state", "")).strip().casefold()
+            marker = (
+                state,
+                str(raw_item.get("error_code", "")),
+                str(raw_item.get("finished_at", "")),
+                repr(raw_item.get("error_payload", {})),
+            )
+            current_markers[job_id] = marker
+            if not self._jobs_snapshot_initialized or state not in terminal_states:
+                continue
+            if self._terminal_job_notification_markers.get(job_id) == marker:
+                continue
+            if state == "succeeded" and self._success_status_is_reloadable(raw_item, job_id):
+                # OCR, translation and production TTS publish through a
+                # follow-up get_project action, whose status explains the
+                # destination (for example, "đã chuyển sang Timeline"). Do
+                # not replace that more useful toast with a generic success.
+                continue
+            self._set_status(self._format_terminal_job_status(raw_item))
+        self._terminal_job_notification_markers = current_markers
+        self._jobs_snapshot_initialized = True
+
+    def _success_status_is_reloadable(self, item: dict[str, object], job_id: str) -> bool:
+        spec = item.get("spec")
+        if not isinstance(spec, dict):
+            return False
+        kind = str(spec.get("kind", ""))
+        if kind == "ocr":
+            return job_id in self._reloaded_ocr_jobs
+        if kind == "translate":
+            return job_id in self._reloaded_translation_jobs
+        if kind == "tts":
+            config = spec.get("provider_config")
+            config = config if isinstance(config, dict) else {}
+            return (
+                config.get("purpose") == "production"
+                and config.get("job_mode") != "voice_conform"
+                and job_id in self._reloaded_tts_jobs
+            )
+        return False
+
+    @Slot(bool)
+    def _set_backend_ready(self, value: bool) -> None:
+        if value == self._backend_ready:
+            return
+        self._backend_ready = value
+        self.backendReadyChanged.emit()
+        if not value and self._multi_detail_busy:
+            self._multi_detail_generation += 1
+            self._finish_multi_detail()
+        if not value and self._pending_tts_start is not None:
+            self._pending_tts_start = None
+            self._set_voice_playback_enabled(True)
+            self._set_tts_busy(False)
+            self._set_tts_job_state("interrupted")
+
+    @Slot(str)
+    def _set_runtime_state(self, value: str) -> None:
+        if value == self._runtime_state:
+            return
+        self._runtime_state = value
+        self.runtimeStateChanged.emit()
+
+    @Slot(object)
+    def _replace_jobs(self, raw_items: object) -> None:
+        project_id = self.project_state.projectId
+        for model in (self.jobs, self.subtitle_jobs, self.voice_jobs, self.export_jobs):
+            model.setProjectFilter(project_id)
+        self.jobs.replace(raw_items)
+        self.subtitle_jobs.replace(raw_items)
+        self.voice_jobs.replace(raw_items)
+        self.export_jobs.replace(raw_items)
+        active_id = self.subtitle_jobs.active_job_id(self.project_state.projectId, "ocr")
+        self._ocr_job_id = active_id
+        self._set_ocr_busy(bool(active_id))
+        if not isinstance(raw_items, list):
+            return
+        latest_ocr = next(
+            (
+                item
+                for item in raw_items
+                if isinstance(item, dict)
+                and isinstance(item.get("spec"), dict)
+                and item["spec"].get("kind") == "ocr"
+                and item["spec"].get("project_id") == self.project_state.projectId
+            ),
+            None,
+        )
+        next_state = str(latest_ocr.get("state", "")) if latest_ocr else ""
+        if not active_id and latest_ocr and next_state in {"interrupted", "failed"}:
+            self._ocr_job_id = str(latest_ocr.get("id", ""))
+        self._set_ocr_job_state(next_state)
+        visible_job_ids = {
+            str(item.get("id", ""))
+            for item in raw_items
+            if isinstance(item, dict) and item.get("id")
+        }
+        completed_history_deletions = self._pending_history_deletion_ids - visible_job_ids
+        if completed_history_deletions:
+            self._request_translation_cache_list(project_id)
+        active_translation_id = self.subtitle_jobs.active_job_id(
+            self.project_state.projectId, "translate"
+        )
+        if active_translation_id:
+            self._translation_job_id = active_translation_id
+        translation_start_pending = (
+            not active_translation_id
+            and self._translation_busy
+            and self._translation_job_state == "start_requested"
+        )
+        if not translation_start_pending:
+            self._set_translation_busy(bool(active_translation_id))
+        newest_translation = next(
+            (
+                item
+                for item in raw_items
+                if isinstance(item, dict)
+                and isinstance(item.get("spec"), dict)
+                and item["spec"].get("kind") == "translate"
+                and item["spec"].get("project_id") == self.project_state.projectId
+            ),
+            None,
+        )
+        if newest_translation:
+            newest_state = str(newest_translation.get("state", ""))
+            newest_marker = (
+                str(newest_translation.get("id", "")),
+                newest_state,
+                str(newest_translation.get("finished_at", "")),
+                str(newest_translation.get("error_code", "")),
+            )
+            if (
+                newest_state in {"succeeded", "failed", "interrupted", "cancelled"}
+                and newest_marker != self._translation_cache_refresh_marker
+            ):
+                self._translation_cache_refresh_marker = newest_marker
+                self._request_translation_cache_list(project_id)
+        selected_translation = next(
+            (
+                item
+                for item in raw_items
+                if isinstance(item, dict)
+                and str(item.get("id", "")) == self._selected_translation_cache_id
+            ),
+            None,
+        )
+        active_translation = next(
+            (
+                item
+                for item in raw_items
+                if isinstance(item, dict) and str(item.get("id", "")) == active_translation_id
+            ),
+            None,
+        )
+        active_translation_config = (
+            active_translation.get("spec", {}).get("provider_config", {})
+            if isinstance(active_translation, dict)
+            else {}
+        )
+        active_timing_repair = (
+            isinstance(active_translation_config, dict)
+            and active_translation_config.get("translation_purpose") == "voice_timing_repair"
+        )
+        self._set_voice_timing_auto_repair_busy(
+            active_timing_repair
+            or (bool(self._voice_timing_repair_requests) and self._translation_busy)
+        )
+        latest_translation = (
+            active_translation
+            if active_translation_id
+            else selected_translation or newest_translation
+        )
+        if not translation_start_pending:
+            self._translation_provider_id = ""
+            if latest_translation and isinstance(latest_translation.get("spec"), dict):
+                self._translation_provider_id = str(
+                    latest_translation["spec"].get("provider_id", "")
+                )
+        translation_state = str(latest_translation.get("state", "")) if latest_translation else ""
+        if (
+            latest_translation
+            and latest_translation.get("error_code") == "translation_review_required"
+        ):
+            translation_state = "review"
+        if (
+            not active_translation_id
+            and latest_translation
+            and translation_state in {"interrupted", "failed", "review", "cancelled"}
+        ):
+            self._translation_job_id = str(latest_translation.get("id", ""))
+        if not translation_start_pending:
+            self._set_translation_job_state(translation_state)
+        selected_cache_protects_preview = bool(
+            self._selected_translation_cache_id
+            and latest_translation
+            and str(latest_translation.get("id", "")) != self._selected_translation_cache_id
+        )
+        if (
+            latest_translation
+            and translation_state not in {"succeeded", "review"}
+            and not selected_cache_protects_preview
+            and not translation_start_pending
+        ):
+            latest_translation_id = str(latest_translation.get("id", ""))
+            terminal_translation = translation_state in {"failed", "cancelled"}
+            if latest_translation_id and (
+                not terminal_translation
+                or latest_translation_id not in self._translation_terminal_event_jobs
+            ):
+                self._request_translation_deltas(
+                    latest_translation_id,
+                    self.project_state.projectId,
+                    terminal=terminal_translation,
+                )
+                self._request_translation_qa_status(
+                    latest_translation_id,
+                    self.project_state.projectId,
+                    terminal=terminal_translation,
+                )
+        elif not latest_translation:
+            self._set_translation_qa({"status": "NONE", "issues": []})
+        active_tts = next(
+            (
+                item
+                for item in raw_items
+                if isinstance(item, dict)
+                and isinstance(item.get("spec"), dict)
+                and item["spec"].get("kind") == "tts"
+                and item["spec"].get("project_id") == self.project_state.projectId
+                and isinstance(item["spec"].get("provider_config"), dict)
+                and item["spec"]["provider_config"].get("job_mode") != "voice_conform"
+                and item["spec"]["provider_config"].get("purpose") in {"production", "preview"}
+                and item.get("state")
+                in {
+                    "queued",
+                    "start_requested",
+                    "running",
+                    "pause_requested",
+                    "paused",
+                    "resume_requested",
+                    "cancel_requested",
+                }
+            ),
+            None,
+        )
+        active_tts_id = str(active_tts.get("id", "")) if active_tts else ""
+        latest_tts = next(
+            (
+                item
+                for item in raw_items
+                if isinstance(item, dict)
+                and isinstance(item.get("spec"), dict)
+                and item["spec"].get("kind") == "tts"
+                and item["spec"].get("project_id") == self.project_state.projectId
+                and isinstance(item["spec"].get("provider_config"), dict)
+                and item["spec"]["provider_config"].get("purpose") == "production"
+                and item["spec"]["provider_config"].get("job_mode") != "voice_conform"
+            ),
+            None,
+        )
+        latest_preview_tts = next(
+            (
+                item
+                for item in raw_items
+                if isinstance(item, dict)
+                and isinstance(item.get("spec"), dict)
+                and item["spec"].get("kind") == "tts"
+                and item["spec"].get("project_id") == self.project_state.projectId
+                and isinstance(item["spec"].get("provider_config"), dict)
+                and item["spec"]["provider_config"].get("purpose") == "preview"
+            ),
+            None,
+        )
+        current_tts = active_tts or latest_tts or latest_preview_tts
+        if current_tts is not None:
+            self._tts_job_id = str(current_tts.get("id", ""))
+            current_config = current_tts.get("spec", {}).get("provider_config", {})
+            current_config = current_config if isinstance(current_config, dict) else {}
+            current_purpose = (
+                "voice_conform"
+                if current_config.get("job_mode") == "voice_conform"
+                else str(current_config.get("purpose", ""))
+            )
+            self._set_tts_job_purpose(current_purpose)
+            current_state = str(current_tts.get("state", ""))
+            if current_tts.get("error_code") == "tts_review_required":
+                current_state = "review"
+            self._set_tts_job_state(current_state)
+        else:
+            self._tts_job_id = ""
+            self._set_tts_job_purpose("")
+            self._set_tts_job_state("")
+        self._set_tts_busy(bool(active_tts_id))
+        tts_state = str(latest_tts.get("state", "")) if latest_tts else ""
+        if latest_tts and latest_tts.get("error_code") == "tts_review_required":
+            tts_state = "review"
+        conform_jobs = [
+            item
+            for item in raw_items
+            if isinstance(item, dict)
+            and isinstance(item.get("spec"), dict)
+            and item["spec"].get("kind") == "tts"
+            and item["spec"].get("project_id") == self.project_state.projectId
+            and isinstance(item["spec"].get("provider_config"), dict)
+            and item["spec"]["provider_config"].get("job_mode") == "voice_conform"
+        ]
+        latest_conform = conform_jobs[0] if conform_jobs else None
+        if latest_conform is not None:
+            self._voice_conform_job_id = str(latest_conform.get("id", ""))
+            conform_state = str(latest_conform.get("state", ""))
+            self._voice_conform_job_state = conform_state
+            self._voice_conform_busy = conform_state in {
+                "queued",
+                "start_requested",
+                "running",
+                "pause_requested",
+                "paused",
+                "resume_requested",
+                "cancel_requested",
+            }
+            # A newly failed/interrupted conform job does not roll back a
+            # previously published project revision.  Job outcome and the
+            # persisted project state are independent; derive the applied
+            # flag from the latter for every conform refresh.
+            self._voice_conform_applied = self.project_state.voiceConformApplied
+            self.voiceConformChanged.emit()
+        elif not self.project_state.voiceConformApplied and not self._voice_conform_busy:
+            self._voice_conform_job_id = ""
+            self._voice_conform_job_state = ""
+            self._voice_conform_applied = False
+        latest_tts_config = (
+            latest_tts.get("spec", {}).get("provider_config", {})
+            if isinstance(latest_tts, dict)
+            else {}
+        )
+        if isinstance(latest_tts_config, dict) and (
+            latest_tts_config.get("allow_timeline_overflow") is True
+            and tts_state
+            in {
+                "succeeded",
+                "failed",
+                "interrupted",
+                "cancelled",
+            }
+        ):
+            self._voice_timing_override_requests.discard(
+                str(latest_tts_config.get("timing_override_parent_job_id", ""))
+            )
+        latest_tts_is_production = (
+            isinstance(latest_tts_config, dict) and latest_tts_config.get("purpose") == "production"
+        )
+        if latest_tts and latest_tts_is_production and tts_state in {"review", "succeeded"}:
+            self._request_voice_timing_review(str(latest_tts.get("id", "")))
+        if latest_tts and latest_tts_is_production and tts_state == "succeeded":
+            timing_override = latest_tts_config.get("allow_timeline_overflow") is True
+            latest_tts_result = latest_tts.get("result", {})
+            latest_tts_result = latest_tts_result if isinstance(latest_tts_result, dict) else {}
+            adjusted_cue_count = int(latest_tts_result.get("adjusted_cue_count", 0) or 0)
+            self._set_voice_timing_qa(
+                {
+                    "status": "PASS",
+                    "job_id": str(latest_tts.get("id", "")),
+                    "issue_count": 0,
+                    "issues": [],
+                    "voice_read_speed": float(
+                        latest_tts_result.get(
+                            "voice_read_speed",
+                            latest_tts_config.get("voice_read_speed", 1.0),
+                        )
+                        or 1.0
+                    ),
+                    "cue_max_total_speed": float(
+                        latest_tts_result.get(
+                            "cue_max_total_speed",
+                            latest_tts_config.get("max_absolute_speed", 1.0),
+                        )
+                        or 1.0
+                    ),
+                    "adjusted_cue_count": adjusted_cue_count,
+                    "maximum_additional_factor": float(
+                        latest_tts_result.get("maximum_additional_factor", 1.0) or 1.0
+                    ),
+                    "unresolved_timing_cue_count": 0,
+                    "message": (
+                        "Đã thêm nguyên voice vào Timeline; hãy chỉnh tốc độ voice hoặc "
+                        "video trước khi xuất."
+                        if timing_override
+                        else (
+                            "Voice đã khớp timeline và đạt QA; "
+                            f"{adjusted_cue_count} cue dài đã được tăng thêm."
+                        )
+                    ),
+                }
+            )
+        preview_tts = next(
+            (
+                item
+                for item in raw_items
+                if isinstance(item, dict)
+                and isinstance(item.get("spec"), dict)
+                and item["spec"].get("kind") == "tts"
+                and item["spec"].get("project_id") == self.project_state.projectId
+                and item.get("state") == "succeeded"
+                and isinstance(item.get("result"), dict)
+                and item["result"].get("purpose") == "preview"
+            ),
+            None,
+        )
+        if preview_tts and isinstance(preview_tts.get("result"), dict):
+            tts_result = preview_tts["result"]
+            output_path = tts_result.get("output_path")
+            if isinstance(output_path, str) and Path(output_path).is_file():
+                preview_source = QUrl.fromLocalFile(output_path).toString()
+                if preview_source != self._voice_preview_source:
+                    self._voice_preview_source = preview_source
+                    self.voicePreviewChanged.emit()
+        active_export_id = self.export_jobs.active_job_id(self.project_state.projectId, "export")
+        if active_export_id:
+            self._export_job_id = active_export_id
+        self._set_export_busy(bool(active_export_id))
+        latest_export = next(
+            (
+                item
+                for item in raw_items
+                if isinstance(item, dict)
+                and isinstance(item.get("spec"), dict)
+                and item["spec"].get("kind") == "export"
+                and item["spec"].get("project_id") == self.project_state.projectId
+            ),
+            None,
+        )
+        export_state = str(latest_export.get("state", "")) if latest_export else ""
+        if not active_export_id and latest_export and export_state in {"interrupted", "failed"}:
+            self._export_job_id = str(latest_export.get("id", ""))
+        self._set_export_job_state(export_state)
+        if latest_export and isinstance(latest_export.get("result"), dict):
+            export_result = latest_export["result"]
+            output_path = export_result.get("output_path")
+            qa_path = export_result.get("qa_path")
+            if isinstance(output_path, str) and output_path:
+                preview_source = QUrl.fromLocalFile(output_path).toString()
+                changed = preview_source != self._last_export_source
+                self._last_export_source = preview_source
+                self._last_export_qa_path = qa_path if isinstance(qa_path, str) else ""
+                if changed:
+                    self.exportPreviewChanged.emit()
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            is_importable_terminal = item.get("state") == "succeeded" or (
+                item.get("state") == "failed"
+                and item.get("error_code")
+                in {
+                    "ocr_review_required",
+                    "translation_review_required",
+                    "tts_review_required",
+                }
+            )
+            if not is_importable_terminal:
+                continue
+            spec = item.get("spec", {})
+            job_id = str(item.get("id", ""))
+            if (
+                isinstance(spec, dict)
+                and spec.get("kind") == "ocr"
+                and spec.get("project_id") == self.project_state.projectId
+                and job_id
+                and job_id not in self._reloaded_ocr_jobs
+            ):
+                self._reloaded_ocr_jobs.add(job_id)
+                self.runtime.request(
+                    "get_project",
+                    {"project_id": self.project_state.projectId},
+                    context={"ocr_completed": True, "ocr_job_id": job_id},
+                )
+            # A production TTS review report does not modify the project: the
+            # worker deliberately withholds the final WAV until timing/quality
+            # blockers are resolved.  Refreshing the project for that failed
+            # review used to trigger the generic get_project handler, which
+            # navigated to Timeline and made the UI look as if a voice track
+            # had been created even though D1 was still absent.  Only a PASS
+            # can change the project snapshot (via the guarded WAV import).
+            is_tts_terminal = item.get("state") == "succeeded"
+            if (
+                is_tts_terminal
+                and isinstance(spec, dict)
+                and spec.get("kind") == "tts"
+                and spec.get("project_id") == self.project_state.projectId
+                and isinstance(spec.get("provider_config"), dict)
+                and spec["provider_config"].get("purpose") == "production"
+                and job_id
+                and job_id not in self._reloaded_tts_jobs
+            ):
+                self._reloaded_tts_jobs.add(job_id)
+                self.runtime.request(
+                    "get_project",
+                    {"project_id": self.project_state.projectId},
+                    context={"tts_completed": True, "tts_job_id": job_id},
+                )
+            is_translation_terminal = item.get("state") == "succeeded" or (
+                item.get("state") == "failed"
+                and item.get("error_code") == "translation_review_required"
+            )
+            if (
+                is_translation_terminal
+                and isinstance(spec, dict)
+                and spec.get("kind") == "translate"
+                and spec.get("project_id") == self.project_state.projectId
+                and job_id
+                and job_id not in self._reloaded_translation_jobs
+            ):
+                self._reloaded_translation_jobs.add(job_id)
+                provider_config = spec.get("provider_config", {})
+                is_timing_repair = (
+                    isinstance(provider_config, dict)
+                    and provider_config.get("purpose") == "voice_timing_repair"
+                )
+                self.runtime.request(
+                    "get_project",
+                    {"project_id": self.project_state.projectId},
+                    context=(
+                        {
+                            "voice_timing_repair_job_id": job_id,
+                            "parent_tts_job_id": str(provider_config.get("parent_tts_job_id", "")),
+                            "voice_timing_repair_succeeded": item.get("state") == "succeeded",
+                        }
+                        if is_timing_repair
+                        else {"terminal_translation_job_id": job_id}
+                    ),
+                )
+        self._notify_terminal_job_changes(raw_items)
+
+    @Slot(object)
+    def _replace_multi_videos(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        raw_items = payload.get("items", [])
+        batch = payload.get("batch", {})
+        incoming = (
+            [dict(item) for item in raw_items if isinstance(item, dict)]
+            if isinstance(raw_items, list)
+            else []
+        )
+        next_batch = dict(batch) if isinstance(batch, dict) else {"state": "idle"}
+        hidden_count = payload.get("hidden_count", self._multi_hidden_count)
+        try:
+            next_hidden_count = max(0, int(hidden_count))
+        except (TypeError, ValueError):
+            next_hidden_count = self._multi_hidden_count
+        batch_state = str(next_batch.get("state", "idle"))
+        incoming = [{**item, "batch_state": batch_state} for item in incoming]
+        partial = payload.get("partial") is True
+        if partial:
+            existing = {
+                str(item.get("project_id", "")): dict(item) for item in self._multi_items
+            }
+            items = [
+                {**existing.get(str(item.get("project_id", "")), {}), **item}
+                for item in incoming
+            ]
+        else:
+            items = incoming
+        changed = (
+            items != self._multi_items
+            or next_batch != self._multi_batch
+            or next_hidden_count != self._multi_hidden_count
+        )
+        self._multi_items = items
+        self._multi_batch = next_batch
+        self._multi_hidden_count = next_hidden_count
+        if partial:
+            self.multi_videos.merge(items)
+        else:
+            self.multi_videos.replace(items)
+        if changed:
+            self.multiVideoChanged.emit()
+
+    def _request_translation_deltas(
+        self,
+        job_id: str,
+        project_id: str,
+        *,
+        terminal: bool = False,
+    ) -> None:
+        if (
+            not self._backend_ready
+            or not job_id
+            or not project_id
+            or job_id in self._translation_event_requests
+        ):
+            return
+        self._translation_event_requests.add(job_id)
+        try:
+            self.runtime.request(
+                "list_events",
+                {
+                    "job_id": job_id,
+                    "after_sequence": self._translation_event_sequences.get(job_id, 0),
+                    "kind": "translation_delta",
+                },
+                context={
+                    "translation_deltas": True,
+                    "job_id": job_id,
+                    "project_id": project_id,
+                    "terminal": terminal,
+                },
+            )
+        except Exception:
+            self._translation_event_requests.discard(job_id)
+            raise
+
+    def _request_translation_qa_status(
+        self,
+        job_id: str,
+        project_id: str,
+        *,
+        terminal: bool = False,
+    ) -> None:
+        if (
+            not self._backend_ready
+            or not job_id
+            or not project_id
+            or job_id in self._translation_qa_event_requests
+        ):
+            return
+        self._translation_qa_event_requests.add(job_id)
+        try:
+            self.runtime.request(
+                "list_events",
+                {
+                    "job_id": job_id,
+                    "after_sequence": self._translation_qa_event_sequences.get(job_id, 0),
+                    "kind": "translation_qa_status",
+                },
+                context={
+                    "translation_qa_status": True,
+                    "job_id": job_id,
+                    "project_id": project_id,
+                    "terminal": terminal,
+                },
+            )
+        except Exception:
+            self._translation_qa_event_requests.discard(job_id)
+            raise
+
+    def _request_voice_timing_review(self, job_id: str) -> None:
+        if not self._backend_ready or not job_id or job_id in self._voice_timing_review_requests:
+            return
+        self._voice_timing_review_requests.add(job_id)
+        self.runtime.request(
+            "get_voice_timing_review",
+            {"job_id": job_id},
+            context={"voice_timing_review": True, "job_id": job_id},
+        )
+
+    def _request_voice_timing_repair(self, tts_job_id: str) -> None:
+        if (
+            not self._backend_ready
+            or not self.project_state.projectId
+            or not tts_job_id
+            or tts_job_id in self._voice_timing_repair_requests
+        ):
+            return
+        self._voice_timing_repair_requests.add(tts_job_id)
+        self._set_voice_timing_auto_repair_busy(True)
+        self._set_translation_job_state("start_requested")
+        self._set_translation_busy(True)
+        self.runtime.request(
+            "create_voice_timing_repair_job",
+            {
+                "project_id": self.project_state.projectId,
+                "tts_job_id": tts_job_id,
+                "translation_job_id": self._selected_translation_cache_id,
+            },
+            context={
+                "voice_timing_repair": True,
+                "tts_job_id": tts_job_id,
+            },
+        )
+        self._set_status("Đang tạo tác vụ rút gọn riêng các cue voice quá dài")
+
+    def _request_voice_timing_retry(
+        self,
+        *,
+        parent_tts_job_id: str,
+        repair_job_id: str,
+    ) -> None:
+        if (
+            not self._backend_ready
+            or not self.project_state.projectId
+            or not parent_tts_job_id
+            or not repair_job_id
+            or repair_job_id in self._voice_timing_retry_requests
+        ):
+            return
+        self._voice_timing_retry_requests.add(repair_job_id)
+        self._set_tts_job_state("start_requested")
+        self._set_tts_busy(True)
+        self.runtime.request(
+            "create_tts_timing_retry_job",
+            {
+                "project_id": self.project_state.projectId,
+                "parent_tts_job_id": parent_tts_job_id,
+                "repair_job_id": repair_job_id,
+            },
+            context={
+                "voice_timing_retry": True,
+                "parent_tts_job_id": parent_tts_job_id,
+                "repair_job_id": repair_job_id,
+            },
+        )
+        self._set_status("Đã rút gọn cue dài; đang chuẩn bị tạo lại đúng WAV đã đổi")
+
+    @Slot(str, object, object)
+    def _action_succeeded(self, action: str, result: object, context: object) -> None:
+        if action == "create_project_with_media":
+            request_context = context if isinstance(context, dict) else {}
+            if "multi_import_path" not in request_context:
+                return
+            project = result.get("project") if isinstance(result, dict) else None
+            project_id = str(project.get("id", "")) if isinstance(project, dict) else ""
+            if not project_id:
+                self._finish_failed_multi_import(
+                    "Không tạo được project cho video này",
+                    str(request_context.get("multi_import_path", "")),
+                )
+                return
+            self._multi_import_project_ids.append(project_id)
+            if self._multi_import_paths:
+                self._multi_import_paths.pop(0)
+            completed = len(self._multi_import_project_ids)
+            remaining = len(self._multi_import_paths)
+            self._save_state = f"Đang nhập {completed}/{completed + remaining} video"
+            self.saveStateChanged.emit()
+            self._create_next_multi_project()
+            return
+        if action == "multi_add":
+            request_context = context if isinstance(context, dict) else {}
+            partial_error = str(request_context.get("multi_import_partial_error", ""))
+            failed_path = str(request_context.get("failed_path", ""))
+            total = int(request_context.get("total", 0) or 0)
+            self._set_import_busy(False)
+            self._save_state = "Đã lưu"
+            self.saveStateChanged.emit()
+            self._multi_import_paths = []
+            count = len(self._multi_import_project_ids)
+            self._multi_import_project_ids = []
+            self.runtime.request("list_projects")
+            self.navigate("multi")
+            if partial_error:
+                failed_name = Path(failed_path).name if failed_path else "video tiếp theo"
+                suffix = f"/{total}" if total else ""
+                self._set_status(
+                    f"Đã thêm và chọn {count}{suffix} video. "
+                    f"Dừng tại {failed_name}: {partial_error}"
+                )
+            else:
+                self._set_status(f"Đã thêm {count} video vào Multi video")
+            return
+        if action == "multi_remove":
+            request_context = context if isinstance(context, dict) else {}
+            project_id = str(request_context.get("project_id", ""))
+            items = result.get("items", []) if isinstance(result, dict) else []
+            pending = next(
+                (
+                    item
+                    for item in items
+                    if isinstance(item, dict)
+                    and str(item.get("project_id", "")) == project_id
+                    and item.get("error_code") == "membership_removal_pending"
+                ),
+                None,
+            )
+            if pending is not None:
+                self._set_status(
+                    "Đang chờ tác vụ dừng an toàn; video sẽ tự biến mất khỏi Multi sau khi dừng."
+                )
+                return
+            self._set_status(
+                "Đã xóa khỏi Multi video; project, media và cache vẫn được giữ nguyên."
+            )
+            return
+        if action == "multi_reorder":
+            self._set_status("Đã cập nhật thứ tự Multi video")
+            return
+        if action in {"multi_select", "multi_select_all"}:
+            return
+        if action in {"multi_start", "multi_pause", "multi_resume"}:
+            self._finish_multi_control(action)
+            if action == "multi_start":
+                self._set_status(
+                    "Multi video đã bắt đầu; các video lỗi đang tiếp tục từ stage/cache hiện tại"
+                )
+            elif action == "multi_pause":
+                self._set_status(
+                    "Đã nhận yêu cầu tạm dừng; worker sẽ dừng trong vài giây"
+                )
+            else:
+                self._set_status("Đã tiếp tục Multi video từ checkpoint/cache")
+            return
+        if action == "multi_restore_hidden":
+            self._set_status("Đã khôi phục các video đã ẩn khỏi Multi video")
+            return
+        if action == "multi_preview_descriptor":
+            descriptor = dict(result) if isinstance(result, dict) else {}
+            request_context = context if isinstance(context, dict) else {}
+            for key in ("video_path", "original_audio_path", "voice_audio_path"):
+                path = str(descriptor.get(key, ""))
+                descriptor[key.removesuffix("_path") + "_url"] = (
+                    QUrl.fromLocalFile(path) if path else QUrl()
+                )
+            self.multiPreviewReady.emit(
+                descriptor,
+                bool(request_context.get("use_voice", False)),
+            )
+            return
+        if action == "estimate_voice_conform":
+            self._voice_conform_estimate_request_pending = False
+            request_context = context if isinstance(context, dict) else {}
+            request_generation = request_context.get("generation")
+            try:
+                request_generation = int(request_generation)
+            except (TypeError, ValueError):
+                request_generation = -1
+            request_project_id = str(request_context.get("project_id", ""))
+            is_current_request = "generation" not in request_context or (
+                request_generation == self._voice_conform_estimate_generation
+                and request_project_id == self.project_state.projectId
+                and str(request_context.get("mode", "")) == self._voice_conform_mode
+                and abs(
+                    float(request_context.get("max_audio_speed", -1.0))
+                    - self._voice_conform_max_audio_speed
+                )
+                < 1e-9
+            )
+            if not is_current_request:
+                # A mode/slider change arrived while the old estimate was
+                # running.  Never let that old response overwrite the newly
+                # selected settings; immediately service the queued request.
+                self._voice_conform_estimate_refresh_queued = True
+                self.refreshVoiceConformEstimate()
+                return
+            if not isinstance(result, dict):
+                self._set_status("Ước lượng đồng bộ voice trả về dữ liệu không hợp lệ")
+                return
+            if str(result.get("project_id", "")) != self.project_state.projectId:
+                return
+            self._voice_conform_estimate = dict(result)
+            self._voice_conform_parent_tts_job_id = str(result.get("parent_tts_job_id", ""))
+            self._voice_conform_applied = result.get("applied") is True
+            self.voiceConformChanged.emit()
+            self._set_status(
+                "Ước lượng đồng bộ đạt QA; có thể áp dụng từ cache WAV"
+                if result.get("can_apply") is True
+                else f"Ước lượng đồng bộ còn {result.get('unresolved_count', 0)} cue cần xử lý"
+            )
+            return
+        if action == "create_voice_conform_job":
+            if not isinstance(result, dict):
+                self._voice_conform_busy = False
+                self._voice_conform_job_state = "failed"
+                self.voiceConformChanged.emit()
+                self._set_status("Không tạo được tác vụ đồng bộ voice")
+                return
+            job_id = str(result.get("id", ""))
+            if not job_id:
+                self._voice_conform_busy = False
+                self._voice_conform_job_state = "failed"
+                self.voiceConformChanged.emit()
+                self._set_status("Job Manager không trả về mã tác vụ đồng bộ voice")
+                return
+            self._voice_conform_job_id = job_id
+            state = str(result.get("state", "queued"))
+            self._voice_conform_job_state = state
+            self._voice_conform_busy = state not in {"succeeded", "failed", "interrupted"}
+            self.voiceConformChanged.emit()
+            if state in {"queued", "start_requested"}:
+                self.runtime.request(
+                    "start_job",
+                    {
+                        "job_id": job_id,
+                        "program": str(runtime_program_path()),
+                        "arguments": ["-m", "ducai_studio.workers.tts_worker", job_id],
+                        "resume_stage_key": "tts",
+                        "resume_checkpoint_key": "latest",
+                    },
+                    context={"job_kind": "tts", "voice_conform": True},
+                )
+            elif state == "interrupted":
+                # ``create_voice_conform_job`` deliberately reuses an
+                # interrupted cache-only job.  Requeue that exact job so the
+                # worker resumes its conform checkpoint instead of leaving
+                # the UI idle with an unusable job id.
+                self._voice_conform_job_state = "resume_requested"
+                self._voice_conform_busy = True
+                self.voiceConformChanged.emit()
+                self.runtime.request(
+                    "retry_job",
+                    {"job_id": job_id},
+                    context={
+                        "job_kind": "tts",
+                        "voice_conform": True,
+                        "resume_voice_conform": True,
+                        "job_id": job_id,
+                    },
+                )
+            elif state == "succeeded":
+                self._voice_conform_applied = True
+                self.runtime.request(
+                    "get_project",
+                    {"project_id": self.project_state.projectId},
+                    context={"voice_conform_applied": True},
+                )
+            self._set_status("Đang đồng bộ voice từ cache WAV; không gọi lại VieNeu")
+            return
+        if action == "reset_voice_conform":
+            self._voice_conform_busy = False
+            self._voice_conform_job_state = ""
+            self._voice_conform_estimate = {}
+            self._voice_conform_applied = False
+            self.voiceConformChanged.emit()
+            if isinstance(result, dict):
+                self._apply_project(result)
+            self._set_status("Đã khôi phục nhịp D1 nền")
+            return
+        if action == "get_voice_timing_review":
+            review_context = context if isinstance(context, dict) else {}
+            job_id = str(review_context.get("job_id", ""))
+            self._voice_timing_review_requests.discard(job_id)
+            if not isinstance(result, dict):
+                self._set_status("Job Manager trả về QA timing voice không hợp lệ")
+                return
+            if str(result.get("project_id", self.project_state.projectId)) != (
+                self.project_state.projectId
+            ):
+                return
+            self._voice_timing_review_requests.add(job_id)
+            self._set_voice_timing_qa(result)
+            issues = result.get("issues", [])
+            if isinstance(issues, list) and issues:
+                if result.get("qa_non_blocking") is not True:
+                    self.navigate("translate")
+                    first = issues[0]
+                    if isinstance(first, dict) and type(first.get("id")) is int:
+                        self.selectTranslationQaIssue(int(first["id"]))
+                review_message = str(result.get("message", "Voice có cue quá dài"))
+                if result.get("error_code"):
+                    speed = float(result.get("cue_max_total_speed", 1.0) or 1.0)
+                    review_message = (
+                        f"{review_message}: {len(issues)} cue vượt "
+                        f"giới hạn tổng {speed:.2f}×; cache WAV vẫn được giữ, "
+                        "nên Tiếp tục từ cache sẽ kiểm tra lại chứ không tự bỏ qua QA."
+                    )
+                self._set_status(review_message)
+                if (
+                    result.get("qa_non_blocking") is not True
+                    and result.get("status") == "REVIEW"
+                    and self.voiceAutoCondenseLongCuesEnabled
+                    and result.get("repairable") is True
+                ):
+                    self._request_voice_timing_repair(job_id)
+            return
+        if action == "create_voice_timing_repair_job":
+            repair_context = context if isinstance(context, dict) else {}
+            parent_tts_job_id = str(repair_context.get("tts_job_id", ""))
+            self._voice_timing_repair_requests.discard(parent_tts_job_id)
+            if not isinstance(result, dict):
+                self._set_voice_timing_auto_repair_busy(False)
+                self._set_translation_busy(False)
+                self._set_translation_job_state("review")
+                self._set_status("Không tạo được tác vụ rút gọn cue dài")
+                return
+            job_id = str(result.get("id", ""))
+            if not job_id:
+                self._set_voice_timing_auto_repair_busy(False)
+                self._set_translation_busy(False)
+                self._set_translation_job_state("review")
+                self._set_status("Job Manager không trả về mã tác vụ rút gọn cue dài")
+                return
+            self._voice_timing_repair_requests.add(parent_tts_job_id)
+            self._translation_job_id = job_id
+            self._selected_translation_cache_id = job_id
+            spec = result.get("spec", {})
+            self._translation_provider_id = (
+                str(spec.get("provider_id", "")) if isinstance(spec, dict) else ""
+            )
+            self.translationCachesChanged.emit()
+            self.translationBusyChanged.emit()
+            state = str(result.get("state", "queued"))
+            if state == "succeeded":
+                self._set_voice_timing_auto_repair_busy(False)
+                self._set_translation_busy(False)
+                self._set_translation_job_state("succeeded")
+                self.runtime.request(
+                    "get_project",
+                    {"project_id": self.project_state.projectId},
+                    context={
+                        "voice_timing_repair_job_id": job_id,
+                        "parent_tts_job_id": parent_tts_job_id,
+                        "voice_timing_repair_succeeded": True,
+                    },
+                )
+                return
+            if state not in {
+                "queued",
+                "start_requested",
+                "running",
+                "pause_requested",
+                "paused",
+                "resume_requested",
+            }:
+                self._set_voice_timing_auto_repair_busy(False)
+                self._set_translation_busy(False)
+                self._set_translation_job_state("review")
+                self.navigate("translate")
+                self._set_status("Tác vụ rút gọn cue dài cần kiểm tra thủ công")
+                return
+            self._set_translation_job_state("start_requested")
+            self._set_translation_busy(True)
+            if state in {"queued", "start_requested"}:
+                self._start_translation_worker(job_id)
+            else:
+                self.runtime.request("list_jobs")
+            self._set_status("Đang rút gọn riêng các cue voice quá dài từ cache dịch")
+            return
+        if action == "create_tts_timing_retry_job":
+            retry_context = context if isinstance(context, dict) else {}
+            repair_job_id = str(retry_context.get("repair_job_id", ""))
+            self._voice_timing_retry_requests.discard(repair_job_id)
+            if not isinstance(result, dict):
+                self._set_tts_busy(False)
+                self._set_tts_job_state("review")
+                self._set_status("Không tạo được tác vụ voice sau khi rút gọn")
+                return
+            job_id = str(result.get("id", ""))
+            if not job_id:
+                self._set_tts_busy(False)
+                self._set_tts_job_state("review")
+                self._set_status("Job Manager không trả về mã tác vụ tạo lại voice")
+                return
+            self._voice_timing_retry_requests.add(repair_job_id)
+            self._tts_job_id = job_id
+            self.ttsBusyChanged.emit()
+            state = str(result.get("state", "queued"))
+            if state == "succeeded":
+                self._set_tts_busy(False)
+                self._set_tts_job_state("succeeded")
+                self.runtime.request("list_jobs")
+                return
+            if state not in {
+                "queued",
+                "start_requested",
+                "running",
+                "pause_requested",
+                "paused",
+                "resume_requested",
+            }:
+                self._set_tts_busy(False)
+                self._set_tts_job_state("review")
+                self.navigate("translate")
+                self._set_status("Tạo lại voice vẫn cần rà soát cue dài")
+                return
+            self._set_tts_job_state("start_requested")
+            self._set_tts_busy(True)
+            if state in {"queued", "start_requested"}:
+                self._start_tts_worker(job_id)
+            else:
+                self.runtime.request("list_jobs")
+            self._set_status("Đang dò cache WAV; chỉ cue đã rút gọn mới được tạo lại")
+            return
+        if action == "create_tts_timing_override_job":
+            override_context = context if isinstance(context, dict) else {}
+            parent_tts_job_id = str(override_context.get("parent_tts_job_id", ""))
+            self._voice_timing_override_requests.discard(parent_tts_job_id)
+            if not isinstance(result, dict) or not str(result.get("id", "")):
+                self._set_tts_busy(False)
+                self._set_tts_job_state("review")
+                self._set_status("Không tạo được tác vụ thêm voice lỗi vào Timeline")
+                return
+            self._voice_timing_override_requests.add(parent_tts_job_id)
+            job_id = str(result["id"])
+            self._tts_job_id = job_id
+            self.ttsBusyChanged.emit()
+            state = str(result.get("state", "queued"))
+            if state == "succeeded":
+                self._set_tts_busy(False)
+                self._set_tts_job_state("succeeded")
+                self.runtime.request("list_jobs")
+                return
+            if state not in {
+                "queued",
+                "start_requested",
+                "running",
+                "pause_requested",
+                "paused",
+                "resume_requested",
+            }:
+                self._set_tts_busy(False)
+                self._set_tts_job_state("review")
+                self._set_status("Tác vụ thêm voice lỗi vào Timeline chưa thể chạy")
+                return
+            self._set_tts_job_state("start_requested")
+            self._set_tts_busy(True)
+            if state in {"queued", "start_requested"}:
+                self._start_tts_worker(job_id)
+            else:
+                self.runtime.request("list_jobs")
+            self._set_status("Đang dùng cache WAV để ghép nguyên voice vào Timeline")
+            return
+        if action == "list_translation_caches":
+            self._translation_cache_refresh_pending = False
+            project_id = (
+                str(context.get("project_id", "")) if isinstance(context, dict) else ""
+            ) or self.project_state.projectId
+            if project_id != self.project_state.projectId:
+                return
+            caches = (
+                [dict(item) for item in result if isinstance(item, dict)]
+                if isinstance(result, list)
+                else []
+            )
+            available = {str(item.get("job_id", "")) for item in caches}
+            self._pending_history_deletion_ids.intersection_update(available)
+            selected = self._selected_translation_cache_id
+            if selected not in available:
+                selected = str(caches[0].get("job_id", "")) if caches else ""
+            changed = (
+                caches != self._translation_caches
+                or selected != self._selected_translation_cache_id
+            )
+            self._translation_caches = caches
+            self._selected_translation_cache_id = selected
+            if changed:
+                self.translationCachesChanged.emit()
+            if selected:
+                selected_cache = next(
+                    (item for item in caches if str(item.get("job_id", "")) == selected),
+                    None,
+                )
+                active_translation_id = self.subtitle_jobs.active_job_id(
+                    self.project_state.projectId, "translate"
+                )
+                # Do not let a delayed cache refresh overwrite a different
+                # translation that is already running.  When there is no
+                # active job, bind the selected ledger immediately; the
+                # preview response only supplies the cue text/QA details.
+                if isinstance(selected_cache, dict) and (
+                    not active_translation_id or active_translation_id == selected
+                ):
+                    self._bind_translation_cache_record(selected_cache)
+                self.runtime.request(
+                    "get_translation_preview",
+                    {"project_id": project_id, "job_id": selected},
+                    context={
+                        "project_id": project_id,
+                        "cache_selection": True,
+                        "cache_job_id": selected,
+                    },
+                )
+            return
+        if action == "get_translation_preview" and isinstance(result, dict):
+            project_id = str(result.get("project_id", ""))
+            if not project_id or project_id != self.project_state.projectId:
+                return
+            job_id = str(result.get("job_id", ""))
+            preview_context = context if isinstance(context, dict) else {}
+            requested_job_id = str(preview_context.get("cache_job_id", ""))
+            if requested_job_id and requested_job_id != self._selected_translation_cache_id:
+                return
+            if requested_job_id and job_id != requested_job_id:
+                return
+            if (
+                not requested_job_id
+                and self._selected_translation_cache_id
+                and job_id != self._selected_translation_cache_id
+            ):
+                return
+            if job_id and job_id != self._selected_translation_cache_id:
+                self._selected_translation_cache_id = job_id
+                self.translationCachesChanged.emit()
+            if job_id and not self._translation_busy:
+                self._translation_job_id = job_id
+                self._translation_provider_id = str(result.get("provider_id", ""))
+                display_state = str(result.get("display_state", result.get("state", "")))
+                self._set_translation_job_state(display_state)
+                self.translationBusyChanged.emit()
+            if isinstance(result.get("qa"), dict):
+                self._set_translation_qa(result["qa"])
+            values = result.get("values")
+            if not isinstance(values, list):
+                return
+            changed = self.project_state.subtitle_cues.apply_translation_delta(values)
+            if changed:
+                self.project_state.subtitle_cues.finalize_translation_preview()
+                if self._selected_cue_id:
+                    self.selectedCueChanged.emit()
+            return
+        if (
+            action == "list_events"
+            and isinstance(context, dict)
+            and context.get("translation_deltas") is True
+        ):
+            job_id = str(context.get("job_id", ""))
+            project_id = str(context.get("project_id", ""))
+            self._translation_event_requests.discard(job_id)
+            if project_id != self.project_state.projectId:
+                return
+            if (
+                self._selected_translation_cache_id
+                and job_id != self._selected_translation_cache_id
+            ):
+                return
+            events = result if isinstance(result, list) else []
+            cursor = self._translation_event_sequences.get(job_id, 0)
+            selected_changed = False
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                sequence = event.get("sequence")
+                if type(sequence) is int:
+                    cursor = max(cursor, sequence)
+                if event.get("kind") != "translation_delta":
+                    continue
+                payload = event.get("payload")
+                values = payload.get("values") if isinstance(payload, dict) else None
+                if project_id != self.project_state.projectId or not isinstance(values, list):
+                    continue
+                self.project_state.subtitle_cues.apply_translation_delta(values)
+                if self._selected_cue_id and any(
+                    isinstance(value, dict) and value.get("id") == self._selected_cue_id
+                    for value in values
+                ):
+                    selected_changed = True
+            self._translation_event_sequences[job_id] = cursor
+            if context.get("terminal") is True:
+                if self.project_state.subtitle_cues.finalize_translation_preview() > 0:
+                    selected_changed = bool(self._selected_cue_id)
+                self._translation_terminal_event_jobs.add(job_id)
+                # A terminal checkpoint may be the first durable cache for a
+                # newly failed/cancelled job. Refresh the selector so every
+                # compatible historical job becomes available without a
+                # project reload.
+                self._request_translation_cache_list(project_id)
+            if selected_changed:
+                self.selectedCueChanged.emit()
+            return
+        if (
+            action == "list_events"
+            and isinstance(context, dict)
+            and context.get("translation_qa_status") is True
+        ):
+            job_id = str(context.get("job_id", ""))
+            project_id = str(context.get("project_id", ""))
+            self._translation_qa_event_requests.discard(job_id)
+            if project_id != self.project_state.projectId:
+                return
+            events = result if isinstance(result, list) else []
+            cursor = self._translation_qa_event_sequences.get(job_id, 0)
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                sequence = event.get("sequence")
+                if type(sequence) is int:
+                    cursor = max(cursor, sequence)
+                if event.get("kind") != "translation_qa_status":
+                    continue
+                payload = event.get("payload")
+                if isinstance(payload, dict):
+                    self._set_translation_qa(payload)
+            self._translation_qa_event_sequences[job_id] = cursor
+            return
+        if action == "list_credentials" and isinstance(result, dict):
+            raw_vault = result.get("references", [])
+            vault = _stable_credential_references(raw_vault)
+            vault_by_name = {value.casefold(): value for value in vault}
+            provider_ids = {"gemini-api", *OPENAI_COMPATIBLE_PROVIDER_IDS}
+            claimed_elsewhere = {
+                reference.casefold()
+                for provider_id in provider_ids - {"gemini-api"}
+                for reference in self._translation_api_references(provider_id)
+            }
+            for provider_id in provider_ids:
+                saved = [
+                    vault_by_name[value.casefold()]
+                    for value in self._translation_api_references(provider_id)
+                    if value.casefold() in vault_by_name
+                ]
+                saved_folded = {value.casefold() for value in saved}
+                if provider_id == "gemini-api":
+                    saved.extend(
+                        value
+                        for value in vault
+                        if value.casefold() not in saved_folded
+                        and value.casefold() not in claimed_elsewhere
+                    )
+                self.settings.setValue(
+                    _credential_setting_key(provider_id),
+                    _stable_credential_references(saved),
+                )
+            self.translationSettingsChanged.emit()
+            return
+        if action == "inspect_media_usage" and isinstance(result, dict):
+            media_path = context.get("media_path") if isinstance(context, dict) else None
+            intent = context.get("intent") if isinstance(context, dict) else None
+            if not isinstance(media_path, str) or intent not in {"new_project", "append"}:
+                self._set_import_busy(False)
+                self._set_status("Kết quả kiểm tra media không hợp lệ")
+                return
+            usages = result.get("usages", [])
+            if not isinstance(usages, list):
+                usages = []
+            if not usages:
+                self._continue_media_import(Path(media_path), intent=intent)
+                return
+            path = Path(media_path)
+            names = {
+                str(item.get("project_name", "")).strip().casefold()
+                for item in usages
+                if isinstance(item, dict)
+            }
+            suffix = 2
+            suggested_name = f"{path.stem} ({suffix})"
+            while suggested_name.casefold() in names:
+                suffix += 1
+                suggested_name = f"{path.stem} ({suffix})"
+            self._pending_media_path = str(path)
+            self._pending_media_intent = intent
+            self._duplicate_media_info = {
+                "media_path": str(path),
+                "media_name": path.name,
+                "intent": intent,
+                "suggested_project_name": suggested_name,
+                "usage_count": len(usages),
+                "usages": usages,
+            }
+            self.duplicateMediaChanged.emit()
+            self._save_state = "Chờ xử lý media trùng"
+            self.saveStateChanged.emit()
+            self._set_status("Media đã có trong dự án; hãy chọn dùng lại hoặc tạo bản mới")
+            self.duplicateMediaDialogRequested.emit()
+            return
+        if action == "runtime_diagnostics" and isinstance(result, dict):
+            self._runtime_diagnostics = result
+            self.diagnosticsChanged.emit()
+            state = str(result.get("overall_status", "unknown"))
+            self._set_status(f"Chẩn đoán runtime hoàn tất: {state}")
+            return
+        if action == "inspect_legacy_project" and isinstance(result, dict):
+            self._legacy_migration_report = result
+            self.legacyMigrationChanged.emit()
+            self._set_status("Dry-run hoàn tất; hãy xem skipped/warning trước khi nhập")
+            return
+        if action == "import_legacy_project" and isinstance(result, dict):
+            project = result.get("project")
+            report = result.get("report")
+            if isinstance(project, dict):
+                self._apply_project(project)
+            if isinstance(report, dict):
+                imported_settings = report.get("imported_settings")
+                applied: list[str] = []
+                if isinstance(imported_settings, dict):
+                    for key, value in _legacy_qsettings_values(
+                        imported_settings, self.project_state.projectId
+                    ).items():
+                        self.settings.setValue(key, value)
+                        applied.append(key)
+                self._legacy_migration_report = {
+                    **report,
+                    "applied_setting_keys": applied,
+                }
+                self.legacyMigrationChanged.emit()
+                self.exportSettingsChanged.emit()
+                self.voiceSettingsChanged.emit()
+            self.runtime.request("list_projects")
+            self._set_status("Đã nhập dự án 0.1.99 một chiều")
+            return
+        if action in {"create_ocr_job", "create_ocr_rescan_job"} and isinstance(result, dict):
+            job_id = result.get("id")
+            if not isinstance(job_id, str) or not job_id:
+                self._set_ocr_busy(False)
+                self._set_status("Job Manager không trả về mã tác vụ OCR")
+                return
+            self._ocr_job_id = job_id
+            self.ocrBusyChanged.emit()
+            self._start_ocr_worker(job_id)
+            self._set_status(
+                "Đang nạp bộ máy trích xuất; giao diện vẫn có thể sử dụng"
+            )
+            return
+        if action == "create_translation_job" and isinstance(result, dict):
+            job_id = result.get("id")
+            if not isinstance(job_id, str) or not job_id:
+                self._set_translation_busy(False)
+                self._set_status("Job Manager không trả về mã tác vụ dịch")
+                return
+            self._translation_job_id = job_id
+            spec = result.get("spec")
+            self._translation_provider_id = (
+                str(spec.get("provider_id", "")) if isinstance(spec, dict) else ""
+            )
+            self.translationBusyChanged.emit()
+            self._start_translation_worker(job_id)
+            self._set_status("Dịch chạy nền độc lập; chuyển tab không làm dừng tác vụ")
+            return
+        if action == "prepare_tts_rerun" and isinstance(result, dict):
+            pending = self._pending_tts_start
+            expected_project_id = (
+                str(pending.get("params", {}).get("project_id", ""))
+                if isinstance(pending, dict) and isinstance(pending.get("params"), dict)
+                else ""
+            )
+            if not expected_project_id or str(result.get("id", "")) != expected_project_id:
+                self._pending_tts_start = None
+                self._set_voice_playback_enabled(True)
+                self._set_tts_busy(False)
+                self._set_tts_job_state("failed")
+                self._set_status(
+                    "Không thể xác nhận D1 đã được gỡ đúng project; chưa tạo tác vụ voice mới"
+                )
+                return
+            self._apply_project(result)
+            self._can_undo_timeline = False
+            self._can_redo_timeline = False
+            self.timelineHistoryChanged.emit()
+            if self.project_state.hasVoiceTrack:
+                self._pending_tts_start = None
+                self._set_voice_playback_enabled(True)
+                self._set_tts_busy(False)
+                self._set_tts_job_state("failed")
+                self._set_status("D1 cũ chưa được gỡ; chưa tạo tác vụ voice mới")
+                return
+            self._set_voice_playback_enabled(True)
+            self._dispatch_pending_tts_start()
+            return
+        if action == "create_tts_job" and isinstance(result, dict):
+            job_id = result.get("id")
+            if not isinstance(job_id, str) or not job_id:
+                self._set_tts_busy(False)
+                self._set_status("Job Manager không trả về mã tác vụ giọng")
+                return
+            self._tts_job_id = job_id
+            self.ttsBusyChanged.emit()
+            self._start_tts_worker(job_id)
+            purpose = context.get("tts_purpose") if isinstance(context, dict) else ""
+            self._set_status(
+                "Đang tạo preview trong tiến trình riêng"
+                if purpose == "preview"
+                else "Tạo giọng chạy nền; chuyển tab không làm dừng tác vụ"
+            )
+            return
+        if action == "create_export_job" and isinstance(result, dict):
+            job_id = result.get("id")
+            if not isinstance(job_id, str) or not job_id:
+                self._set_export_busy(False)
+                self._set_status("Job Manager không trả về mã tác vụ export")
+                return
+            self._export_job_id = job_id
+            self.exportBusyChanged.emit()
+            self._start_export_worker(job_id)
+            self._set_status("Export chạy nền; chuyển tab không làm dừng FFmpeg")
+            return
+        if action == "retry_job" and isinstance(context, dict) and context.get("resume_ocr"):
+            job_id = context.get("job_id")
+            if isinstance(job_id, str):
+                self._start_ocr_worker(job_id)
+            return
+        if (
+            action == "retry_job"
+            and isinstance(context, dict)
+            and context.get("resume_translation")
+        ):
+            job_id = context.get("job_id")
+            if isinstance(job_id, str):
+                self._start_translation_worker(job_id)
+            return
+        if (
+            action == "retry_job"
+            and isinstance(context, dict)
+            and context.get("resume_voice_conform")
+        ):
+            job_id = context.get("job_id")
+            if isinstance(job_id, str):
+                self._voice_conform_job_id = job_id
+                self._voice_conform_job_state = "start_requested"
+                self._voice_conform_busy = True
+                self.voiceConformChanged.emit()
+                self._start_tts_worker(job_id)
+            return
+        if action == "retry_job" and isinstance(context, dict) and context.get("resume_tts"):
+            job_id = context.get("job_id")
+            if isinstance(job_id, str):
+                self._start_tts_worker(job_id)
+            return
+        if action == "retry_job" and isinstance(context, dict) and context.get("resume_export"):
+            job_id = context.get("job_id")
+            if isinstance(job_id, str):
+                self._start_export_worker(job_id)
+            return
+        if action == "store_credential" and isinstance(context, dict):
+            reference = context.get("credential_reference")
+            if isinstance(reference, str):
+                provider_id = str(context.get("credential_provider_id", "gemini-api"))
+                references = _stable_credential_references(
+                    [*self._translation_api_references(provider_id), reference]
+                )
+                self.settings.setValue(_credential_setting_key(provider_id), references)
+                self.translationSettingsChanged.emit()
+                self._set_status("Đã lưu API key an toàn; tool chỉ giữ tên tham chiếu")
+            return
+        if action == "store_credentials" and isinstance(context, dict):
+            raw_references = result.get("references", []) if isinstance(result, dict) else []
+            submitted = _stable_credential_references(raw_references)
+            provider_id = str(context.get("credential_provider_id", "gemini-api"))
+            submitted_folded = {value.casefold() for value in submitted}
+            references = _stable_credential_references(
+                [
+                    *submitted,
+                    *(
+                        value
+                        for value in self._translation_api_references(provider_id)
+                        if value.casefold() not in submitted_folded
+                    ),
+                ]
+            )
+            self.settings.setValue(_credential_setting_key(provider_id), references)
+            self.translationSettingsChanged.emit()
+            self.geminiApiCredentialsStored.emit()
+            pending = self._pending_translation_start
+            self._pending_translation_start = None
+            if context.get("start_translation") is True and isinstance(pending, dict):
+                self._begin_translation(
+                    str(pending["provider_id"]),
+                    str(pending["model_id"]),
+                    pending.get("headed") is True,
+                    pending.get("guest") is True,
+                    credential_references=references,
+                    base_url=str(pending.get("base_url", "")),
+                )
+            else:
+                self._set_status(
+                    f"Đã lưu {len(submitted)} API key; tool chỉ hiển thị tên tham chiếu"
+                )
+            return
+        if action == "delete_credential" and isinstance(context, dict):
+            reference = context.get("credential_reference")
+            if isinstance(reference, str):
+                provider_id = str(context.get("credential_provider_id", "gemini-api"))
+                references = [
+                    value
+                    for value in self._translation_api_references(provider_id)
+                    if value != reference
+                ]
+                self.settings.setValue(_credential_setting_key(provider_id), references)
+                self.translationSettingsChanged.emit()
+                self._set_status("Đã xóa API key khỏi Windows Credential Manager")
+            return
+        if action in {"delete_job_history", "clear_project_job_history"}:
+            self._set_job_history_busy(False)
+            if isinstance(result, dict):
+                pending_ids = (
+                    [result.get("job_id")]
+                    if action == "delete_job_history" and result.get("pending") is True
+                    else result.get("pending_job_ids", [])
+                )
+                if isinstance(pending_ids, list):
+                    self._pending_history_deletion_ids.update(
+                        str(job_id) for job_id in pending_ids if job_id
+                    )
+            self._request_current_translation_preview()
+            self.runtime.request("list_jobs")
+            if action == "delete_job_history":
+                pending = result.get("pending") is True if isinstance(result, dict) else False
+                self._set_status(
+                    "Đang hủy tác vụ; lịch sử sẽ tự xóa ngay khi tiến trình dừng"
+                    if pending
+                    else "Đã xoá lịch sử tác vụ"
+                )
+            else:
+                removed = result.get("deleted_jobs", 0) if isinstance(result, dict) else 0
+                pending = result.get("pending_jobs", 0) if isinstance(result, dict) else 0
+                self._set_status(
+                    f"Đã xoá {removed} lịch sử; đang hủy và tự xóa {pending} tác vụ dở"
+                )
+            return
+        if action == "delete_project" and isinstance(context, dict):
+            deleted_id = str(context.get("project_id", ""))
+            self._project_delete_busy = False
+            self._deleting_project_id = ""
+            self._deleting_project_name = ""
+            self.projectDeleteChanged.emit()
+            if deleted_id and deleted_id == self.project_state.projectId:
+                self._apply_project({})
+                self._playhead_us = 0
+                self.playheadChanged.emit()
+            self.runtime.request("list_projects")
+            self._set_status("Đã xóa dự án nội bộ; media và SRT nguồn được giữ nguyên")
+            return
+        if action in {"start_job", "pause_job", "resume_job", "cancel_job"}:
+            self.runtime.request("list_jobs")
+            return
+        if action == "create_project" and isinstance(result, dict):
+            self._apply_project(result)
+            media_path = context.get("media_path") if isinstance(context, dict) else None
+            if isinstance(media_path, str):
+                import_options = {
+                    key: value
+                    for key, value in context.items()
+                    if key in {"default_logo_path", "overlay_preset"}
+                }
+                self.runtime.request(
+                    "import_media",
+                    {
+                        "project_id": self.project_state.projectId,
+                        "media_path": media_path,
+                        **import_options,
+                    },
+                    context={"media_path": media_path},
+                )
+            return
+        if action in {
+            "get_project",
+            "import_media",
+            "import_translation_srt",
+            "timeline_command",
+            "subtitle_command",
+            "effect_command",
+        } and isinstance(result, dict):
+            project_context = context if isinstance(context, dict) else {}
+            is_multi_detail = (
+                action == "get_project" and project_context.get("multi_detail") is True
+            )
+            if is_multi_detail and not self._multi_detail_context_is_current(project_context):
+                return
+            if is_multi_detail and str(result.get("id", "")) != str(
+                project_context.get("project_id", "")
+            ):
+                self._multi_detail_generation += 1
+                self._finish_multi_detail()
+                self.navigate("multi")
+                self._set_status(
+                    "Không thể mở video: dữ liệu Timeline trả về không đúng project đã chọn."
+                )
+                return
+            if action == "timeline_command":
+                self._can_undo_timeline = result.get("_timeline_can_undo") is True
+                self._can_redo_timeline = result.get("_timeline_can_redo") is True
+                self.timelineHistoryChanged.emit()
+            elif action == "import_media":
+                self._can_undo_timeline = False
+                self._can_redo_timeline = False
+                self.timelineHistoryChanged.emit()
+            elif action == "subtitle_command":
+                self._can_undo_subtitle = result.get("_subtitle_can_undo") is True
+                self._can_redo_subtitle = result.get("_subtitle_can_redo") is True
+                self.subtitleHistoryChanged.emit()
+            elif action == "effect_command":
+                self._can_undo_timeline = False
+                self._can_redo_timeline = False
+                self.timelineHistoryChanged.emit()
+            compact_subtitle_patch = (
+                action == "subtitle_command" and result.get("_subtitle_patch") is True
+            )
+            try:
+                if compact_subtitle_patch:
+                    self.project_state.apply_subtitle_patch(result)
+                    self._set_translation_qa(self._translation_qa)
+                    if not self.project_state.subtitle_cues.find(self._selected_cue_id):
+                        self._selected_cue_id = ""
+                        self.selectedCueChanged.emit()
+                else:
+                    self._apply_project(result)
+            except (TypeError, ValueError, KeyError, LookupError) as exc:
+                # A late or malformed subtitle response must never leave the
+                # editor locked.  Route it through the same rollback/error
+                # path as an explicit backend failure so the busy flag and
+                # optimistic text are restored deterministically.
+                if action == "subtitle_command":
+                    self._action_failed(
+                        action,
+                        {"code": "subtitle_patch_invalid", "message": str(exc)},
+                        project_context,
+                    )
+                    return
+                raise
+            if action in {
+                "get_project",
+                "import_media",
+                "timeline_command",
+                "effect_command",
+            }:
+                review_job_id = str(project_context.get("translation_review_job_id", ""))
+                review_target = str(project_context.get("multi_detail_target", ""))
+                if (
+                    action == "get_project"
+                    and is_multi_detail
+                    and review_target == "translate"
+                    and review_job_id
+                ):
+                    self._selected_translation_cache_id = review_job_id
+                    self.runtime.request(
+                        "get_translation_preview",
+                        {"project_id": self.project_state.projectId, "job_id": review_job_id},
+                        context={
+                            "project_id": self.project_state.projectId,
+                            "cache_job_id": review_job_id,
+                            "multi_detail_translation_review": True,
+                        },
+                    )
+                    self._request_translation_cache_list(self.project_state.projectId)
+                else:
+                    self._request_current_translation_preview()
+            if is_multi_detail:
+                self._finish_multi_detail()
+            # A hand-edited translation changes the project revision but not
+            # the durable Multi batch error row.  Ask only for the lightweight
+            # status projection so the CJK count/green state updates without
+            # reloading the full catalog or touching TTS.
+            if (
+                action == "subtitle_command"
+                and self._backend_ready
+                and self.multi_videos.item(self.project_state.projectId)
+            ):
+                self.runtime.request(
+                    "multi_status",
+                    context={
+                        "multi_refresh_after_subtitle": True,
+                        "project_id": self.project_state.projectId,
+                    },
+                )
+            timing_repair_job_id = str(project_context.get("voice_timing_repair_job_id", ""))
+            if action == "get_project" and self.project_state.projectId:
+                if timing_repair_job_id:
+                    self.navigate("translate")
+                    if project_context.get("voice_timing_repair_succeeded") is True:
+                        self._request_voice_timing_retry(
+                            parent_tts_job_id=str(project_context.get("parent_tts_job_id", "")),
+                            repair_job_id=timing_repair_job_id,
+                        )
+                    else:
+                        self._set_status("Rút gọn cue dài chưa đạt QA; hãy sửa các cue nháy vàng")
+                else:
+                    target_screen = str(project_context.get("multi_detail_target", "timeline"))
+                    self.navigate("translate" if target_screen == "translate" else "timeline")
+            self._set_import_busy(False)
+            self._set_timeline_busy(False)
+            self._set_subtitle_busy(False)
+            self._save_state = "Đã lưu"
+            self.saveStateChanged.emit()
+            status_by_action = {
+                "get_project": "Đã mở dự án",
+                "import_media": "Đã nhập media và đưa vào timeline",
+                "import_translation_srt": "Đã nhập SRT Việt và khớp toàn bộ cue/timestamp",
+                "timeline_command": "Đã cập nhật timeline",
+                "subtitle_command": "Đã cập nhật phụ đề",
+                "effect_command": "Đã cập nhật timeline",
+            }
+            if not timing_repair_job_id:
+                terminal_translation_job_id = str(
+                    project_context.get("terminal_translation_job_id", "")
+                )
+                if action == "get_project" and terminal_translation_job_id:
+                    self._set_status("Đã dịch xong và đã chuyển sang Timeline")
+                elif (
+                    action == "get_project"
+                    and project_context.get("multi_detail_target") == "translate"
+                ):
+                    self._set_status(
+                        "Đã mở bản dịch cần sửa; bấm vào từng cue còn chữ Trung để chỉnh tay"
+                    )
+                elif action == "get_project" and project_context.get("ocr_completed"):
+                    self._set_status("Đã trích xuất SRT xong và đã chuyển sang Timeline")
+                elif action == "get_project" and project_context.get("tts_completed"):
+                    self._set_status("Đã tạo voice xong và đã cập nhật Timeline")
+                elif action == "subtitle_command":
+                    subtitle_command = str(project_context.get("subtitle_command", ""))
+                    if subtitle_command == "find_replace":
+                        replacement_count = int(
+                            project_context.get("replacement_count", 0) or 0
+                        )
+                        replacement_cue_count = int(
+                            project_context.get("replacement_cue_count", 0) or 0
+                        )
+                        self._set_status(
+                            f"Đã thay {replacement_count} lần trong "
+                            f"{replacement_cue_count} cue Việt"
+                        )
+                    elif subtitle_command == "delete":
+                        cue_index = int(project_context.get("deleted_cue_index", 0) or 0)
+                        self._set_status(
+                            f"Đã xoá cue #{cue_index}; có thể bấm Hoàn tác"
+                            if cue_index > 0
+                            else "Đã xoá cue; có thể bấm Hoàn tác"
+                        )
+                    else:
+                        self._set_status("Đã lưu thay đổi phụ đề")
+                else:
+                    self._set_status(status_by_action[action])
+            if not is_multi_detail and action != "subtitle_command":
+                self.runtime.request("list_projects")
+            if action == "effect_command":
+                effect_context = context if isinstance(context, dict) else {}
+                overlay_id = str(effect_context.get("overlay_id", ""))
+                geometry = effect_context.get("geometry") is True
+                values = effect_context.get("values")
+                if geometry and overlay_id and isinstance(values, dict):
+                    for key in ("x", "y", "width", "height"):
+                        if key in values:
+                            self._save_overlay_preset_value(overlay_id, key, values[key])
+                pending = self._take_pending_effect_command()
+                pending_is_same_geometry = (
+                    pending is not None
+                    and pending.get("geometry") is True
+                    and str(pending.get("overlay_id", "")) == overlay_id
+                )
+                if geometry and overlay_id and not pending_is_same_geometry:
+                    self.overlayGeometrySettled.emit(overlay_id, True)
+                if pending is not None:
+                    self._dispatch_pending_effect_command(pending)
+            elif action == "timeline_command":
+                self._dispatch_pending_effect_command()
+
+    @staticmethod
+    def _format_action_error(error: object) -> str:
+        if not isinstance(error, dict):
+            return redact_sensitive_text(str(error or "không rõ nguyên nhân"))
+        message_value = error.get("message")
+        if not message_value and isinstance(error.get("error"), dict):
+            message_value = error["error"].get("message")
+        code = str(error.get("code", error.get("error_code", ""))).strip()
+        message = str(message_value or error.get("reason") or "không rõ nguyên nhân").strip()
+        return ApplicationViewModel._localized_error_message(code, message)
+
+    @Slot(str, object, object)
+    def _action_failed(self, action: str, error: object, context: object) -> None:
+        if action == "subtitle_command":
+            request_context = context if isinstance(context, dict) else {}
+            request_project_id = str(request_context.get("project_id", ""))
+            if not request_project_id or request_project_id == self.project_state.projectId:
+                self.project_state.subtitle_cues.rollback_text_changes(
+                    request_context.get("optimistic_changes", [])
+                )
+            self._set_translation_qa(self._translation_qa)
+            self._refresh_local_multi_translation_review()
+            self._set_subtitle_busy(False)
+            self._save_state = "Chỉnh phụ đề thất bại"
+            self.saveStateChanged.emit()
+            self._set_status(
+                "Không thể lưu thay đổi phụ đề; nội dung trên màn hình đã được hoàn nguyên: "
+                + self._format_action_error(error)
+            )
+            if self._backend_ready and self.multi_videos.item(self.project_state.projectId):
+                # Restore the card from the durable project after a failed
+                # optimistic edit; this is a lightweight status-only refresh.
+                self.runtime.request(
+                    "multi_status",
+                    context={
+                        "multi_refresh_after_subtitle_failure": True,
+                        "project_id": self.project_state.projectId,
+                    },
+                )
+            return
+        if action in {"multi_select", "multi_select_all"}:
+            request_context = context if isinstance(context, dict) else {}
+            generation = int(request_context.get("selection_generation", -1) or -1)
+            previous = request_context.get("previous_selection", {})
+            if generation == self._multi_selection_generation and isinstance(previous, dict):
+                self._apply_multi_selection(
+                    {
+                        str(project_id): bool(selected)
+                        for project_id, selected in previous.items()
+                    }
+                )
+            else:
+                self.runtime.request("multi_list")
+            self._set_status(
+                "Không thể lưu lựa chọn Multi video: " + self._format_action_error(error)
+            )
+            return
+        if (
+            action == "create_project_with_media"
+            and isinstance(context, dict)
+            and ("multi_import_path" in context)
+        ):
+            self._finish_failed_multi_import(
+                self._format_action_error(error),
+                str(context.get("multi_import_path", "")),
+            )
+            return
+        if action == "multi_add":
+            self._multi_import_paths = []
+            self._multi_import_project_ids = []
+            self._set_import_busy(False)
+            self._save_state = "Thêm Multi video thất bại"
+            self.saveStateChanged.emit()
+            self._set_status("Không thể thêm Multi video: " + self._format_action_error(error))
+            return
+        if action in {"multi_start", "multi_pause", "multi_resume"}:
+            self._rollback_multi_control(action)
+            labels = {
+                "multi_start": "bắt đầu Multi video",
+                "multi_pause": "tạm dừng Multi video",
+                "multi_resume": "tiếp tục Multi video",
+            }
+            self._set_status(
+                f"Không thể {labels[action]}: " + self._format_action_error(error)
+            )
+            return
+        if (
+            action == "get_project"
+            and isinstance(context, dict)
+            and (context.get("multi_detail") is True)
+        ):
+            if not self._multi_detail_context_is_current(context):
+                return
+            self._multi_detail_generation += 1
+            self._finish_multi_detail()
+            self.navigate("multi")
+            self._set_status(
+                "Không thể mở video để chỉnh sửa chi tiết: " + self._format_action_error(error)
+            )
+            return
+        if action.startswith("multi_"):
+            self._set_status("Multi video không thể tiếp tục: " + self._format_action_error(error))
+            return
+        if action == "estimate_voice_conform":
+            self._voice_conform_estimate_request_pending = False
+            request_context = context if isinstance(context, dict) else {}
+            try:
+                request_generation = int(request_context.get("generation", -1))
+            except (TypeError, ValueError):
+                request_generation = -1
+            is_current_request = "generation" not in request_context or (
+                request_generation == self._voice_conform_estimate_generation
+                and str(request_context.get("project_id", "")) == self.project_state.projectId
+                and str(request_context.get("mode", "")) == self._voice_conform_mode
+            )
+            if not is_current_request:
+                self._voice_conform_estimate_refresh_queued = True
+                self.refreshVoiceConformEstimate()
+                return
+            self._voice_conform_estimate = {}
+            # An estimate request is read-only.  If it fails, keep showing the
+            # conform plan already persisted on the project instead of making
+            # a transient request error look like a rollback.
+            self._voice_conform_applied = self.project_state.voiceConformApplied
+            self.voiceConformChanged.emit()
+            message = self._format_action_error(error)
+            self._set_status(f"Không thể ước lượng đồng bộ voice: {message}")
+            return
+        if action == "create_voice_conform_job":
+            self._voice_conform_busy = False
+            self._voice_conform_job_state = "failed"
+            self._voice_conform_applied = self.project_state.voiceConformApplied
+            self.voiceConformChanged.emit()
+            message = self._format_action_error(error)
+            self._set_status(f"Đồng bộ voice không thể tiếp tục: {message}")
+            return
+        if action == "reset_voice_conform":
+            self._voice_conform_busy = False
+            self._voice_conform_job_state = "failed"
+            self._voice_conform_applied = self.project_state.voiceConformApplied
+            self.voiceConformChanged.emit()
+            message = self._format_action_error(error)
+            self._set_status(f"Không thể đặt lại đồng bộ voice: {message}")
+            return
+        if action == "get_voice_timing_review":
+            review_context = context if isinstance(context, dict) else {}
+            self._voice_timing_review_requests.discard(str(review_context.get("job_id", "")))
+            message = self._format_action_error(error)
+            self._set_status(f"Không đọc được QA timing voice: {message}")
+            return
+        if action == "create_voice_timing_repair_job":
+            repair_context = context if isinstance(context, dict) else {}
+            self._voice_timing_repair_requests.discard(str(repair_context.get("tts_job_id", "")))
+            self._set_voice_timing_auto_repair_busy(False)
+            self._set_translation_busy(False)
+            self._set_translation_job_state("review")
+            self.navigate("translate")
+            message = self._format_action_error(error)
+            self._set_status(f"Không thể tự rút gọn cue dài: {message}")
+            return
+        if action == "create_tts_timing_retry_job":
+            retry_context = context if isinstance(context, dict) else {}
+            self._voice_timing_retry_requests.discard(str(retry_context.get("repair_job_id", "")))
+            self._set_tts_busy(False)
+            self._set_tts_job_state("review")
+            self.navigate("translate")
+            message = self._format_action_error(error)
+            self._set_status(f"Không thể tạo lại voice từ cache: {message}")
+            return
+        if action == "create_tts_timing_override_job":
+            override_context = context if isinstance(context, dict) else {}
+            self._voice_timing_override_requests.discard(
+                str(override_context.get("parent_tts_job_id", ""))
+            )
+            self._set_tts_busy(False)
+            self._set_tts_job_state("review")
+            message = self._format_action_error(error)
+            self._set_status(f"Không thể thêm voice lỗi vào Timeline: {message}")
+            return
+        if (
+            action == "list_events"
+            and isinstance(context, dict)
+            and context.get("translation_deltas") is True
+        ):
+            self._translation_event_requests.discard(str(context.get("job_id", "")))
+            message = self._format_action_error(error)
+            self._set_status(f"Không cập nhật được bản dịch đang chạy: {message}")
+            return
+        if (
+            action == "list_events"
+            and isinstance(context, dict)
+            and context.get("translation_qa_status") is True
+        ):
+            self._translation_qa_event_requests.discard(str(context.get("job_id", "")))
+            message = self._format_action_error(error)
+            self._set_status(f"Không cập nhật được QA dịch: {message}")
+            return
+        if action in {"get_translation_preview", "list_translation_caches"}:
+            if action == "list_translation_caches":
+                self._translation_cache_refresh_pending = False
+            message = self._format_action_error(error)
+            self._set_status(
+                "Không đọc được danh sách cache dịch: " + message
+                if action == "list_translation_caches"
+                else "Không đọc được bản dịch xem trước: " + message
+            )
+            return
+        if action in {
+            "runtime_diagnostics",
+            "inspect_legacy_project",
+            "import_legacy_project",
+        }:
+            message = self._format_action_error(error)
+            self._set_status(f"{action} thất bại: {message}")
+            return
+        if action == "inspect_media_usage":
+            self._set_import_busy(False)
+            self._save_state = "Kiểm tra media thất bại"
+            self.saveStateChanged.emit()
+            message = self._format_action_error(error)
+            self._set_status(f"Không thể kiểm tra media trùng: {message}")
+            return
+        if action == "import_translation_srt":
+            message = self._format_action_error(error)
+            self._set_status(f"Không thể nhập SRT Việt; dự án chưa bị thay đổi: {message}")
+            return
+        if action == "prepare_tts_rerun":
+            self._pending_tts_start = None
+            self._set_voice_playback_enabled(True)
+            self._set_tts_busy(False)
+            self._set_tts_job_state("failed")
+            message = self._format_action_error(error)
+            self._set_status(
+                "Không thể chuẩn bị tạo lại D1; chưa tạo tác vụ voice mới. "
+                "Hãy tải lại project rồi thử lại: "
+                + message
+            )
+            return
+        if action in {
+            "create_translation_job",
+            "create_tts_job",
+            "create_export_job",
+            "store_credential",
+            "store_credentials",
+            "delete_credential",
+        }:
+            if action == "create_translation_job":
+                self._set_translation_busy(False)
+            elif action == "create_tts_job":
+                self._set_tts_busy(False)
+            elif action == "create_export_job":
+                self._set_export_busy(False)
+            elif action == "store_credentials":
+                self._pending_translation_start = None
+                self._set_translation_busy(False)
+            message = self._format_action_error(error)
+            self._set_status(
+                (
+                    f"Tạo giọng chưa thể tiếp tục: {message}"
+                    if action == "create_tts_job"
+                    else f"Xuất video chưa thể tiếp tục: {message}"
+                )
+                if action in {"create_tts_job", "create_export_job"}
+                else f"Dịch thuật chưa thể tiếp tục: {message}"
+            )
+            return
+        if action == "delete_project":
+            self._project_delete_busy = False
+            self._deleting_project_id = ""
+            self._deleting_project_name = ""
+            self.projectDeleteChanged.emit()
+            message = self._format_action_error(error)
+            self._set_status(f"Không thể xóa dự án: {message}")
+            return
+        if action in {"delete_job_history", "clear_project_job_history"}:
+            self._set_job_history_busy(False)
+            message = self._format_action_error(error)
+            self._set_status(f"Không thể xoá lịch sử tác vụ: {message}")
+            return
+        if action == "effect_command":
+            effect_context = context if isinstance(context, dict) else {}
+            overlay_id = str(effect_context.get("overlay_id", ""))
+            geometry = effect_context.get("geometry") is True
+            pending = self._take_pending_effect_command()
+            self._set_timeline_busy(False)
+            self._save_state = "Chỉnh hiệu ứng thất bại"
+            self.saveStateChanged.emit()
+            pending_is_same_geometry = (
+                pending is not None
+                and pending.get("geometry") is True
+                and str(pending.get("overlay_id", "")) == overlay_id
+            )
+            if geometry and overlay_id and not pending_is_same_geometry:
+                self.overlayGeometrySettled.emit(overlay_id, False)
+            if pending is not None:
+                self._dispatch_pending_effect_command(pending)
+            message = self._format_action_error(error)
+            self._set_status(f"Chỉnh hiệu ứng không thành công: {message}")
+            return
+        if action in {
+            "create_ocr_job",
+            "create_ocr_rescan_job",
+            "start_job",
+            "pause_job",
+            "resume_job",
+            "cancel_job",
+            "retry_job",
+        }:
+            job_kind = context.get("job_kind") if isinstance(context, dict) else ""
+            if not job_kind and isinstance(context, dict):
+                if context.get("resume_translation"):
+                    job_kind = "translate"
+                elif context.get("resume_ocr"):
+                    job_kind = "ocr"
+                elif context.get("resume_tts"):
+                    job_kind = "tts"
+                elif context.get("resume_export"):
+                    job_kind = "export"
+            if action == "start_job" and job_kind == "translate":
+                self._set_translation_busy(False)
+                self._set_translation_job_state("failed")
+            elif action == "retry_job" and job_kind == "translate":
+                # The immutable ledger is still selectable even when the
+                # retry command itself is rejected (for example because a
+                # worker is still shutting down). Release the busy gate and
+                # leave an actionable cache-resume state instead of trapping
+                # the UI in ``resume_requested``.
+                self._set_translation_busy(False)
+                self._set_translation_job_state("failed")
+            elif action == "resume_job" and job_kind == "translate":
+                self._set_translation_busy(False)
+                self._set_translation_job_state("paused")
+            elif action == "start_job" and job_kind == "tts":
+                self._set_tts_busy(False)
+            elif action == "start_job" and job_kind == "export":
+                self._set_export_busy(False)
+            elif action in {"create_ocr_job", "start_job"}:
+                self._set_ocr_busy(False)
+            message = self._format_action_error(error)
+            self._set_status(
+                f"Dịch thuật không thể tiếp tục: {message}"
+                if job_kind == "translate"
+                else (
+                    f"Tạo giọng không thể tiếp tục: {message}"
+                    if job_kind == "tts"
+                    else (
+                        f"Xuất video không thể tiếp tục: {message}"
+                        if job_kind == "export"
+                        else f"OCR không thể tiếp tục: {message}"
+                    )
+                )
+            )
+            return
+        if action not in {
+            "create_project",
+            "import_media",
+            "get_project",
+            "timeline_command",
+            "subtitle_command",
+            "delete_project",
+        }:
+            return
+        self._set_import_busy(False)
+        self._set_timeline_busy(False)
+        self._set_subtitle_busy(False)
+        if action == "timeline_command":
+            self._dispatch_pending_effect_command()
+        self._save_state = {
+            "timeline_command": "Chỉnh timeline thất bại",
+            "subtitle_command": "Chỉnh phụ đề thất bại",
+            "effect_command": "Chỉnh hiệu ứng thất bại",
+            "get_project": "Mở dự án thất bại",
+        }.get(action, "Nhập media thất bại")
+        self.saveStateChanged.emit()
+        message = self._format_action_error(error)
+        self._set_status(f"Tác vụ không thành công: {message}")
+
+    def _apply_project(self, snapshot: dict) -> None:
+        previous_project_id = self.project_state.projectId
+        incoming_project_id = snapshot.get("id", "")
+        self.project_state.replace(
+            snapshot,
+            preserve_live_translations=bool(
+                previous_project_id and incoming_project_id == previous_project_id
+            ),
+        )
+        project_id = self.project_state.projectId
+        conform_applied = self.project_state.voiceConformApplied
+        conform_changed = conform_applied != self._voice_conform_applied
+        self._voice_conform_applied = conform_applied
+        if project_id != previous_project_id:
+            self._voice_conform_job_id = ""
+            self._voice_conform_parent_tts_job_id = ""
+        if conform_applied:
+            self._voice_conform_job_state = "succeeded"
+        elif project_id != previous_project_id:
+            self._voice_conform_job_state = ""
+            self._voice_conform_estimate = {}
+        if conform_changed or project_id != previous_project_id:
+            self.voiceConformChanged.emit()
+        if project_id != previous_project_id:
+            cache_changed = bool(self._translation_caches or self._selected_translation_cache_id)
+            self._translation_caches = []
+            self._selected_translation_cache_id = ""
+            self._translation_cache_refresh_pending = False
+            self._translation_cache_refresh_marker = ("", "", "", "")
+            self._translation_qa_event_sequences.clear()
+            self._translation_qa_event_requests.clear()
+            self._terminal_job_notification_markers.clear()
+            self._jobs_snapshot_initialized = False
+            self._set_translation_qa({"status": "NONE", "issues": []})
+            self._voice_timing_review_requests.clear()
+            self._voice_timing_repair_requests.clear()
+            self._voice_timing_retry_requests.clear()
+            self._voice_timing_override_requests.clear()
+            self._set_voice_timing_qa({"status": "NONE", "issues": []})
+            if cache_changed:
+                self.translationCachesChanged.emit()
+        for model in (self.jobs, self.subtitle_jobs, self.voice_jobs, self.export_jobs):
+            model.setProjectFilter(project_id)
+        if project_id != previous_project_id and self._voice_preview_source:
+            self._voice_preview_source = ""
+            self.voicePreviewChanged.emit()
+        if self.project_state.clip_info(self._selected_clip_id) is None:
+            self._selected_clip_id = ""
+            self.selectedClipChanged.emit()
+        elif self._selected_clip_id:
+            self.selectedClipChanged.emit()
+        if self.project_state.track_info(self._selected_track_id) is None:
+            self._selected_track_id = ""
+            self._selected_track_ids.clear()
+            self.selectedTrackChanged.emit()
+        elif self._selected_track_id:
+            self._selected_track_ids.intersection_update(self.project_state._track_by_id)
+            self.selectedTrackChanged.emit()
+        if not self.project_state.subtitle_cues.find(self._selected_cue_id):
+            self._selected_cue_id = ""
+            self.selectedCueChanged.emit()
+        elif self._selected_cue_id:
+            self.selectedCueChanged.emit()
+        self._project_name = self.project_state.name or "Chưa mở dự án"
+        self.projectNameChanged.emit()
+        self.exportSettingsChanged.emit()
+        if project_id and self.project_state.hasVoiceTrack and not self._voice_conform_busy:
+            self.refreshVoiceConformEstimate()
+
+    def _request_current_translation_preview(self) -> None:
+        project_id = self.project_state.projectId
+        if not project_id:
+            return
+        self._request_translation_cache_list(project_id)
+
+    def _request_translation_cache_list(self, project_id: str) -> None:
+        if not project_id or self._translation_cache_refresh_pending:
+            return
+        self._translation_cache_refresh_pending = True
+        try:
+            self.runtime.request(
+                "list_translation_caches",
+                {"project_id": project_id},
+                context={"project_id": project_id},
+            )
+        except Exception:
+            self._translation_cache_refresh_pending = False
+            raise
+
+    def _set_import_busy(self, value: bool) -> None:
+        if value == self._import_busy:
+            return
+        self._import_busy = value
+        self.importBusyChanged.emit()
+
+    def _set_timeline_busy(self, value: bool) -> None:
+        if value == self._timeline_busy:
+            return
+        self._timeline_busy = value
+        self.timelineBusyChanged.emit()
+
+    def _set_ocr_busy(self, value: bool) -> None:
+        if value == self._ocr_busy:
+            return
+        self._ocr_busy = value
+        self.ocrBusyChanged.emit()
+
+    def _set_ocr_job_state(self, value: str) -> None:
+        if value == self._ocr_job_state:
+            return
+        self._ocr_job_state = value
+        self.ocrBusyChanged.emit()
+
+    def _set_translation_busy(self, value: bool) -> None:
+        if value == self._translation_busy:
+            return
+        self._translation_busy = value
+        self.translationBusyChanged.emit()
+
+    def _set_translation_job_state(self, value: str) -> None:
+        if value == self._translation_job_state:
+            return
+        self._translation_job_state = value
+        self.translationBusyChanged.emit()
+
+    def _set_translation_qa(self, snapshot: object) -> None:
+        if not isinstance(snapshot, dict):
+            return
+        status = str(snapshot.get("status", "NONE")).upper()
+        if status not in {"NONE", "PENDING", "REVIEW", "PASS"}:
+            status = "PENDING"
+        issues = [dict(issue) for issue in snapshot.get("issues", []) if isinstance(issue, dict)]
+        normalized: dict[str, object] = {
+            "status": status,
+            "completed_cues": int(snapshot.get("completed_cues", 0) or 0),
+            "checked_cues": int(snapshot.get("checked_cues", 0) or 0),
+            "cue_total": int(snapshot.get("cue_total", 0) or 0),
+            "blocking_count": int(snapshot.get("blocking_count", len(issues)) or 0),
+            "blocking_issue_count": int(snapshot.get("blocking_issue_count", len(issues)) or 0),
+            "warning_count": int(snapshot.get("warning_count", 0) or 0),
+            "issues": issues,
+            "content_warnings": [
+                dict(issue)
+                for issue in snapshot.get("content_warnings", [])
+                if isinstance(issue, dict)
+            ],
+        }
+        normalized = self._reconcile_translation_qa_with_current_cues(normalized)
+        if normalized == self._translation_qa:
+            return
+        self._translation_qa = normalized
+        self.translationQaChanged.emit()
+        self._refresh_subtitle_issue_roles()
+
+    @staticmethod
+    def _is_cjk_translation_issue(issue: dict[str, object]) -> bool:
+        code = str(issue.get("code", "")).casefold()
+        message = str(issue.get("message", "")).casefold()
+        return (
+            "cjk" in code
+            or "chữ hán" in message
+            or "chữ trung" in message
+        )
+
+    def _reconcile_translation_qa_with_current_cues(
+        self,
+        snapshot: dict[str, object],
+    ) -> dict[str, object]:
+        model = self.project_state.subtitle_cues
+        rows = [model.get(row) for row in range(model.count)]
+        translated_rows = [
+            row
+            for row in rows
+            if str(row.get("translation_cue_id", ""))
+            or str(row.get("translated_text", "")).strip()
+        ]
+        source_total = model.count
+        if not translated_rows:
+            if source_total > 0:
+                return {**snapshot, "cue_total": source_total}
+            previous_status = str(snapshot.get("status", "NONE"))
+            return {
+                **snapshot,
+                "status": "NONE" if previous_status != "PENDING" else "PENDING",
+                "completed_cues": 0,
+                "checked_cues": 0,
+                "cue_total": source_total,
+                "blocking_count": 0,
+                "blocking_issue_count": 0,
+                "issues": [],
+                "content_warnings": [],
+            }
+
+        by_cue_id = {
+            str(row.get("cue_id", "")): row
+            for row in translated_rows
+            if str(row.get("cue_id", ""))
+        }
+        by_index = {
+            int(row["index"]): row
+            for row in translated_rows
+            if type(row.get("index")) is int
+        }
+        reconciled: list[dict[str, object]] = []
+        cjk_cue_ids: set[str] = set()
+        raw_issues = snapshot.get("issues", [])
+        issues = raw_issues if isinstance(raw_issues, list) else []
+        for raw_issue in issues:
+            if not isinstance(raw_issue, dict):
+                continue
+            cue_id = str(raw_issue.get("cue_id", ""))
+            cue_index = raw_issue.get("id")
+            row = by_cue_id.get(cue_id)
+            if row is None and type(cue_index) is int:
+                row = by_index.get(cue_index)
+            if row is None:
+                continue
+            translated_text = str(row.get("translated_text", ""))
+            if self._is_cjk_translation_issue(raw_issue):
+                if not contains_cjk(translated_text):
+                    continue
+                cjk_cue_ids.add(str(row.get("cue_id", "")))
+            reconciled.append(
+                {
+                    **raw_issue,
+                    "id": int(row.get("index", 0) or 0),
+                    "cue_id": str(row.get("cue_id", "")),
+                    "translated_text": translated_text,
+                }
+            )
+
+        for row in translated_rows:
+            translated_text = str(row.get("translated_text", ""))
+            cue_id = str(row.get("cue_id", ""))
+            if not contains_cjk(translated_text) or cue_id in cjk_cue_ids:
+                continue
+            reconciled.append(
+                {
+                    "id": int(row.get("index", 0) or 0),
+                    "cue_id": cue_id,
+                    "code": "cjk_remaining",
+                    "message": "Bản dịch còn chữ Hán/CJK.",
+                    "translated_text": translated_text,
+                    "original_severity": "blocker",
+                }
+            )
+
+        reconciled.sort(key=lambda issue: int(issue.get("id", 0) or 0))
+        previous_status = str(snapshot.get("status", "NONE"))
+        full_translation = (
+            source_total > 0
+            and len(translated_rows) == source_total
+            and all(str(row.get("translated_text", "")).strip() for row in translated_rows)
+        )
+        if reconciled:
+            status = "REVIEW"
+        elif previous_status == "NONE":
+            status = "NONE"
+        elif previous_status == "PENDING" or not full_translation:
+            status = "PENDING"
+        else:
+            status = "PASS"
+        cue_total = source_total
+        return {
+            **snapshot,
+            "status": status,
+            "completed_cues": min(
+                cue_total,
+                max(int(snapshot.get("completed_cues", 0) or 0), len(translated_rows)),
+            ),
+            "checked_cues": min(
+                cue_total,
+                max(int(snapshot.get("checked_cues", 0) or 0), len(translated_rows)),
+            ),
+            "cue_total": cue_total,
+            "blocking_count": len(reconciled),
+            "blocking_issue_count": len(reconciled),
+            "issues": reconciled,
+        }
+
+    def _set_voice_timing_qa(self, snapshot: object) -> None:
+        if not isinstance(snapshot, dict):
+            return
+        raw_issues = snapshot.get("issues", [])
+        issues = [dict(item) for item in raw_issues if isinstance(item, dict)]
+        status = str(snapshot.get("status", "NONE")).upper()
+        if status not in {"NONE", "REVIEW", "PASS"}:
+            status = "REVIEW" if issues else "NONE"
+        normalized: dict[str, object] = {
+            "status": status,
+            "job_id": str(snapshot.get("job_id", "")),
+            "error_code": str(snapshot.get("error_code", "")),
+            "issue_count": int(snapshot.get("issue_count", len(issues)) or 0),
+            "issues": issues,
+            "overflow_us": int(snapshot.get("overflow_us", 0) or 0),
+            "maximum_delay_us": int(snapshot.get("maximum_delay_us", 0) or 0),
+            "repair_cycle": int(snapshot.get("repair_cycle", 0) or 0),
+            "max_repair_cycles": int(snapshot.get("max_repair_cycles", 3) or 3),
+            "repairable": snapshot.get("repairable") is True,
+            "timing_warning_count": int(snapshot.get("timing_warning_count", 0) or 0),
+            "qa_non_blocking": snapshot.get("qa_non_blocking") is True,
+            "voice_read_speed": float(snapshot.get("voice_read_speed", 1.0) or 1.0),
+            "cue_max_total_speed": float(snapshot.get("cue_max_total_speed", 1.0) or 1.0),
+            "adjusted_cue_count": int(snapshot.get("adjusted_cue_count", 0) or 0),
+            "maximum_additional_factor": float(
+                snapshot.get("maximum_additional_factor", 1.0) or 1.0
+            ),
+            "unresolved_timing_cue_count": int(
+                snapshot.get("unresolved_timing_cue_count", len(issues)) or 0
+            ),
+            "cue_timeline": [
+                dict(item) for item in snapshot.get("cue_timeline", []) if isinstance(item, dict)
+            ],
+            "message": str(snapshot.get("message", "")),
+        }
+        if normalized == self._voice_timing_qa:
+            return
+        self._voice_timing_qa = normalized
+        self.project_state.replace_voice_timing_rows(normalized["cue_timeline"])
+        self.voiceTimingQaChanged.emit()
+        self._refresh_subtitle_issue_roles()
+
+    def _refresh_subtitle_issue_roles(self) -> None:
+        model = self.project_state.subtitle_cues
+        combined: dict[int, dict[str, object]] = {}
+        for snapshot in (self._translation_qa, self._voice_timing_qa):
+            for raw in snapshot.get("issues", []):
+                if not isinstance(raw, dict) or type(raw.get("id")) is not int:
+                    continue
+                cue_index = int(raw["id"])
+                current = combined.get(cue_index)
+                if current is None:
+                    combined[cue_index] = dict(raw)
+                    continue
+                codes = [str(current.get("code", "")), str(raw.get("code", ""))]
+                messages = [
+                    str(current.get("message", "")),
+                    str(raw.get("message", "")),
+                ]
+                current["code"] = ", ".join(value for value in codes if value)
+                current["message"] = "\n".join(value for value in messages if value)
+                if not current.get("cue_id") and raw.get("cue_id"):
+                    current["cue_id"] = raw["cue_id"]
+        model.set_qa_issues(list(combined.values()))
+
+    def _set_tts_busy(self, value: bool) -> None:
+        if value == self._tts_busy:
+            return
+        self._tts_busy = value
+        self.ttsBusyChanged.emit()
+
+    def _set_voice_playback_enabled(self, value: bool) -> None:
+        enabled = bool(value)
+        if enabled == self._voice_playback_enabled:
+            return
+        self._voice_playback_enabled = enabled
+        self.voicePlaybackEnabledChanged.emit()
+
+    def _set_tts_job_state(self, value: str) -> None:
+        if value == self._tts_job_state:
+            return
+        self._tts_job_state = value
+        self.ttsBusyChanged.emit()
+
+    def _set_tts_job_purpose(self, value: str) -> None:
+        if value == self._tts_job_purpose:
+            return
+        self._tts_job_purpose = value
+        self.ttsBusyChanged.emit()
+
+    def _set_voice_timing_auto_repair_busy(self, value: bool) -> None:
+        value = bool(value)
+        if value == self._voice_timing_auto_repair_busy:
+            return
+        self._voice_timing_auto_repair_busy = value
+        self.ttsBusyChanged.emit()
+
+    def _set_export_busy(self, value: bool) -> None:
+        if value == self._export_busy:
+            return
+        self._export_busy = value
+        self.exportBusyChanged.emit()
+
+    def _set_export_job_state(self, value: str) -> None:
+        if value == self._export_job_state:
+            return
+        self._export_job_state = value
+        self.exportBusyChanged.emit()
+
+    def _set_subtitle_busy(self, value: bool) -> None:
+        if value == self._subtitle_busy:
+            return
+        self._subtitle_busy = value
+        self.subtitleBusyChanged.emit()
+
+    def _send_subtitle_command(
+        self,
+        command: str,
+        *,
+        cue_id: str | None = None,
+        language: str = "source",
+        values: dict[str, object] | None = None,
+        needs_selection: bool = True,
+        optimistic_changes: list[dict[str, str]] | None = None,
+        status_context: dict[str, object] | None = None,
+    ) -> None:
+        changes = optimistic_changes or []
+
+        def rollback_optimistic() -> None:
+            self.project_state.subtitle_cues.rollback_text_changes(changes)
+            self._set_translation_qa(self._translation_qa)
+            self._refresh_local_multi_translation_review()
+
+        if self._subtitle_busy or not self.project_state.hasProject:
+            rollback_optimistic()
+            return
+        if needs_selection and command != "add" and not cue_id:
+            rollback_optimistic()
+            self._set_status("Hãy chọn cue trước")
+            return
+        params: dict[str, object] = {
+            "project_id": self.project_state.projectId,
+            "command": command,
+            "language": language,
+            "values": values or {},
+            "compact": True,
+        }
+        if cue_id:
+            params["cue_id"] = cue_id
+        self._set_subtitle_busy(True)
+        if changes:
+            # The editor already owns the optimistic Vietnamese text. Mirror
+            # its CJK count onto the Multi card before the disk/IPC round trip;
+            # a failed save rolls both projections back together above.
+            self._refresh_local_multi_translation_review()
+        context: dict[str, object] = {
+            "subtitle_command": command,
+            "project_id": self.project_state.projectId,
+            "optimistic_changes": changes,
+            **(status_context or {}),
+        }
+        try:
+            self.runtime.request("subtitle_command", params, context=context)
+        except Exception:
+            rollback_optimistic()
+            self._set_subtitle_busy(False)
+            raise
+        self._set_status(
+            "Đã cập nhật trên màn hình; đang lưu project…"
+            if changes
+            else "Đang cập nhật phụ đề"
+        )
+
+    def _start_ocr_worker(self, job_id: str) -> None:
+        self.runtime.request(
+            "start_job",
+            {
+                "job_id": job_id,
+                "program": str(runtime_program_path()),
+                "arguments": [
+                    "-m",
+                    "ducai_studio.workers.ocr_worker",
+                    job_id,
+                ],
+                "resume_stage_key": "ocr",
+                "resume_checkpoint_key": "latest",
+            },
+            context={"job_kind": "ocr"},
+        )
+
+    def _start_translation_worker(self, job_id: str) -> None:
+        self.runtime.request(
+            "start_job",
+            {
+                "job_id": job_id,
+                "program": str(runtime_program_path()),
+                "arguments": [
+                    "-m",
+                    "ducai_studio.workers.translation_worker",
+                    job_id,
+                ],
+                "resume_stage_key": "translation",
+                "resume_checkpoint_key": "latest",
+            },
+            context={"job_kind": "translate"},
+        )
+
+    def _start_tts_worker(self, job_id: str) -> None:
+        self.runtime.request(
+            "start_job",
+            {
+                "job_id": job_id,
+                "program": str(runtime_program_path()),
+                "arguments": [
+                    "-m",
+                    "ducai_studio.workers.tts_worker",
+                    job_id,
+                ],
+                "resume_stage_key": "tts",
+                "resume_checkpoint_key": "latest",
+            },
+            context={"job_kind": "tts"},
+        )
+
+    def _start_export_worker(self, job_id: str) -> None:
+        self.runtime.request(
+            "start_job",
+            {
+                "job_id": job_id,
+                "program": str(runtime_program_path()),
+                "arguments": [
+                    "-m",
+                    "ducai_studio.workers.export_worker",
+                    job_id,
+                ],
+                "resume_stage_key": "export",
+                "resume_checkpoint_key": "latest",
+            },
+            context={"job_kind": "export"},
+        )
+
+    def _send_timeline_command(
+        self,
+        command: str,
+        *,
+        value: str | int | float | None = None,
+        apply_linked: bool = True,
+        use_playhead: bool = False,
+        needs_selection: bool = True,
+    ) -> None:
+        if self._timeline_busy or not self.project_state.hasProject:
+            return
+        if needs_selection and not self._selected_clip_id:
+            self._set_status("Hãy chọn clip trước")
+            return
+        params: dict[str, object] = {
+            "project_id": self.project_state.projectId,
+            "command": command,
+            "apply_linked": apply_linked,
+        }
+        if needs_selection:
+            params["clip_id"] = self._selected_clip_id
+        if use_playhead:
+            params["timeline_us"] = self._playhead_us
+        if value is not None:
+            params["value"] = value
+        self._set_timeline_busy(True)
+        self.runtime.request("timeline_command", params)
+        self._set_status("Đang cập nhật timeline")
+
+    def _send_track_command(self, command: str, value: bool) -> None:
+        if self._timeline_busy or not self.project_state.hasProject or not self._selected_track_id:
+            self._set_status("Hãy chọn track trước")
+            return
+        self._send_track_command_by_id(command, self._selected_track_id, value)
+
+    def _send_track_command_by_id(self, command: str, track_id: str, value: bool | float) -> None:
+        if self._timeline_busy or not self.project_state.hasProject:
+            return
+        if self.project_state.track_info(track_id) is None:
+            self._set_status("Track cần chỉnh không tồn tại")
+            return
+        self._set_timeline_busy(True)
+        self.runtime.request(
+            "timeline_command",
+            {
+                "project_id": self.project_state.projectId,
+                "command": command,
+                "track_id": track_id,
+                "value": value,
+            },
+        )
+        self._set_status("Đang cập nhật track")
