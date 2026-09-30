@@ -449,6 +449,60 @@ def test_vietnamese_srt_import_preserves_source_asset_ids_and_exact_timing(
     ]
 
 
+def test_vietnamese_srt_import_accepts_source_timing_at_srt_precision(
+    tmp_path: Path,
+) -> None:
+    translated = tmp_path / "source_codex_vi.srt"
+    translated.write_text(
+        "1\n00:02:09,900 --> 00:02:12,294\nDị tộc thống soái.\n",
+        encoding="utf-8",
+    )
+    source_cue = SubtitleCue(
+        id="cue-77",
+        index=1,
+        range=TimeRange(129_900_000, 132_294_443),
+        text="异族统帅",
+        language="zh",
+    )
+    service = MediaImportService(
+        FakeProbe(MediaProbeResult(SECOND, False, True)),
+    )
+
+    updated = service.import_srt(
+        ProjectSnapshot("p", "Phim", 1, source_cues=(source_cue,)),
+        translated,
+        language="vi",
+    )
+
+    assert updated.translated_cues[0].id == source_cue.id
+    assert updated.translated_cues[0].range == source_cue.range
+
+
+def test_vietnamese_srt_import_still_rejects_actual_retiming(tmp_path: Path) -> None:
+    translated = tmp_path / "source_codex_vi.srt"
+    translated.write_text(
+        "1\n00:02:09,900 --> 00:02:12,292\nDị tộc thống soái.\n",
+        encoding="utf-8",
+    )
+    source_cue = SubtitleCue(
+        id="cue-77",
+        index=1,
+        range=TimeRange(129_900_000, 132_294_443),
+        text="异族统帅",
+        language="zh",
+    )
+    service = MediaImportService(
+        FakeProbe(MediaProbeResult(SECOND, False, True)),
+    )
+
+    with pytest.raises(ValueError, match="source cue 1"):
+        service.import_srt(
+            ProjectSnapshot("p", "Phim", 1, source_cues=(source_cue,)),
+            translated,
+            language="vi",
+        )
+
+
 def test_vietnamese_srt_import_rejects_missing_or_retimed_cues(tmp_path: Path) -> None:
     source = tmp_path / "source.srt"
     translated = tmp_path / "bad_codex_vi.srt"

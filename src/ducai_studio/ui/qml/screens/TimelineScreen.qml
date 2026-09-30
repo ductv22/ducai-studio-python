@@ -1316,7 +1316,8 @@ Item {
                                                 || root.appModel.selectedClipId === model.clipId
                                         )
                                     Accessible.name: model.isAggregate
-                                        ? model.trackName + ", " + model.aggregateCount + " clip được gom khi thu nhỏ"
+                                        ? model.trackName + ", " + model.aggregateCount
+                                            + " cue tổng quan; phóng to để xem chữ"
                                         : model.trackName + ", clip " + model.clipId
                                     Accessible.role: Accessible.ListItem
 
@@ -1325,7 +1326,8 @@ Item {
                                         visible: clipItem.model.isAggregate || parent.width >= 28
                                         width: Math.max(0, parent.width - Theme.space12)
                                         text: clipItem.model.isAggregate
-                                            ? clipItem.model.aggregateCount + " clip"
+                                            ? clipItem.model.aggregateCount
+                                                + " cue · phóng to để xem chữ"
                                             : (clipItem.isSubtitleClip
                                                 ? (clipItem.model.cueText || clipItem.model.trackId)
                                                 : ((clipItem.model.cueText || (clipItem.model.trackKind === "voice" ? "D1" : ""))

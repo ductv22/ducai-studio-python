@@ -853,6 +853,7 @@ class TimelineClipListModel(QAbstractListModel):
         self._viewport_end_us = 60_000_000
         self._prefetch_us = 10_000_000
         self._max_delegates = 480
+        self._max_sparse_track_clips = 120
 
     def rowCount(self, parent: QModelIndex = _INVALID_INDEX) -> int:
         return 0 if parent.isValid() else len(self._items)
@@ -1005,10 +1006,40 @@ class TimelineClipListModel(QAbstractListModel):
         if total <= self._max_delegates:
             items = [item for track_items in tracks_in_view for item in track_items]
         else:
-            for track_items in tracks_in_view:
+            # Keep genuinely sparse tracks (normally S2/S3 scene text) as
+            # individual editable cues. A very dense S1 track must not consume
+            # the proportional budget and collapse 75 scene labels into a few
+            # unusable "15 clip" blocks.
+            sparse_budget = self._max_delegates // 2
+            sparse_track_indexes: set[int] = set()
+            sparse_count = 0
+            sparse_candidates = sorted(
+                (
+                    (len(track_items), track_index)
+                    for track_index, track_items in enumerate(tracks_in_view)
+                    if 0 < len(track_items) <= self._max_sparse_track_clips
+                ),
+                key=lambda value: (value[0], value[1]),
+            )
+            for track_count, track_index in sparse_candidates:
+                if sparse_count + track_count > sparse_budget:
+                    continue
+                sparse_track_indexes.add(track_index)
+                sparse_count += track_count
+
+            dense_total = sum(
+                len(track_items)
+                for track_index, track_items in enumerate(tracks_in_view)
+                if track_index not in sparse_track_indexes
+            )
+            dense_budget = max(1, self._max_delegates - sparse_count)
+            for track_index, track_items in enumerate(tracks_in_view):
                 if not track_items:
                     continue
-                target = max(1, int(self._max_delegates * len(track_items) / total))
+                if track_index in sparse_track_indexes:
+                    items.extend(track_items)
+                    continue
+                target = max(1, int(dense_budget * len(track_items) / dense_total))
                 chunk_size = max(1, ceil(len(track_items) / target))
                 for offset in range(0, len(track_items), chunk_size):
                     chunk = track_items[offset : offset + chunk_size]

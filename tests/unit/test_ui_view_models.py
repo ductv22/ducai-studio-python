@@ -2234,6 +2234,11 @@ def test_subtitle_multi_selection_uses_stable_cue_ids(monkeypatch) -> None:
 
     assert view_model.selectedCueIds == ["dialogue-1", "scene-1", "scene-2"]
 
+    view_model.selectCueWithModifiers("scene-2", 3_000_000, 0)
+
+    assert view_model.selectedCueIds == ["scene-2"]
+    assert view_model.selectedCueId == "scene-2"
+
 
 def test_manual_scene_text_waits_for_current_subtitle_save_then_dispatches(
     monkeypatch,
@@ -6179,6 +6184,58 @@ def test_full_project_view_aggregates_4333_cues_without_losing_source_model() ->
         not model.data(model.index(row, 0), TimelineClipListModel.AggregateRole)
         for row in range(model.count)
     )
+
+
+def test_full_project_view_keeps_sparse_scene_text_tracks_editable() -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    model = TimelineClipListModel()
+    dialogue_count = 4_333
+    scene_count = 75
+
+    def clips(track_id: str, count: int) -> list[dict]:
+        return [
+            {
+                "id": f"{track_id}-cue-{index + 1}",
+                "track_id": track_id,
+                "timeline_range": {
+                    "start_us": index * 1_000_000,
+                    "end_us": (index + 1) * 1_000_000,
+                },
+                "speed": {"numerator": 1, "denominator": 1},
+                "volume": 1.0,
+            }
+            for index in range(count)
+        ]
+
+    model.setViewport(0, dialogue_count * 1_000_000, 0)
+    model.replace(
+        [
+            {
+                "id": "S1",
+                "kind": "subtitle",
+                "name": "Phụ đề thoại",
+                "clips": clips("S1", dialogue_count),
+            },
+            {
+                "id": "S2",
+                "kind": "subtitle",
+                "name": "Chữ trong cảnh",
+                "clips": clips("S2", scene_count),
+            },
+        ]
+    )
+
+    scene_rows = [
+        model.index(row, 0)
+        for row in range(model.count)
+        if model.data(model.index(row, 0), TimelineClipListModel.TrackIdRole) == "S2"
+    ]
+    assert len(scene_rows) == scene_count
+    assert all(
+        not model.data(index, TimelineClipListModel.AggregateRole)
+        for index in scene_rows
+    )
+    assert model.count <= 480
 
 
 def test_translation_cache_refresh_batches_contiguous_qml_notifications() -> None:

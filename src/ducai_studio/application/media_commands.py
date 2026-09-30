@@ -18,7 +18,11 @@ from ducai_studio.domain.project import (
     VoiceConformState,
     dialogue_cues,
 )
-from ducai_studio.domain.timebase import TimeRange, parse_srt_timestamp
+from ducai_studio.domain.timebase import (
+    TimeRange,
+    format_srt_timestamp,
+    parse_srt_timestamp,
+)
 from ducai_studio.domain.timeline import (
     VOICE_TIMING_OVERFLOW,
     classify_voice_timing,
@@ -217,7 +221,17 @@ class MediaImportService:
                     aligned.append(cue)
                     continue
                 source = snapshot.source_cues[index]
-                if cue.index != source.index or cue.range != source.range:
+                source_start_at_srt_precision = parse_srt_timestamp(
+                    format_srt_timestamp(source.range.start_us)
+                )
+                source_end_at_srt_precision = parse_srt_timestamp(
+                    format_srt_timestamp(source.range.end_us)
+                )
+                if (
+                    cue.index != source.index
+                    or cue.range.start_us != source_start_at_srt_precision
+                    or cue.range.end_us != source_end_at_srt_precision
+                ):
                     raise ValueError(
                         f"Translated SRT timing does not match source cue {source.index}"
                     )

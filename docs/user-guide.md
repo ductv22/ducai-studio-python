@@ -82,6 +82,9 @@ portable dùng vùng staging trong LocalAppData để không tự ghi gói tải
    xuống S2/S3… chỉ đổi vị trí hiển thị, không làm mất vai trò thoại và vẫn được
    lồng tiếng. Nếu đè cue đang có trên lane đích, tool tự tìm lane trống hoặc báo
    rõ lý do khi S1 không thể nhận cue.
+   Khi xem toàn bộ phim dài, S1 dày đặc có thể hiện khối tổng quan để giữ giao
+   diện mượt; nhãn khối hướng dẫn phóng to để xem chữ. Các lane chữ cảnh thưa như
+   S2/S3/S4 vẫn giữ từng cue riêng để có thể chọn và chỉnh trực tiếp.
    Chữ cảnh đã dịch xuất hiện trực tiếp theo playhead trong Timeline Preview, không cần
     xuất video trước. Lượt OCR toàn khung đối chiếu chữ, timestamp và vùng ảnh với
     S1 để không đưa lại hội thoại thường vào S2.
@@ -98,7 +101,9 @@ portable dùng vùng staging trong LocalAppData để không tự ghi gói tải
    Chọn một cue trên S1/S2/S3… để mở bảng chữ gọn kiểu trình soạn thảo. Click
    thường luôn thu lựa chọn về đúng một cue; chỉ Ctrl+click mới cộng hoặc bỏ từng
    cue khỏi nhóm. Việc focus hoặc đúp chuột vào ô nguồn/Việt không xóa nội dung
-   đang có. Bảng này
+   đang có. Tab **Dịch thuật** cũng hiển thị thanh định dạng và nút **Thêm chữ**,
+   nên có thể sửa hoặc bổ sung cue trực tiếp mà không cần chuyển sang Biên tập
+   phụ đề. Bảng này
    sửa nội dung tiếng Việt, cỡ chữ từ 1–100, hướng ngang/dọc, kiểu chữ, màu chữ và
    màu nền. Cỡ chữ là giá trị chủ động: kéo chữ lên cao hoặc thu khung đặt không
    tự làm chữ nhỏ lại. Chữ trong cảnh có thêm **Nền ngang/Nền dọc** để nền ôm
@@ -649,6 +654,9 @@ thay model một lần; response cũ hoặc lỗi tải không thể ghi đè pr
   chọn logo đang chờ.
 - **Trích xuất**, **Dịch thuật** và **Biên tập phụ đề** dùng chung dữ liệu cue
   nhưng mở đúng bộ điều khiển của từng công đoạn.
+- SRT chỉ biểu diễn timestamp đến mili-giây. Khi nhập bản dịch, tool kiểm tra theo
+  đúng độ phân giải đó rồi khôi phục timestamp micro-giây của cue nguồn; cue thủ
+  công không còn bị báo sai timing chỉ vì phần lẻ nhỏ hơn một mili-giây.
 - Trong **Biên tập phụ đề**, **Tìm / thay** chỉ tác động cột bản dịch Việt.
   Tool đếm chính xác số lần khớp, hỏi xác nhận rồi mới thay; khoảng trắng đầu/cuối
   trong ô thay thế được giữ nguyên. Chỉnh text hiển thị ngay trong danh sách và

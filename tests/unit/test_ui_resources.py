@@ -976,6 +976,28 @@ def test_timeline_exposes_multicue_scene_layers_text_tool_and_marquee() -> None:
         "                                                    editTargetCueId"
     )
     assert stable_editor_commit in editor
+    assert '" cue · phóng to để xem chữ"' in timeline
+
+
+def test_translation_editor_plain_click_collapses_selection_and_exposes_manual_text() -> None:
+    editor = (
+        Path(__file__).parents[2]
+        / "src"
+        / "ducai_studio"
+        / "ui"
+        / "qml"
+        / "screens"
+        / "SubtitleEditorScreen.qml"
+    ).read_text(encoding="utf-8")
+
+    assert (
+        'visible: root.workspaceMode === "translate" '
+        '|| root.workspaceMode === "subtitles"'
+    ) in editor
+    assert "acceptedModifiers: Qt.NoModifier" in editor
+    assert "acceptedModifiers: Qt.ControlModifier" in editor
+    assert editor.count("root.appModel.selectCueWithModifiers(") >= 2
+    assert "Boolean(point.modifiers & Qt.ControlModifier)" not in editor
 
 
 def test_timeline_voice_resize_is_local_until_release_and_has_visual_snap_guides() -> None:

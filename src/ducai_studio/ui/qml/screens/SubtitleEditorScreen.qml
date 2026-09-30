@@ -1109,7 +1109,7 @@ Item {
             SubtitleTextToolbar {
                 id: subtitleTextToolbar
                 Layout.fillWidth: true
-                visible: root.workspaceMode === "subtitles"
+                visible: root.workspaceMode === "translate" || root.workspaceMode === "subtitles"
                 appModel: root.appModel
                 allowManualPlacement: true
                 onManualPlacementRequested: manualCueDialog.openForPlayhead(
@@ -1209,6 +1209,21 @@ Item {
                         delegate: Rectangle {
                             id: cueRow
                             required property var model
+                            function editorContains(position) {
+                                const sourcePoint = sourceEditorHost.mapFromItem(
+                                    cueRow, position.x, position.y
+                                )
+                                if (sourcePoint.x >= 0 && sourcePoint.y >= 0
+                                        && sourcePoint.x <= sourceEditorHost.width
+                                        && sourcePoint.y <= sourceEditorHost.height)
+                                    return true
+                                const translatedPoint = translatedEditorHost.mapFromItem(
+                                    cueRow, position.x, position.y
+                                )
+                                return translatedPoint.x >= 0 && translatedPoint.y >= 0
+                                    && translatedPoint.x <= translatedEditorHost.width
+                                    && translatedPoint.y <= translatedEditorHost.height
+                            }
                             width: ListView.view.width
                             height: model.qaIssueCode ? 76 : 66
                             color: root.appModel.isCueSelected(model.cueId)
@@ -1235,11 +1250,25 @@ Item {
 
                             TapHandler {
                                 acceptedButtons: Qt.LeftButton
-                                onTapped: root.appModel.selectCueWithAdditive(
-                                    cueRow.model.cueId,
-                                    cueRow.model.startUs,
-                                    Boolean(point.modifiers & Qt.ControlModifier)
-                                )
+                                acceptedModifiers: Qt.NoModifier
+                                onTapped: {
+                                    if (!cueRow.editorContains(point.position))
+                                        root.appModel.selectCue(
+                                            cueRow.model.cueId, cueRow.model.startUs
+                                        )
+                                }
+                            }
+                            TapHandler {
+                                acceptedButtons: Qt.LeftButton
+                                acceptedModifiers: Qt.ControlModifier
+                                onTapped: {
+                                    if (!cueRow.editorContains(point.position))
+                                        root.appModel.selectCueWithAdditive(
+                                            cueRow.model.cueId,
+                                            cueRow.model.startUs,
+                                            true
+                                        )
+                                }
                             }
                             TapHandler {
                                 acceptedButtons: Qt.RightButton
@@ -1339,12 +1368,12 @@ Item {
                                             when: !sourceEditor.activeFocus
                                             restoreMode: Binding.RestoreNone
                                         }
-                                        onPressed: {
-                                            if (!activeFocus)
-                                                root.appModel.selectCue(
-                                                    cueRow.model.cueId,
-                                                    cueRow.model.startUs
-                                                )
+                                        onPressed: function(mouse) {
+                                            root.appModel.selectCueWithModifiers(
+                                                cueRow.model.cueId,
+                                                cueRow.model.startUs,
+                                                Number(mouse.modifiers || Qt.NoModifier)
+                                            )
                                         }
                                         onActiveFocusChanged: {
                                             if (activeFocus) {
@@ -1410,12 +1439,12 @@ Item {
                                             when: !translatedEditor.activeFocus
                                             restoreMode: Binding.RestoreNone
                                         }
-                                        onPressed: {
-                                            if (!activeFocus)
-                                                root.appModel.selectCue(
-                                                    cueRow.model.cueId,
-                                                    cueRow.model.startUs
-                                                )
+                                        onPressed: function(mouse) {
+                                            root.appModel.selectCueWithModifiers(
+                                                cueRow.model.cueId,
+                                                cueRow.model.startUs,
+                                                Number(mouse.modifiers || Qt.NoModifier)
+                                            )
                                         }
                                         onActiveFocusChanged: {
                                             if (activeFocus) {
