@@ -26,7 +26,10 @@ from .host_client import EngineHostClient, EngineHostError
 def _default_host_script() -> Path:
     source_path = Path(__file__).parents[2] / "engine_hosts" / "tts_engine_host.py"
     release_path = runtime_program_path().parent / "engine_hosts" / "tts_engine_host.py"
-    return source_path if source_path.is_file() else release_path
+    if source_path.is_file():
+        return source_path
+    compiled_path = release_path.with_suffix(".pyc")
+    return compiled_path if compiled_path.is_file() else release_path
 
 
 class PiperTtsProvider:

@@ -5,6 +5,19 @@ import pytest
 from ducai_studio.ui.app import _application_data_root, _ui_resource_root
 
 
+def test_settings_update_panel_requires_explicit_restart_confirmation() -> None:
+    root = Path(__file__).parents[2] / "src" / "ducai_studio" / "ui" / "qml"
+    settings = (root / "screens" / "SettingsScreen.qml").read_text(encoding="utf-8")
+    main = (root / "Main.qml").read_text(encoding="utf-8")
+
+    assert 'SectionTitle { text: "Cập nhật DUCAI STUDIO" }' in settings
+    assert 'text: "Cài đặt khi xong tác vụ"' in settings
+    assert "root.appModel.updater.requestInstallConfirmation()" in settings
+    assert "textFormat: Text.PlainText" in settings
+    assert "onInstallConfirmationRequested" in main
+    assert "window.appModel.updater.installConfirmed()" in main
+
+
 def test_application_data_root_is_canonical_before_single_instance_lock(tmp_path: Path) -> None:
     target = tmp_path / "target"
     target.mkdir()
@@ -23,6 +36,87 @@ def test_file_dialogs_pass_url_strings_to_python_for_unicode_safe_normalization(
     assert "window.appModel.importPaths(values)" in qml
     assert "inspectLegacyProjectPath(selectedFile.toString())" in qml
     assert "selectedFile.toLocalFile()" not in qml
+
+
+def test_scene_text_preview_is_glyph_aware_monotonic_and_manually_adjustable() -> None:
+    qml_root = Path(__file__).parents[2] / "src" / "ducai_studio" / "ui" / "qml"
+    preview = (qml_root / "controls" / "TimelinePreview.qml").read_text(
+        encoding="utf-8"
+    )
+    editor = (qml_root / "screens" / "SubtitleEditorScreen.qml").read_text(
+        encoding="utf-8"
+    )
+    toolbar = (qml_root / "controls" / "SubtitleTextToolbar.qml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "const glyph = sceneGlyphRect(cue)" in preview
+    assert "automaticSize * fontScale" in preview
+    assert "const widthRatio = calligraphy ? 1.96 : 1.28" in preview
+    assert "Math.min(240" not in preview
+    assert "fontSizeMode: Text.Fit" not in preview
+    assert "background_padding_x" in preview
+    assert "background_padding_y" in preview
+    assert "clip: true" in preview
+    assert "SubtitleTextToolbar {" in editor
+    assert 'text: "Kích thước chữ S2"' not in editor
+    assert "from: 1" in toolbar
+    assert "to: 100" in toolbar
+    assert "setSelectedSubtitleTextFormat" in toolbar
+    assert preview.count("enabled: !root.editableOverlays") >= 2
+    assert preview.count("visible: !root.editableOverlays") >= 2
+    assert 'text: "Ngang"' in toolbar
+    assert 'text: "Dọc"' in toolbar
+    assert 'Accessible.name: "Độ rộng nền theo chiều ngang"' in toolbar
+    assert 'Accessible.name: "Độ rộng nền theo chiều dọc"' in toolbar
+    assert 'value: "calligraphy_soft"' in toolbar
+    assert 'value: "calligraphy_bold"' in toolbar
+    assert 'value: "calligraphy_ink"' in toolbar
+    assert 'value: "calligraphy_brush"' in toolbar
+    assert 'value: "calligraphy_water"' in toolbar
+    assert 'value: "calligraphy_splash"' in toolbar
+    assert 'value: "calligraphy_hurricane"' in toolbar
+    assert 'value: "ink_splash"' in toolbar
+    assert 'value: "ink_wash"' in toolbar
+    assert 'value: "ink_cloud"' in toolbar
+    assert 'value: "brush_stroke"' in toolbar
+    assert 'text: "Mực tàu"' in toolbar
+    assert 'Accessible.name: "Áp preset chữ và nền mực tàu"' in toolbar
+    assert "InkSplashBackground" in preview
+    assert "background_style" in preview
+
+
+def test_subtitle_cues_can_be_opened_deleted_formatted_and_drawn_from_ui() -> None:
+    qml_root = Path(__file__).parents[2] / "src" / "ducai_studio" / "ui" / "qml"
+    preview = (qml_root / "controls" / "TimelinePreview.qml").read_text(
+        encoding="utf-8"
+    )
+    timeline = (qml_root / "screens" / "TimelineScreen.qml").read_text(
+        encoding="utf-8"
+    )
+    editor = (qml_root / "screens" / "SubtitleEditorScreen.qml").read_text(
+        encoding="utf-8"
+    )
+    manual_dialog = (
+        qml_root / "controls" / "ManualSubtitleCueDialog.qml"
+    ).read_text(encoding="utf-8")
+
+    assert "readonly property bool isSubtitleClip" in timeline
+    assert "root.appModel.openSubtitleCueInEditor(" in timeline
+    assert 'text: "Xóa cue chữ và nền"' in timeline
+    assert "root.appModel.deleteSubtitleCue(" in timeline
+    assert "SubtitleTextToolbar {" in timeline
+    assert "onDoubleClicked" in preview
+    assert 'text: "Xóa cue chữ và nền"' in preview
+    assert '"Quét vùng OCR"' in editor
+    assert '"Vùng không OCR"' in editor
+    assert 'root.regionEditorMode = "manual_text"' in editor
+    assert "ManualSubtitleCueDialog {" in editor
+    assert "appModel.addManualSubtitleCue(" in manual_dialog
+    assert 'value: "dialogue"' in manual_dialog
+    assert 'value: "scene_text"' in manual_dialog
+    assert 'text: "Mờ dần vào/ra"' in manual_dialog
+    assert "root.appModel.setOcrRegions(" in editor
 
 
 def test_projects_screen_uses_a_dedicated_new_project_dialog_contract() -> None:
@@ -54,10 +148,40 @@ def test_every_integer_spinbox_is_editable_and_uses_the_shared_control() -> None
     assert not any(line.lstrip().startswith("SpinBox {") for line in export.splitlines())
     # Coordinate fields for logo/blur are intentionally removed. Geometry is
     # edited directly on the video preview to avoid pointer jumps.
-    assert export.count("DsSpinBox {") == 14
+    assert export.count("DsSpinBox {") == 17
     assert "editable: true" in control
     assert "selectByMouse: true" in control
     assert export.count("accessibleName:") >= export.count("DsSpinBox {")
+
+
+def test_subtitle_numeric_controls_and_timeline_inspector_are_width_safe() -> None:
+    root = Path(__file__).parents[2] / "src" / "ducai_studio" / "ui" / "qml"
+    spinbox = (root / "controls" / "DsSpinBox.qml").read_text(encoding="utf-8")
+    button = (root / "controls" / "DsButton.qml").read_text(encoding="utf-8")
+    toolbar = (root / "controls" / "SubtitleTextToolbar.qml").read_text(
+        encoding="utf-8"
+    )
+    dialog = (root / "controls" / "ManualSubtitleCueDialog.qml").read_text(
+        encoding="utf-8"
+    )
+    timeline = (root / "screens" / "TimelineScreen.qml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Layout.minimumWidth: 104" in spinbox
+    assert "readonly property int indicatorWidth: 28" in spinbox
+    assert "ToolTip.text: control.accessibleName" in spinbox
+    assert 'property string tooltipText: ""' in button
+    assert "ToolTip.text: control.tooltipText" in button
+    assert toolbar.count("Layout.preferredWidth: 104") >= 5
+    assert 'text: "MÀU & HIỆU ỨNG"' in toolbar
+    assert 'tooltipText: "Cho chữ trong cảnh xuất hiện' in toolbar
+    assert "standardButtons: Dialog.NoButton" in dialog
+    assert 'text: "Hủy"' in dialog
+    assert 'text: root.cueRole === "dialogue"' in dialog
+    assert timeline.count("Layout.minimumWidth: 0") >= 6
+    assert 'tooltipText: "Thuộc tính clip đang chọn."' in timeline
+    assert 'tooltipText: "Áp dụng phần trăm tốc độ' in timeline
 
 
 def test_timeline_context_menus_render_inside_the_main_window() -> None:
@@ -150,6 +274,25 @@ def test_voice_studio_exposes_finished_voice_player_and_detailed_tts_phases() ->
     assert '"Đã kiểm tra cache " + model.phaseCurrent + "/" + model.phaseTotal' in panel
     assert '"Đã tổng hợp " + model.phaseCurrent + "/" + model.phaseTotal' in panel
     assert '"Đã ghép " + model.phaseCurrent + "/" + model.phaseTotal' in panel
+
+
+def test_voice_library_separates_preview_install_and_selection_actions() -> None:
+    qml = (
+        Path(__file__).parents[2]
+        / "src"
+        / "ducai_studio"
+        / "ui"
+        / "qml"
+        / "screens"
+        / "VoiceStudioScreen.qml"
+    ).read_text(encoding="utf-8")
+
+    assert '"Dừng" : "Nghe thử"' in qml
+    assert "root.appModel.previewCatalogVoice(voiceDelegate.voiceId)" in qml
+    assert "root.appModel.installVoice(voiceDelegate.voiceId)" in qml
+    assert 'runningText: "Đang tải " + voiceDelegate.installProgress + "%"' in qml
+    assert "enabled: voiceDelegate.installed" in qml
+    assert "opacity: installed ? 1.0 : 0.55" not in qml
 
 
 def test_job_activity_panel_localizes_whisper_phases() -> None:
@@ -311,9 +454,29 @@ def test_effects_screen_has_live_logo_and_blur_preview() -> None:
     assert "property bool showProjectOverlays: false" in preview
     assert "ShaderEffectSource {" in preview
     assert "MultiEffect {" in preview
+    assert "* root.subtitleScale()" in preview
+    assert "? Math.SQRT2 : 1.0" in preview
+    assert 'root.blurOverlay.concealment_mode === "cover"' in preview
+    assert 'opacity: 0.90' in preview
+    assert 'overlayFrame.overlay.concealment_mode === "cover"' in preview
+    assert 'overlayFrame.overlay.tracking_mode === "ocr_watermark"' in preview
+    assert '"CHE WATERMARK OCR"' in preview
+    assert "overlayFrame.tracksAutomaticRegion" in preview
+    assert 'item.tracking_mode === "ocr_watermark"' in export
+    assert "Đã tự che " in export
+    assert "Bật Che kín chữ gốc" in export
+    assert "setOverlayConcealmentMode" in export
+    assert "automaticBlurPaddingY.value / 1000" in export
+    assert "Number(value / 10).toLocaleString" in export
     assert 'overlay("overlay-default-blur")' in preview
     assert 'overlay("overlay-default-logo")' in preview
-    assert "mediaSource(\n                            overlayFrame.modelData.asset_id" in preview
+    assert "sourceSubtitleRegionsAt(playhead)" in preview
+    assert "const withinRange = root.appModel.playheadUs >= startUs" in preview
+    assert "return Boolean(root.activeSubtitleRegions" in preview
+    assert "&& root.overlayActive(root.blurOverlay)" in preview
+    assert "? root.activeSubtitleRegions : []" in preview
+    assert "root.trackedSubtitleBlur(root.blurOverlay, modelData)" in preview
+    assert "mediaSource(\n                            overlayFrame.overlay.asset_id" in preview
     assert "function captureCurrentGeometry()" in preview
     assert preview.index("const currentX = overlayFrame.x") < preview.index(
         "overlayFrame.localOverride = true"
@@ -329,11 +492,30 @@ def test_effects_screen_has_live_logo_and_blur_preview() -> None:
     assert "overlayFrame.manualHeight = bottom - overlayFrame.manualY" in preview
     assert "anchors.bottom: parent.bottom" in preview
     assert "visible: !root.editableOverlays && opacity > 0.01" in preview
-    assert "root.selectedOverlayId === overlayFrame.modelData.id" in preview
+    assert "root.selectedOverlayId === overlayFrame.overlay.id" in preview
     assert "? 100 : 40" in preview
     assert 'objectName: "overlayTopRightResizeHandle"' in preview
     assert 'objectName: "overlayBottomLeftResizeHandle"' in preview
     assert "function compactHandleCorner()" in preview
+
+
+def test_translation_style_rules_use_multiline_editor_and_serialized_save() -> None:
+    editor = (
+        Path(__file__).parents[2]
+        / "src"
+        / "ducai_studio"
+        / "ui"
+        / "qml"
+        / "screens"
+        / "SubtitleEditorScreen.qml"
+    ).read_text(encoding="utf-8")
+
+    assert "id: translationRulesScroll" in editor
+    assert "id: translationRules" in editor
+    assert "wrapMode: TextEdit.Wrap" in editor
+    assert "if (text.length <= 4000) return" in editor
+    assert "!root.appModel.translationPreferencesBusy" in editor
+    assert 'runningText: "Đang lưu…"' in editor
 
 
 def test_shared_buttons_expose_text_states_and_top_center_feedback() -> None:
@@ -385,6 +567,48 @@ def test_subtitle_style_and_video_filters_are_real_preview_controls() -> None:
     assert 'objectName: "liveSubtitlePreview"' in preview
     assert "exportSubtitleOutlineWidth * scaleFactor" in preview
     assert "exportSubtitleOpacityPercent / 100" in preview
+
+
+def test_scene_text_preview_conceals_glyphs_and_preserves_review_cues() -> None:
+    project_root = Path(__file__).parents[2]
+    preview = (
+        project_root
+        / "src"
+        / "ducai_studio"
+        / "ui"
+        / "qml"
+        / "controls"
+        / "TimelinePreview.qml"
+    ).read_text(encoding="utf-8")
+    fonts = project_root / "src" / "ducai_studio" / "ui" / "assets" / "fonts"
+
+    assert "currentProject.sceneTextsAt(playhead)" in preview
+    assert "root.sceneGlyphRect(modelData)" in preview
+    assert "root.scenePanelRect(modelData)" in preview
+    assert 'String(modelData.review_state || "accepted") === "accepted"' in preview
+
+    editor = (
+        project_root
+        / "src"
+        / "ducai_studio"
+        / "ui"
+        / "qml"
+        / "screens"
+        / "SubtitleEditorScreen.qml"
+    ).read_text(encoding="utf-8")
+    assert "Chấp nhận chữ trong cảnh" in editor
+    assert "acceptSceneTextCue" in editor
+    assert ') + " · CẦN DUYỆT"' in preview
+    assert 'if (style === "calligraphy") return "Playwrite VN"' in preview
+    assert 'if (style === "calligraphy_soft") return "Dancing Script"' in preview
+    assert 'if (style === "calligraphy_bold") return "Lobster"' in preview
+    assert 'if (style === "calligraphy_ink") return "Agbalumo"' in preview
+    assert 'if (style === "calligraphy_brush") return "Comforter Brush"' in preview
+    assert 'if (style === "calligraphy_water") return "Water Brush"' in preview
+    assert 'if (style === "calligraphy_splash") return "Splash"' in preview
+    assert 'if (style === "calligraphy_hurricane") return "Hurricane"' in preview
+    assert (fonts / "PlaywriteVN-Variable.ttf").is_file()
+    assert (fonts / "PLAYWRITE-VN-OFL.txt").is_file()
 
 
 def test_subtitle_editor_confirms_vietnamese_replace_and_right_click_delete() -> None:
@@ -442,7 +666,9 @@ def test_timeline_has_resizable_preview_zoom_slider_and_preview_transport_shortc
     assert "readonly property bool controlsHovered: viewportHovered || transportHovered" in preview
     assert "interval: 0" in preview
     assert "color: Qt.rgba(0.03, 0.06, 0.09, 0.78)" in preview
-    assert preview.index("z: 110") < preview.index("model: root.appModel.currentProject.overlays")
+    assert preview.index("z: 110") < preview.index(
+        "model: root.appModel.currentProject.overlayModel"
+    )
     assert "z: 120" in preview
     assert 'text: "Phụ đề"' in timeline
     assert "model: root.appModel.currentProject.subtitleCueModel" in timeline
@@ -663,7 +889,8 @@ def test_timeline_exposes_timestamped_per_cue_voice_sync() -> None:
         / "TimelineScreen.qml"
     ).read_text(encoding="utf-8")
 
-    assert 'text: "Khớp voice theo SRT"' in qml
+    assert 'text: "Khớp D1"' in qml
+    assert 'tooltipText: "Mở công cụ cân thời lượng từng cue D1 theo mốc SRT."' in qml
     assert 'root.selectInspectorTab("voice-sync")' in qml
     assert "currentProject.voiceConformCueModel.setViewport" in qml
     assert "model: root.appModel.currentProject.voiceConformCueModel" in qml
@@ -697,6 +924,60 @@ def test_timeline_voice_resize_handles_leave_a_double_click_target() -> None:
     assert 'objectName: "timelineClipBody-" + clipItem.model.clipId' in qml
 
 
+def test_timeline_exposes_multicue_scene_layers_text_tool_and_marquee() -> None:
+    qml_root = Path(__file__).parents[2] / "src" / "ducai_studio" / "ui" / "qml"
+    timeline = (qml_root / "screens" / "TimelineScreen.qml").read_text(
+        encoding="utf-8"
+    )
+    preview = (qml_root / "controls" / "TimelinePreview.qml").read_text(
+        encoding="utf-8"
+    )
+    editor = (qml_root / "screens" / "SubtitleEditorScreen.qml").read_text(
+        encoding="utf-8"
+    )
+    manual_dialog = (qml_root / "controls" / "ManualSubtitleCueDialog.qml").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'text: "T"' in timeline
+    assert 'id: manualCueDialog' in timeline
+    assert 'id: subtitleMarqueeArea' in timeline
+    assert "subtitleCueIdsInRange(" in timeline
+    assert "selectSubtitleCueIds(ids, additive)" in timeline
+    assert "moveSelectedSceneTexts(" in timeline
+    assert "previewSelectedSceneTextMove" in timeline
+    assert "!root.cueSelected(clipItem.model.cueId)" in timeline
+    assert "property bool selectionHandledOnPress" in timeline
+    assert "&& !selectionHandledOnPress" in timeline
+    assert '&& root.sceneTimingLaneDelta !== 0)' in timeline
+    assert "manualCueDialog.openForPlayhead(root.appModel.playheadUs)" in timeline
+    assert "manualCueDialog.submitAtRegion(x, y, width, height)" in timeline
+    assert "startUs + durationSeconds * 1000000" in manual_dialog
+    assert "projectEndUs - 100000" not in timeline
+    assert "isSceneTextCue(" not in timeline
+    assert "Math.max(1 - currentLane, rawLaneDelta)" in timeline
+    assert "root.seekTimelineAt(mouse.x)" in timeline
+    assert "root.seekTimelineAt(point.x)" in timeline
+    assert 'id: subtitleTextToolbar' in timeline
+    assert "visible: root.appModel.selectedCueCount > 0" not in timeline
+    assert "transformSelectedSubtitleGeometry" in preview
+    assert "subtitleGeometryPending" in preview
+    assert preview.count("property bool selectedOnPress") >= 2
+    assert "property string editTargetCueId" in editor
+    assert editor.count("restoreMode: Binding.RestoreNone") == 2
+    assert "selectCueWithAdditive(" in editor
+    assert "selectCueWithAdditive(" in timeline
+    assert "selectCueWithAdditive(" in preview
+    assert "ScrollBar.vertical: ScrollBar" in timeline
+    assert "ensureSelectedCueTrackVisible" not in timeline
+    assert "selectSubtitleCueIds([], false)" not in timeline
+    stable_editor_commit = (
+        "root.appModel.updateSubtitleText(\n"
+        "                                                    editTargetCueId"
+    )
+    assert stable_editor_commit in editor
+
+
 def test_timeline_voice_resize_is_local_until_release_and_has_visual_snap_guides() -> None:
     qml = (
         Path(__file__).parents[2]
@@ -713,13 +994,13 @@ def test_timeline_voice_resize_is_local_until_release_and_has_visual_snap_guides
     assert "function finishClipResize()" in qml
     assert qml.count("root.appModel.resizeSelectedClip(") == 1
     assert qml.count("root.updateClipResize(point.x)") == 2
-    assert qml.count("mapToItem(clipLayer, mouse.x, mouse.y)") == 4
+    assert qml.count("mapToItem(clipLayer, mouse.x, mouse.y)") == 6
     assert "id: resizeVerticalGuide" in qml
     assert "id: resizeDistanceGuide" in qml
     assert "id: resizeGuideLabel" in qml
     assert "Math.min(500_000, Math.max(80_000, eightPixelsUs))" in qml
     assert "Math.ceil(root.clipResizeSourceDurationUs / 3.0)" in qml
-    assert 'event.key === Qt.Key_Escape && root.clipResizeActive' in qml
+    assert "root.clipResizeActive || root.sceneTimingActive || root.clipMoveActive" in qml
     assert "Keys.priority: Keys.AfterItem" in qml
     assert 'state === "overflow"' in qml
     assert 'state === "underflow" || state === "position_mismatch"' in qml
@@ -757,6 +1038,33 @@ def test_timeline_preserves_vertical_track_scroll_across_model_refresh() -> None
     assert "function onModelReset()" in qml
     assert "trackList.contentHeight - trackList.height" in qml
     assert "trackList.modelResetInProgress = false" in qml
+    assert "positionViewAtIndex" not in qml
+
+
+def test_preview_playback_toggle_color_picker_and_scene_snap_are_direct() -> None:
+    qml_root = Path(__file__).parents[2] / "src" / "ducai_studio" / "ui" / "qml"
+    preview = (qml_root / "controls" / "TimelinePreview.qml").read_text(
+        encoding="utf-8"
+    )
+    timeline = (qml_root / "screens" / "TimelineScreen.qml").read_text(
+        encoding="utf-8"
+    )
+    toolbar = (qml_root / "controls" / "SubtitleTextToolbar.qml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "function togglePlayback()" in preview
+    assert 'id: videoPlaybackToggleArea' in preview
+    assert 'id: previewColorPicker' in preview
+    assert "filteredVideo.grabToImage" in preview
+    assert "samplePreviewColor(" in preview
+    assert 'signal colorPickRequested(string target)' in toolbar
+    assert "applyPickedColor" in toolbar
+    assert 'sequence: "Space"' in preview
+    assert "!root.textEditorHasFocus()" in preview
+    assert "sceneTimingSnapActive" in timeline
+    assert "Math.min(\n            500_000, Math.max(80_000, eightPixelsUs)" in timeline
+    assert 'id: sceneTimingSnapGuide' in timeline
 
 
 def test_global_status_notifications_are_readable_and_dismissible() -> None:

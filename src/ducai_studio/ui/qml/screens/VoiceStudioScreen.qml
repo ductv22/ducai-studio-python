@@ -214,13 +214,17 @@ Item {
 
     MediaPlayer {
         id: previewPlayer
-        source: root.appModel.voicePreviewSource
+        source: root.appModel.voiceCatalogPreviewSource
+            ? root.appModel.voiceCatalogPreviewSource
+            : root.appModel.voicePreviewSource
         audioOutput: previewAudio
         onMediaStatusChanged: {
-            if (mediaStatus === MediaPlayer.LoadedMedia
-                    && root.appModel.voicePreviewSource) {
+            if (mediaStatus === MediaPlayer.LoadedMedia && source) {
                 productionPlayer.pause()
                 play()
+            } else if (mediaStatus === MediaPlayer.EndOfMedia
+                    && root.appModel.voiceCatalogPreviewId) {
+                root.appModel.stopVoiceCatalogPreview()
             }
         }
     }
@@ -245,7 +249,13 @@ Item {
     Connections {
         target: root.appModel
         function onVoicePreviewChanged() {
-            previewPlayer.source = root.appModel.voicePreviewSource
+            if (!root.appModel.voiceCatalogPreviewSource)
+                previewPlayer.source = root.appModel.voicePreviewSource
+        }
+        function onVoiceCatalogPlaybackChanged() {
+            previewPlayer.source = root.appModel.voiceCatalogPreviewSource
+                ? root.appModel.voiceCatalogPreviewSource
+                : root.appModel.voicePreviewSource
         }
         function onVoicePlaybackEnabledChanged() {
             if (root.appModel.voicePlaybackEnabled) return
@@ -515,23 +525,37 @@ Item {
                                 required property string voiceDescription
                                 required property string rightsLabel
                                 required property bool installed
+                                required property string previewSource
+                                required property string previewText
+                                required property bool previewAvailable
+                                required property bool installable
+                                required property string installState
+                                required property int installProgress
+                                required property string installError
+                                required property bool isClone
 
                                 width: ListView.view.width
-                                height: 72
+                                height: 112
                                 radius: Theme.radiusSmall
                                 color: voiceId === root.appModel.selectedVoiceId
                                     ? Theme.selectionFill
                                     : (voiceMouse.containsMouse ? Theme.surfaceHover : Theme.surfaceRaised)
                                 border.width: voiceId === root.appModel.selectedVoiceId ? 1 : 0
                                 border.color: Theme.primary
-                                opacity: installed ? 1.0 : 0.55
+                                MouseArea {
+                                    id: voiceMouse
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    enabled: voiceDelegate.installed
+                                    onClicked: root.appModel.selectVoice(voiceDelegate.voiceId)
+                                }
 
-                                Column {
+                                ColumnLayout {
                                     anchors.fill: parent
                                     anchors.margins: Theme.space8
                                     spacing: 3
                                     Text {
-                                        width: parent.width
+                                        Layout.fillWidth: true
                                         text: voiceDelegate.voiceName + "  •  " + voiceDelegate.voiceSource
                                         color: Theme.textPrimary
                                         font.family: Theme.fontFamily
@@ -540,7 +564,7 @@ Item {
                                         elide: Text.ElideRight
                                     }
                                     Text {
-                                        width: parent.width
+                                        Layout.fillWidth: true
                                         text: voiceDelegate.voiceDescription
                                         color: Theme.textSecondary
                                         font.family: Theme.fontFamily
@@ -548,7 +572,7 @@ Item {
                                         elide: Text.ElideRight
                                     }
                                     Text {
-                                        width: parent.width
+                                        Layout.fillWidth: true
                                         text: (voiceDelegate.installed ? "Đã cài" : "Chưa cài")
                                             + " • " + voiceDelegate.rightsLabel
                                         color: voiceDelegate.installed ? Theme.success : Theme.warning
@@ -556,14 +580,64 @@ Item {
                                         font.pixelSize: 9
                                         elide: Text.ElideRight
                                     }
-                                }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: Theme.space4
 
-                                MouseArea {
-                                    id: voiceMouse
-                                    anchors.fill: parent
-                                    hoverEnabled: true
-                                    enabled: voiceDelegate.installed
-                                    onClicked: root.appModel.selectVoice(voiceDelegate.voiceId)
+                                        DsButton {
+                                            text: root.appModel.voiceCatalogPreviewId === voiceDelegate.voiceId
+                                                ? "Dừng" : "Nghe thử"
+                                            compact: true
+                                            enabled: voiceDelegate.previewAvailable
+                                            disabledReason: voiceDelegate.isClone
+                                                ? "Chọn file mẫu clone để nghe giọng của bạn."
+                                                : "Chưa có mẫu nghe được xác minh cho giọng này."
+                                            feedbackEnabled: false
+                                            onClicked: root.appModel.previewCatalogVoice(voiceDelegate.voiceId)
+                                            ToolTip.visible: hovered && Boolean(voiceDelegate.previewText)
+                                            ToolTip.text: voiceDelegate.previewText
+                                            ToolTip.delay: 500
+                                        }
+
+                                        DsButton {
+                                            visible: !voiceDelegate.installed && voiceDelegate.installable
+                                            text: voiceDelegate.installState === "error" ? "Thử lại" : "Cài"
+                                            compact: true
+                                            primary: true
+                                            enabled: voiceDelegate.installState !== "downloading"
+                                            operationState: voiceDelegate.installState === "downloading"
+                                                ? "running"
+                                                : (voiceDelegate.installState === "error" ? "failed" : "idle")
+                                            runningText: "Đang tải " + voiceDelegate.installProgress + "%"
+                                            failedText: "Thử lại"
+                                            feedbackEnabled: false
+                                            onClicked: root.appModel.installVoice(voiceDelegate.voiceId)
+                                            ToolTip.visible: hovered && Boolean(voiceDelegate.installError)
+                                            ToolTip.text: voiceDelegate.installError
+                                            ToolTip.delay: 350
+                                        }
+
+                                        Text {
+                                            visible: voiceDelegate.installed
+                                            text: voiceDelegate.voiceId === root.appModel.selectedVoiceId
+                                                ? "Đang dùng" : "Sẵn sàng"
+                                            color: voiceDelegate.voiceId === root.appModel.selectedVoiceId
+                                                ? Theme.primary : Theme.success
+                                            font.family: Theme.fontFamily
+                                            font.pixelSize: 10
+                                            font.weight: Font.DemiBold
+                                        }
+
+                                        Item { Layout.fillWidth: true }
+
+                                        Text {
+                                            visible: !voiceDelegate.installed && !voiceDelegate.installable
+                                            text: "Chưa có gói cài hợp lệ"
+                                            color: Theme.textMuted
+                                            font.family: Theme.fontFamily
+                                            font.pixelSize: 9
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -579,7 +653,7 @@ Item {
 
                         ColumnLayout {
                             Layout.fillWidth: true
-                            visible: root.appModel.selectedVoiceProvider === "vieneu-3.3"
+                            visible: Boolean(root.selectedValue("is_clone", false))
                             spacing: Theme.space4
                             Text {
                                 text: "Mẫu clone mới (để trống để dùng profile hiện có)"
@@ -604,7 +678,7 @@ Item {
                             DsTextField {
                                 Layout.fillWidth: true
                                 text: root.appModel.vieneuReferenceText
-                                placeholderText: "Lời mẫu (ghi chú; VieNeu 3.3 không bắt buộc)"
+                                placeholderText: "Lời mẫu (ghi chú; VieNeu 3 Turbo không bắt buộc)"
                                 onEditingFinished: root.appModel.setVieNeuReferenceText(text)
                             }
                             CheckBox {

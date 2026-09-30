@@ -12,6 +12,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -20,10 +21,12 @@ from uuid import uuid4
 from ducai_studio.application.ocr_pipeline import (
     apply_quality_rescue,
     coalesce_rescue_windows,
+    cross_pass_consensus_candidates,
     group_visual_evidence,
     measure_hard_sub_coverage,
     merge_band_candidates,
     reinforce_candidate_ranges,
+    scene_text_cues_from_evidence,
     targeted_rescue_windows,
 )
 from ducai_studio.application.subtitle_finalizer import (
@@ -341,6 +344,8 @@ class OcrWorker:
         self.config: dict[str, Any] = {}
         self.stage = "fast"
         self.cursor_us = 0
+        self._change_events: list[int] = []
+        self._scene_change_events: list[int] = []
         self._whisper_force_cpu = False
         self._whisper_runtime: dict[str, Any] = {}
         self._whisper_segment_total = 0
@@ -448,6 +453,12 @@ class OcrWorker:
         self.stage = str(payload.get("stage", "fast"))
         raw_cursor = payload.get("cursor_us", checkpoint.get("cursor_us", 0))
         self.cursor_us = int(raw_cursor) if type(raw_cursor) is int else 0
+        self._change_events = self._checkpoint_event_values(
+            payload.get("change_events_us")
+        )
+        self._scene_change_events = self._checkpoint_event_values(
+            payload.get("scene_change_events_us")
+        )
         if self.stage == "fast":
             interval = self._integer_config("sample_interval_us", 800_000, 400_000)
             rewind = max(0, self.cursor_us - interval * 2)
@@ -458,6 +469,12 @@ class OcrWorker:
                 )
             )
             self.cursor_us = rewind
+            self._change_events = [
+                value for value in self._change_events if value < rewind
+            ]
+            self._scene_change_events = [
+                value for value in self._scene_change_events if value < rewind
+            ]
         elif self.stage == "quality" and self.cursor_us > 0:
             fast_interval = self._integer_config("sample_interval_us", 800_000, 400_000)
             quality_interval = max(400_000, fast_interval // 2)
@@ -470,6 +487,18 @@ class OcrWorker:
                 )
             )
             self.cursor_us = rewind
+
+    @staticmethod
+    def _checkpoint_event_values(value: object) -> list[int]:
+        if not isinstance(value, list):
+            return []
+        return sorted(
+            {
+                item
+                for item in value
+                if type(item) is int and item >= 0
+            }
+        )
 
     def _restore_whisper_checkpoint(self, checkpoint: object) -> None:
         self.stage = "whisper"
@@ -536,6 +565,58 @@ class OcrWorker:
             for band in DEFAULT_SUBTITLE_BANDS
         ]
 
+    @staticmethod
+    def _normalized_region_list(raw: object, *, key: str) -> list[list[float]]:
+        if raw is None:
+            return []
+        if not isinstance(raw, list):
+            raise ValueError(f"invalid_{key}")
+        normalized: list[list[float]] = []
+        for item in raw:
+            if (
+                not isinstance(item, (list, tuple))
+                or len(item) != 4
+                or any(
+                    isinstance(value, bool) or not isinstance(value, (int, float))
+                    for value in item
+                )
+            ):
+                raise ValueError(f"invalid_{key}")
+            x, y, width, height = (float(value) for value in item)
+            if (
+                x < 0
+                or y < 0
+                or width <= 0
+                or height <= 0
+                or x + width > 1.000001
+                or y + height > 1.000001
+            ):
+                raise ValueError(f"invalid_{key}")
+            normalized.append([x, y, width, height])
+        return normalized
+
+    def _recognize_region_payload(
+        self,
+        bands: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Return stable full-frame masks shared by every OCR host request."""
+
+        exclusions = self._normalized_region_list(
+            self.config.get("exclusion_regions", []),
+            key="ocr_exclusion_regions",
+        )
+        raw_dialogue = self.config.get("dialogue_region")
+        dialogue = self._normalized_region_list(
+            [raw_dialogue] if raw_dialogue is not None else [],
+            key="ocr_dialogue_region",
+        )
+        payload: dict[str, Any] = {"exclusion_regions": exclusions}
+        if dialogue and any(str(item.get("name", "")) == "scene" for item in bands):
+            # Scene text (S2+) is deliberately scanned outside the dialogue
+            # band. User exclusions still apply globally and therefore win.
+            payload["exclusion_regions_by_band"] = {"scene": dialogue}
+        return payload
+
     def _open_engine(self, mode: str) -> None:
         if self.engine is not None:
             self.engine.close()
@@ -578,13 +659,15 @@ class OcrWorker:
         bands = self._bands_payload()
         configured_windows = self._configured_scan_windows(duration_us)
         if self.stage == "fast":
-            self._scan_fast(
+            scene_timestamps = self._scan_fast(
                 duration_us,
                 fast_interval_us,
                 batch_frames,
                 bands,
                 configured_windows,
             )
+            if scene_timestamps:
+                self._scan_scene_text(scene_timestamps, batch_frames)
             self.stage = "quality"
             self.cursor_us = 0
             self._checkpoint()
@@ -611,9 +694,22 @@ class OcrWorker:
         rescan_cue_id = self.config.get("rescan_cue_id")
         if isinstance(rescan_cue_id, str):
             return self._finish_targeted_rescan(final_candidates)
-        result = finalize_ocr_candidates(final_candidates, video_duration_us=duration_us)
+        evidence = self._load_evidence()
+        result = finalize_ocr_candidates(
+            final_candidates,
+            video_duration_us=duration_us,
+            evidence=evidence,
+        )
+        scene_cues = scene_text_cues_from_evidence(
+            evidence,
+            video_duration_us=duration_us,
+            first_index=len(result.cues) + 1,
+            dialogue_cues=result.cues,
+        )
+        if scene_cues:
+            result = replace(result, cues=(*result.cues, *scene_cues))
         coverage = measure_hard_sub_coverage(
-            self._load_evidence(),
+            evidence,
             result.cues,
             minimum_coverage=0.95,
             ignored_overlay_tokens=result.overlay_tokens,
@@ -648,6 +744,7 @@ class OcrWorker:
                     coverage=coverage.as_json(),
                     blockers=blockers,
                     warnings=list(result.warnings),
+                    cues=result.cues,
                 ),
             )
             self._checkpoint(
@@ -709,6 +806,7 @@ class OcrWorker:
                 coverage=coverage.as_json(),
                 blockers=[],
                 warnings=list(result.warnings),
+                cues=result.cues,
             ),
         )
         self.send(
@@ -734,10 +832,11 @@ class OcrWorker:
         coverage: dict[str, Any],
         blockers: list[str],
         warnings: list[str],
+        cues: tuple[SubtitleCue, ...],
     ) -> dict[str, Any]:
         output_stat = output_path.stat()
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "kind": "ocr_hard_sub_coverage",
             "status": status,
             "job_id": self.job_id,
@@ -756,6 +855,29 @@ class OcrWorker:
             "cue_count": cue_count,
             "blockers": blockers,
             "warnings": warnings,
+            "cue_regions": [
+                {
+                    "id": cue.id,
+                    "index": cue.index,
+                    "start_us": cue.range.start_us,
+                    "end_us": cue.range.end_us,
+                    "box": list(cue.visual_box) if cue.visual_box is not None else None,
+                    "source": cue.visual_box_source or "estimated",
+                    "role": cue.role,
+                    "orientation": cue.orientation,
+                    "style_hint": cue.style_hint,
+                    "panel_box": list(cue.panel_box) if cue.panel_box is not None else None,
+                    "background_color": cue.background_color,
+                    "review_state": cue.review_state,
+                }
+                for cue in cues
+            ],
+            # Platform marks are deliberately excluded from subtitle evidence,
+            # but their repeated OCR geometry remains useful for concealing the
+            # baked-in mark during preview/export. A single observation is not
+            # enough to create an automatic mask; _watermark_regions enforces
+            # that confidence boundary.
+            "watermark_regions": self._watermark_regions(),
             "output_path": str(output_path),
             "output_sha256": _file_sha256(output_path),
             "output_size": output_stat.st_size,
@@ -1231,7 +1353,7 @@ class OcrWorker:
         batch_frames: int,
         bands: list[dict[str, Any]],
         configured_windows: tuple[RescueWindow, ...],
-    ) -> None:
+    ) -> tuple[int, ...]:
         mode = "fast"
         try:
             self._open_engine(mode)
@@ -1258,15 +1380,55 @@ class OcrWorker:
             timestamps = list(range(self.cursor_us, duration_us, interval_us))
         started = time.monotonic()
         completed = 0
+        historical_burst, historical_scene = self._adaptive_timestamps_from_events(
+            self._change_events,
+            duration_us,
+            scene_events=self._scene_change_events,
+        ) if not configured_windows else ((), ())
+        processed_burst_timestamps = {
+            value for value in historical_burst if value < self.cursor_us
+        }
+        processed_scene_timestamps = {
+            value for value in historical_scene if value < self.cursor_us
+        }
+        change_probe_interval_us = 200_000
+        change_probe_timestamps = (
+            list(range(self.cursor_us, duration_us, change_probe_interval_us))
+            if not configured_windows
+            else []
+        )
+        change_probe_offset = 0
         for offset in range(0, len(timestamps), batch_frames):
             batch = timestamps[offset : offset + batch_frames]
             if not batch:
                 continue
             if self._handle_controls(stage="fast", cursor_us=self.cursor_us):
                 raise WorkerStopped
+            change_probe_end_us = min(duration_us, batch[-1] + interval_us)
+            next_change_probe_offset = change_probe_offset
+            while (
+                next_change_probe_offset < len(change_probe_timestamps)
+                and change_probe_timestamps[next_change_probe_offset]
+                < change_probe_end_us
+            ):
+                next_change_probe_offset += 1
+            batch_change_timestamps = change_probe_timestamps[
+                change_probe_offset:next_change_probe_offset
+            ]
+            change_probe_offset = next_change_probe_offset
             try:
                 result = self.engine.request(
-                    "recognize", {"timestamps_us": batch, "bands": bands}
+                    "recognize",
+                    {
+                        "timestamps_us": batch,
+                        "bands": bands,
+                        "evidence_kind": "global",
+                        "detect_changes": not configured_windows,
+                        "change_threshold": 0.115,
+                        "scene_change_threshold": 0.10,
+                        "change_timestamps_us": batch_change_timestamps or batch,
+                        **self._recognize_region_payload(bands),
+                    },
                 )
             except EngineError:
                 if mode == "compatibility":
@@ -1282,14 +1444,206 @@ class OcrWorker:
                 )
                 self._open_engine(mode)
                 result = self.engine.request(
-                    "recognize", {"timestamps_us": batch, "bands": bands}
+                    "recognize",
+                    {
+                        "timestamps_us": batch,
+                        "bands": bands,
+                        "evidence_kind": "global",
+                        "detect_changes": not configured_windows,
+                        "change_threshold": 0.115,
+                        "scene_change_threshold": 0.10,
+                        "change_timestamps_us": batch_change_timestamps or batch,
+                        **self._recognize_region_payload(bands),
+                    },
                 )
             self._append_evidence(result.get("evidence", []))
+            self._append_evidence(result.get("watermark_detections", []))
+            raw_events = result.get("event_timestamps_us", [])
+            if not isinstance(raw_events, list) or not all(
+                type(value) is int for value in raw_events
+            ):
+                raise EngineError("ocr_change_probe_invalid")
+            self._change_events = sorted({*self._change_events, *raw_events})
+            raw_scene_events = result.get("scene_event_timestamps_us", raw_events)
+            if not isinstance(raw_scene_events, list) or not all(
+                type(value) is int for value in raw_scene_events
+            ):
+                raise EngineError("ocr_scene_change_probe_invalid")
+            self._scene_change_events = sorted(
+                {*self._scene_change_events, *raw_scene_events}
+            )
+            burst_timestamps, scene_timestamps = self._adaptive_timestamps_from_events(
+                self._change_events,
+                duration_us,
+                scene_events=self._scene_change_events,
+            ) if not configured_windows else ((), ())
+            adaptive_horizon_us = min(duration_us, change_probe_end_us + 240_000)
+            pending_burst = tuple(
+                value
+                for value in burst_timestamps
+                if value <= adaptive_horizon_us
+                and value not in processed_burst_timestamps
+            )
+            pending_scene = tuple(
+                value
+                for value in scene_timestamps
+                if value <= adaptive_horizon_us
+                and value not in processed_scene_timestamps
+            )
+            if pending_burst or pending_scene:
+                self._scan_adaptive(
+                    pending_burst,
+                    pending_scene,
+                    batch_frames,
+                    bands,
+                )
+                processed_burst_timestamps.update(pending_burst)
+                processed_scene_timestamps.update(pending_scene)
             self.cursor_us = batch[-1]
             completed += len(batch)
             self._send_progress("fast", completed, len(timestamps), started)
             if completed % (batch_frames * 5) == 0:
                 self._checkpoint()
+        return ()
+
+    @staticmethod
+    def _adaptive_timestamps_from_events(
+        raw_events: list[int],
+        duration_us: int,
+        *,
+        scene_events: list[int] | None = None,
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        def bounded_events(values: list[int]) -> list[int]:
+            # Fixed slots select the first chronological transition in each
+            # slot. This is stable while a scan is still growing, remains
+            # capped at thirteen events per 30 seconds and is O(n), not a
+            # full event-list scan for every time window.
+            bounded: list[int] = []
+            occupied: set[tuple[int, int]] = set()
+            for value in sorted(set(values)):
+                if value < 0 or value >= duration_us:
+                    continue
+                window = value // window_us
+                offset = value - window * window_us
+                slot = min(12, offset * 13 // window_us)
+                key = (window, slot)
+                if key in occupied:
+                    continue
+                occupied.add(key)
+                bounded.append(value)
+            return bounded
+
+        window_us = 30_000_000
+        events = bounded_events(raw_events)
+        scene_source = list(dict.fromkeys((*raw_events, *(scene_events or ()))))
+        bounded_scene_events = bounded_events(scene_source)
+        burst = sorted(
+            {
+                timestamp + offset
+                for timestamp in events
+                # A one-character subtitle can exist for only ~0.5 s. Sample
+                # densely around the detected transition, but only in this
+                # local burst so normal full-video OCR cost does not increase.
+                for offset in (-100_000, 0, 100_000, 200_000, 300_000, 400_000)
+                if 0 <= timestamp + offset < duration_us
+            }
+        )
+        scene_values = {
+            timestamp + offset
+            for timestamp in bounded_scene_events
+            for offset in (0, 240_000)
+            if 0 <= timestamp + offset < duration_us
+        }
+        scene_values.update(range(0, duration_us, 10_000_000))
+        scene = sorted(scene_values)
+        return tuple(burst), tuple(scene)
+
+    def _scan_adaptive(
+        self,
+        burst_timestamps: tuple[int, ...],
+        scene_timestamps: tuple[int, ...],
+        batch_frames: int,
+        bands: list[dict[str, Any]],
+    ) -> None:
+        """OCR one local, chronological adaptive window without full rescans."""
+
+        timestamps = sorted({*burst_timestamps, *scene_timestamps})
+        if not timestamps:
+            return
+        scene_band = {
+            "name": "scene",
+            "x1": 0.0,
+            "y1": 0.0,
+            "x2": 1.0,
+            "y2": 1.0,
+            "scale": 1.0,
+        }
+        band_names = [str(item["name"]) for item in bands]
+        started = time.monotonic()
+        for offset in range(0, len(timestamps), batch_frames):
+            batch = timestamps[offset : offset + batch_frames]
+            if self._handle_controls(stage="fast", cursor_us=self.cursor_us):
+                raise WorkerStopped
+            burst_batch = [value for value in batch if value in burst_timestamps]
+            scene_batch = [value for value in batch if value in scene_timestamps]
+            band_timestamps = {
+                name: burst_batch
+                for name in band_names
+            }
+            band_timestamps["scene"] = scene_batch
+            result = self.engine.request(
+                "recognize",
+                {
+                    "timestamps_us": batch,
+                    "bands": [*bands, scene_band],
+                    "band_timestamps_us": band_timestamps,
+                    "evidence_kinds_by_band": {
+                        **{name: "burst" for name in band_names},
+                        "scene": "scene",
+                    },
+                    **self._recognize_region_payload([*bands, scene_band]),
+                },
+            )
+            self._append_evidence(result.get("evidence", []))
+            self._append_evidence(result.get("watermark_detections", []))
+            self._send_progress(
+                "adaptive_ocr",
+                min(offset + len(batch), len(timestamps)),
+                len(timestamps),
+                started,
+            )
+
+    def _scan_scene_text(
+        self,
+        timestamps: tuple[int, ...],
+        batch_frames: int,
+    ) -> None:
+        scene_band = [
+            {"name": "scene", "x1": 0.0, "y1": 0.0, "x2": 1.0, "y2": 1.0, "scale": 1.0}
+        ]
+        started = time.monotonic()
+        for offset in range(0, len(timestamps), batch_frames):
+            batch = list(timestamps[offset : offset + batch_frames])
+            if self._handle_controls(stage="fast", cursor_us=self.cursor_us):
+                raise WorkerStopped
+            result = self.engine.request(
+                "recognize",
+                {
+                    "timestamps_us": batch,
+                    "bands": scene_band,
+                    "evidence_kind": "scene",
+                    **self._recognize_region_payload(scene_band),
+                },
+            )
+            self._append_evidence(result.get("evidence", []))
+            self._append_evidence(result.get("watermark_detections", []))
+            self.cursor_us = batch[-1]
+            self._send_progress(
+                "scene_text",
+                min(offset + len(batch), len(timestamps)),
+                len(timestamps),
+                started,
+            )
 
     def _scan_quality(
         self,
@@ -1328,7 +1682,12 @@ class OcrWorker:
             compatibility_fallback = compatibility_mode
             try:
                 result = self.engine.request(
-                    "recognize", {"timestamps_us": batch, "bands": bands}
+                    "recognize",
+                    {
+                        "timestamps_us": batch,
+                        "bands": bands,
+                        **self._recognize_region_payload(bands),
+                    },
                 )
             except EngineError:
                 if compatibility_mode:
@@ -1337,9 +1696,15 @@ class OcrWorker:
                 compatibility_fallback = True
                 compatibility_mode = True
                 result = self.engine.request(
-                    "recognize", {"timestamps_us": batch, "bands": bands}
+                    "recognize",
+                    {
+                        "timestamps_us": batch,
+                        "bands": bands,
+                        **self._recognize_region_payload(bands),
+                    },
                 )
             rows = result.get("evidence", [])
+            watermark_rows = result.get("watermark_detections", [])
             if compatibility_fallback and isinstance(rows, list):
                 rows = [
                     {**row, "provider_id": "rapid-quality-fallback"}
@@ -1347,7 +1712,15 @@ class OcrWorker:
                     else row
                     for row in rows
                 ]
+            if compatibility_fallback and isinstance(watermark_rows, list):
+                watermark_rows = [
+                    {**row, "provider_id": "rapid-quality-fallback"}
+                    if isinstance(row, dict)
+                    else row
+                    for row in watermark_rows
+                ]
             self._append_evidence(rows)
+            self._append_evidence(watermark_rows)
             self.cursor_us = batch[-1]
             self._send_progress(
                 "quality",
@@ -1448,6 +1821,8 @@ class OcrWorker:
             for line in stream:
                 try:
                     raw = json.loads(line)
+                    if isinstance(raw, dict) and raw.get("ignored_overlay") is True:
+                        continue
                     item = _evidence_from_row(raw)
                 except (json.JSONDecodeError, TypeError, ValueError):
                     continue
@@ -1457,6 +1832,95 @@ class OcrWorker:
                 values.values(), key=lambda item: (item.timestamp_us, item.band, item.id)
             )
         )
+
+    def _load_watermark_evidence(self) -> tuple[SubtitleEvidence, ...]:
+        if not self.evidence_path.is_file():
+            return ()
+        values: dict[str, SubtitleEvidence] = {}
+        with self.evidence_path.open("r", encoding="utf-8") as stream:
+            for line in stream:
+                try:
+                    raw = json.loads(line)
+                    if not isinstance(raw, dict) or raw.get("ignored_overlay") is not True:
+                        continue
+                    item = _evidence_from_row(raw)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    continue
+                values[item.id] = item
+        return tuple(
+            sorted(
+                values.values(), key=lambda item: (item.timestamp_us, item.band, item.id)
+            )
+        )
+
+    def _watermark_regions(self) -> list[dict[str, object]]:
+        detections = [
+            item for item in self._load_watermark_evidence() if item.box is not None
+        ]
+        clusters: list[list[SubtitleEvidence]] = []
+        for item in detections:
+            box = item.box
+            assert box is not None
+            center = (box.x + box.width / 2, box.y + box.height / 2)
+            target = next(
+                (
+                    cluster
+                    for cluster in clusters
+                    if cluster[-1].box is not None
+                    and abs(
+                        center[0]
+                        - (cluster[-1].box.x + cluster[-1].box.width / 2)
+                    )
+                    <= 0.15
+                    and abs(
+                        center[1]
+                        - (cluster[-1].box.y + cluster[-1].box.height / 2)
+                    )
+                    <= 0.10
+                ),
+                None,
+            )
+            if target is None:
+                clusters.append([item])
+            else:
+                target.append(item)
+        duration_us = self._integer_config("duration_us", 0, 1)
+        result: list[dict[str, object]] = []
+        for cluster in clusters:
+            global_cluster = [
+                item for item in cluster if item.evidence_kind == "global"
+            ]
+            frame_ids = {item.frame_id for item in global_cluster}
+            timestamps = sorted({item.timestamp_us for item in global_cluster})
+            if len(frame_ids) < 3 or len(timestamps) < 3:
+                continue
+            minimum_span_us = min(5_000_000, max(600_000, duration_us // 10))
+            if timestamps[-1] - timestamps[0] < minimum_span_us:
+                continue
+            boxes = [item.box for item in global_cluster if item.box is not None]
+            if not boxes or not all(
+                box.x <= 0.12
+                or box.x + box.width >= 0.88
+                or box.y <= 0.16
+                or box.y + box.height >= 0.84
+                for box in boxes
+            ):
+                continue
+            left = max(0.0, min(box.x for box in boxes) - 0.008)
+            top = max(0.0, min(box.y for box in boxes) - 0.006)
+            right = min(1.0, max(box.x + box.width for box in boxes) + 0.008)
+            bottom = min(1.0, max(box.y + box.height for box in boxes) + 0.006)
+            result.append(
+                {
+                    "id": f"ocr-watermark-{len(result) + 1}",
+                    "start_us": 0,
+                    "end_us": duration_us,
+                    "box": [left, top, right - left, bottom - top],
+                    "sample_count": len(frame_ids),
+                    "source": "ocr_bilibili_anchor",
+                }
+            )
+        return result
 
     def _fast_candidates(self, duration_us: int, interval_us: int):
         evidence = tuple(
@@ -1490,9 +1954,10 @@ class OcrWorker:
         duration_us: int,
         interval_us: int,
     ):
+        all_evidence = self._load_evidence()
         evidence = tuple(
             item
-            for item in self._load_evidence()
+            for item in all_evidence
             if item.provider_id in {"paddle-quality", "rapid-quality-fallback"}
         )
         by_band = {
@@ -1510,7 +1975,17 @@ class OcrWorker:
             by_band.get("lower", ()),
             id_factory=lambda: f"quality-merged-{next(ids)}",
         )
-        rescued = apply_quality_rescue(fast_candidates, quality, rescue_windows)
+        cross_pass = cross_pass_consensus_candidates(
+            all_evidence,
+            video_duration_us=duration_us,
+            evidence_half_interval_us=max(1, interval_us // 2),
+            maximum_gap_us=max(400_000, interval_us),
+        )
+        rescued = apply_quality_rescue(
+            fast_candidates,
+            (*quality, *cross_pass),
+            rescue_windows,
+        )
         return reinforce_candidate_ranges(
             rescued,
             evidence,
@@ -1607,6 +2082,8 @@ class OcrWorker:
                 "band_cursors_us": {
                     band.name: self.cursor_us for band in DEFAULT_SUBTITLE_BANDS
                 },
+                "change_events_us": self._change_events,
+                "scene_change_events_us": self._scene_change_events,
                 **(extra_payload or {}),
             },
             "artifact_path": str(source),
@@ -1782,6 +2259,10 @@ def _evidence_from_row(raw: object) -> SubtitleEvidence:
     box = None
     if isinstance(raw_box, list) and len(raw_box) == 4:
         box = NormalizedBox(*(float(value) for value in raw_box))
+    raw_panel_box = raw.get("panel_box")
+    panel_box = None
+    if isinstance(raw_panel_box, list) and len(raw_panel_box) == 4:
+        panel_box = NormalizedBox(*(float(value) for value in raw_panel_box))
     return SubtitleEvidence(
         id=str(raw["id"]),
         frame_id=str(raw["frame_id"]),
@@ -1792,6 +2273,12 @@ def _evidence_from_row(raw: object) -> SubtitleEvidence:
         provider_id=str(raw["provider_id"]),
         model_id=str(raw["model_id"]),
         box=box,
+        evidence_kind=str(raw.get("evidence_kind", "global")),
+        orientation=str(raw.get("orientation", "horizontal")),
+        style_hint=str(raw.get("style_hint", "standard")),
+        panel_box=panel_box,
+        background_color=str(raw.get("background_color", "")),
+        scene_confidence=float(raw.get("scene_confidence", 0.0)),
     )
 
 

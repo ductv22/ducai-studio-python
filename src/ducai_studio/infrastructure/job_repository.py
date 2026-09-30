@@ -425,6 +425,16 @@ class JobRepository:
                 raise RuntimeError("Progress event id belongs to another job")
         return int(row["sequence"])
 
+    def project_id_for(self, job_id: str) -> str:
+        """Resolve telemetry ownership without decoding thousands of cue records."""
+        with self.database.connect(read_only=True) as connection:
+            row = connection.execute(
+                "SELECT project_id FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        if row is None:
+            raise LookupError(f"Unknown job: {job_id}")
+        return str(row["project_id"])
+
     def list_events(
         self,
         job_id: str,
@@ -765,6 +775,38 @@ class JobRepository:
                 parameters,
             ).fetchone()
         return str(row["id"]) if row is not None else ""
+
+    def active_jobs(self) -> tuple[tuple[str, JobState], ...]:
+        """Return every job that can still own work or a live worker.
+
+        Update installation uses this unbounded query instead of the recent-job
+        UI feed.  A paused job may still own a worker process, so it remains
+        active until it reaches a terminal or interrupted state.
+        """
+
+        active_states = tuple(
+            state.value
+            for state in (
+                JobState.QUEUED,
+                JobState.START_REQUESTED,
+                JobState.RUNNING,
+                JobState.PAUSE_REQUESTED,
+                JobState.PAUSED,
+                JobState.RESUME_REQUESTED,
+                JobState.CANCEL_REQUESTED,
+            )
+        )
+        placeholders = ", ".join("?" for _value in active_states)
+        with self.database.connect(read_only=True) as connection:
+            rows = connection.execute(
+                f"""
+                SELECT id, state FROM jobs
+                WHERE state IN ({placeholders})
+                ORDER BY created_at, id
+                """,
+                active_states,
+            ).fetchall()
+        return tuple((str(row["id"]), JobState(str(row["state"]))) for row in rows)
 
     def delete_terminal(self, job_id: str) -> None:
         if not job_id.strip():

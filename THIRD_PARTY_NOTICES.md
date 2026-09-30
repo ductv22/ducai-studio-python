@@ -9,6 +9,78 @@ DUCAI STUDIO 2 currently bundles the following visual assets.
 - License: SIL Open Font License 1.1
 - Full license: `src/ducai_studio/ui/assets/fonts/OFL.txt`
 
+## Playwrite Việt Nam
+
+- Upstream: `https://github.com/TypeTogether/Playwrite`
+- Google Fonts family: `ofl/playwritevn`
+- File: `src/ducai_studio/ui/assets/fonts/PlaywriteVN-Variable.ttf`
+- Source SHA-256: `DA510F64CE3E9844F169F7C742A9F1370ADE81BCF9AD17C7409137BA3F3D604C`
+- License: SIL Open Font License 1.1
+- Full license: `src/ducai_studio/ui/assets/fonts/PLAYWRITE-VN-OFL.txt`
+
+## Dancing Script
+
+- Upstream: `https://github.com/googlefonts/DancingScript`
+- Google Fonts family: `ofl/dancingscript`
+- File: `src/ducai_studio/ui/assets/fonts/DancingScript-Variable.ttf`
+- Source SHA-256: `21808625578FE8D8CD10CB684BE546DCA077B27CD03A53A2F1EC11DC743C924C`
+- License: SIL Open Font License 1.1
+- Full license: `src/ducai_studio/ui/assets/fonts/DANCING-SCRIPT-OFL.txt`
+
+## Lobster
+
+- Upstream: `https://github.com/impallari/The-Lobster-Font`
+- Google Fonts family: `ofl/lobster`
+- File: `src/ducai_studio/ui/assets/fonts/Lobster-Regular.ttf`
+- Source SHA-256: `D6568E697FD50CEDC0BE04D8AAE4127FE95ADD607E7BFF954CA88604BE80C205`
+- License: SIL Open Font License 1.1
+- Full license: `src/ducai_studio/ui/assets/fonts/LOBSTER-OFL.txt`
+
+## Agbalumo
+
+- Upstream: `https://github.com/SorkinType/Agbalumo`
+- Google Fonts family: `ofl/agbalumo`
+- File: `src/ducai_studio/ui/assets/fonts/Agbalumo-Regular.ttf`
+- Source SHA-256: `D9E35C6DEBF1319267140838F3C30C3C51D9F47C7050B5482C14C5ACCF7F4D94`
+- License: SIL Open Font License 1.1
+- Full license: `src/ducai_studio/ui/assets/fonts/AGBALUMO-OFL.txt`
+
+## Comforter Brush
+
+- Upstream: `https://github.com/googlefonts/comforter-brush`
+- Google Fonts family: `ofl/comforterbrush`
+- File: `src/ducai_studio/ui/assets/fonts/ComforterBrush-Regular.ttf`
+- Source SHA-256: `7BD357DC8BF83D71F27FD5155ECE5C8C100A2042D4530E4487635473C5836F95`
+- License: SIL Open Font License 1.1
+- Full license: `src/ducai_studio/ui/assets/fonts/COMFORTER-BRUSH-OFL.txt`
+
+## Water Brush
+
+- Upstream: `https://github.com/googlefonts/water-brush`
+- Google Fonts family: `ofl/waterbrush`
+- File: `src/ducai_studio/ui/assets/fonts/WaterBrush-Regular.ttf`
+- Source SHA-256: `2CBDCCBCA5D4BE005FE4EDD8895B91618A7F96639EAEEB4987AD83E81AFC71A7`
+- License: SIL Open Font License 1.1
+- Full license: `src/ducai_studio/ui/assets/fonts/WATER-BRUSH-OFL.txt`
+
+## Splash
+
+- Upstream: `https://github.com/googlefonts/splash`
+- Google Fonts family: `ofl/splash`
+- File: `src/ducai_studio/ui/assets/fonts/Splash-Regular.ttf`
+- Source SHA-256: `42C2DDC11917333BCD24A3EB0BC7DF5205278226E2F6521459384479F1B6675C`
+- License: SIL Open Font License 1.1
+- Full license: `src/ducai_studio/ui/assets/fonts/SPLASH-OFL.txt`
+
+## Hurricane
+
+- Upstream: `https://github.com/googlefonts/hurricane`
+- Google Fonts family: `ofl/hurricane`
+- File: `src/ducai_studio/ui/assets/fonts/Hurricane-Regular.ttf`
+- Source SHA-256: `5EA86B562CA5C2B1893C233367CDE1AEE0D677BB6D30AF9C3F699C270880DA13`
+- License: SIL Open Font License 1.1
+- Full license: `src/ducai_studio/ui/assets/fonts/HURRICANE-OFL.txt`
+
 ## Lucide icons
 
 - Upstream: `https://github.com/lucide-icons/lucide`
@@ -28,6 +100,9 @@ otherwise unchanged.
 - Voice-model rights are separate from the engine license and are displayed per
   catalog entry. The tool does not claim that community or real-person-labelled
   weights are commercially safe.
+- Preview files `vi_VN-vais1000-medium.wav` and `vi_VN-vivos-x_low.wav` were
+  generated locally from the corresponding official Piper models. They retain
+  the model/dataset licenses shown in the catalog: CC BY 4.0 and CC BY-NC-SA 4.0.
 
 ## PaddleOCR / PaddlePaddle GPU
 
@@ -50,9 +125,12 @@ otherwise unchanged.
 ## VieNeu-TTS runtime
 
 - Upstream: `https://github.com/pnnbao97/VieNeu-TTS`
-- Pinned source commit: `f49d70246f18dece32666d79057e98ec94fd699e`
-- Runtime version: 3.3.0
+- Pinned source tag: `v3.8.1` (`592ba27c8f932b80768f6cee405badaef32bdb17`)
+- Runtime version: 3.8.1 with PyTorch/Torchaudio 2.8.0 CUDA 12.8
 - Runtime and model dependencies retain their upstream licenses.
+- The bundled `vieneu-*.wav` catalog previews were generated from the 25 preset
+  voices shipped in VieNeu 3.8.1. The preset metadata declares CC BY-NC 4.0 and
+  non-commercial use; DUCAI preserves that restriction in every voice card.
 - User reference audio and derived clone profiles remain local.
 
 ## FFmpeg

@@ -26,6 +26,7 @@ from ducai_studio.providers.translation.contracts import (
     ProviderResponse,
     TransientProviderFailure,
     TranslationPurpose,
+    TranslationRequest,
 )
 from ducai_studio.workers.protocol import PROTOCOL_VERSION, WorkerMessage
 from ducai_studio.workers.translation_worker import (
@@ -33,6 +34,36 @@ from ducai_studio.workers.translation_worker import (
     _drop_resolved_qa_issues,
     _repair_values_from_qa_suggestions,
 )
+
+
+def test_provider_request_event_thaws_nested_usage_for_worker_protocol() -> None:
+    worker = TranslationWorker("nested-usage-job")
+    events: list[tuple[str, dict]] = []
+    worker.send = lambda kind, payload: events.append((kind, payload))  # type: ignore[method-assign]
+    request = TranslationRequest(
+        "diagnostic",
+        TranslationPurpose.TRANSLATE,
+        "Return JSON",
+    )
+    response = ProviderResponse(
+        "diagnostic",
+        '{"ok":true}',
+        "gemini-api",
+        "gemini-3.5-flash-lite",
+        {
+            "promptTokenCount": 7,
+            "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 7}],
+        },
+    )
+
+    worker._emit_provider_request(request, response)
+
+    kind, payload = events[0]
+    message = WorkerMessage(PROTOCOL_VERSION, "nested-usage-job", "event-1", kind, payload)
+    decoded = json.loads(message.to_json_line())
+    assert decoded["payload"]["transport"]["promptTokensDetails"] == [
+        {"modality": "TEXT", "tokenCount": 7}
+    ]
 
 
 def test_worker_factory_accepts_openai_compatible_provider(monkeypatch) -> None:
@@ -469,6 +500,33 @@ class PersistentOverlongRepairProvider(DeterministicProvider):
         )
 
 
+class PersistentAncientStyleProvider(DeterministicProvider):
+    def generate(self, request) -> ProviderResponse:
+        self.calls.append(request)
+        if request.purpose is TranslationPurpose.FILM_BIBLE:
+            payload = {
+                "profile": "xianxia",
+                "synopsis": "Một câu chuyện tu luyện.",
+                "characters": ["Hồng Ly"],
+                "terms": [],
+            }
+        else:
+            payload = {
+                "translations": [
+                    {"id": index, "text": "Tỷ tỷ Hồng Ly, anh đến rồi."}
+                    for index in request.expected_ids
+                ],
+                "glossary_updates": [],
+                "issues": [],
+            }
+        return ProviderResponse(
+            request.request_id,
+            json.dumps(payload, ensure_ascii=False),
+            self.provider_id,
+            self.model_id,
+        )
+
+
 class MalformedIntegratedQaProvider(DeterministicProvider):
     def generate(self, request) -> ProviderResponse:
         if request.purpose is TranslationPurpose.FILM_BIBLE:
@@ -564,6 +622,72 @@ def test_transient_1095_retries_exact_chunk_and_publishes_pass(tmp_path, monkeyp
     assert output.is_file()
     assert events[-1][0] == "succeeded"
     assert events[-1][1]["status"] == "PASS"
+
+
+@pytest.mark.parametrize(
+    ("manual_source", "manual_role", "manual_track"),
+    (
+        ("manual_scene_text", "scene_text", "S2"),
+        ("manual_dialogue", "dialogue", "S1"),
+    ),
+)
+def test_manual_cue_is_preserved_without_provider_translation(
+    tmp_path: Path,
+    monkeypatch,
+    manual_source: str,
+    manual_role: str,
+    manual_track: str,
+) -> None:
+    monkeypatch.setenv("DUCAI_ARTIFACT_STAGING_ROOT", str(tmp_path / "staging"))
+    provider = DeterministicProvider()
+    output = tmp_path / "film_ZH_FINAL_codex_vi.srt"
+    config = _config(output, 3)
+    config["source_cues"][1].update(
+        {
+            "text": "Bí cảnh",
+            "language": "vi",
+            "source": manual_source,
+            "role": manual_role,
+            "subtitle_track_id": manual_track,
+            "text_font_size": 22,
+        }
+    )
+    config["preserved_manual_translations"] = [
+        {"index": 2, "text": "Bí cảnh thủ công"}
+    ]
+    worker = TranslationWorker(
+        "manual-cue-job",
+        provider_factory=lambda _config: provider,
+    )
+    events: list[tuple[str, dict]] = []
+    worker.send = lambda kind, payload: events.append((kind, payload))  # type: ignore[method-assign]
+    worker._interruptible_wait = lambda _seconds: None  # type: ignore[method-assign]
+    worker._configure(
+        {
+            "job": {
+                "kind": "translate",
+                "provider_id": provider.provider_id,
+                "model_id": provider.model_id,
+                "provider_config": config,
+            }
+        }
+    )
+
+    worker._execute()
+
+    translation_calls = [
+        call for call in provider.calls if call.purpose is TranslationPurpose.TRANSLATE
+    ]
+    assert [call.expected_ids for call in translation_calls] == [(1,), (3,)]
+    cues = parse_srt(
+        output.read_text(encoding="utf-8-sig"),
+        language="vi",
+        id_factory=lambda: "parsed-cue",
+    )
+    assert cues[1].text == "Bí cảnh thủ công"
+    assert "số 1" in cues[0].text
+    assert "số 3" in cues[2].text
+    assert events[-1][0] == "succeeded"
 
 
 def test_persistent_transport_failure_never_splits_the_chunk(tmp_path, monkeypatch) -> None:
@@ -937,6 +1061,47 @@ def test_multi_policy_reports_cjk_as_the_only_semantic_blocker(tmp_path, monkeyp
     assert events[-1][1]["cjk_cue_ids"] == [2]
     assert events[-1][1]["cjk_blocker_count"] == 1
     assert events[-1][1]["warnings_only"] is False
+
+
+def test_ancient_style_repair_runs_once_then_becomes_warning(tmp_path, monkeypatch) -> None:
+    provider = PersistentAncientStyleProvider()
+    monkeypatch.setenv("DUCAI_ARTIFACT_STAGING_ROOT", str(tmp_path / "staging"))
+    output = tmp_path / "film_ZH_FINAL_codex_vi.srt"
+    config = _config(output, 2)
+    config.update(
+        {
+            "qa_mode": "integrated",
+            "qa_non_blocking": True,
+            "translation_style_preset": "xianxia",
+            "translation_custom_rules": "Giữ danh xưng theo vai vế.",
+        }
+    )
+    worker = TranslationWorker(
+        "translation-style-job",
+        provider_factory=lambda _config: provider,
+    )
+    events: list[tuple[str, dict]] = []
+    worker.send = lambda kind, payload: events.append((kind, payload))  # type: ignore[method-assign]
+    worker._interruptible_wait = lambda _seconds: None  # type: ignore[method-assign]
+    worker._configure(
+        {
+            "job": {
+                "kind": "translate",
+                "provider_id": provider.provider_id,
+                "model_id": provider.model_id,
+                "provider_config": config,
+            }
+        }
+    )
+
+    worker._execute()
+
+    repairs = [call for call in provider.calls if call.request_id.startswith("repair-")]
+    assert len(repairs) == 1
+    assert "Giữ danh xưng theo vai vế" in repairs[0].prompt
+    assert output.is_file()
+    assert events[-1][0] == "succeeded"
+    assert events[-1][1]["warning_count"] >= 1
 
 
 def test_4333_cues_publish_with_identical_timeline_and_no_empty_cue(tmp_path, monkeypatch) -> None:

@@ -59,7 +59,13 @@ def ensure_default_overlays(
             _preset_number(blur_preset, "width", 0.92),
             _preset_number(blur_preset, "height", 0.15),
             enabled=_preset_bool(blur_preset, "enabled", True),
-            blur_radius=_preset_int(blur_preset, "blur_radius", 22),
+            blur_radius=_preset_int(blur_preset, "blur_radius", 46),
+            tracking_mode="source_subtitle",
+            padding_x=_preset_number(blur_preset, "padding_x", 0.02),
+            padding_y=_preset_number(blur_preset, "padding_y", 0.014),
+            concealment_mode=_preset_string(
+                blur_preset, "concealment_mode", "cover"
+            ),
         ),
     )
     logo = existing.get(
@@ -114,6 +120,10 @@ class EffectsEditor:
         enabled: bool | None = None,
         opacity: float | None = None,
         blur_radius: int | None = None,
+        tracking_mode: str | None = None,
+        padding_x: float | None = None,
+        padding_y: float | None = None,
+        concealment_mode: str | None = None,
     ) -> ProjectSnapshot:
         selected = next(
             (overlay for overlay in self.snapshot.overlays if overlay.id == overlay_id),
@@ -137,6 +147,16 @@ class EffectsEditor:
             enabled=selected.enabled if enabled is None else enabled,
             opacity=selected.opacity if opacity is None else opacity,
             blur_radius=(selected.blur_radius if blur_radius is None else blur_radius),
+            tracking_mode=(
+                selected.tracking_mode if tracking_mode is None else tracking_mode
+            ),
+            padding_x=selected.padding_x if padding_x is None else padding_x,
+            padding_y=selected.padding_y if padding_y is None else padding_y,
+            concealment_mode=(
+                selected.concealment_mode
+                if concealment_mode is None
+                else concealment_mode
+            ),
         )
         overlays = tuple(
             updated if overlay.id == overlay_id else overlay
@@ -256,3 +276,10 @@ def _preset_bool(values: dict, key: str, default: bool) -> bool:
     if type(value) is not bool:
         raise ValueError(f"Overlay preset {key} must be boolean")
     return value
+
+
+def _preset_string(values: dict, key: str, default: str) -> str:
+    value = values.get(key, default)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Overlay preset {key} must be a non-empty string")
+    return value.strip()

@@ -1,4 +1,4 @@
-from .catalog import VoiceCatalog, VoiceCatalogEntry, discover_data_root
+from .catalog import VoiceCatalog, VoiceCatalogEntry, VoiceDownloadFile, discover_data_root
 from .contracts import (
     TtsBatchResult,
     TtsCueArtifact,
@@ -21,5 +21,6 @@ __all__ = [
     "VieNeuTtsProvider",
     "VoiceCatalog",
     "VoiceCatalogEntry",
+    "VoiceDownloadFile",
     "discover_data_root",
 ]

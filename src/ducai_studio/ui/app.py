@@ -12,6 +12,7 @@ from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtWidgets import QApplication
 from shiboken6 import delete as delete_qt_object
 
+from ducai_studio import __version__
 from ducai_studio.ui.multi_thumbnail_provider import MultiThumbnailProvider
 from ducai_studio.ui.viewmodels.application_view_model import ApplicationViewModel
 
@@ -94,6 +95,41 @@ def run(argv: list[str] | None = None) -> int:
         return 1
 
     root_window = engine.rootObjects()[0]
+
+    health_path = os.environ.get("DUCAI_UPDATE_HEALTH_PATH", "").strip()
+    health_nonce = os.environ.get("DUCAI_UPDATE_HEALTH_NONCE", "").strip()
+    health_version = os.environ.get("DUCAI_UPDATE_HEALTH_VERSION", "").strip()
+    update_health_written = False
+
+    def publish_update_health() -> None:
+        nonlocal update_health_written
+        if update_health_written or not health_path or not app_model.backendReady:
+            return
+        if not health_nonce or health_version != __version__:
+            return
+        target = Path(health_path).expanduser()
+        if not target.is_absolute() or not target.parent.is_dir():
+            return
+        payload = {
+            "schema": "ducai-update-health-v1",
+            "pid": os.getpid(),
+            "nonce": health_nonce,
+            "version": __version__,
+            "backend_ready": True,
+            "install_root": str(Path(sys.executable).resolve().parent),
+        }
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        try:
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            temporary.replace(target)
+            update_health_written = True
+        except OSError:
+            temporary.unlink(missing_ok=True)
+
+    app_model.backendReadyChanged.connect(publish_update_health)
     smoke_size = os.environ.get("DUCAI_SMOKE_SIZE", "")
     requested_size: tuple[int, int] | None = None
     if smoke_size:
@@ -218,6 +254,7 @@ def run(argv: list[str] | None = None) -> int:
         app_model.backendReadyChanged.connect(start_smoke_import)
 
     app_model.start()
+    publish_update_health()
 
     smoke_exit_ms = os.environ.get("DUCAI_SMOKE_EXIT_MS")
     if smoke_exit_ms:

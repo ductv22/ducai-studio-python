@@ -357,7 +357,7 @@ class ProductionRunner:
                 "create_tts_job",
                 {
                     "project_id": project_id,
-                    "provider_id": "vieneu-3.3",
+                    "provider_id": "vieneu-3.8",
                     "voice_id": self.arguments.vieneu_profile.stem,
                     "provider_options": {
                         "purpose": "production",

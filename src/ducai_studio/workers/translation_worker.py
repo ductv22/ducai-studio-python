@@ -17,6 +17,7 @@ from uuid import uuid4
 
 from ducai_studio.application.subtitle_finalizer import render_srt
 from ducai_studio.application.translation_pipeline import (
+    STYLE_QA_CODES,
     ChunkState,
     FilmBible,
     FilmTerm,
@@ -28,6 +29,7 @@ from ducai_studio.application.translation_pipeline import (
     TranslationValue,
     build_ledger,
     contains_cjk,
+    downgrade_style_qa_issues,
     film_bible_request,
     film_bible_translation_qa,
     ledger_from_dict,
@@ -47,8 +49,10 @@ from ducai_studio.application.translation_pipeline import (
     summarize_qa,
     translation_qa_snapshot,
     translation_request,
+    translation_style_qa,
     wrap_vietnamese_subtitle,
 )
+from ducai_studio.domain.jobs import thaw_json
 from ducai_studio.domain.project import SubtitleCue
 from ducai_studio.domain.timebase import TimeRange
 from ducai_studio.infrastructure.credential_store import WindowsCredentialStore
@@ -192,6 +196,27 @@ def _drop_resolved_qa_issues(
 def _cue_from_config(raw: object) -> SubtitleCue:
     if not isinstance(raw, dict):
         raise ValueError("translation_source_cue_must_be_object")
+    def optional_box(key: str) -> tuple[float, float, float, float] | None:
+        value = raw.get(key)
+        if value is None:
+            return None
+        if (
+            not isinstance(value, list)
+            or len(value) != 4
+            or not all(
+                isinstance(item, (int, float)) and not isinstance(item, bool)
+                for item in value
+            )
+        ):
+            raise ValueError(f"translation_source_cue_{key}_invalid")
+        return tuple(float(item) for item in value)
+
+    raw_evidence = raw.get("evidence_ids", [])
+    if not isinstance(raw_evidence, list) or not all(
+        isinstance(item, str) and item for item in raw_evidence
+    ):
+        raise ValueError("translation_source_cue_evidence_invalid")
+    confidence = raw.get("confidence")
     return SubtitleCue(
         str(raw["id"]),
         int(raw["index"]),
@@ -200,6 +225,32 @@ def _cue_from_config(raw: object) -> SubtitleCue:
         str(raw.get("language", "zh")),
         revision=int(raw.get("revision", 1)),
         source=str(raw.get("source", "translation_input")),
+        confidence=None if confidence is None else float(confidence),
+        evidence_ids=tuple(raw_evidence),
+        visual_box=optional_box("visual_box"),
+        visual_box_source=str(raw.get("visual_box_source", "")),
+        role=str(raw.get("role", "dialogue")),
+        orientation=str(raw.get("orientation", "horizontal")),
+        style_hint=str(raw.get("style_hint", "standard")),
+        panel_box=optional_box("panel_box"),
+        background_color=str(raw.get("background_color", "")),
+        text_color=str(raw.get("text_color", "")),
+        review_state=str(raw.get("review_state", "accepted")),
+        scene_font_scale=float(raw.get("scene_font_scale", 1.0)),
+        text_font_size=int(raw.get("text_font_size", 12)),
+        subtitle_track_id=str(raw.get("subtitle_track_id", "")),
+        background_padding_x=int(raw.get("background_padding_x", 20)),
+        background_padding_y=int(raw.get("background_padding_y", 10)),
+        background_style=str(raw.get("background_style", "solid")),
+        letter_spacing_percent=int(raw.get("letter_spacing_percent", 0)),
+        font_bold=bool(raw.get("font_bold", False)),
+        font_italic=bool(raw.get("font_italic", False)),
+        text_opacity_percent=int(raw.get("text_opacity_percent", 100)),
+        background_opacity_percent=int(
+            raw.get("background_opacity_percent", 90)
+        ),
+        fade_enabled=bool(raw.get("fade_enabled", False)),
+        fade_duration_ms=int(raw.get("fade_duration_ms", 300)),
     )
 
 
@@ -341,6 +392,8 @@ class TranslationWorker:
         self.cjk_is_blocker = False
         self.auto_compact_overlong_once = False
         self.max_overlong_compaction_passes = 0
+        self.translation_style_preset = "legacy"
+        self.translation_custom_rules = ""
         staging_root = (
             Path(os.environ.get("DUCAI_ARTIFACT_STAGING_ROOT", Path.cwd() / ".ducai-staging"))
             .expanduser()
@@ -455,6 +508,24 @@ class TranslationWorker:
         self.max_overlong_compaction_passes = raw_compaction_passes
         if self.qa_policy == "multi_auto" and not self.cjk_is_blocker:
             raise ValueError("translation_multi_policy_cjk_blocker_disabled")
+        self.translation_style_preset = str(
+            config.get("translation_style_preset", "legacy")
+        ).strip().casefold()
+        self.translation_custom_rules = str(
+            config.get("translation_custom_rules", "")
+        )
+        if self.translation_style_preset not in {
+            "legacy",
+            "auto",
+            "xianxia",
+            "wuxia",
+            "palace",
+            "modern",
+            "neutral",
+        }:
+            raise ValueError("translation_style_preset_invalid")
+        if len(self.translation_custom_rules) > 4_000:
+            raise ValueError("translation_custom_rules_too_long")
         self.translation_purpose = str(
             config.get("translation_purpose", "standard")
         ).strip().casefold()
@@ -485,14 +556,66 @@ class TranslationWorker:
         self.cues = tuple(_cue_from_config(raw) for raw in raw_cues)
         if [cue.index for cue in self.cues] != list(range(1, len(self.cues) + 1)):
             raise ValueError("translation_source_indices_not_contiguous")
+        raw_preserved = config.get("preserved_manual_translations", [])
+        if not isinstance(raw_preserved, list):
+            raise ValueError("translation_preserved_manual_cues_invalid")
+        preserved_manual: dict[int, str] = {}
+        for item in raw_preserved:
+            if (
+                not isinstance(item, dict)
+                or type(item.get("index")) is not int
+                or not isinstance(item.get("text"), str)
+                or not str(item["text"]).strip()
+            ):
+                raise ValueError("translation_preserved_manual_cues_invalid")
+            preserved_manual[int(item["index"])] = str(item["text"])
+        cue_by_index = {cue.index: cue for cue in self.cues}
+        if any(
+            index not in cue_by_index
+            or cue_by_index[index].source
+            not in {"manual_dialogue", "manual_scene_text"}
+            for index in preserved_manual
+        ):
+            raise ValueError("translation_preserved_manual_cues_mismatch")
         max_chunk_cues = self._integer_config("max_chunk_cues", 24, 1, 150)
         max_chunk_source_chars = self._integer_config("max_chunk_source_chars", 1_800, 200, 8_000)
         groups = semantic_groups(self.cues)
-        planned_chunks = plan_chunks(
+        base_chunks = plan_chunks(
             groups,
             max_cues=max_chunk_cues,
             max_source_chars=max_chunk_source_chars,
         )
+        planned_chunks_list: list[TranslationChunk] = []
+        for base_chunk in base_chunks:
+            run: list[SubtitleCue] = []
+            run_is_manual: bool | None = None
+
+            def flush_run() -> None:
+                nonlocal run
+                if not run:
+                    return
+                chunk_index = len(planned_chunks_list)
+                planned_chunks_list.append(
+                    TranslationChunk(
+                        chunk_index,
+                        (
+                            SemanticGroup(
+                                f"translation-run-{chunk_index + 1}",
+                                tuple(run),
+                            ),
+                        ),
+                    )
+                )
+                run = []
+
+            for cue in base_chunk.cues:
+                is_manual = cue.index in preserved_manual
+                if run_is_manual is not None and is_manual != run_is_manual:
+                    flush_run()
+                run_is_manual = is_manual
+                run.append(cue)
+            flush_run()
+        planned_chunks = tuple(planned_chunks_list)
         self.provider = self.provider_factory(config)
         self.fallback_provider = self._fallback_from_config(config)
         expected_ledger = build_ledger(
@@ -500,8 +623,23 @@ class TranslationWorker:
             planned_chunks,
             provider_id=self.provider.provider_id,
             model_id=self.provider.model_id,
-            film_bible=FilmBible(title=str(config.get("title", ""))),
+            film_bible=FilmBible(
+                title=str(config.get("title", "")),
+                style_preset=self.translation_style_preset,
+                custom_rules=self.translation_custom_rules,
+            ),
         )
+        if preserved_manual:
+            expected_ledger = replace(
+                expected_ledger,
+                chunks=tuple(
+                    replace(entry, state=ChunkState.QA_PASS)
+                    if all(index in preserved_manual for index in entry.cue_ids)
+                    else entry
+                    for entry in expected_ledger.chunks
+                ),
+                translations=preserved_manual,
+            )
         restored = self._restore_checkpoint(start_payload.get("checkpoint"))
         if restored is None and self.translation_purpose == "voice_timing_repair":
             raw_seed = config.get("seed_ledger")
@@ -763,7 +901,7 @@ class TranslationWorker:
         provider_id = str(getattr(response, "provider_id", ""))
         model_id = str(getattr(response, "model_id", ""))
         usage = getattr(response, "usage", {})
-        safe_usage = dict(usage) if isinstance(usage, Mapping) else {}
+        safe_usage = thaw_json(usage) if isinstance(usage, Mapping) else {}
         self.send(
             "provider_request",
             {
@@ -854,7 +992,10 @@ class TranslationWorker:
                     only_cjk_blocker=self.cjk_is_blocker,
                 )
             compaction_attempted = False
+            style_repair_attempted = False
             for _repair_cycle in range(2):
+                if style_repair_attempted:
+                    issues = downgrade_style_qa_issues(issues)
                 blockers = [
                     issue for issue in issues if issue.severity is TranslationQaSeverity.BLOCKER
                 ]
@@ -962,6 +1103,8 @@ class TranslationWorker:
                 repair_issues = tuple(blockers)
                 repair_bible = film_bible
                 values_before_repair = values
+                if any(issue.code in STYLE_QA_CODES for issue in repair_issues):
+                    style_repair_attempted = True
 
                 def make_repair_request(
                     current: TranslationChunk,
@@ -1030,6 +1173,8 @@ class TranslationWorker:
                 unresolved_ids = {issue.index for issue in unresolved_previous}
                 for index in repair_ids.difference(unresolved_ids):
                     self.resume_review_issues.pop(index, None)
+            if style_repair_attempted:
+                issues = downgrade_style_qa_issues(issues)
             if self.qa_non_blocking:
                 issues = normalize_semantic_qa_issues(
                     issues,
@@ -1090,13 +1235,18 @@ class TranslationWorker:
         request = film_bible_request(
             self.cues,
             title=str(self.config.get("title", "")),
+            style_preset=self.translation_style_preset,
+            custom_rules=self.translation_custom_rules,
         )
         for attempt in range(1, 4):
             self._control_point()
             try:
                 response = self._generate(request)
                 bible = parse_film_bible_response(
-                    response.text, title=str(self.config.get("title", ""))
+                    response.text,
+                    title=str(self.config.get("title", "")),
+                    style_preset=self.translation_style_preset,
+                    custom_rules=self.translation_custom_rules,
                 )
                 self.ledger = replace(self.ledger, film_bible=bible)
                 return
@@ -1379,8 +1529,13 @@ class TranslationWorker:
         if not isinstance(banned, list) or not all(isinstance(value, str) for value in banned):
             banned = []
         issues = (
-            *local_translation_qa(values, banned_latin_terms=banned),
+            *local_translation_qa(
+                values,
+                banned_latin_terms=banned,
+                scene_text_ids=(cue.index for cue in chunk.cues if cue.is_scene_text),
+            ),
             *film_bible_translation_qa(chunk, values, film_bible=film_bible),
+            *translation_style_qa(chunk, values, film_bible=film_bible),
         )
         return tuple({(item.index, item.code): item for item in issues}.values())
 
@@ -1443,9 +1598,37 @@ class TranslationWorker:
                 cue.id,
                 cue.index,
                 cue.range,
-                wrap_vietnamese_subtitle(str(self.ledger.translations[cue.index])),
+                (
+                    wrap_vietnamese_subtitle(str(self.ledger.translations[cue.index]))
+                    if cue.is_dialogue
+                    else " ".join(str(self.ledger.translations[cue.index]).split())
+                ),
                 "vi",
                 source="gemini_translation",
+                confidence=cue.confidence,
+                evidence_ids=cue.evidence_ids,
+                visual_box=cue.visual_box,
+                visual_box_source=cue.visual_box_source,
+                role=cue.role,
+                orientation=cue.orientation,
+                style_hint=cue.style_hint,
+                panel_box=cue.panel_box,
+                background_color=cue.background_color,
+                text_color=cue.text_color,
+                review_state=cue.review_state,
+                scene_font_scale=cue.scene_font_scale,
+                text_font_size=cue.text_font_size,
+                subtitle_track_id=cue.subtitle_track_id,
+                background_padding_x=cue.background_padding_x,
+                background_padding_y=cue.background_padding_y,
+                background_style=cue.background_style,
+                letter_spacing_percent=cue.letter_spacing_percent,
+                font_bold=cue.font_bold,
+                font_italic=cue.font_italic,
+                text_opacity_percent=cue.text_opacity_percent,
+                background_opacity_percent=cue.background_opacity_percent,
+                fade_enabled=cue.fade_enabled,
+                fade_duration_ms=cue.fade_duration_ms,
             )
             for cue in self.cues
         )
@@ -1515,6 +1698,8 @@ class TranslationWorker:
                 "output_path": str(output_path),
                 "qa_path": str(qa_path),
                 "cue_count": len(translated),
+                "warning_count": int(qa.get("warning_count", 0)),
+                "blocking_count": int(qa.get("blocking_count", 0)),
             },
         )
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
+import re
 import shutil
 import subprocess
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
@@ -13,18 +15,27 @@ from ducai_studio.application.effects_commands import (
     EffectsEditor,
     ensure_default_overlays,
 )
-from ducai_studio.application.export_pipeline import build_export_snapshot
+from ducai_studio.application.export_pipeline import (
+    SCENE_TEXT_FONT_FAMILIES,
+    _scene_text_font_size,
+    _scene_text_layout,
+    build_export_snapshot,
+)
 from ducai_studio.domain.effects import (
     ExportSettings,
     ExportSnapshot,
     RenderClip,
     RenderOverlay,
+    RenderSceneText,
+    RenderSubtitleBlur,
     SubtitleStyle,
     VideoFilterSettings,
 )
 from ducai_studio.domain.project import (
     MediaAsset,
     MediaKind,
+    Overlay,
+    OverlayKind,
     ProjectSnapshot,
     SubtitleCue,
     TimelineClip,
@@ -35,7 +46,12 @@ from ducai_studio.domain.timebase import TimeRange
 from ducai_studio.providers.export.ffmpeg import (
     FfmpegCapabilities,
     _ass_color,
+    _ink_splash_ass_drawing,
+    _range_enable,
+    _scene_label_background_pixels,
     _video_filter_chain,
+    _write_ass,
+    decode_export_snapshot,
     materialize_export_chunk,
 )
 from ducai_studio.providers.media_probe import MediaProbeResult
@@ -44,6 +60,52 @@ from ducai_studio.providers.media_probe import MediaProbeResult
 class Probe:
     def probe(self, _media_path):
         return MediaProbeResult(10_000_000, True, True, 1920, 1080, "mp4")
+
+
+def test_scene_text_font_catalog_includes_vietnamese_brush_alternatives() -> None:
+    assert SCENE_TEXT_FONT_FAMILIES["calligraphy_brush"] == "Comforter Brush"
+    assert SCENE_TEXT_FONT_FAMILIES["calligraphy_water"] == "Water Brush"
+    assert SCENE_TEXT_FONT_FAMILIES["calligraphy_splash"] == "Splash"
+    assert SCENE_TEXT_FONT_FAMILIES["calligraphy_hurricane"] == "Hurricane"
+
+
+def test_timed_effect_enable_uses_half_open_project_ranges() -> None:
+    assert _range_enable(0, 100_000, 0, 1_000_000) == (
+        "gte(t,0.000000)*lt(t,0.100000)"
+    )
+
+
+def test_schema_two_export_snapshot_decodes_without_dynamic_blur_field() -> None:
+    snapshot = ExportSnapshot(
+        2,
+        "legacy-export",
+        1,
+        0,
+        1_000_000,
+        1920,
+        1080,
+        RenderClip(
+            "video",
+            "V1",
+            "video",
+            "movie.mp4",
+            0,
+            1_000_000,
+            0,
+            1_000_000,
+        ),
+        (),
+        (),
+        (),
+        ExportSettings(),
+    )
+    raw = json.loads(json.dumps(asdict(snapshot)))
+    raw.pop("subtitle_blurs")
+
+    decoded = decode_export_snapshot(raw)
+
+    assert decoded.schema_version == 2
+    assert decoded.subtitle_blurs == ()
 
 
 def _project(tmp_path: Path) -> ProjectSnapshot:
@@ -75,6 +137,9 @@ def _project(tmp_path: Path) -> ProjectSnapshot:
                 (TimelineClip("d", "D1", timeline, timeline, "voice", volume=0.9),),
             ),
         ),
+        source_cues=(
+            SubtitleCue("cue", 1, TimeRange(1_000_000, 2_000_000), "你好。", "zh"),
+        ),
         translated_cues=(
             SubtitleCue("cue", 1, TimeRange(1_000_000, 2_000_000), "Xin chào.", "vi"),
         ),
@@ -92,6 +157,10 @@ def test_default_overlays_cover_full_video_and_logo_asset_can_be_replaced(
     assert all(item.range == TimeRange(0, 10_000_000) for item in seeded.overlays)
     assert seeded.overlays[0].enabled is True
     assert seeded.overlays[1].enabled is True
+    assert seeded.overlays[0].blur_radius == 46
+    assert seeded.overlays[0].padding_x == pytest.approx(0.02)
+    assert seeded.overlays[0].padding_y == pytest.approx(0.014)
+    assert seeded.overlays[0].concealment_mode == "cover"
 
     updated = EffectsEditor(seeded).update_overlay(
         DEFAULT_BLUR_ID,
@@ -121,6 +190,31 @@ def test_effects_editor_supports_multiple_blur_regions_and_deletes_added_region(
         EffectsEditor(removed).delete_overlay(DEFAULT_BLUR_ID)
 
 
+def test_overlay_rejects_invalid_or_non_blur_concealment_mode() -> None:
+    values = (
+        "overlay",
+        OverlayKind.BLUR,
+        TimeRange(0, 1_000_000),
+        0.1,
+        0.8,
+        0.8,
+        0.1,
+    )
+    with pytest.raises(ValueError, match="concealment mode"):
+        Overlay(*values, concealment_mode="remove")
+    with pytest.raises(ValueError, match="Only blur overlays"):
+        Overlay(
+            "logo",
+            OverlayKind.LOGO,
+            TimeRange(0, 1_000_000),
+            0.1,
+            0.1,
+            0.2,
+            0.1,
+            concealment_mode="cover",
+        )
+
+
 def test_export_snapshot_keeps_video_audio_subtitle_and_effect_contract(
     tmp_path: Path,
 ) -> None:
@@ -136,8 +230,593 @@ def test_export_snapshot_keeps_video_audio_subtitle_and_effect_contract(
 
     assert snapshot.video.path.endswith("movie.mp4")
     assert [item.track_kind for item in snapshot.audio] == ["voice"]
-    assert {item.kind for item in snapshot.overlays} == {"blur", "logo"}
+    assert {item.kind for item in snapshot.overlays} == {"logo"}
+    assert len(snapshot.subtitle_blurs) == 1
+    assert snapshot.subtitle_blurs[0].region_source == "estimated"
+    assert snapshot.subtitle_blurs[0].concealment_mode == "cover"
+    assert snapshot.subtitle_blurs[0].start_us == snapshot.subtitles[0].start_us
+    assert snapshot.subtitle_blurs[0].end_us == snapshot.subtitles[0].end_us
     assert snapshot.subtitles[0].text == "Xin chào."
+
+
+def test_export_snapshot_splits_scene_text_from_dialogue_and_fits_vertical_panel(
+    tmp_path: Path,
+) -> None:
+    project = _project(tmp_path)
+    source_scene = SubtitleCue(
+        "scene",
+        2,
+        TimeRange(3_000_000, 5_000_000),
+        "海王兽",
+        "zh",
+        visual_box=(0.80, 0.25, 0.07, 0.28),
+        visual_box_source="ocr",
+        role="scene_text",
+        orientation="vertical",
+        style_hint="calligraphy",
+        panel_box=(0.75, 0.19, 0.17, 0.40),
+        background_color="#121212",
+        background_style="ink_splash",
+        scene_font_scale=0.75,
+    )
+    translated_scene = replace(
+        source_scene,
+        text="Hải Vương Thú",
+        language="vi",
+        scene_font_scale=2.0,
+    )
+    project = replace(
+        project,
+        source_cues=(*project.source_cues, source_scene),
+        translated_cues=(*project.translated_cues, translated_scene),
+    )
+
+    snapshot = build_export_snapshot(
+        project,
+        settings=ExportSettings(),
+        media_probe=Probe(),
+    )
+
+    assert snapshot.schema_version == 4
+    assert [cue.cue_id for cue in snapshot.subtitles] == ["cue"]
+    assert len(snapshot.scene_texts) == 1
+    scene = snapshot.scene_texts[0]
+    assert scene.text == "Hải\nVương\nThú"
+    assert scene.orientation == "vertical"
+    assert scene.font_family == "Playwrite VN"
+    assert scene.background_color == "#121212"
+    assert scene.font_size == _scene_text_font_size(
+        "Hải\nVương\nThú",
+        orientation="vertical",
+        panel_width_px=round(0.17 * 1920),
+        panel_height_px=round(0.40 * 1080),
+        glyph_width_px=round(0.07 * 1920),
+        glyph_height_px=round(0.28 * 1080),
+        font_scale=0.75,
+        style_hint="calligraphy",
+    )
+    assert (scene.panel_x, scene.panel_y, scene.panel_width, scene.panel_height) == (
+        0.75,
+        0.19,
+        0.17,
+        0.40,
+    )
+
+
+def test_scene_text_font_size_uses_source_glyph_and_manual_scale_monotonically() -> None:
+    automatic = _scene_text_font_size(
+        "Hàn Lập",
+        orientation="horizontal",
+        panel_width_px=700,
+        panel_height_px=300,
+        glyph_width_px=160,
+        glyph_height_px=40,
+    )
+    smaller = _scene_text_font_size(
+        "Hàn Lập",
+        orientation="horizontal",
+        panel_width_px=700,
+        panel_height_px=300,
+        glyph_width_px=160,
+        glyph_height_px=40,
+        font_scale=0.5,
+    )
+    larger = _scene_text_font_size(
+        "Hàn Lập",
+        orientation="horizontal",
+        panel_width_px=700,
+        panel_height_px=300,
+        glyph_width_px=160,
+        glyph_height_px=40,
+        font_scale=2.0,
+    )
+    narrow = _scene_text_font_size(
+        "Một danh xưng tiếng Việt rất dài",
+        orientation="horizontal",
+        panel_width_px=80,
+        panel_height_px=30,
+        glyph_width_px=70,
+        glyph_height_px=26,
+        font_scale=2.0,
+    )
+
+    assert automatic == 36
+    assert smaller == 18
+    assert larger > automatic
+    assert narrow > 0
+    assert smaller < automatic < larger
+
+
+def test_scene_text_font_size_word_values_keep_growing_past_panel_fit() -> None:
+    sizes = [
+        _scene_text_font_size(
+            "Hàn Lập",
+            orientation="horizontal",
+            panel_width_px=120,
+            panel_height_px=60,
+            glyph_width_px=100,
+            glyph_height_px=48,
+            font_scale=value / 12,
+        )
+        for value in (12, 36, 72)
+    ]
+
+    assert sizes[0] < sizes[1] < sizes[2]
+
+
+def test_export_scene_text_uses_persisted_manual_scale() -> None:
+    base = _scene_text_font_size(
+        "Hàn Lập",
+        orientation="horizontal",
+        panel_width_px=700,
+        panel_height_px=300,
+        glyph_width_px=160,
+        glyph_height_px=40,
+    )
+    enlarged = _scene_text_font_size(
+        "Hàn Lập",
+        orientation="horizontal",
+        panel_width_px=700,
+        panel_height_px=300,
+        glyph_width_px=160,
+        glyph_height_px=40,
+        font_scale=1.25,
+    )
+
+    assert enlarged > base
+
+
+def test_scene_text_layout_preserves_horizontal_line_breaks() -> None:
+    assert _scene_text_layout("  Tên rất dài  \n  Hai dòng  ", "horizontal") == (
+        "Tên rất dài\nHai dòng"
+    )
+
+
+def test_export_scene_text_sizing_uses_output_resolution(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    source_scene = SubtitleCue(
+        "scene-output-size",
+        2,
+        TimeRange(3_000_000, 5_000_000),
+        "天命",
+        "zh",
+        visual_box=(0.10, 0.20, 0.20, 0.10),
+        visual_box_source="ocr",
+        role="scene_text",
+        panel_box=(0.08, 0.18, 0.30, 0.16),
+        scene_font_scale=1.25,
+    )
+    translated_scene = replace(
+        source_scene,
+        text="Thiên\nMệnh",
+        language="vi",
+        scene_font_scale=1.25,
+    )
+    project = replace(
+        project,
+        source_cues=(*project.source_cues, source_scene),
+        translated_cues=(*project.translated_cues, translated_scene),
+    )
+
+    snapshot = build_export_snapshot(
+        project,
+        settings=ExportSettings(output_width=854, output_height=480),
+        media_probe=Probe(),
+    )
+
+    scene = snapshot.scene_texts[0]
+    assert scene.text == "Thiên\nMệnh"
+    assert scene.font_size == _scene_text_font_size(
+        scene.text,
+        orientation="horizontal",
+        panel_width_px=round(0.30 * 854),
+        panel_height_px=round(0.16 * 480),
+        glyph_width_px=round(0.20 * 854),
+        glyph_height_px=round(0.10 * 480),
+        font_scale=1.25,
+    )
+
+
+def test_scene_text_ass_uses_panel_position_without_shrinking_or_clipping(tmp_path: Path) -> None:
+    path = tmp_path / "scene-text.ass"
+    cue = RenderSceneText(
+        "scene-clip",
+        1,
+        0,
+        1_000_000,
+        "WWWWWW",
+        0.25,
+        0.25,
+        0.20,
+        0.20,
+        0.25,
+        0.25,
+        0.50,
+        0.50,
+        font_size=42,
+    )
+
+    _write_ass(
+        path,
+        [],
+        chunk_start_us=0,
+        chunk_end_us=1_000_000,
+        width=800,
+        height=400,
+        style=SubtitleStyle(),
+        scene_texts=[cue],
+    )
+
+    ass = path.read_text(encoding="utf-8-sig")
+    assert r"\pos(400,200)" in ass
+    assert r"\clip(200,100,600,300)" not in ass
+
+
+def test_calligraphy_scene_text_uses_libass_metrics_and_remains_readable() -> None:
+    font_size = _scene_text_font_size(
+        "W\nW\nW",
+        orientation="vertical",
+        panel_width_px=200,
+        panel_height_px=500,
+        glyph_width_px=180,
+        glyph_height_px=450,
+        font_scale=2.0,
+        style_hint="calligraphy",
+    )
+
+    assert font_size > 0
+
+
+def test_scene_text_export_preserves_font_and_background_padding(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    source_scene = SubtitleCue(
+        "scene-style",
+        2,
+        TimeRange(3_000_000, 5_000_000),
+        "仙人",
+        "zh",
+        visual_box=(0.20, 0.20, 0.20, 0.12),
+        visual_box_source="ocr",
+        role="scene_text",
+        style_hint="calligraphy_soft",
+        panel_box=(0.18, 0.18, 0.26, 0.18),
+        background_color="#121212",
+        background_padding_x=24,
+        background_padding_y=12,
+        background_style="ink_splash",
+        letter_spacing_percent=18,
+        font_bold=True,
+        font_italic=True,
+        text_opacity_percent=84,
+        background_opacity_percent=93,
+        fade_enabled=True,
+        fade_duration_ms=450,
+    )
+    translated_scene = replace(source_scene, text="Tiên Nhân", language="vi")
+    project = replace(
+        project,
+        source_cues=(*project.source_cues, source_scene),
+        translated_cues=(*project.translated_cues, translated_scene),
+    )
+
+    snapshot = build_export_snapshot(project, settings=ExportSettings(), media_probe=Probe())
+    scene = snapshot.scene_texts[0]
+
+    assert scene.font_family == "Dancing Script"
+    assert scene.background_style == "ink_splash"
+    assert scene.background_padding_x == 24
+    assert scene.background_padding_y == 12
+    assert scene.letter_spacing_percent == 18
+    assert scene.font_bold is True
+    assert scene.font_italic is True
+    assert scene.text_opacity_percent == 84
+    assert scene.background_opacity_percent == 93
+    assert scene.fade_enabled is True
+    assert scene.fade_duration_ms == 450
+
+
+def test_s1_dialogue_export_preserves_per_cue_typography_and_position(
+    tmp_path: Path,
+) -> None:
+    project = _project(tmp_path)
+    source = replace(
+        project.source_cues[0],
+        text_font_size=36,
+        orientation="vertical",
+        style_hint="calligraphy_bold",
+        background_color="#102030",
+        text_color="#F0E0D0",
+        panel_box=(0.22, 0.18, 0.40, 0.36),
+        subtitle_track_id="S1",
+    )
+    translated = replace(source, text="Hồng Ly tỷ tỷ", language="vi")
+    settings = ExportSettings()
+
+    snapshot = build_export_snapshot(
+        replace(project, source_cues=(source,), translated_cues=(translated,)),
+        settings=settings,
+        media_probe=Probe(),
+    )
+    subtitle = snapshot.subtitles[0]
+
+    assert subtitle.font_size == settings.subtitle_style.font_size * 3
+    assert subtitle.orientation == "vertical"
+    assert subtitle.font_family == "Lobster"
+    assert subtitle.background_color == "#102030"
+    assert subtitle.text_color == "#F0E0D0"
+    assert (
+        subtitle.panel_x,
+        subtitle.panel_y,
+        subtitle.panel_width,
+        subtitle.panel_height,
+    ) == pytest.approx((0.22, 0.18, 0.40, 0.36))
+
+
+def test_scene_text_background_padding_expands_tight_label_without_leaving_frame() -> None:
+    cue = RenderSceneText(
+        "scene-padding",
+        1,
+        0,
+        1_000_000,
+        "Hồng Ly tỷ tỷ",
+        0.42,
+        0.40,
+        0.16,
+        0.08,
+        0.80,
+        0.86,
+        0.18,
+        0.12,
+        font_size=48,
+        background_color="#101010",
+    )
+
+    default_box = _scene_label_background_pixels(cue, 1920, 1080)
+    padded_box = _scene_label_background_pixels(
+        replace(cue, background_padding_x=60, background_padding_y=40),
+        1920,
+        1080,
+    )
+
+    assert padded_box[2] > default_box[2]
+    assert padded_box[3] > default_box[3]
+    assert 0 <= padded_box[0] <= 1920 - padded_box[2]
+    assert 0 <= padded_box[1] <= 1080 - padded_box[3]
+
+
+def test_ink_scene_text_writes_vector_background_before_brush_text(tmp_path: Path) -> None:
+    path = tmp_path / "ink-scene-text.ass"
+    cue = RenderSceneText(
+        "ink-scene",
+        2,
+        0,
+        1_000_000,
+        "Ma\nTôn",
+        0.70,
+        0.15,
+        0.10,
+        0.42,
+        0.67,
+        0.12,
+        0.16,
+        0.50,
+        orientation="vertical",
+        style_hint="calligraphy_ink",
+        font_family="Agbalumo",
+        font_size=58,
+        background_color="#080808",
+        background_style="ink_splash",
+        background_padding_x=34,
+        background_padding_y=26,
+        fade_enabled=True,
+        fade_duration_ms=300,
+    )
+
+    _write_ass(
+        path,
+        [],
+        chunk_start_us=0,
+        chunk_end_us=1_000_000,
+        width=1920,
+        height=1080,
+        style=SubtitleStyle(),
+        scene_texts=[cue],
+    )
+
+    ass = path.read_text(encoding="utf-8-sig")
+    assert r"\p1" in ass
+    assert "Agbalumo" in ass
+    assert "Dialogue: 0" in ass
+    assert "Dialogue: 1" in ass
+    assert ass.count(r"\fad(300,300)") == 2
+    assert ass.index(r"\p1") < ass.index("Agbalumo")
+
+
+def test_scene_text_fade_is_clamped_and_does_not_restart_at_chunk_boundary(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "short-scene-text.ass"
+    cue = RenderSceneText(
+        "short-scene",
+        1,
+        0,
+        400_000,
+        "A Cẩu",
+        0.1,
+        0.1,
+        0.2,
+        0.1,
+        0.08,
+        0.08,
+        0.3,
+        0.14,
+        fade_enabled=True,
+        fade_duration_ms=300,
+    )
+
+    _write_ass(
+        path,
+        [],
+        chunk_start_us=100_000,
+        chunk_end_us=400_000,
+        width=1920,
+        height=1080,
+        style=SubtitleStyle(),
+        scene_texts=[cue],
+    )
+
+    ass = path.read_text(encoding="utf-8-sig")
+    assert r"\fad(0,200)" in ass
+    assert r"\fad(300,300)" not in ass
+
+
+@pytest.mark.parametrize(
+    "background_style",
+    ("ink_splash", "ink_wash", "ink_cloud", "brush_stroke"),
+)
+@pytest.mark.parametrize(
+    ("orientation", "text", "panel"),
+    (
+        ("vertical", "Tịch\nTà\nThần\nLôi", (0.70, 0.08, 0.16, 0.78)),
+        ("horizontal", "Hồng Ly tỷ tỷ", (0.08, 0.66, 0.82, 0.18)),
+    ),
+)
+def test_ink_variants_keep_vector_geometry_inside_frame_for_extreme_aspects(
+    background_style: str,
+    orientation: str,
+    text: str,
+    panel: tuple[float, float, float, float],
+) -> None:
+    cue = RenderSceneText(
+        cue_id=f"{background_style}-{orientation}",
+        index=3,
+        start_us=0,
+        end_us=1_000_000,
+        text=text,
+        glyph_x=panel[0],
+        glyph_y=panel[1],
+        glyph_width=panel[2],
+        glyph_height=panel[3],
+        panel_x=panel[0],
+        panel_y=panel[1],
+        panel_width=panel[2],
+        panel_height=panel[3],
+        orientation=orientation,
+        font_size=72,
+        background_color="#080808",
+        background_style=background_style,
+        background_padding_x=34,
+        background_padding_y=26,
+    )
+
+    drawing = _ink_splash_ass_drawing(cue, 1920, 1080)
+    coordinates = [int(value) for value in re.findall(r"-?\d+", drawing)]
+
+    assert drawing.startswith("m ")
+    assert " b " in drawing
+    assert len(coordinates) % 2 == 0
+    assert all(0 <= value <= 1920 for value in coordinates[0::2])
+    assert all(0 <= value <= 1080 for value in coordinates[1::2])
+
+
+def test_scene_text_font_size_scales_past_legacy_240_pixel_cap_for_4k() -> None:
+    preview = _scene_text_font_size(
+        "Hàn Lập",
+        orientation="horizontal",
+        panel_width_px=960,
+        panel_height_px=300,
+        glyph_width_px=500,
+        glyph_height_px=210,
+        font_scale=1.0,
+    )
+    export_4k = _scene_text_font_size(
+        "Hàn Lập",
+        orientation="horizontal",
+        panel_width_px=3840,
+        panel_height_px=1200,
+        glyph_width_px=2000,
+        glyph_height_px=840,
+        font_scale=1.0,
+    )
+
+    assert preview > 0
+    assert abs(export_4k - preview * 4) <= 3
+    assert export_4k > 240
+
+
+def test_scene_text_word_like_sizes_are_strictly_monotonic() -> None:
+    def rendered_size(editor_size: int) -> int:
+        return _scene_text_font_size(
+            "Hồng Ly tỷ tỷ",
+            orientation="horizontal",
+            panel_width_px=640,
+            panel_height_px=240,
+            glyph_width_px=360,
+            glyph_height_px=120,
+            font_scale=editor_size / 12,
+            style_hint="calligraphy_soft",
+        )
+
+    assert rendered_size(12) < rendered_size(36) < rendered_size(72)
+
+
+def test_export_snapshot_renders_ocr_watermark_as_strong_dynamic_concealment(
+    tmp_path: Path,
+) -> None:
+    watermark = Overlay(
+        "overlay-ocr-watermark-1",
+        OverlayKind.BLUR,
+        TimeRange(0, 10_000_000),
+        0.72,
+        0.08,
+        0.26,
+        0.09,
+        blur_radius=46,
+        tracking_mode="ocr_watermark",
+        concealment_mode="cover",
+    )
+    project = replace(_project(tmp_path), overlays=(watermark,))
+
+    snapshot = build_export_snapshot(
+        project,
+        settings=ExportSettings(),
+        media_probe=Probe(),
+    )
+
+    assert snapshot.overlays == ()
+    assert len(snapshot.subtitle_blurs) == 1
+    rendered = snapshot.subtitle_blurs[0]
+    assert rendered.cue_id == watermark.id
+    assert rendered.region_source == "ocr"
+    assert rendered.concealment_mode == "cover"
+    assert rendered.blur_radius == 46
+    assert (rendered.x, rendered.y, rendered.width, rendered.height) == (
+        0.72,
+        0.08,
+        0.26,
+        0.09,
+    )
+    assert (rendered.start_us, rendered.end_us) == (0, 10_000_000)
 
 
 def test_export_snapshot_preserves_cue_scoped_d1_clips(tmp_path: Path) -> None:
@@ -598,3 +1277,199 @@ def test_chunk_plan_decodes_static_logo_once_and_avoids_chunk_faststart(
     assert "-framerate" not in plan.arguments
     assert "-movflags" not in plan.arguments
     assert "eof_action=repeat" in plan.filter_script_path.read_text(encoding="utf-8")
+
+
+def test_dynamic_subtitle_blur_groups_one_full_frame_source_per_radius(
+    tmp_path: Path,
+) -> None:
+    source = (tmp_path / "movie.mp4").resolve()
+    source.write_bytes(b"source")
+    duration_us = 100_000_000
+    subtitle_blurs = tuple(
+        RenderSubtitleBlur(
+            f"cue-{index}",
+            index + 1,
+            index * 1_000_000,
+            (index + 1) * 1_000_000,
+            0.2,
+            0.8,
+            0.6,
+            0.12,
+            22 if index < 70 else 30,
+            1.0,
+            "ocr",
+        )
+        for index in range(100)
+    )
+    snapshot = ExportSnapshot(
+        3,
+        "project",
+        1,
+        0,
+        duration_us,
+        852,
+        480,
+        RenderClip(
+            "video",
+            "V1",
+            "video",
+            str(source),
+            0,
+            duration_us,
+            0,
+            duration_us,
+        ),
+        (),
+        (),
+        (),
+        ExportSettings(subtitle_style=SubtitleStyle(enabled=False)),
+        (),
+        subtitle_blurs,
+    )
+
+    plan = materialize_export_chunk(
+        snapshot,
+        index=0,
+        start_us=0,
+        end_us=duration_us,
+        work_dir=tmp_path / "dynamic-blur-work",
+        output_path=tmp_path / "dynamic-blur.mp4",
+        capabilities=FfmpegCapabilities("ffmpeg", "ffmpeg test", False, True, True),
+    )
+    graph = plan.filter_script_path.read_text(encoding="utf-8")
+
+    assert graph.count("boxblur=luma_radius=") == 2
+    assert graph.count("luma_power=1") == 2
+    assert "luma_power=2" not in graph
+    assert graph.count("drawbox=") == 100
+    assert graph.count("maskedmerge") == 2
+    assert graph.index("maskedmerge") < graph.index("null[vout]")
+
+
+def test_dynamic_subtitle_cover_uses_strong_blur_and_dark_veil(
+    tmp_path: Path,
+) -> None:
+    source = (tmp_path / "movie.mp4").resolve()
+    source.write_bytes(b"source")
+    duration_us = 2_000_000
+    snapshot = ExportSnapshot(
+        3,
+        "project",
+        1,
+        0,
+        duration_us,
+        852,
+        480,
+        RenderClip(
+            "video",
+            "V1",
+            "video",
+            str(source),
+            0,
+            duration_us,
+            0,
+            duration_us,
+        ),
+        (),
+        (),
+        (),
+        ExportSettings(subtitle_style=SubtitleStyle(enabled=False)),
+        (),
+        (
+            RenderSubtitleBlur(
+                "cue-1",
+                1,
+                0,
+                duration_us,
+                0.2,
+                0.8,
+                0.6,
+                0.12,
+                46,
+                1.0,
+                "ocr",
+                "cover",
+            ),
+        ),
+    )
+
+    plan = materialize_export_chunk(
+        snapshot,
+        index=0,
+        start_us=0,
+        end_us=duration_us,
+        work_dir=tmp_path / "covered-blur-work",
+        output_path=tmp_path / "covered-blur.mp4",
+        capabilities=FfmpegCapabilities("ffmpeg", "ffmpeg test", False, True, True),
+    )
+    graph = plan.filter_script_path.read_text(encoding="utf-8")
+
+    assert "luma_power=2" in graph
+    assert "chroma_power=2" in graph
+    assert "color=black@0.900000" in graph
+    assert graph.count("boxblur=luma_radius=") == 1
+
+
+def test_scene_text_conceals_glyph_only_and_writes_positioned_calligraphy_ass(
+    tmp_path: Path,
+) -> None:
+    source = (tmp_path / "movie.mp4").resolve()
+    source.write_bytes(b"source")
+    duration_us = 2_000_000
+    scene = RenderSceneText(
+        "scene",
+        1,
+        0,
+        duration_us,
+        "Hải\nVương\nThú",
+        0.80,
+        0.25,
+        0.07,
+        0.28,
+        0.75,
+        0.19,
+        0.17,
+        0.40,
+        "vertical",
+        "calligraphy",
+        "Playwrite VN",
+        38,
+        "#121212",
+    )
+    snapshot = ExportSnapshot(
+        4,
+        "project",
+        1,
+        0,
+        duration_us,
+        852,
+        480,
+        RenderClip(
+            "video", "V1", "video", str(source), 0, duration_us, 0, duration_us
+        ),
+        (),
+        (),
+        (),
+        ExportSettings(),
+        (),
+        (),
+        (scene,),
+    )
+
+    plan = materialize_export_chunk(
+        snapshot,
+        index=0,
+        start_us=0,
+        end_us=duration_us,
+        work_dir=tmp_path / "scene-work",
+        output_path=tmp_path / "scene.mp4",
+        capabilities=FfmpegCapabilities("ffmpeg", "ffmpeg test", False, True, True),
+    )
+    graph = plan.filter_script_path.read_text(encoding="utf-8")
+    ass = plan.ass_path.read_text(encoding="utf-8-sig") if plan.ass_path else ""
+
+    assert "vscene0mask" in graph
+    assert "color=0x121212@0.900000" in graph
+    assert "\\fnPlaywrite VN" in ass
+    assert "\\pos(" in ass
+    assert "Hải\\NVương\\NThú" in ass

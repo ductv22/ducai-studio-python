@@ -26,7 +26,7 @@ def test_runtime_diagnostics_reports_every_managed_boundary_without_secrets(
         "gemini-web",
         "gemini-cli",
         "piper",
-        "vieneu-3.3",
+        "vieneu-3.8",
     }
     assert report.overall_status == "blocked"
     assert "api_key" not in serialized.casefold()

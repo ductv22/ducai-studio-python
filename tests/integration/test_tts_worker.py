@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 import sys
 import wave
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from hashlib import sha256
 from pathlib import Path
 
@@ -36,6 +37,27 @@ from ducai_studio.providers.tts.contracts import (
     TtsRuntimeUnavailable,
 )
 from ducai_studio.workers.tts_worker import TtsWorker, _tts_failure_payload
+
+
+def test_command_reader_allows_clean_exit_while_manager_stdin_stays_open():
+    code = (
+        "import sys,time; from ducai_studio.workers.tts_worker import TtsWorker; "
+        "w=TtsWorker('exit-check'); w._reader.start(); time.sleep(.1); print('ready',flush=True)"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", code], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    try:
+        # Do not communicate(): closing stdin would hide the shutdown regression.
+        assert process.wait(timeout=8) == 0, process.stderr.read().decode("utf-8", "replace")
+        assert process.stdout.read().strip() == b"ready"
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=3)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            stream.close()
 
 
 class DeterministicTtsProvider:
@@ -173,13 +195,13 @@ def test_tts_worker_uses_checkpoint_compatible_runtime_engine_override(
     )
     monkeypatch.setenv("DUCAI_TTS_ENGINE_HOST_MANAGED", "1")
     worker = TtsWorker("tts-runtime-host")
-    worker.spec = {"provider_id": "vieneu-3.3"}
+    worker.spec = {"provider_id": "vieneu-3.8"}
     worker.config = {
         "runtime_python": sys.executable,
         "data_root": str(tmp_path),
         "engine_host_path": str(configured_host),
         "profile_path": str(profile),
-        "batch_size": 64,
+        "batch_size": 32,
     }
 
     provider = worker._provider_from_config()
@@ -198,7 +220,7 @@ def test_tts_worker_rejects_changed_runtime_engine_host(
     monkeypatch.setenv("DUCAI_TTS_ENGINE_HOST_SHA256", "0" * 64)
     monkeypatch.setenv("DUCAI_TTS_ENGINE_HOST_MANAGED", "1")
     worker = TtsWorker("tts-runtime-host-hash")
-    worker.spec = {"provider_id": "vieneu-3.3"}
+    worker.spec = {"provider_id": "vieneu-3.8"}
     worker.config = {
         "runtime_python": sys.executable,
         "data_root": str(tmp_path),
@@ -225,7 +247,7 @@ def test_tts_worker_ignores_inherited_runtime_override_for_custom_host(
     )
     monkeypatch.setenv("DUCAI_TTS_ENGINE_HOST_MANAGED", "0")
     worker = TtsWorker("tts-custom-runtime-host")
-    worker.spec = {"provider_id": "vieneu-3.3"}
+    worker.spec = {"provider_id": "vieneu-3.8"}
     worker.config = {
         "runtime_python": sys.executable,
         "data_root": str(tmp_path),
@@ -371,6 +393,40 @@ def test_worker_announces_synthesis_before_provider_starts(tmp_path, monkeypatch
     assert kind == "progress"
     assert payload["phase"] == "synthesis"
     assert payload["phase_current"] == 0
+    assert payload["eta_ms"] is None
+
+
+def test_large_cache_scan_reports_elapsed_cadence_and_exact_final_count(tmp_path, monkeypatch):
+    from ducai_studio.workers import tts_worker as module
+
+    provider = DeterministicTtsProvider()
+    worker, events = _worker(tmp_path, monkeypatch, provider)
+    worker.cues = tuple(
+        replace(worker.cues[0], cue_id=f"cue-{i}", index=i) for i in range(1, 8588)
+    )
+    ticks = iter(i / 1000 for i in range(100_000))
+    monkeypatch.setattr(module.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(worker, "_restore_global_cache", lambda cue: True)
+    monkeypatch.setattr(worker, "_checkpoint", lambda: None)
+    monkeypatch.setattr(worker, "_publish_result", lambda: None)
+
+    worker._execute()
+
+    updates = [p for k, p in events if k == "progress" and p["phase"] == "cache_restore"]
+    assert 2 <= len(updates) <= 12
+    assert updates[0]["phase_current"] == 0
+    assert updates[-1]["phase_current"] == updates[-1]["phase_total"] == 8587
+    assert provider.calls == []
+
+
+def test_provider_stage_progress_keeps_real_cue_count(tmp_path, monkeypatch):
+    worker, events = _worker(tmp_path, monkeypatch, DeterministicTtsProvider())
+    worker._provider_progress("model_loading", "Đang nạp VieNeu lên GPU")
+    kind, payload = events[-1]
+    assert kind == "progress"
+    assert payload["phase"] == "model_loading"
+    assert payload["phase_detail"] == "Đang nạp VieNeu lên GPU"
+    assert payload["current"] == 0
     assert payload["eta_ms"] is None
 
 
@@ -830,7 +886,7 @@ def test_vieneu_read_speed_uses_cache_variant_and_never_changes_inference_speed(
 ) -> None:
     monkeypatch.setenv("DUCAI_ARTIFACT_STAGING_ROOT", str(tmp_path / "staging"))
     provider = DeterministicTtsProvider(duration_samples=24_000)
-    provider.provider_id = "vieneu-3.3"
+    provider.provider_id = "vieneu-3.8"
     config = _config(
         tmp_path,
         pipeline_settings={
@@ -852,8 +908,8 @@ def test_vieneu_read_speed_uses_cache_variant_and_never_changes_inference_speed(
         {
             "job": {
                 "kind": "tts",
-                "provider_id": "vieneu-3.3",
-                "provider_version": "3.3.0",
+                "provider_id": "vieneu-3.8",
+                "provider_version": "3.8.1",
                 "model_id": "v3turbo",
                 "provider_config": config,
             }

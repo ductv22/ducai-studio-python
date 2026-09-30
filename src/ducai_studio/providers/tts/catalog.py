@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sys
+import unicodedata
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
@@ -16,6 +17,14 @@ class VoiceRightsState(StrEnum):
     RESTRICTED = "restricted"
     UNCLEAR = "unclear"
     PERMISSION_REQUIRED = "permission_required"
+
+
+@dataclass(frozen=True, slots=True)
+class VoiceDownloadFile:
+    filename: str
+    url: str
+    size_bytes: int
+    md5: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +41,11 @@ class VoiceCatalogEntry:
     config_path: str = ""
     model_fingerprint: str = ""
     recommended: bool = False
+    preset_name: str = ""
+    preview_path: str = ""
+    preview_text: str = ""
+    installable: bool = False
+    download_files: tuple[VoiceDownloadFile, ...] = ()
 
     def __post_init__(self) -> None:
         required = (
@@ -43,22 +57,83 @@ class VoiceCatalogEntry:
         )
         if any(not value.strip() for value in required):
             raise ValueError("Voice catalog identity, source and rights are required")
-        if self.installed and (
-            not Path(self.model_path).is_file() or not Path(self.config_path).is_file()
+        if (
+            self.installed
+            and self.provider_id == "piper"
+            and (not Path(self.model_path).is_file() or not Path(self.config_path).is_file())
         ):
             raise ValueError("Installed Piper catalog entry must own ONNX and JSON files")
+        if self.provider_id == "vieneu-3.8" and not self.preset_name:
+            raise ValueError("VieNeu catalog entry must identify its preset")
+
+    @property
+    def preview_available(self) -> bool:
+        return bool(self.preview_path and Path(self.preview_path).is_file())
+
+    @property
+    def download_bytes(self) -> int:
+        return sum(item.size_bytes for item in self.download_files)
 
 
-_VOICE_SPECS = (
-    (
+_PIPER_REVISION = "320d5f7f7751a17ef6512d5c23863056c6a11c0f"
+_PIPER_BASE = f"https://huggingface.co/rhasspy/piper-voices/resolve/{_PIPER_REVISION}"
+
+
+@dataclass(frozen=True, slots=True)
+class _PiperVoiceSpec:
+    voice_id: str
+    name: str
+    source: str
+    description: str
+    rights_label: str
+    rights_state: VoiceRightsState
+    recommended: bool
+    preview_text: str
+    remote_directory: str
+    model_size: int
+    model_md5: str
+    config_size: int
+    config_md5: str
+
+
+_PIPER_SPECS = (
+    _PiperVoiceSpec(
         "vi_VN-vais1000-medium",
         "Vais1000 Medium",
-        "Piper",
-        "Rõ, cân bằng",
+        "Piper chính thức",
+        "Giọng Việt rõ, cân bằng; model mặc định gọn nhẹ",
         "CC BY 4.0",
         VoiceRightsState.VERIFIED,
         True,
+        "Một bản thu tốt cần rõ lời, tự nhiên và giữ được nhịp kể chuyện ổn định, "
+        "để người nghe luôn tập trung vào nội dung.",
+        "vi/vi_VN/vais1000/medium",
+        63_201_294,
+        "5e42428c4f6131f75557cf156c9c1526",
+        4_860,
+        "5ec9669253541d64ba97f60e422f1ad0",
     ),
+    _PiperVoiceSpec(
+        "vi_VN-vivos-x_low",
+        "VIVOS X-Low",
+        "Piper chính thức",
+        "Model rất nhẹ, phù hợp máy yếu",
+        "CC BY-NC-SA 4.0, chỉ phi thương mại",
+        VoiceRightsState.RESTRICTED,
+        False,
+        "Buổi sáng trên bến cảng, từng con thuyền chậm rãi rời bờ trong làn sương mỏng.",
+        "vi/vi_VN/vivos/x_low",
+        27_789_413,
+        "d5880d32e340f57489dcb9d4f1f7aa04",
+        5_592,
+        "708356072a75e33cff652f1b5d455795",
+    ),
+)
+
+# Keep the historic IDs loadable for old jobs/projects, but do not publish them
+# as installable UI choices until their redistribution and voice-personality
+# rights have been verified. This is a compatibility contract, not a download list.
+_LEGACY_PIPER_SPECS = (
     (
         "vi_VN-25hours_single-low",
         "25 Hours Low",
@@ -66,16 +141,6 @@ _VOICE_SPECS = (
         "Nhẹ",
         "Giấy phép dữ liệu chưa rõ",
         VoiceRightsState.UNCLEAR,
-        False,
-    ),
-    (
-        "vi_VN-vivos-x_low",
-        "VIVOS X-Low",
-        "Piper ngoài",
-        "Siêu nhẹ",
-        "Chỉ phi thương mại",
-        VoiceRightsState.RESTRICTED,
-        False,
     ),
     (
         "vi_VN-banmai-vntts",
@@ -84,7 +149,6 @@ _VOICE_SPECS = (
         "Giọng cộng đồng",
         "Kiểm tra quyền giọng",
         VoiceRightsState.UNCLEAR,
-        False,
     ),
     (
         "nghitts-chieu-thanh",
@@ -93,7 +157,6 @@ _VOICE_SPECS = (
         "Giọng cộng đồng",
         "Kiểm tra quyền giọng",
         VoiceRightsState.UNCLEAR,
-        False,
     ),
     (
         "nghitts-duy-onyx-moi",
@@ -102,7 +165,6 @@ _VOICE_SPECS = (
         "Giọng cộng đồng",
         "Kiểm tra quyền giọng",
         VoiceRightsState.UNCLEAR,
-        False,
     ),
     (
         "nghitts-duy-oryx",
@@ -111,7 +173,6 @@ _VOICE_SPECS = (
         "Giọng cộng đồng",
         "Kiểm tra quyền giọng",
         VoiceRightsState.UNCLEAR,
-        False,
     ),
     (
         "nghitts-lac-phi",
@@ -120,7 +181,6 @@ _VOICE_SPECS = (
         "Giọng cộng đồng",
         "Kiểm tra quyền giọng",
         VoiceRightsState.UNCLEAR,
-        False,
     ),
     (
         "nghitts-mai-phuong",
@@ -129,7 +189,6 @@ _VOICE_SPECS = (
         "Giọng cộng đồng",
         "Kiểm tra quyền giọng",
         VoiceRightsState.UNCLEAR,
-        False,
     ),
     (
         "nghitts-minh-khang",
@@ -138,7 +197,6 @@ _VOICE_SPECS = (
         "Giọng cộng đồng",
         "Kiểm tra quyền giọng",
         VoiceRightsState.UNCLEAR,
-        False,
     ),
     (
         "nghitts-minh-quang",
@@ -147,7 +205,6 @@ _VOICE_SPECS = (
         "Giọng cộng đồng",
         "Kiểm tra quyền giọng",
         VoiceRightsState.UNCLEAR,
-        False,
     ),
     (
         "nghitts-manh-dung",
@@ -156,7 +213,6 @@ _VOICE_SPECS = (
         "Giọng cộng đồng",
         "Kiểm tra quyền giọng",
         VoiceRightsState.UNCLEAR,
-        False,
     ),
     (
         "nghitts-my-tam",
@@ -165,7 +221,6 @@ _VOICE_SPECS = (
         "Tên người thật",
         "Cần quyền sử dụng giọng",
         VoiceRightsState.PERMISSION_REQUIRED,
-        False,
     ),
     (
         "nghitts-my-tam-real",
@@ -174,7 +229,6 @@ _VOICE_SPECS = (
         "Tên người thật",
         "Cần quyền sử dụng giọng",
         VoiceRightsState.PERMISSION_REQUIRED,
-        False,
     ),
     (
         "nghitts-ngoc-huyen-moi",
@@ -183,7 +237,6 @@ _VOICE_SPECS = (
         "Giọng cộng đồng",
         "Kiểm tra quyền giọng",
         VoiceRightsState.UNCLEAR,
-        False,
     ),
     (
         "nghitts-ngoc-ngan",
@@ -192,7 +245,6 @@ _VOICE_SPECS = (
         "Tên người thật",
         "Cần quyền sử dụng giọng",
         VoiceRightsState.PERMISSION_REQUIRED,
-        False,
     ),
     (
         "nghitts-phuong-trang",
@@ -201,7 +253,6 @@ _VOICE_SPECS = (
         "Giọng cộng đồng",
         "Kiểm tra quyền giọng",
         VoiceRightsState.UNCLEAR,
-        False,
     ),
     (
         "nghitts-thanh-phuong-viettel",
@@ -210,7 +261,6 @@ _VOICE_SPECS = (
         "Giọng cộng đồng",
         "Kiểm tra quyền giọng",
         VoiceRightsState.UNCLEAR,
-        False,
     ),
     (
         "nghitts-thien-tam",
@@ -219,7 +269,6 @@ _VOICE_SPECS = (
         "Giọng cộng đồng",
         "Kiểm tra quyền giọng",
         VoiceRightsState.UNCLEAR,
-        False,
     ),
     (
         "nghitts-tran-thanh",
@@ -228,7 +277,6 @@ _VOICE_SPECS = (
         "Tên người thật",
         "Cần quyền sử dụng giọng",
         VoiceRightsState.PERMISSION_REQUIRED,
-        False,
     ),
     (
         "nghitts-tai-an",
@@ -237,7 +285,6 @@ _VOICE_SPECS = (
         "Giọng cộng đồng",
         "Kiểm tra quyền giọng",
         VoiceRightsState.UNCLEAR,
-        False,
     ),
     (
         "nghitts-viet-thao",
@@ -246,7 +293,6 @@ _VOICE_SPECS = (
         "Tên người thật",
         "Cần quyền sử dụng giọng",
         VoiceRightsState.PERMISSION_REQUIRED,
-        False,
     ),
     (
         "nghitts-adam",
@@ -255,9 +301,102 @@ _VOICE_SPECS = (
         "Giọng cộng đồng",
         "Kiểm tra quyền giọng",
         VoiceRightsState.UNCLEAR,
-        False,
     ),
 )
+
+_VIENEU_PREVIEW_TEXTS = {
+    "Adam bựa": (
+        "Hôm nay trời mát, chúng ta cứ thong thả kể một câu chuyện vui bên tách cà phê, "
+        "rồi ngắm phố lên đèn ngoài khung cửa."
+    ),
+    "Trúc Ly": (
+        "Mỗi sáng, khu vườn nhỏ lại đón nắng qua những tán lá xanh còn đọng sương, "
+        "tiếng chim gọi nhau từ phía hàng rào."
+    ),
+    "Anh Khôi": (
+        "Con thuyền rời bến lúc bình minh, mang theo hy vọng về một hành trình bình yên, "
+        "phía xa mặt biển sáng dần dưới mây."
+    ),
+    "Mai Anh": (
+        "Bản tin chiều nay ghi nhận giao thông ổn định và thời tiết thuận lợi trên cả nước, "
+        "nhiệt độ giảm nhẹ vào lúc tối."
+    ),
+    "Minh Quân Pro": (
+        "Một giọng đọc tự nhiên cần rõ chữ, đúng nhịp và giữ cảm xúc vừa đủ, "
+        "để người nghe theo dõi thật dễ dàng."
+    ),
+    "Thùy Dung": (
+        "Thị trường sáng nay có nhiều tín hiệu tích cực, "
+        "trong khi giá năng lượng tiếp tục ổn định và sức mua đang phục hồi."
+    ),
+    "Thiền Tâm Đức": "Người lữ khách dừng chân bên suối, lắng nghe tiếng rừng đêm thở thật khẽ.",
+    "Ngọc Huyền": (
+        "Tôi thích những buổi chiều yên tĩnh, khi thành phố chậm lại sau một ngày dài, "
+        "và mọi con đường dần lên ánh đèn."
+    ),
+    "Quang Sơn": (
+        "Gió miền Trung thổi qua triền cát, mang theo vị mặn của biển và nắng, "
+        "gợi nhớ những mùa hè xa quê."
+    ),
+    "Ngọc Trân": (
+        "Ngoài hiên, tiếng mưa đều đặn làm căn phòng trở nên ấm áp và gần gũi, "
+        "bên cạnh một tách trà vừa pha."
+    ),
+    "Minh Đức": (
+        "Chương trình hôm nay cập nhật các thông tin quan trọng về kinh tế và đời sống, "
+        "cùng những thay đổi đáng chú ý trong tuần."
+    ),
+    "Phạm Tuyên": (
+        "Bạn có thể bắt đầu từ điều nhỏ nhất, rồi kiên trì tiến thêm mỗi ngày, "
+        "kết quả tốt sẽ đến vào đúng lúc."
+    ),
+    "Thái Sơn": (
+        "Đêm xuống rất nhanh, nhưng ngọn đèn trong căn nhà cuối phố vẫn sáng, "
+        "như đang chờ một người trở về."
+    ),
+    "Xuân Vĩnh": (
+        "Một chuyến đi đáng nhớ không chỉ nằm ở đích đến, mà còn ở bạn đồng hành "
+        "và những điều bất ngờ nhỏ trên đường."
+    ),
+    "Thanh Bình": (
+        "Ông lão mở cuốn sổ cũ, chậm rãi kể lại mùa hè của nhiều năm trước, "
+        "khi cả làng còn chưa có điện."
+    ),
+    "Ngọc Linh": (
+        "Cánh cửa gỗ khẽ mở, để lộ căn phòng đầy sách và mùi trà thơm, "
+        "nơi người chủ vẫn ngồi chờ khách."
+    ),
+    "Đoan Trang": (
+        "Cuối tuần này, cả nhà sẽ về quê thăm bà và cùng nấu một bữa cơm, "
+        "rồi ngồi kể nhau nghe chuyện cũ."
+    ),
+    "Thục Đoan": (
+        "Cô bé lần theo dấu chân nhỏ, đi sâu vào khu rừng phủ đầy ánh nắng, "
+        "không biết ai đang đợi phía trước."
+    ),
+    "Minh Triết": (
+        "Dự báo cho thấy nhiệt độ giảm nhẹ, người dân nên chuẩn bị áo ấm khi ra đường, "
+        "đặc biệt trong khoảng sáng sớm mai."
+    ),
+    "Mỹ Duyên": "Từ trên đồi cao, cô nhìn thấy dòng sông uốn quanh những cánh đồng xanh.",
+    "Quỳnh Anh": (
+        "Ngày xưa, bên bờ hồ có một ngôi làng nhỏ luôn rộn ràng tiếng hát, "
+        "và những mái nhà phủ đầy hoa trắng."
+    ),
+    "Đức Trí": (
+        "Anh giữ tấm bản đồ trong tay, quyết định đi theo con đường ít người biết, "
+        "dù trời đã bắt đầu chuyển tối."
+    ),
+    "Kim Thanh": "Bà khép cửa sổ, rồi ngồi bên bếp lửa kể chuyện cho lũ trẻ nghe.",
+    "Adam": (
+        "Buổi sớm miền Nam trong trẻo, tiếng xe hòa cùng tiếng chim trên hàng cây, "
+        "người bán hàng vui vẻ chào khách quen."
+    ),
+    "Mạnh Dũng": (
+        "Sau nhiều lần thử sức, anh hiểu rằng sự bình tĩnh luôn tạo nên khác biệt, "
+        "nhất là khi mọi người đều vội vàng."
+    ),
+}
 
 
 def discover_data_root(
@@ -278,6 +417,21 @@ def discover_data_root(
     return (Path.home() / "AppData" / "Local" / "DUCAI STUDIO" / "DUCAI_STUDIO_DATA").resolve()
 
 
+def discover_voice_preview_root(module_path: Path | None = None) -> Path:
+    source = (module_path or Path(__file__)).resolve()
+    for parent in (source.parent, *source.parents):
+        candidate = parent / "ui" / "assets" / "voice-previews"
+        if candidate.is_dir():
+            return candidate
+    return Path(sys.executable).resolve().parent / "ui" / "assets" / "voice-previews"
+
+
+def voice_slug(value: str) -> str:
+    normalized = unicodedata.normalize("NFD", value.casefold().replace("đ", "d"))
+    ascii_text = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+    return "-".join("".join(ch if ch.isalnum() else " " for ch in ascii_text).split())
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -296,13 +450,101 @@ def _validate_piper_config(path: Path) -> bool:
 
 
 class VoiceCatalog:
-    def __init__(self, data_root: Path | None = None) -> None:
+    def __init__(
+        self,
+        data_root: Path | None = None,
+        *,
+        preview_root: Path | None = None,
+    ) -> None:
         self.data_root = (data_root or discover_data_root()).expanduser().resolve()
         self.voice_root = self.data_root / "piper_voices"
+        self.preview_root = (preview_root or discover_voice_preview_root()).expanduser().resolve()
+
+    def vieneu_runtime_installed(self) -> bool:
+        """Return whether the immutable VieNeu 3.8.1 assets are present.
+
+        The voice library needs an immediate installation state, not a CUDA
+        health diagnosis.  A full provider health probe starts a managed
+        Python process and imports torch, which is both slow on the Qt thread
+        and can fail transiently while a portable venv is being relocated.
+        Runtime health is still validated when synthesis actually starts.
+        """
+
+        runtime_root = self.data_root / "vieneu_3_8_runtime"
+        metadata_path = runtime_root / "ducai_runtime.json"
+        preset_path = (
+            runtime_root
+            / ".venv"
+            / "Lib"
+            / "site-packages"
+            / "vieneu"
+            / "assets"
+            / "voices_v3_turbo.json"
+        )
+        runtime_python = runtime_root / ".venv" / "Scripts" / "python.exe"
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            presets = json.loads(preset_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return False
+        return (
+            runtime_python.is_file()
+            and str(metadata.get("version", "")) == "3.8.1"
+            and isinstance(presets.get("presets"), dict)
+            and bool(presets["presets"])
+        )
 
     def entries(self) -> tuple[VoiceCatalogEntry, ...]:
         result: list[VoiceCatalogEntry] = []
-        for voice_id, name, source, description, rights, state, recommended in _VOICE_SPECS:
+        for spec in _PIPER_SPECS:
+            filename = f"{spec.voice_id}.onnx"
+            downloads = (
+                VoiceDownloadFile(
+                    filename,
+                    f"{_PIPER_BASE}/{spec.remote_directory}/{filename}?download=true",
+                    spec.model_size,
+                    spec.model_md5,
+                ),
+                VoiceDownloadFile(
+                    f"{filename}.json",
+                    f"{_PIPER_BASE}/{spec.remote_directory}/{filename}.json?download=true",
+                    spec.config_size,
+                    spec.config_md5,
+                ),
+            )
+            entry = VoiceCatalogEntry(
+                spec.voice_id,
+                "piper",
+                spec.name,
+                spec.source,
+                spec.description,
+                spec.rights_label,
+                spec.rights_state,
+                recommended=spec.recommended,
+                preview_path=str(self.preview_root / f"{spec.voice_id}.wav"),
+                preview_text=spec.preview_text,
+                installable=True,
+                download_files=downloads,
+            )
+            model = self.voice_root / filename
+            config = model.with_suffix(model.suffix + ".json")
+            if model.is_file() and config.is_file() and _validate_piper_config(config):
+                stat = model.stat()
+                identity = hashlib.sha256(
+                    (
+                        f"{model.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|"
+                        f"{_sha256_file(config)}"
+                    ).encode()
+                ).hexdigest()
+                entry = replace(
+                    entry,
+                    installed=True,
+                    model_path=str(model.resolve()),
+                    config_path=str(config.resolve()),
+                    model_fingerprint=identity,
+                )
+            result.append(entry)
+        for voice_id, name, source, description, rights, state in _LEGACY_PIPER_SPECS:
             entry = VoiceCatalogEntry(
                 voice_id,
                 "piper",
@@ -311,7 +553,6 @@ class VoiceCatalog:
                 description,
                 rights,
                 state,
-                recommended=recommended,
             )
             model = self.voice_root / f"{voice_id}.onnx"
             config = model.with_suffix(model.suffix + ".json")
@@ -331,6 +572,55 @@ class VoiceCatalog:
                     model_fingerprint=identity,
                 )
             result.append(entry)
+        return tuple(result)
+
+    def vieneu_presets(self, *, installed: bool) -> tuple[VoiceCatalogEntry, ...]:
+        preset_file = (
+            self.data_root
+            / "vieneu_3_8_runtime"
+            / ".venv"
+            / "Lib"
+            / "site-packages"
+            / "vieneu"
+            / "assets"
+            / "voices_v3_turbo.json"
+        )
+        try:
+            payload = json.loads(preset_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return ()
+        presets = payload.get("presets")
+        if not isinstance(presets, dict):
+            return ()
+        result: list[VoiceCatalogEntry] = []
+        for order, (name, raw) in enumerate(presets.items()):
+            if not isinstance(raw, dict):
+                continue
+            description = str(raw.get("description") or "Giọng dựng sẵn VieNeu")
+            preview_text = str(
+                raw.get("preview_text")
+                or _VIENEU_PREVIEW_TEXTS.get(
+                    name,
+                    f"Đây là đoạn nghe thử ngắn để bạn nhận biết chất giọng {name}.",
+                )
+            )
+            result.append(
+                VoiceCatalogEntry(
+                    voice_id=f"preset:{name}",
+                    provider_id="vieneu-3.8",
+                    name=name,
+                    source="VieNeu-TTS v3 Turbo 3.8.1",
+                    description=description,
+                    rights_label="CC BY-NC 4.0, chỉ phi thương mại",
+                    rights_state=VoiceRightsState.RESTRICTED,
+                    installed=installed,
+                    model_fingerprint=f"vieneu-3.8.1-preset-{voice_slug(name)}",
+                    recommended=bool(raw.get("featured")) or order < 4,
+                    preset_name=name,
+                    preview_path=str(self.preview_root / f"vieneu-{voice_slug(name)}.wav"),
+                    preview_text=preview_text,
+                )
+            )
         return tuple(result)
 
     def get(self, voice_id: str, *, require_installed: bool = False) -> VoiceCatalogEntry:

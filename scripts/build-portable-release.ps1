@@ -195,7 +195,7 @@ foreach ($name in @("LICENSE", "README.txt")) {
     }
 }
 
-$runtimeNames = @("paddle_runtime", "piper_runtime", "vieneu_3_3_runtime")
+$runtimeNames = @("paddle_runtime", "piper_runtime", "vieneu_3_8_runtime")
 if ($IncludeWhisper) { $runtimeNames += "whisper_runtime" }
 foreach ($runtime in $runtimeNames) {
     $source = Join-Path $sourceDataPath $runtime
@@ -239,7 +239,7 @@ Copy-SlimPythonHome $python311Source $python311Target
 Copy-SlimPythonHome $python312Source $python312Target
 Set-VenvHome (Join-Path $portableData "paddle_runtime\.venv") $python311Target
 Set-VenvHome (Join-Path $portableData "piper_runtime\.venv") $python312Target
-Set-VenvHome (Join-Path $portableData "vieneu_3_3_runtime\.venv") $python312Target
+Set-VenvHome (Join-Path $portableData "vieneu_3_8_runtime\.venv") $python312Target
 if ($IncludeWhisper) {
     Set-VenvHome (Join-Path $portableData "whisper_runtime\.venv") $python312Target
     $whisperModel = Join-Path $sourceDataPath `
@@ -294,7 +294,7 @@ $criticalRoots = @(
     (Join-Path $portableRoot "engine_hosts"),
     (Join-Path $portableData "paddle_runtime"),
     (Join-Path $portableData "piper_runtime"),
-    (Join-Path $portableData "vieneu_3_3_runtime"),
+    (Join-Path $portableData "vieneu_3_8_runtime"),
     (Join-Path $portableData "python_runtime_311"),
     (Join-Path $portableData "python_runtime_312"),
     (Join-Path $portableData "piper_voices"),
@@ -323,7 +323,7 @@ $totalBytes = ($allFiles | Measure-Object Length -Sum).Sum
 $portableManifestPath = Join-Path $portableRoot "portable-manifest.json"
 $components = @(
     "DUCAI GUI", "PaddleOCR GPU", "Piper 1.6 + vi_VN-vais1000-medium",
-    "VieNeu 3.3 Turbo + model/tokenizer", "FFmpeg 8.1.1"
+    "VieNeu-TTS v3 Turbo 3.8.1 + model/tokenizer", "FFmpeg 8.1.1"
 )
 if ($IncludeWhisper) {
     $components += "Whisper large-v3 + faster-whisper 1.2.1"

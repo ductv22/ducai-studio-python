@@ -169,6 +169,46 @@ def test_create_translation_job_persists_multi_qa_policy_options(tmp_path: Path)
     assert config["max_overlong_compaction_passes"] == 1
 
 
+def test_project_translation_style_is_persisted_and_changes_only_translation_cache(
+    tmp_path: Path,
+) -> None:
+    service = JobManagerService(
+        database_path=tmp_path / "state.db",
+        artifact_root=tmp_path / "artifacts",
+        media_probe=StaticProbe(),
+    )
+    project_id, _source = _project(service, tmp_path)
+    first = service.create_translation_job(
+        project_id=project_id,
+        provider_id="gemini-api",
+        model_id="gemini-test",
+        provider_options={"credential_references": ["style-key"]},
+    )
+    service.jobs.transition(str(first["id"]), JobState.CANCEL_REQUESTED)
+    service.jobs.transition(str(first["id"]), JobState.CANCELLED)
+
+    service.set_translation_preferences(
+        project_id=project_id,
+        preset="xianxia",
+        custom_rules="Hồng Ly luôn được gọi là Hồng Ly tỷ tỷ.",
+    )
+    second = service.create_translation_job(
+        project_id=project_id,
+        provider_id="gemini-api",
+        model_id="gemini-test",
+        provider_options={"credential_references": ["style-key"]},
+    )
+
+    first_spec = service.jobs.get(str(first["id"])).spec
+    second_spec = service.jobs.get(str(second["id"])).spec
+    assert first_spec.input_fingerprint == second_spec.input_fingerprint
+    assert first_spec.settings_fingerprint != second_spec.settings_fingerprint
+    assert second_spec.provider_config["translation_style_preset"] == "xianxia"
+    assert second_spec.provider_config["translation_custom_rules"] == (
+        "Hồng Ly luôn được gọi là Hồng Ly tỷ tỷ."
+    )
+
+
 def test_manual_multi_translation_review_requires_all_cues_without_cjk(tmp_path: Path) -> None:
     service = JobManagerService(
         database_path=tmp_path / "state.db",
@@ -361,7 +401,7 @@ def test_voice_timing_repair_marks_only_affected_chunks_pending(tmp_path: Path) 
             "kind": "tts",
             "project_id": project_id,
             "input_revision": service.projects.load(project_id).revision,
-            "provider_id": "vieneu-3.3",
+            "provider_id": "vieneu-3.8",
             "provider_version": "fixture",
             "model_id": "clone",
             "input_fingerprint": "voice-input",
@@ -786,10 +826,7 @@ def test_retry_api_translation_refreshes_key_pool_without_invalidating_checkpoin
         checkpoint_key="latest",
     )
     assert retried["state"] == "queued"
-    assert refreshed.spec.provider_config["credential_references"] == (
-        "gemini-1",
-        "tqboyvn",
-    )
+    assert refreshed.spec.provider_config["credential_references"] == ("gemini-1",)
     assert refreshed.spec.resume_fingerprint == original.spec.resume_fingerprint
     assert checkpoint is not None
     assert checkpoint["cursor_us"] == 513_800_000

@@ -4,7 +4,12 @@ from collections.abc import Callable
 from dataclasses import replace
 from uuid import uuid4
 
-from ducai_studio.domain.project import ProjectSnapshot, TimelineClip, TimelineTrack
+from ducai_studio.domain.project import (
+    ProjectSnapshot,
+    TimelineClip,
+    TimelineTrack,
+    TrackKind,
+)
 from ducai_studio.domain.timebase import SpeedRatio, TimeRange, TimeUs
 from ducai_studio.domain.timeline import (
     VOICE_TIMING_OVERFLOW,
@@ -157,6 +162,42 @@ class TimelineEditor:
         targets = self._targets(clip_id, apply_linked=apply_linked)
         replacements = {
             clip.id: (trim_tail(clip, timeline_us, unlink=not apply_linked),)
+            for clip in targets
+        }
+        return self._commit(self._replace_clips(replacements))
+
+    def move(
+        self,
+        clip_id: str,
+        timeline_start_us: TimeUs,
+        *,
+        apply_linked: bool = True,
+    ) -> ProjectSnapshot:
+        """Move a media clip (and its linked A/V partner) without trimming it."""
+
+        if type(timeline_start_us) is not int or timeline_start_us < 0:
+            raise TimelineEditError("Vị trí clip trên Timeline không hợp lệ")
+        selected = self._find_clip(clip_id)
+        track = self._find_track(selected.track_id)
+        if track.kind not in {TrackKind.VIDEO, TrackKind.ORIGINAL_AUDIO}:
+            raise TimelineEditError("Chỉ clip video hoặc âm thanh gốc mới có thể kéo vị trí")
+        targets = self._targets(clip_id, apply_linked=apply_linked)
+        delta_us = timeline_start_us - selected.timeline_range.start_us
+        if delta_us == 0:
+            return self.snapshot
+        if any(clip.timeline_range.start_us + delta_us < 0 for clip in targets):
+            raise TimelineEditError("Clip liên kết không thể nằm trước đầu Timeline")
+        replacements = {
+            clip.id: (
+                replace(
+                    clip,
+                    timeline_range=TimeRange(
+                        clip.timeline_range.start_us + delta_us,
+                        clip.timeline_range.end_us + delta_us,
+                    ),
+                    payload_revision=clip.payload_revision + 1,
+                ),
+            )
             for clip in targets
         }
         return self._commit(self._replace_clips(replacements))

@@ -275,6 +275,52 @@ def test_voice_import_splits_master_into_measured_cue_clips(tmp_path: Path) -> N
     assert len({clip.media_id for clip in voice_track.clips}) == 1
 
 
+def test_voice_import_ignores_scene_text_when_validating_dialogue_ledger(
+    tmp_path: Path,
+) -> None:
+    voice = tmp_path / "voice_master.wav"
+    voice.write_bytes(b"fixture")
+    service = MediaImportService(
+        FakeProbe(MediaProbeResult(2 * SECOND, False, True, format_name="wav"))
+    )
+    project = ProjectSnapshot(
+        "p",
+        "Phim",
+        1,
+        source_cues=(
+            SubtitleCue("dialogue-1", 1, TimeRange(0, SECOND), "你好", "zh"),
+            SubtitleCue(
+                "scene-2",
+                2,
+                TimeRange(200_000, 1_200_000),
+                "海王兽",
+                "zh",
+                role="scene_text",
+                orientation="vertical",
+                style_hint="calligraphy",
+            ),
+        ),
+    )
+
+    snapshot = service.import_voice_media(
+        project,
+        voice,
+        cue_timing=(
+            {
+                "cue_id": "dialogue-1",
+                "index": 1,
+                "timeline_start_us": 0,
+                "timeline_end_us": SECOND,
+                "source_start_us": 0,
+                "source_end_us": SECOND,
+            },
+        ),
+    )
+
+    voice_track = next(track for track in snapshot.tracks if track.id == "D1")
+    assert [clip.cue_id for clip in voice_track.clips] == ["dialogue-1"]
+
+
 def test_voice_import_rejects_timing_for_a_different_source_cue_set(
     tmp_path: Path,
 ) -> None:

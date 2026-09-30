@@ -30,6 +30,31 @@ class WorkerSupervisor(QObject):
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._workers: dict[str, _WorkerHandle] = {}
+        self._pending_progress: dict[str, WorkerMessage] = {}
+        self._progress_timer = QTimer(self)
+        self._progress_timer.setInterval(200)
+        self._progress_timer.timeout.connect(self._flush_progress)
+
+    def _flush_progress(self, job_id: str | None = None) -> None:
+        job_ids = (job_id,) if job_id is not None else tuple(self._pending_progress)
+        for current in job_ids:
+            message = self._pending_progress.pop(current, None)
+            if message is not None:
+                self.eventReceived.emit(current, message)
+        if not self._pending_progress:
+            self._progress_timer.stop()
+
+    def _deliver_event(self, job_id: str, message: WorkerMessage) -> None:
+        # Progress is an absolute snapshot, not a durable operation. Superseded
+        # snapshots must not queue hundreds of synchronous database/UI updates.
+        if message.kind == "progress":
+            self._pending_progress[job_id] = message
+            if not self._progress_timer.isActive():
+                self._progress_timer.start()
+            return
+        # Preserve checkpoint/control/terminal ordering and the last real count.
+        self._flush_progress(job_id)
+        self.eventReceived.emit(job_id, message)
 
     def start(
         self,
@@ -183,9 +208,11 @@ class WorkerSupervisor(QObject):
                 self.workerFailed.emit(job_id, "Worker message job id does not match owner")
                 self.request_stop(job_id)
                 return
+            if handle.terminal_received and message.kind == "progress":
+                continue
             if message.kind in {"succeeded", "failed", "stopped"}:
                 handle.terminal_received = True
-            self.eventReceived.emit(job_id, message)
+            self._deliver_event(job_id, message)
 
     def _read_error(self, job_id: str) -> None:
         handle = self._workers.get(job_id)
@@ -198,6 +225,8 @@ class WorkerSupervisor(QObject):
             self.workerLog.emit(job_id, raw)
 
     def _finished(self, job_id: str, exit_code: int) -> None:
+        self._read_output(job_id)
+        self._flush_progress(job_id)
         handle = self._workers.pop(job_id, None)
         if handle is None:
             return

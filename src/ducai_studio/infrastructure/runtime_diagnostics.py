@@ -251,7 +251,7 @@ def _check_vieneu(data_root: Path) -> RuntimeCheck:
     ready = health.state.value == "ready"
     details = dict(health.details)
     return RuntimeCheck(
-        "vieneu-3.3",
+        "vieneu-3.8",
         "ready" if ready else "blocked",
         health.summary,
         str(details.get("runtime_version", "")),

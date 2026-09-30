@@ -112,7 +112,9 @@ class MultiVideoCoordinator(QObject):
             raise ValueError("Hãy chọn ít nhất một video trong Multi video")
         config = self._unattended_settings(settings)
         assert_no_secret_fields(config)
-        self._validate_settings(config, selected)
+        config["translation_preferences_by_project"] = self._validate_settings(
+            config, selected
+        )
         self._settings = config
         self._handled_terminal_jobs.clear()
         # A completed-with-errors run is resumed from its durable stage
@@ -297,11 +299,11 @@ class MultiVideoCoordinator(QObject):
         config["translation"] = translation
         return config
 
-    def on_worker_event(self, job_id: str, kind: str, payload: Mapping[str, object]) -> None:
+    def on_worker_event(self, job_id: str, kind: str, payload: Mapping[str, object]) -> bool:
         items = self.service.multi_videos.list_items()
         item = next((x for x in items if str(x.get("child_job_id", "")) == job_id), None)
         if item is None:
-            return
+            return False
         stage = str(item.get("stage", MultiStage.OCR.value))
         if kind == "progress":
             fraction = self._progress_fraction(payload)
@@ -309,9 +311,10 @@ class MultiVideoCoordinator(QObject):
                 str(item["project_id"]), progress=stage_progress(stage, fraction)
             )
             self._publish_status()
-            return
+            return True
         if kind in {"succeeded", "failed", "paused", "stopped"}:
             self._schedule_advance(0)
+        return True
 
     def on_worker_finished(self, job_id: str) -> None:
         self._schedule_advance(0)
@@ -921,6 +924,16 @@ class MultiVideoCoordinator(QObject):
             elif stage is MultiStage.TRANSLATE:
                 options = dict(config.get("translation", {}))
                 provider_options = dict(options.get("provider_options", {}))
+                frozen_preferences = config.get("translation_preferences_by_project", {})
+                if isinstance(frozen_preferences, Mapping):
+                    project_preferences = frozen_preferences.get(project_id, {})
+                    if isinstance(project_preferences, Mapping):
+                        provider_options["translation_style_preset"] = str(
+                            project_preferences.get("preset", "auto")
+                        )
+                        provider_options["translation_custom_rules"] = str(
+                            project_preferences.get("custom_rules", "")
+                        )
                 provider_options.update(
                     {
                         key: options[key]
@@ -1568,7 +1581,7 @@ class MultiVideoCoordinator(QObject):
         self,
         settings: Mapping[str, object],
         selected_items: list[dict[str, object]],
-    ) -> None:
+    ) -> dict[str, dict[str, str]]:
         for section in ("ocr", "translation", "tts"):
             value = settings.get(section, {})
             if not isinstance(value, Mapping):
@@ -1653,11 +1666,12 @@ class MultiVideoCoordinator(QObject):
         tts = dict(settings.get("tts", {}))
         if str(tts.get("provider_id", "")).strip().casefold() not in {
             "piper",
-            "vieneu-3.3",
+            "vieneu-3.8",
         }:
             raise ValueError("Chưa chọn bộ máy giọng hợp lệ cho Multi video.")
         if not str(tts.get("voice_id", "")).strip():
             raise ValueError("Chưa chọn giọng đọc cho Multi video.")
+        translation_preferences: dict[str, dict[str, str]] = {}
         for item in selected_items:
             project_id = str(item.get("project_id", ""))
             try:
@@ -1667,3 +1681,8 @@ class MultiVideoCoordinator(QObject):
             videos = [media for media in snapshot.media if media.kind.value == "video"]
             if not videos or not Path(videos[0].path).is_file():
                 raise ValueError(f"Video nguồn của project “{snapshot.name}” không còn tồn tại.")
+            translation_preferences[project_id] = {
+                "preset": snapshot.translation_preferences.preset,
+                "custom_rules": snapshot.translation_preferences.custom_rules,
+            }
+        return translation_preferences

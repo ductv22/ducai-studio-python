@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,7 +16,12 @@ from ducai_studio.domain.multi_video import (
     stage_local_progress,
     stage_progress,
 )
-from ducai_studio.domain.project import MediaAsset, MediaKind, ProjectSnapshot
+from ducai_studio.domain.project import (
+    MediaAsset,
+    MediaKind,
+    ProjectSnapshot,
+    TranslationPreferences,
+)
 from ducai_studio.infrastructure.database import Database
 from ducai_studio.infrastructure.multi_video_repository import MultiVideoRepository
 from ducai_studio.job_manager.multi_video_coordinator import MultiVideoCoordinator
@@ -707,6 +713,60 @@ def test_multi_translation_job_receives_cjk_only_qa_policy() -> None:
     assert provider_options["cjk_is_blocker"] is True
     assert provider_options["auto_compact_overlong_once"] is True
     assert provider_options["max_overlong_compaction_passes"] == 1
+
+
+def test_multi_start_freezes_each_projects_translation_preferences(tmp_path: Path) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    video = tmp_path / "source.mp4"
+    video.write_bytes(b"video")
+    engine = tmp_path / "python.exe"
+    engine.write_bytes(b"runtime")
+    snapshot = ProjectSnapshot(
+        "project-1",
+        "Project 1",
+        1,
+        media=(MediaAsset("video", str(video), MediaKind.VIDEO, 1_000_000),),
+        translation_preferences=TranslationPreferences(
+            "xianxia",
+            "Hồng Ly luôn được gọi là Hồng Ly tỷ tỷ.",
+        ),
+    )
+    current_snapshot = [snapshot]
+    item = {"project_id": snapshot.id, "selected": True}
+    server = FakeServer([item], {})
+    server.service.multi_videos.batch["state"] = MultiBatchState.IDLE.value
+    server.service.projects = SimpleNamespace(
+        load=lambda _project_id: current_snapshot[0]
+    )
+    server.service.list_credentials = lambda: {"references": []}
+    captured: dict[str, object] = {}
+    server.service.create_translation_job = lambda **kwargs: (
+        captured.update(kwargs) or {"id": "translation-job", "reused": False}
+    )
+    coordinator = MultiVideoCoordinator(server)
+    coordinator._advance = lambda: None  # type: ignore[method-assign]
+
+    coordinator.start(
+        {
+            "ocr": {"engine_python": str(engine)},
+            "translation": {"provider_id": "gemini-web", "model_id": "web-model"},
+            "tts": {"provider_id": "piper", "voice_id": "voice"},
+        }
+    )
+    current_snapshot[0] = replace(
+        snapshot,
+        revision=2,
+        translation_preferences=TranslationPreferences("modern", "Dùng anh/em."),
+    )
+
+    coordinator._start_child(snapshot.id, MultiStage.TRANSLATE)
+
+    options = captured["provider_options"]
+    assert isinstance(options, dict)
+    assert options["translation_style_preset"] == "xianxia"
+    assert options["translation_custom_rules"] == (
+        "Hồng Ly luôn được gọi là Hồng Ly tỷ tỷ."
+    )
 
 
 @pytest.mark.parametrize(

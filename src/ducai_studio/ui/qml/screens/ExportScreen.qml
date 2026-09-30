@@ -14,18 +14,28 @@ Item {
 
     property var appModel
     property string selectedBlurId: "overlay-default-blur"
+    property var automaticBlurOverlay: {
+        const revision = appModel.currentProject.revision
+        return appModel.currentProject.overlay("overlay-default-blur")
+    }
     property var blurOverlays: {
         const revision = appModel.currentProject.revision
         return appModel.currentProject.overlays.filter(function(item) {
-            return item.kind === "blur"
+            return item.kind === "blur" && item.tracking_mode === "fixed"
+        })
+    }
+    property var watermarkBlurOverlays: {
+        const revision = appModel.currentProject.revision
+        return appModel.currentProject.overlays.filter(function(item) {
+            return item.kind === "blur" && item.tracking_mode === "ocr_watermark"
         })
     }
     property var blurOverlay: {
         const revision = appModel.currentProject.revision
         const selected = appModel.currentProject.overlay(selectedBlurId)
-        return selected && selected.id
-            ? selected
-            : appModel.currentProject.overlay("overlay-default-blur")
+        if (selected && selected.id && selected.tracking_mode === "fixed")
+            return selected
+        return blurOverlays.length > 0 ? blurOverlays[0] : ({})
     }
     property var logoOverlay: {
         const revision = appModel.currentProject.revision
@@ -466,7 +476,139 @@ Item {
                     }
                     RowLayout {
                         Layout.fillWidth: true
-                        SectionTitle { text: "Che phụ đề cứng / Blur" }
+                        SectionTitle { text: "Blur theo phụ đề nguồn" }
+                        Item { Layout.fillWidth: true }
+                        Text {
+                            text: root.appModel.currentProject.sourceSubtitleRegionStatus
+                            color: Theme.textMuted
+                            font.family: Theme.fontFamily
+                            font.pixelSize: 10
+                        }
+                    }
+                    CheckBox {
+                        text: "Tự bám vùng chữ Trung theo timestamp SRT"
+                        checked: Boolean(root.automaticBlurOverlay.enabled)
+                            && root.automaticBlurOverlay.tracking_mode === "source_subtitle"
+                        enabled: Boolean(root.automaticBlurOverlay.id)
+                            && root.automaticBlurOverlay.tracking_mode === "source_subtitle"
+                        onClicked: root.appModel.setOverlayEnabled(
+                            root.automaticBlurOverlay.id, checked
+                        )
+                        Accessible.name: text
+                    }
+                    DsButton {
+                        Layout.fillWidth: true
+                        visible: Boolean(root.automaticBlurOverlay.id)
+                            && root.automaticBlurOverlay.tracking_mode !== "source_subtitle"
+                        text: "Chuyển blur cố định cũ sang tự bám phụ đề"
+                        onClicked: root.appModel.setOverlayTrackingMode(
+                            root.automaticBlurOverlay.id, "source_subtitle"
+                        )
+                    }
+                    DsButton {
+                        Layout.fillWidth: true
+                        enabled: Boolean(root.automaticBlurOverlay.id)
+                            && root.automaticBlurOverlay.tracking_mode === "source_subtitle"
+                        primary: root.automaticBlurOverlay.concealment_mode === "cover"
+                        text: root.automaticBlurOverlay.concealment_mode === "cover"
+                            ? "Che kín: Đang bật" : "Bật Che kín chữ gốc"
+                        feedbackText: root.automaticBlurOverlay.concealment_mode === "cover"
+                            ? "Đã tắt Che kín; vẫn giữ blur tự động"
+                            : "Đã bật Che kín chữ gốc"
+                        onClicked: root.appModel.setOverlayConcealmentMode(
+                            root.automaticBlurOverlay.id,
+                            root.automaticBlurOverlay.concealment_mode === "cover"
+                                ? "blur" : "cover"
+                        )
+                    }
+                    GridLayout {
+                        Layout.fillWidth: true
+                        columns: 2
+                        columnSpacing: Theme.space8
+                        rowSpacing: Theme.space8
+                        enabled: root.automaticBlurOverlay.tracking_mode === "source_subtitle"
+                        Text { text: "Bán kính"; color: Theme.textSecondary; font.pixelSize: 11 }
+                        DsSpinBox {
+                            Layout.fillWidth: true
+                            accessibleName: "Bán kính blur tự bám"
+                            from: 1; to: 100
+                            value: root.overlayNumber(
+                                root.automaticBlurOverlay, "blur_radius", 46
+                            )
+                            onValueModified: root.appModel.setOverlayBlurRadius(
+                                root.automaticBlurOverlay.id, value
+                            )
+                        }
+                        Text { text: "Padding ngang (%)"; color: Theme.textSecondary; font.pixelSize: 11 }
+                        DsSpinBox {
+                            id: automaticBlurPaddingX
+                            Layout.fillWidth: true
+                            accessibleName: "Padding ngang blur tự bám"
+                            from: 0; to: 200; stepSize: 1
+                            value: Math.round(root.overlayNumber(
+                                root.automaticBlurOverlay, "padding_x", 0.02
+                            ) * 1000)
+                            textFromValue: function(value, locale) {
+                                return Number(value / 10).toLocaleString(locale, "f", 1)
+                            }
+                            valueFromText: function(text, locale) {
+                                return Math.round(Number.fromLocaleString(locale, text) * 10)
+                            }
+                            onValueModified: root.appModel.setOverlayPadding(
+                                root.automaticBlurOverlay.id,
+                                value / 1000,
+                                automaticBlurPaddingY.value / 1000
+                            )
+                        }
+                        Text { text: "Padding dọc (%)"; color: Theme.textSecondary; font.pixelSize: 11 }
+                        DsSpinBox {
+                            id: automaticBlurPaddingY
+                            Layout.fillWidth: true
+                            accessibleName: "Padding dọc blur tự bám"
+                            from: 0; to: 200; stepSize: 1
+                            value: Math.round(root.overlayNumber(
+                                root.automaticBlurOverlay, "padding_y", 0.014
+                            ) * 1000)
+                            textFromValue: function(value, locale) {
+                                return Number(value / 10).toLocaleString(locale, "f", 1)
+                            }
+                            valueFromText: function(text, locale) {
+                                return Math.round(Number.fromLocaleString(locale, text) * 10)
+                            }
+                            onValueModified: root.appModel.setOverlayPadding(
+                                root.automaticBlurOverlay.id,
+                                automaticBlurPaddingX.value / 1000,
+                                value / 1000
+                            )
+                        }
+                    }
+                    Text {
+                        Layout.fillWidth: true
+                        text: "Theo OCR dùng đúng box nhận diện. Che kín phủ thêm một lớp tối trên blur mạnh để chữ gốc không còn đọc được; lớp này chỉ hiện theo timestamp cue và luôn nằm dưới phụ đề Việt."
+                        color: Theme.textMuted
+                        font.family: Theme.fontFamily
+                        font.pixelSize: 10
+                        wrapMode: Text.Wrap
+                    }
+                    Text {
+                        Layout.fillWidth: true
+                        visible: root.watermarkBlurOverlays.length > 0
+                        text: "Đã tự che " + root.watermarkBlurOverlays.length
+                            + " vùng watermark Bilibili lặp lại; các vùng này không được đưa vào SRT."
+                        color: Theme.success
+                        font.family: Theme.fontFamily
+                        font.pixelSize: 10
+                        wrapMode: Text.Wrap
+                    }
+
+                    Rectangle {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 1
+                        color: Theme.borderSubtle
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        SectionTitle { text: "Blur thủ công" }
                         Item { Layout.fillWidth: true }
                         DsButton {
                             text: "+ Thêm blur"
@@ -488,9 +630,10 @@ Item {
                             Layout.fillWidth: true
                             model: root.blurOverlays
                             textRole: "id"
-                            currentIndex: Math.max(0, root.blurOverlays.findIndex(
+                            currentIndex: root.blurOverlays.findIndex(
                                 function(item) { return item.id === root.blurOverlay.id }
-                            ))
+                            )
+                            displayText: count > 0 ? currentText : "Chưa có vùng thủ công"
                             onActivated: {
                                 const selected = root.blurOverlays[currentIndex]
                                 if (!selected) return
@@ -503,6 +646,7 @@ Item {
                             compact: true
                             danger: true
                             enabled: root.blurOverlay.id !== "overlay-default-blur"
+                                && Boolean(root.blurOverlay.id)
                                 && !root.appModel.timelineBusy
                             disabledReason: "Vùng mặc định chỉ có thể tắt."
                             onClicked: {
@@ -513,14 +657,15 @@ Item {
                         }
                     }
                     CheckBox {
-                        text: "Bật blur toàn timeline"
+                        text: "Bật vùng blur thủ công"
                         checked: Boolean(root.blurOverlay.enabled)
+                        enabled: Boolean(root.blurOverlay.id)
                         onClicked: root.appModel.setOverlayEnabled(root.blurOverlay.id, checked)
                         Accessible.name: text
                     }
                     Text {
                         Layout.fillWidth: true
-                        text: "Kéo vùng blur trong preview. Vị trí và kích thước sẽ được giữ nguyên trong phạm vi video."
+                        text: "Kéo vùng blur thủ công trong preview; vùng này độc lập với blur theo phụ đề nguồn."
                         color: Theme.textMuted
                         font.family: Theme.fontFamily
                         font.pixelSize: 10
@@ -531,6 +676,7 @@ Item {
                         columns: 2
                         columnSpacing: Theme.space8
                         rowSpacing: Theme.space8
+                        enabled: Boolean(root.blurOverlay.id)
                         Text { text: "Bán kính"; color: Theme.textSecondary; font.pixelSize: 11 }
                         DsSpinBox {
                             Layout.fillWidth: true

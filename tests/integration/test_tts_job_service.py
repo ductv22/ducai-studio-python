@@ -73,6 +73,30 @@ def _data_root(tmp_path: Path) -> Path:
     return data_root
 
 
+def _vieneu_data_root(tmp_path: Path) -> Path:
+    data_root = tmp_path / "vieneu-data"
+    runtime = data_root / "vieneu_3_8_runtime" / ".venv" / "Scripts" / "python.exe"
+    runtime.parent.mkdir(parents=True)
+    runtime.write_bytes(b"fixture-python")
+    presets = (
+        runtime.parent.parent
+        / "Lib"
+        / "site-packages"
+        / "vieneu"
+        / "assets"
+        / "voices_v3_turbo.json"
+    )
+    presets.parent.mkdir(parents=True)
+    presets.write_text(
+        json.dumps(
+            {"presets": {"Mai Anh": {"description": "Nữ miền Bắc"}}},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return data_root
+
+
 def _project_with_translation(service: JobManagerService, tmp_path: Path) -> str:
     video = tmp_path / "film.mp4"
     video.write_bytes(b"fixture-video")
@@ -197,6 +221,83 @@ def test_create_tts_job_has_exact_cues_and_final_import_replaces_voice_track(
     assert len(voice_tracks) == 1
     assert voice_tracks[0]["id"] == "D1"
     assert voice_tracks[0]["clips"][0]["timeline_range"]["end_us"] == 5_000_000
+
+
+def test_create_tts_job_excludes_scene_text_from_voice_requests(tmp_path: Path) -> None:
+    service = JobManagerService(
+        database_path=tmp_path / "state.db",
+        artifact_root=tmp_path / "artifacts",
+        media_probe=FixtureProbe(),
+    )
+    project_id = _project_with_translation(service, tmp_path)
+    snapshot = service.projects.load(project_id)
+    snapshot = replace(
+        snapshot,
+        revision=snapshot.revision + 1,
+        source_cues=(
+            replace(snapshot.source_cues[0], subtitle_track_id="S2"),
+            replace(
+                snapshot.source_cues[1],
+                role="scene_text",
+                orientation="vertical",
+                style_hint="calligraphy",
+                visual_box=(0.72, 0.22, 0.08, 0.31),
+                visual_box_source="ocr",
+                panel_box=(0.68, 0.18, 0.16, 0.39),
+            ),
+        ),
+        translated_cues=(
+            replace(snapshot.translated_cues[0], subtitle_track_id="S2"),
+            replace(
+                snapshot.translated_cues[1],
+                role="scene_text",
+                orientation="vertical",
+                style_hint="calligraphy",
+                visual_box=(0.72, 0.22, 0.08, 0.31),
+                visual_box_source="ocr",
+                panel_box=(0.68, 0.18, 0.16, 0.39),
+            ),
+        ),
+    )
+    summary = service.projects.get_summary(project_id)
+    service.projects.save(project_path=summary["path"], snapshot=snapshot)
+
+    job = service.create_tts_job(
+        project_id=project_id,
+        provider_id="piper",
+        voice_id="nghitts-chieu-thanh",
+        provider_options={"data_root": str(_data_root(tmp_path))},
+    )
+
+    assert [cue["id"] for cue in job["spec"]["provider_config"]["cues"]] == [
+        snapshot.source_cues[0].id
+    ]
+    assert [cue["text"] for cue in job["spec"]["provider_config"]["cues"]] == [
+        "Xin chào."
+    ]
+
+
+def test_create_tts_job_accepts_vieneu_preset_without_clone_profile(tmp_path: Path) -> None:
+    service = JobManagerService(
+        database_path=tmp_path / "state.db",
+        artifact_root=tmp_path / "artifacts",
+        media_probe=FixtureProbe(),
+    )
+    project_id = _project_with_translation(service, tmp_path)
+    data_root = _vieneu_data_root(tmp_path)
+
+    job = service.create_tts_job(
+        project_id=project_id,
+        provider_id="vieneu-3.8",
+        voice_id="preset:Mai Anh",
+        provider_options={"data_root": str(data_root)},
+    )
+    config = job["spec"]["provider_config"]
+
+    assert config["voice_id"] == "preset:Mai Anh"
+    assert config["profile_path"] == ""
+    assert config["reference_audio_path"] == ""
+    assert config["voice_identity"].startswith("preset:Mai Anh:vieneu-3.8.1-preset-")
 
 
 def test_production_tts_rerun_promotes_candidate_and_replaces_active_d1(
@@ -671,7 +772,7 @@ def test_create_vieneu_job_can_enroll_a_missing_profile_from_reference_audio(
     )
     project_id = _project_with_translation(service, tmp_path)
     data_root = tmp_path / "data"
-    runtime = data_root / "vieneu_3_3_runtime" / ".venv" / "Scripts" / "python.exe"
+    runtime = data_root / "vieneu_3_8_runtime" / ".venv" / "Scripts" / "python.exe"
     runtime.parent.mkdir(parents=True)
     runtime.write_bytes(b"fixture-vieneu-python")
     reference = tmp_path / "clone-reference.wav"
@@ -679,7 +780,7 @@ def test_create_vieneu_job_can_enroll_a_missing_profile_from_reference_audio(
 
     job = service.create_tts_job(
         project_id=project_id,
-        provider_id="vieneu-3.3",
+        provider_id="vieneu-3.8",
         voice_id="clone",
         provider_options={
             "data_root": str(data_root),
@@ -689,14 +790,15 @@ def test_create_vieneu_job_can_enroll_a_missing_profile_from_reference_audio(
             "voice_read_speed": 1.3,
             "max_absolute_speed": 2.25,
             "defer_timing_conform": False,
-            "batch_size": 64,
+            "batch_size": 32,
         },
     )
     config = job["spec"]["provider_config"]
 
     assert config["reference_audio_path"] == str(reference.resolve())
     assert config["reference_denoise"] is True
-    assert config["batch_size"] == 64
+    assert config["batch_size"] == 32
+    assert job["spec"]["provider_version"] == "3.8.1"
     assert config["pipeline_settings"]["adaptive_timing"] is True
     assert config["pipeline_settings"]["voice_read_speed"] == 1.3
     assert config["pipeline_settings"]["max_absolute_speed"] == 2.25

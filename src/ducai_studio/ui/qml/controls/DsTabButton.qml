@@ -5,6 +5,8 @@ import DucaiStudio 1.0
 TabButton {
     id: control
 
+    property string tooltipText: ""
+
     implicitHeight: 36
     implicitWidth: Math.max(88, contentItem.implicitWidth + 24)
     padding: 8
@@ -46,4 +48,8 @@ TabButton {
             ColorAnimation { duration: Theme.motionFast }
         }
     }
+
+    ToolTip.visible: control.hovered && Boolean(control.tooltipText)
+    ToolTip.text: control.tooltipText
+    ToolTip.delay: 350
 }

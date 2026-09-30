@@ -8,6 +8,45 @@ from pathlib import Path
 from PySide6.QtCore import QCoreApplication
 
 from ducai_studio.job_manager.worker_supervisor import WorkerSupervisor
+from ducai_studio.workers.protocol import PROTOCOL_VERSION, WorkerMessage
+
+
+def test_progress_burst_coalesces_without_reordering_checkpoints_or_terminal():
+    _application = QCoreApplication.instance() or QCoreApplication([])
+    supervisor = WorkerSupervisor()
+    events = []
+    supervisor.eventReceived.connect(lambda job, message: events.append((job, message)))
+    for i in range(538):
+        supervisor._deliver_event(
+            "large-job", WorkerMessage(PROTOCOL_VERSION, "large-job", str(i), "progress",
+                                       {"current": i * 16, "total": 8587})
+        )
+    assert events == []
+    for kind in ("checkpoint", "paused", "resumed", "succeeded"):
+        supervisor._deliver_event(
+            "large-job", WorkerMessage(PROTOCOL_VERSION, "large-job", kind, kind, {})
+        )
+    assert [message.kind for _, message in events] == [
+        "progress", "checkpoint", "paused", "resumed", "succeeded"
+    ]
+    assert events[0][1].payload["current"] == 537 * 16
+    supervisor._flush_progress()
+    assert len(events) == 5
+    assert not supervisor._progress_timer.isActive()
+
+
+def test_progress_is_flushed_within_timer_and_isolated_per_job():
+    application = QCoreApplication.instance() or QCoreApplication([])
+    supervisor = WorkerSupervisor()
+    events = []
+    supervisor.eventReceived.connect(lambda job, message: events.append((job, message)))
+    for job in ("one", "two"):
+        supervisor._deliver_event(
+            job, WorkerMessage(PROTOCOL_VERSION, job, job, "progress", {"current": 32})
+        )
+    assert pump_until(application, lambda: len(events) == 2, timeout=1)
+    assert {job for job, _ in events} == {"one", "two"}
+    assert not supervisor._progress_timer.isActive()
 
 
 def process_is_active(process_id: int) -> bool:

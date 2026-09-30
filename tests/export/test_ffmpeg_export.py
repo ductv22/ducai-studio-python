@@ -213,6 +213,8 @@ def test_real_conform_export_has_video_audio_burned_subtitle_and_mapped_duration
     ]
     assert render["subtitles"][0]["start_us"] == 0
     assert render["subtitles"][0]["end_us"] == 4_000_000
+    assert render["subtitle_blurs"][0]["start_us"] == 0
+    assert render["subtitle_blurs"][0]["end_us"] == 4_000_000
     assert {item["track_kind"] for item in render["audio"]} >= {
         "original_audio",
         "voice",

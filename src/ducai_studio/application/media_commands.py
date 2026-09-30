@@ -16,6 +16,7 @@ from ducai_studio.domain.project import (
     TimelineTrack,
     TrackKind,
     VoiceConformState,
+    dialogue_cues,
 )
 from ducai_studio.domain.timebase import TimeRange, parse_srt_timestamp
 from ducai_studio.domain.timeline import (
@@ -227,6 +228,28 @@ class MediaImportService:
                         index=source.index,
                         range=source.range,
                         source="translated_srt",
+                        confidence=source.confidence,
+                        evidence_ids=source.evidence_ids,
+                        visual_box=source.visual_box,
+                        visual_box_source=source.visual_box_source,
+                        role=source.role,
+                        orientation=source.orientation,
+                        style_hint=source.style_hint,
+                        panel_box=source.panel_box,
+                        background_color=source.background_color,
+                        text_color=source.text_color,
+                        review_state=source.review_state,
+                        scene_font_scale=source.scene_font_scale,
+                        text_font_size=source.text_font_size,
+                        subtitle_track_id=source.subtitle_track_id,
+                        background_padding_x=source.background_padding_x,
+                        background_padding_y=source.background_padding_y,
+                        background_style=source.background_style,
+                        letter_spacing_percent=source.letter_spacing_percent,
+                        font_bold=source.font_bold,
+                        font_italic=source.font_italic,
+                        text_opacity_percent=source.text_opacity_percent,
+                        background_opacity_percent=source.background_opacity_percent,
                     )
                 )
             without_voice = (
@@ -353,7 +376,7 @@ class MediaImportService:
             result.duration_us,
             cue_timing,
             fallback_range=source_range,
-            expected_cues=snapshot.source_cues,
+            expected_cues=dialogue_cues(snapshot.source_cues),
         )
         tracks.append(TimelineTrack("D1", TrackKind.VOICE, "Thuyết minh", clips))
         return replace(
@@ -618,7 +641,7 @@ class MediaImportService:
                 result.duration_us,
                 cue_timing,
                 fallback_range=output_range,
-                expected_cues=snapshot.source_cues,
+                expected_cues=dialogue_cues(snapshot.source_cues),
             )
         )
         tracks = [track for track in snapshot.tracks if track.id != "D1"]
@@ -701,7 +724,7 @@ class MediaImportService:
             base.duration_us,
             cue_timing,
             fallback_range=base_range,
-            expected_cues=snapshot.source_cues,
+            expected_cues=dialogue_cues(snapshot.source_cues),
         )
         clips = tuple(
             replace(clip, volume=voice_track.clips[0].volume)

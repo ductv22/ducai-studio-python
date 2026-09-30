@@ -289,6 +289,20 @@ def main() -> int:
                 for descendant in visual_descendants(child)
             ]
 
+        track_list = window.findChild(QObject, "timelineTrackList")
+        if track_list is None:
+            fail(23)
+            return
+        maximum_content_y = max(
+            0.0,
+            float(track_list.property("contentHeight") or 0)
+            - float(track_list.property("height") or 0),
+        )
+        track_list.setProperty("contentY", maximum_content_y)
+        QCoreApplication.processEvents()
+        # ListView may recycle delegates while a vertical scroll is applied.
+        # Resolve the click target after scrolling instead of keeping a stale
+        # QObject whose old scene coordinates now belong to the blank layer.
         visual_items = visual_descendants(window.contentItem())
         body = next(
             (
@@ -310,12 +324,6 @@ def main() -> int:
             )
             fail(21)
             return
-        track_list = window.findChild(QObject, "timelineTrackList")
-        if track_list is None:
-            fail(23)
-            return
-        track_list.setProperty("contentY", 62.0)
-        QCoreApplication.processEvents()
         centre = body.mapToScene(QPointF(body.width() / 2, body.height() / 2)).toPoint()
         QTest.mouseDClick(
             window,

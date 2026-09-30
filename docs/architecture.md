@@ -40,6 +40,28 @@ cadence. Job-list polling reads compact activity summaries and never transports
 the full provider configuration or cue array; terminal, checkpoint and control
 events retain the durable general event path.
 
+TTS cache scanning emits its first/last count and at most one intermediate
+snapshot per second. WorkerSupervisor keeps only the newest pending progress
+snapshot per job on a 200 ms timer, flushing it before checkpoint/control/terminal
+events and worker exit. The manager resolves project ownership with a compact
+query instead of decoding the entire job/cue configuration; Multi publishes each
+managed progress change once. Only progress telemetry is coalesced, never durable
+operations or cache contents.
+
+Managed VieNeu jobs may exclusively lease one manager-owned warm engine over
+authenticated loopback JSON. Launch parameters come from the manager, not socket
+requests. One-use session tokens exist only in worker environment/memory; they
+are not stored in job specs or SQLite. Loading runs on the broker thread, not
+the Qt thread. Runtime/host/package identity and batch capacity must match for
+reuse, and each new session clears voice state before binding its own profile.
+The engine remains idle for at most 120 seconds after successful worker exit,
+is evicted before a new OCR job, and is discarded on failure/cancel or manager
+shutdown. Concurrent TTS jobs use the standalone path rather than sharing mutable
+voice state. A pre-owned gate launcher keeps the host tree cancellable; its gate
+read consumes exact bytes without stealing the child's first command. Custom
+hosts, Piper and cache-only conform keep their existing behavior. No schema or
+cache-fingerprint change is needed.
+
 The view model keeps a marker for each current-project terminal job while
 polling. A transition to succeeded, cancelled, interrupted or failed is
 announced once with the stage name, a bounded/redacted worker reason translated
@@ -64,6 +86,37 @@ The GUI and Job Manager each take an OS-visible lock so only one manager writes
 the state database. The GUI also owns the manager through a Windows Job Object;
 an abnormal GUI exit therefore cannot leave an unreachable manager or worker
 tree behind.
+
+## Signed application update boundary
+
+The source repository remains private. Update discovery anonymously queries the
+public binary-only `ductv22/ducai-studio-releases` release feed and selects the
+highest eligible PEP 440 version for the chosen stable or testing channel. The
+application pins one Ed25519 public key. A canonical signed manifest binds the
+product, channel, platform, archive size/hash and the exact sorted managed-file
+list with per-file size/hash. GitHub asset metadata is only a cross-check; it is
+not the trust root. Archive extraction rejects extra/missing entries, traversal,
+ADS/reserved Windows names, links/reparse entries, source/wheel payloads and
+expansion abuse. External engine hosts ship as interpreter-matched `.pyc`, so
+the public update never carries private Python source.
+
+Update staging is outside the install tree; portable builds use LocalAppData
+rather than their adjacent data directory. Before shutdown, Job Manager grants
+one global install reservation only when every job is terminal and Multi is not
+running or pausing. All create/start/retry/resume and Multi admission paths honor
+that reservation. The UI never auto-installs after work completes: eligibility
+only returns the downloaded update to the explicit confirmation state.
+
+An out-of-process PowerShell helper receives the digest of the already verified
+manifest, rechecks it and every staged file, rejects reparse parents, copies into
+a temporary target, verifies the temporary hash and only then replaces the
+managed path. It does not trust the legacy unsigned release manifest and does
+not delete stale a117 files. The new process must atomically acknowledge a
+nonce-bound health record containing its launched PID, version, install root and
+backend-ready state. Failure kills only that launched process tree, restores the
+backups in reverse order and reopens the old executable. User data and external
+runtimes are outside the signed managed-file set. a118 is the bootstrap boundary:
+older builds cannot initiate this protocol themselves.
 
 Starting, pausing, resuming and cancelling a job are manager commands. The
 manager commits a `start_requested` intent before spawning anything; `running`
@@ -327,8 +380,14 @@ the error-code column.
 
 The GUI and Job Manager use Python 3.12. PaddleOCR and RapidOCR run in a
 persistent Python 3.11 engine host over a versioned line-delimited JSON
-protocol. The OCR worker sends bounded timestamp batches and two normalized
-subtitle bands; no per-frame PNG files are created. The worker owns control
+protocol. The OCR worker sends bounded timestamp batches and normalized crop
+regions; no per-frame PNG files are created. A project may replace the default
+dialogue band with one normalized frame-backed region and may define multiple
+exclusion regions. The engine host maps exclusions into each crop and blacks
+them out on a copy immediately before inference, so it neither mutates decoded
+frames nor lets logo/watermark evidence enter dialogue or scene consensus.
+Scene scanning also excludes the configured dialogue region, making dialogue
+S1 and scene-text S2 disjoint by construction. The worker owns control
 acknowledgements and technical evidence snapshots. Application code owns
 two-frame consensus, multiband conflict rules, targeted Quality rescue,
 overlay learning and the final SRT gate.
@@ -350,6 +409,113 @@ Paddle host submits crops from both subtitle bands together when its runtime
 exposes the batched API, while retaining the per-band fallback for compatible
 external engines. These optimizations change only inference batching, not
 timestamps, evidence IDs, consensus, or the OCR QA contract.
+
+Short-cue recovery keeps one sequential decode stream but samples inexpensive
+96x24 grayscale signatures every 200 ms between regular Fast OCR timestamps.
+Only the normal Fast timestamps and bounded transition offsets reach Paddle;
+the intermediate frames never become OCR inference calls. The worker caps
+accepted transitions at 13 per 30-second window and OCRs six bounded offsets
+from 100 ms before through 400 ms after each transition. It requires two
+high-confidence stable burst boxes
+before a one-character cue can enter consensus. There is no independent second
+full-video decode pass: burst and scene samples are decoded together inside the
+current Fast window. Transition history is part of the checkpoint and is rewound
+with the matching evidence, so pause/process restart cannot lose earlier adaptive
+samples. A separate cross-pass bridge handles multi-character
+dialogue that appears on one Fast timestamp and one Quality timestamp: both
+readings must be high-confidence, temporally close, text-compatible and spatially
+aligned. It never applies to one-glyph evidence and it flows through the same
+targeted rescue merge as ordinary Quality candidates.
+
+Sparse scene-text OCR samples the full frame at accepted transitions and ten-second
+anchors. Stable transient labels become `role=scene_text` cues with normalized
+glyph/panel boxes, orientation, typography hint, sampled panel colour and review
+state. Low-confidence spelling variants may join the same short spatial cluster,
+but every cluster needs at least one strong reading. A single non-corner card may
+be accepted only with exceptionally strong OCR and visual evidence. Horizontal
+candidates need panel/placement evidence; ambiguous middle-frame
+dialogue is not promoted automatically. Dialogue is projected onto S1. Scene
+text uses deterministic interval partitioning across S2…Sn: simultaneous cues
+cannot share a lane, while later non-overlapping cues reuse the lowest lane.
+Automatic allocation never consumes S1. An explicit user move of scene text to
+S1 promotes the paired source/translation cues to `role=dialogue`; moving a
+dialogue cue away from S1 never demotes it. Role remains the semantic authority,
+so TTS/SRT do not infer speech from the display lane during load or export.
+Immutable cue/clip IDs and media references remain stable. Legacy dialogue cues
+missing role fields retain their compatibility default. Legacy scene cues with a
+missing lane, or simultaneous automatic cues overlapping on one lane, are
+normalized on decode by reserving valid/manual lanes and interval-partitioning the
+remainder across S2…Sn. The compatibility projection rebuilds only subtitle tracks;
+cue IDs, timing, geometry and the stored revision remain stable, so no SQLite
+migration is required. Translation retains
+the scene metadata and Film Bible identity. User-facing SRT export, TTS and D1
+filter to dialogue cues; guarded worker SRT artifacts remain an internal transport
+that can carry aligned S2 rows while publishing the full project snapshot.
+All subtitle cues may carry `text_font_size` (integer `1–100`, default `12`),
+`text_orientation`, `background_color`, `text_color`, `style_hint`, optional
+`background_padding_x/background_padding_y`, `background_style`,
+`letter_spacing_percent`, `font_bold`, `font_italic`, per-cue text/background
+opacity and an optional stable display-track ID. Legacy snapshots decode these
+new fields to the former solid, non-spaced, non-styled appearance. Legacy S2
+`scene_font_scale` remains readable and participates in automatic
+source-glyph sizing, while the editor size is a monotonic relative multiplier
+resolved against video geometry rather than a desktop-pixel promise. The panel
+is a placement/hit-test box, not a font-size clamp; only the video frame and a
+large renderer-safety bound limit paint. Scene backgrounds use measured/estimated
+glyph bounds plus per-cue padding instead of filling the panel. Preview and export
+map `calligraphy`, `calligraphy_soft`, `calligraphy_bold`, `calligraphy_ink`,
+`calligraphy_brush`, `calligraphy_water`, `calligraphy_splash` and
+`calligraphy_hurricane` to the bundled Playwrite VN, Dancing Script, Lobster,
+Agbalumo, Comforter Brush, Water Brush, Splash and Hurricane fonts. The
+`ink_splash`, `ink_wash`, `ink_cloud` and `brush_stroke` backgrounds use a
+lightweight QML Canvas in Preview and the same deterministic polygon/splats as
+an ASS vector layer in export. End-cap coordinates scale from the short-axis
+thickness while only the centre span expands, preventing long/short labels from
+stretching the brush ends. No per-cue raster input or decoder is created.
+New `scene_text` cues created by OCR or the manual `T` tool resolve shared domain
+defaults to `calligraphy_brush`, white text and a 100%-opaque black `ink_splash`
+background. These creation defaults do not rewrite decoded legacy cues or explicit
+per-cue overrides.
+Scene-text cues optionally persist `fade_enabled` and a per-end
+`fade_duration_ms` (default 300 ms). Preview and ASS export clamp fade to half
+the cue duration, apply it only to the translated text/background, and keep the
+source-glyph concealment fully opaque. One undoable subtitle command updates paired
+source/translation cues and the matching Timeline clip, and returns a compact
+patch instead of rebuilding large models. Multi-selection stores stable cue IDs;
+pointer movement remains local to QML and one release commits one atomic format,
+geometry or time/lane command. Deletion removes the pair, clip and generated
+background; double-click navigation resolves the same cue identity from Preview
+or S1/S2/S3. Text editors pin the cue ID on focus entry and use non-restoring
+focus bindings, so focusing an editor cannot restore an empty default and delegate
+recycling or post-save sorting cannot redirect a pending edit to another row.
+Selection APIs receive an explicit additive boolean; plain click is exclusive and
+Ctrl+click is the only toggle path.
+
+Timeline preserves and clamps the prior `ListView.contentY` across model resets;
+cue selection never calls `positionViewAtIndex`. The typography toolbar remains
+allocated even without a current cue, while a blank timeline click seeks without
+clearing the last cue selection. Scene timing preview is QML-local and snaps the
+dragged start/end edge to the playhead within `max(80 ms, 8 px)` capped at 500 ms;
+leaving that distance releases the snap and only pointer release sends one command.
+The shared Preview owns Space/click playback toggling and disables those gestures
+during text entry, OCR region selection, color sampling or overlay manipulation.
+
+The shared manual-cue dialog creates either spoken `dialogue` or visual-only
+`scene_text` at the playhead. Manual dialogue inherits geometry and typography
+from the nearest spoken cue and prefers S1; a timing collision allocates the
+lowest free S lane without changing its spoken role. Manual scene text uses
+normalized frame geometry and allocates a new lane below every known subtitle
+track/cue. A bounded project-scoped FIFO accepts manual additions
+while one subtitle revision is in flight and dispatches them after that atomic save
+releases the command gate. The selected cue resolves back to its track index,
+allowing Timeline to reveal S3+ after model resets without scrolling during a
+pointer drag. A scene cue moved to S1 is promoted atomically in both source and
+translated collections; lane occupancy is checked before commit. OCR
+publication merges prior manual cues after newly detected cues and translation
+seeds them as already translated, so rerunning either stage cannot overwrite or
+send them to a provider. OCR dialogue/scene role separation, manual-cue origin
+and region settings are optional snapshot fields; legacy projects retain their
+previous defaults without a SQLite migration.
 
 ### Whisper audio extraction boundary
 
@@ -382,6 +548,16 @@ Web, Gemini CLI/OAuth, Gemini API and the shared OpenAI-compatible API transport
 implement transport only; semantic grouping,
 Film Bible state, prompts, exact numbered-ID validation, glossary updates,
 translation QA and final publication remain in the application pipeline.
+
+New translation jobs snapshot the project's style preset and up to 4,000
+characters of custom rules into the settings fingerprint. `auto` resolves from
+the Film Bible profile; old jobs without these fields use `legacy`, preserving
+their ledger signature. Ancient presets add deterministic local QA for
+inappropriate modern pronouns, reversed intimate titles and source-proven
+`阿狗/阿猫/老狗` aliases. Only violating cue IDs receive one targeted style repair;
+remaining findings are downgraded to warnings with original severity evidence.
+CJK detection remains a separate blocker. Multi snapshots preferences per
+project at batch start, so mid-run UI edits cannot alter an active batch.
 
 Every completed chunk updates an immutable ledger checkpoint. A transient Web
 failure closes the page/context and resends the exact unfinished chunk after a
@@ -476,7 +652,11 @@ provider and content failures keep their original retry accounting.
 
 Piper and VieNeu never import their ML dependencies into the GUI environment.
 Each runs in its own managed runtime behind a persistent engine host. Piper is
-the fast default; VieNeu 3.3 Turbo is the slower quality-first clone provider.
+the fast default; VieNeu-TTS v3 Turbo 3.8.1 is the quality-first preset and clone
+provider. Catalog auditions are static licensed WAV assets, so preview never
+loads a model or requires a project. Verified Piper downloads run on Qt's worker
+pool, land as `.part` files, and are published only after size, digest and config
+validation; the QML thread only consumes progress events.
 The catalog reports the real install/readiness state and preserves explicit
 rights warnings instead of downloading community or real-person-labelled voices
 silently.
@@ -495,8 +675,10 @@ call.
 VieNeu enrollment derives a local 192-dimensional speaker embedding and
 reference codes from the selected reference audio. The NPZ and metadata are
 written atomically and fail closed unless the binding receipt proves the exact
-3.3 profile contract. Reference text is stored only as a user note because the
-current 3.3 inference binding is audio/profile-based.
+3.8.1 profile contract. Reference text is stored only as a user note because
+the current inference binding is audio/profile-based. Profiles created by 3.3
+remain immutable on disk; the 3.8 host removes the legacy encoder pad frame in
+memory before binding when present.
 
 Approved cue audio passes DC/silence cleanup, onset-click repair, edge fades,
 segment normalization, an absolute speed cap and pitch-preserving fit. The
@@ -516,14 +698,12 @@ Multimedia preview seeks, pauses and mutes D1 with the active video clip, while
 Voice Studio can also play the final D1 WAV directly.
 
 VieNeu batches inference through one persistent host/model session. Batch
-transport uses up to 64 cues per GPU request and halves the batch after a proven
+transport uses up to 32 cues per GPU request and halves the batch after a proven
 out-of-memory error, but the application still evaluates each returned artifact
-independently. The release-local VieNeu 3.3 CUDA adapter keeps the 64-frame
-repetition window, EOS/cap state and generated codes on the device, then invokes
-the MOSS codec in bounded batches. It is enabled only for the pinned 3.3.0
-PyTorch/CUDA contract and falls back to the unmodified runtime for CPU, an
-incompatible private API or decoder memory pressure; the shared managed runtime
-is never patched on disk.
+independently. Version 3.8.1 owns the fused CUDA Graph implementation upstream;
+DUCAI no longer monkey-patches VieNeu private APIs. The runtime is pinned and
+validated for CUDA 12.8, while application-level per-cue QA and ordered output
+remain unchanged.
 
 VieNeu inference always runs at 1.00x. The immutable synthesis cache stores that
 base WAV after audio QA. A second variant cache is keyed by the base WAV SHA-256,
@@ -658,6 +838,63 @@ remains disabled until its image asset exists. Geometry, opacity, blur radius,
 enabled state and active range are real persisted values, not preview-only UI
 state. Original audio, voice and music remain timeline tracks, so mixer changes
 affect preview and export through the same volume/mute contract.
+
+Frame OCR QA schema 3 stores optional full-frame normalized regions per source
+cue and optional repeat-proven platform-mark regions; schema 2 remains readable.
+Crop-local boxes are mapped to the source frame before persistence, while SRT
+remains the sole timing authority. A tracked blur
+uses every active source cue region and falls back to a bounded text-length/line
+estimate when no OCR box exists. Preview and export map those cue ranges through
+the same voice-conform time map. FFmpeg groups regions by blur radius and
+strength, creates one blurred full-frame source per group and drives time-varying alpha masks,
+rather than creating a full-frame blur branch per cue. New overlays use a
+stronger radius/padding and optional `cover` concealment mode. Cover adds a
+90% dark veil after the shared strong blur while legacy snapshots missing the
+field decode as blur-only. The cover veil is identical in Preview and export.
+Preview scales the pixel radius to its rendered
+canvas, while export applies the radius at output resolution. Both use
+half-open cue ranges, so adjacent cues do not conceal an extra boundary frame.
+Blur and cover composition remain before ASS subtitles.
+
+Export snapshot schema 4 carries accepted scene replacements separately from
+dialogue subtitles. FFmpeg creates one full-frame blur source per scene blur
+radius, masks only each Chinese glyph box, optionally applies the sampled panel
+colour, and then writes a positioned ASS label inside the retained panel. Vertical
+labels are stacked and use a source-derived automatic size multiplied by the
+explicit 1–100 editor value; moving or shrinking the panel does not silently
+reduce that chosen value. Calligraphic sources use one of the bundled OFL
+Vietnamese-capable brush faces; ordinary display text uses Be Vietnam Pro. Preview
+follows the same glyph/panel geometry and hides replacement output for
+`review` cues, which remain visible to the editor as a yellow review guide.
+
+The OCR engine retains segment geometry until platform-watermark filtering is
+complete. A fuzzy Bilibili recognition is a spatial anchor; only nearby
+same-row compact fragments carrying a complete channel signature (handle with
+numeric suffix, resolution/repair marker or a non-dialogue channel name) are
+removed with it. Common OCR deletions/substitutions inside `bilibili` are
+accepted. The finalizer learns a pure-CJK channel marker from pre-grouped OCR
+evidence only after it repeats across multiple timeline regions at a frame
+edge. This avoids broad keyword deletion and preserves dialogue containing
+ordinary numbers or `漫剧`, even when it sits beside the platform mark.
+Filtered watermark detections are persisted as ignored evidence in the same
+checkpoint NDJSON, never entering cue consensus or coverage. Two distinct
+frames with spatially clustered boxes produce a generated `ocr_watermark` blur
+overlay; a new OCR publication replaces the previous generated set atomically
+without touching manual effects. Export compiles these overlays into the same
+grouped strong-blur/cover path used by subtitle regions, so it does not add one
+full-frame blur branch per watermark. During scene scanning, a Chinese companion
+glyph whose box substantially overlaps a Bilibili anchor from the same frame is
+discarded before scene clustering; this removes split fragments such as `独` or
+`独播`. If Paddle misses the Latin anchor, only the small known `独播` platform
+badge forms in a frame corner are rejected; centered dialogue with the same word
+is retained.
+
+Effect edits use a compact revisioned patch containing changed overlays/media
+only. The stable overlay list model updates one row; dragging/resizing stays
+entirely local and emits one command on release. Other controls apply an
+optimistic local patch and roll back to the last value on failure. Per-overlay
+generations prevent an older acknowledgement from replacing newer geometry,
+and effect acknowledgements never trigger project, cache or preview rehydration.
 
 Starting an export compiles an immutable snapshot of one covering video clip,
 audio tracks, subtitles and overlays. The first release deliberately rejects a

@@ -30,6 +30,7 @@ from ducai_studio.application.translation_pipeline import (
     replan_ledger_for_resume,
     semantic_groups,
     translation_request,
+    translation_style_qa,
     wrap_vietnamese_subtitle,
 )
 from ducai_studio.domain.project import SubtitleCue
@@ -59,6 +60,117 @@ def _cues(count: int = 6) -> tuple[SubtitleCue, ...]:
 
 def test_cjk_detection_covers_supplementary_han_extensions() -> None:
     assert contains_cjk("Còn sót chữ \U00020000") is True
+
+
+def test_xianxia_prompt_carries_pronoun_title_and_contextual_alias_rules() -> None:
+    chunk = plan_chunks(semantic_groups(_cues(3)))[0]
+    bible = FilmBible(
+        profile="xianxia",
+        style_preset="xianxia",
+        custom_rules="Nhân vật chính luôn xưng tại hạ khi gặp người lạ.",
+    )
+
+    request = translation_request(chunk, film_bible=bible)
+
+    assert "Tu tiên cổ trang" in request.prompt
+    assert "Hồng Ly tỷ tỷ" in request.prompt
+    assert "阿狗 → A Cẩu" in request.prompt
+    assert "không đổi từ chó/mèo" in request.prompt.casefold()
+    assert bible.custom_rules in request.prompt
+
+
+def test_scene_text_prompt_preserves_visual_role_and_skips_dialogue_length_qa() -> None:
+    cue = SubtitleCue(
+        "scene-title",
+        1,
+        TimeRange(0, 800_000),
+        "海王兽",
+        "zh",
+        role="scene_text",
+        orientation="vertical",
+        style_hint="calligraphy",
+        visual_box=(0.72, 0.22, 0.08, 0.31),
+        visual_box_source="ocr",
+        panel_box=(0.68, 0.18, 0.16, 0.39),
+    )
+    chunk = plan_chunks(semantic_groups((cue,)))[0]
+
+    request = translation_request(chunk, film_bible=FilmBible())
+    issues = local_translation_qa(
+        (TranslationValue(cue.id, cue.index, "Hải Vương Thú " * 20),),
+        long_line_chars=20,
+        scene_text_ids=(cue.index,),
+    )
+
+    assert '"role": "scene_text"' in request.prompt
+    assert '"orientation": "vertical"' in request.prompt
+    assert '"style_hint": "calligraphy"' in request.prompt
+    assert "không biến thành câu thoại" in request.prompt
+    assert not {"long_line", "overlong_translation"} & {issue.code for issue in issues}
+
+
+def test_ancient_style_qa_uses_source_context_and_ignores_ordinary_animal_words() -> None:
+    cues = (
+        SubtitleCue("alias", 1, TimeRange(0, 1_000_000), "阿狗，你过来。", "zh"),
+        SubtitleCue("animal", 2, TimeRange(1_000_000, 2_000_000), "这只狗很可爱。", "zh"),
+        SubtitleCue("title", 3, TimeRange(2_000_000, 3_000_000), "红璃姐姐。", "zh"),
+    )
+    chunk = plan_chunks(semantic_groups(cues))[0]
+    values = (
+        TranslationValue("alias", 1, "A Chó, anh qua đây."),
+        TranslationValue("animal", 2, "Con chó này rất đáng yêu."),
+        TranslationValue("title", 3, "Tỷ tỷ Hồng Ly."),
+    )
+
+    issues = translation_style_qa(
+        chunk,
+        values,
+        film_bible=FilmBible(profile="xianxia", style_preset="xianxia"),
+    )
+
+    by_index = {
+        index: {item.code for item in issues if item.index == index}
+        for index in range(1, 4)
+    }
+    assert by_index[1] == {"ancient_alias_mismatch", "ancient_modern_pronoun"}
+    assert by_index[2] == set()
+    assert by_index[3] == {"ancient_title_order"}
+
+
+def test_ancient_title_qa_does_not_treat_lowercase_words_as_character_names() -> None:
+    cue = SubtitleCue("family", 1, TimeRange(0, 1_000_000), "我的姐姐。", "zh")
+    chunk = plan_chunks(semantic_groups((cue,)))[0]
+
+    issues = translation_style_qa(
+        chunk,
+        (TranslationValue("family", 1, "Tỷ tỷ của tôi."),),
+        film_bible=FilmBible(profile="xianxia", style_preset="xianxia"),
+    )
+
+    assert not {item.code for item in issues} & {"ancient_title_order"}
+
+
+def test_translation_style_changes_new_ledger_signature_but_legacy_remains_stable() -> None:
+    cues = _cues(2)
+    chunks = plan_chunks(semantic_groups(cues))
+    legacy = build_ledger(cues, chunks, provider_id="fixture", model_id="model")
+    ancient = build_ledger(
+        cues,
+        chunks,
+        provider_id="fixture",
+        model_id="model",
+        film_bible=FilmBible(style_preset="xianxia"),
+    )
+    modern = build_ledger(
+        cues,
+        chunks,
+        provider_id="fixture",
+        model_id="model",
+        film_bible=FilmBible(style_preset="modern"),
+    )
+
+    assert legacy.signature != ancient.signature
+    assert ancient.signature != modern.signature
 
 
 def _numbered_cues(count: int) -> tuple[SubtitleCue, ...]:
@@ -438,6 +550,14 @@ def test_subtitle_wrap_preserves_every_word_and_uses_at_most_two_lines() -> None
 
     assert wrapped.replace("\n", " ") == original
     assert len(wrapped.splitlines()) == 2
+
+
+def test_subtitle_wrap_default_keeps_up_to_sixty_eight_characters_on_one_line() -> None:
+    sixty_eight = "a" * 68
+    longer = "Một " + "câu chữ " * 10
+
+    assert wrap_vietnamese_subtitle(sixty_eight) == sixty_eight
+    assert "\n" in wrap_vietnamese_subtitle(longer)
 
 
 def test_qa_parser_rejects_unknown_ids_and_invalid_severity() -> None:

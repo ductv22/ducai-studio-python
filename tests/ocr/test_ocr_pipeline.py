@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from itertools import count
 from pathlib import Path
 
 import pytest
 
+from ducai_studio.application import ocr_pipeline as ocr_pipeline_module
 from ducai_studio.application.ocr_pipeline import (
     apply_quality_rescue,
     coalesce_rescue_windows,
@@ -13,6 +15,7 @@ from ducai_studio.application.ocr_pipeline import (
     measure_hard_sub_coverage,
     merge_band_candidates,
     reinforce_candidate_ranges,
+    scene_text_cues_from_evidence,
     targeted_rescue_windows,
 )
 from ducai_studio.application.subtitle_finalizer import (
@@ -20,6 +23,7 @@ from ducai_studio.application.subtitle_finalizer import (
     finalize_ocr_candidates,
     publish_final_srt,
 )
+from ducai_studio.domain.project import SubtitleCue
 from ducai_studio.domain.subtitles import (
     NormalizedBox,
     RescueWindow,
@@ -100,6 +104,411 @@ def test_consensus_requires_two_distinct_frames_and_keeps_longer_reading() -> No
     assert candidate.text == "必然会有一大堆人来求药买药"
     assert len(candidate.evidence_ids) == 2
     assert consensus_candidate(evidence[:1], visual_range, candidate_id="single") is None
+
+
+def test_one_character_dialogue_requires_two_stable_high_confidence_burst_frames() -> None:
+    visual_range = TimeRange(1_000_000, 1_500_000)
+    box = NormalizedBox(0.46, 0.82, 0.08, 0.09)
+    confirmed = (
+        SubtitleEvidence(
+            "short-a",
+            "frame-1000000",
+            1_000_000,
+            "upper",
+            "走",
+            0.96,
+            "paddle-fast",
+            "PP-OCRv6-small",
+            box,
+            "burst",
+        ),
+        SubtitleEvidence(
+            "short-b",
+            "frame-1120000",
+            1_120_000,
+            "upper",
+            "走",
+            0.95,
+            "paddle-fast",
+            "PP-OCRv6-small",
+            NormalizedBox(0.462, 0.821, 0.079, 0.089),
+            "burst",
+        ),
+    )
+
+    assert consensus_candidate(confirmed, visual_range, candidate_id="short") is not None
+    assert (
+        consensus_candidate(confirmed[:1], visual_range, candidate_id="short-noise")
+        is None
+    )
+    unstable = (confirmed[0], replace(confirmed[1], box=NormalizedBox(0.12, 0.82, 0.08, 0.09)))
+    assert consensus_candidate(unstable, visual_range, candidate_id="short-shift") is None
+
+
+def test_cross_pass_consensus_recovers_reading_seen_once_by_fast_and_quality() -> None:
+    evidence = (
+        SubtitleEvidence(
+            "fast-short-dialogue",
+            "frame-58800000",
+            58_800_000,
+            "upper",
+            "好吧",
+            0.997509,
+            "paddle-fast",
+            "PP-OCRv6-small",
+            NormalizedBox(0.46, 0.89, 0.08, 0.06),
+        ),
+        SubtitleEvidence(
+            "quality-short-dialogue",
+            "frame-58600000",
+            58_600_000,
+            "lower",
+            "好吧",
+            0.999855,
+            "paddle-quality",
+            "PP-OCRv6-medium",
+            NormalizedBox(0.462, 0.895, 0.079, 0.058),
+        ),
+    )
+
+    candidates = ocr_pipeline_module.cross_pass_consensus_candidates(
+        evidence,
+        video_duration_us=120_000_000,
+        evidence_half_interval_us=400_000,
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].text == "好吧"
+    assert candidates[0].source == "paddle-cross-pass-consensus"
+    assert candidates[0].evidence_ids == (
+        "fast-short-dialogue",
+        "quality-short-dialogue",
+    )
+    assert not ocr_pipeline_module.cross_pass_consensus_candidates(
+        (evidence[0], replace(evidence[1], provider_id="paddle-fast")),
+        video_duration_us=120_000_000,
+        evidence_half_interval_us=400_000,
+    )
+    assert not ocr_pipeline_module.cross_pass_consensus_candidates(
+        (
+            evidence[0],
+            replace(
+                evidence[1],
+                box=NormalizedBox(0.10, 0.40, 0.079, 0.058),
+            ),
+        ),
+        video_duration_us=120_000_000,
+        evidence_half_interval_us=400_000,
+    )
+
+
+def test_scene_text_classifier_keeps_transient_vertical_title_and_rejects_persistent_corner(
+) -> None:
+    panel = NormalizedBox(0.73, 0.18, 0.18, 0.43)
+    title_box = NormalizedBox(0.78, 0.24, 0.08, 0.31)
+    title = tuple(
+        SubtitleEvidence(
+            f"title-{index}",
+            f"scene-frame-{index}",
+            timestamp,
+            "scene",
+            "海王兽",
+            0.96,
+            "paddle-fast",
+            "PP-OCRv6-small",
+            title_box,
+            "scene",
+            "vertical",
+            "calligraphy",
+            panel,
+            "#111111",
+        )
+        for index, timestamp in enumerate((1_000_000, 1_240_000), start=1)
+    )
+    watermark_box = NormalizedBox(0.88, 0.03, 0.10, 0.05)
+    watermark = tuple(
+        SubtitleEvidence(
+            f"wm-{index}",
+            f"wm-frame-{index}",
+            timestamp,
+            "scene",
+            "平台独播",
+            0.97,
+            "paddle-fast",
+            "PP-OCRv6-small",
+            watermark_box,
+            "scene",
+            "horizontal",
+            "display",
+        )
+        for index, timestamp in enumerate((0, 10_000_000, 20_000_000, 30_000_000), start=1)
+    )
+
+    cues = scene_text_cues_from_evidence(
+        (*title, *watermark),
+        video_duration_us=60_000_000,
+        first_index=11,
+    )
+
+    assert len(cues) == 1
+    assert cues[0].text == "海王兽"
+    assert cues[0].index == 11
+    assert cues[0].role == "scene_text"
+    assert cues[0].orientation == "vertical"
+    assert cues[0].style_hint == "calligraphy_brush"
+    assert cues[0].background_style == "ink_splash"
+    assert cues[0].text_color == "#FFFFFF"
+    assert cues[0].background_color == "#000000"
+    assert cues[0].background_opacity_percent == 100
+
+
+def test_scene_text_rejects_two_frame_corner_platform_badge_without_anchor() -> None:
+    badge = tuple(
+        SubtitleEvidence(
+            f"badge-{index}",
+            f"badge-frame-{index}",
+            timestamp,
+            "scene",
+            "独播",
+            0.99,
+            "paddle-fast",
+            "PP-OCRv6-small",
+            NormalizedBox(0.94, 0.04, 0.03, 0.07),
+            "scene",
+            "vertical",
+            "display",
+            scene_confidence=0.99,
+        )
+        for index, timestamp in enumerate((1_000_000, 1_240_000), start=1)
+    )
+
+    assert not scene_text_cues_from_evidence(
+        badge,
+        video_duration_us=5_000_000,
+        first_index=1,
+    )
+
+
+def test_scene_text_clusters_weak_variants_around_one_strong_reading() -> None:
+    box = NormalizedBox(0.022, 0.019, 0.135, 0.478)
+    variants = tuple(
+        SubtitleEvidence(
+            f"scene-variant-{index}",
+            f"scene-frame-{index}",
+            timestamp,
+            "scene",
+            text,
+            confidence,
+            "paddle-fast",
+            "PP-OCRv6-small",
+            box,
+            "scene",
+            "horizontal",
+            "display",
+            NormalizedBox(0.0, 0.0, 0.252, 0.574),
+            "#101010",
+            scene_confidence,
+        )
+        for index, (timestamp, text, confidence, scene_confidence) in enumerate(
+            (
+                (7_600_000, "宝星海", 0.611878, 0.82),
+                (7_840_000, "北乱星海", 0.813903, 0.90),
+                (8_800_000, "北乱星海", 0.590797, 0.90),
+                (9_040_000, "乱星海", 0.996099, 0.98),
+            ),
+            start=1,
+        )
+    )
+
+    cues = scene_text_cues_from_evidence(
+        variants,
+        video_duration_us=20_000_000,
+        first_index=1,
+    )
+
+    assert len(cues) == 1
+    assert cues[0].text == "乱星海"
+    assert cues[0].review_state == "accepted"
+    assert len(cues[0].evidence_ids) == 4
+
+
+def test_scene_text_accepts_one_extremely_strong_non_watermark_card() -> None:
+    card = SubtitleEvidence(
+        "scene-strong-single",
+        "scene-frame-118240000",
+        118_240_000,
+        "scene",
+        "海王兽",
+        0.995393,
+        "paddle-fast",
+        "PP-OCRv6-small",
+        NormalizedBox(0.77, 0.23, 0.07, 0.28),
+        "scene",
+        "vertical",
+        "calligraphy",
+        NormalizedBox(0.72, 0.18, 0.17, 0.38),
+        "#111111",
+        1.0,
+    )
+
+    cues = scene_text_cues_from_evidence(
+        (card,),
+        video_duration_us=180_000_000,
+        first_index=1,
+    )
+
+    assert len(cues) == 1
+    assert cues[0].text == "海王兽"
+    assert cues[0].review_state == "accepted"
+
+
+def test_scene_text_does_not_promote_a_cluster_made_only_of_weak_readings() -> None:
+    weak = tuple(
+        SubtitleEvidence(
+            f"scene-weak-{index}",
+            f"scene-weak-frame-{index}",
+            timestamp,
+            "scene",
+            "疑似文字",
+            confidence,
+            "paddle-fast",
+            "PP-OCRv6-small",
+            NormalizedBox(0.72, 0.20, 0.08, 0.28),
+            "scene",
+            "vertical",
+            "calligraphy",
+            scene_confidence=0.98,
+        )
+        for index, (timestamp, confidence) in enumerate(
+            ((1_000_000, 0.58), (1_240_000, 0.61)),
+            start=1,
+        )
+    )
+
+    assert not scene_text_cues_from_evidence(
+        weak,
+        video_duration_us=5_000_000,
+        first_index=1,
+    )
+
+
+def test_scene_text_classifier_rejects_ambiguous_middle_dialogue_without_panel() -> None:
+    dialogue = tuple(
+        SubtitleEvidence(
+            f"dialogue-{index}",
+            f"scene-dialogue-frame-{index}",
+            timestamp,
+            "scene",
+            "你在做什么",
+            0.97,
+            "paddle-fast",
+            "PP-OCRv6-small",
+            NormalizedBox(0.28, 0.36, 0.44, 0.10),
+            "scene",
+            "horizontal",
+            "display",
+            scene_confidence=0.58,
+        )
+        for index, timestamp in enumerate((1_000_000, 1_240_000), start=1)
+    )
+
+    assert not scene_text_cues_from_evidence(
+        dialogue,
+        video_duration_us=5_000_000,
+        first_index=1,
+    )
+
+
+def test_scene_text_classifier_removes_full_frame_duplicate_of_dialogue() -> None:
+    dialogue_box = NormalizedBox(0.44, 0.89, 0.12, 0.06)
+    duplicate = tuple(
+        SubtitleEvidence(
+            f"scene-dialogue-{index}",
+            f"scene-dialogue-frame-{index}",
+            timestamp,
+            "scene",
+            "海王兽",
+            0.98,
+            "paddle-fast",
+            "PP-OCRv6-small",
+            dialogue_box,
+            "scene",
+            "horizontal",
+            "display",
+            scene_confidence=0.98,
+        )
+        for index, timestamp in enumerate((1_000_000, 1_240_000), start=1)
+    )
+    real_title = tuple(
+        SubtitleEvidence(
+            f"scene-title-{index}",
+            f"scene-title-frame-{index}",
+            timestamp,
+            "scene",
+            "海王兽",
+            0.98,
+            "paddle-fast",
+            "PP-OCRv6-small",
+            NormalizedBox(0.78, 0.20, 0.07, 0.28),
+            "scene",
+            "vertical",
+            "calligraphy",
+            scene_confidence=0.98,
+        )
+        for index, timestamp in enumerate((1_000_000, 1_240_000), start=1)
+    )
+    dialogue = SubtitleCue(
+        id="dialogue-1",
+        index=1,
+        range=TimeRange(800_000, 1_600_000),
+        text="海王兽",
+        language="zh",
+        visual_box=(0.439, 0.891, 0.121, 0.061),
+        visual_box_source="ocr",
+    )
+
+    cues = scene_text_cues_from_evidence(
+        (*duplicate, *real_title),
+        video_duration_us=5_000_000,
+        first_index=2,
+        dialogue_cues=(dialogue,),
+    )
+
+    assert [cue.text for cue in cues] == ["海王兽"]
+    assert cues[0].visual_box == (0.78, 0.20, 0.07, 0.28)
+
+
+def test_horizontal_scene_panel_stays_review_only_until_user_accepts_it() -> None:
+    title = tuple(
+        SubtitleEvidence(
+            f"horizontal-title-{index}",
+            f"horizontal-title-frame-{index}",
+            timestamp,
+            "scene",
+            "玄天宗",
+            0.96,
+            "paddle-fast",
+            "PP-OCRv6-small",
+            NormalizedBox(0.38, 0.22, 0.24, 0.09),
+            "scene",
+            "horizontal",
+            "display",
+            NormalizedBox(0.35, 0.18, 0.30, 0.17),
+            "#101010",
+            0.78,
+        )
+        for index, timestamp in enumerate((1_000_000, 1_240_000), start=1)
+    )
+
+    cues = scene_text_cues_from_evidence(
+        title,
+        video_duration_us=5_000_000,
+        first_index=1,
+    )
+
+    assert len(cues) == 1
+    assert cues[0].role == "scene_text"
+    assert cues[0].review_state == "review"
 
 
 def test_multiband_union_keeps_unobserved_cues_and_marks_conflicts_for_review() -> None:
@@ -596,6 +1005,146 @@ def test_finalizer_removes_only_proven_overlay_and_never_density_filters_dialogu
     assert all("修复超清" not in cue.text for cue in result.cues)
     output = publish_final_srt(tmp_path / "sample_ZH_FINAL.srt", result)
     assert output.read_text(encoding="utf-8-sig").count("-->") == len(result.cues)
+
+
+def test_finalizer_removes_repeated_known_channel_marker_without_broad_keyword_filter(
+    tmp_path: Path,
+) -> None:
+    items: list[SubtitleCandidate] = []
+    for index in range(8):
+        start = index * 10_000_000
+        items.append(
+            _candidate(
+                f"channel-{index}", start, start + 900_000, "小李看漫剧"
+            )
+        )
+        items.append(
+            _candidate(
+                f"dialogue-{index}",
+                start + 1_000_000,
+                start + 4_000_000,
+                f"第{index}句真正台词",
+            )
+        )
+    items.append(_candidate("legitimate", 82_000_000, 84_000_000, "我也想看漫剧"))
+
+    result = finalize_ocr_candidates(tuple(items), video_duration_us=90_000_000)
+
+    assert result.status is FinalizationStatus.PASS
+    assert "小李看漫剧" in result.overlay_tokens
+    assert all(cue.text != "小李看漫剧" for cue in result.cues)
+    assert any(cue.text == "我也想看漫剧" for cue in result.cues)
+    output = publish_final_srt(tmp_path / "channel_ZH_FINAL.srt", result)
+    assert "小李看漫剧" not in output.read_text(encoding="utf-8-sig")
+
+
+def test_finalizer_learns_persistent_channel_marker_from_pre_grouped_evidence() -> None:
+    watermark = tuple(
+        _evidence(
+            f"watermark-{index}",
+            f"frame-{index}",
+            "小李看漫剧",
+            0.98,
+            band="lower",
+            box=NormalizedBox(0.73, 0.84, 0.22, 0.07),
+        )
+        for index in range(20)
+    )
+    dialogue = (
+        _evidence(
+            "dialogue-20",
+            "frame-20",
+            "真正的台词",
+            0.99,
+            band="lower",
+            box=NormalizedBox(0.34, 0.82, 0.32, 0.08),
+        ),
+        _evidence(
+            "dialogue-21",
+            "frame-21",
+            "真正的台词",
+            0.99,
+            band="lower",
+            box=NormalizedBox(0.34, 0.82, 0.32, 0.08),
+        ),
+    )
+    evidence = watermark + dialogue
+    candidates = group_visual_evidence(
+        evidence,
+        band="lower",
+        duration_us=18_000_000,
+        sample_interval_us=800_000,
+    )
+
+    assert [item.text for item in candidates] == ["小李看漫剧", "真正的台词"]
+
+    result = finalize_ocr_candidates(
+        candidates,
+        video_duration_us=18_000_000,
+        evidence=evidence,
+    )
+
+    assert result.status is FinalizationStatus.PASS
+    assert result.overlay_tokens == ("小李看漫剧",)
+    assert [cue.text for cue in result.cues] == ["真正的台词"]
+
+
+def test_finalizer_does_not_learn_centered_repeated_dialogue_as_channel_marker() -> None:
+    evidence = tuple(
+        _evidence(
+            f"dialogue-{index}",
+            f"frame-{index}",
+            "我也想看漫剧",
+            0.99,
+            band="lower",
+            box=NormalizedBox(0.28, 0.82, 0.44, 0.08),
+        )
+        for index in range(8)
+    )
+    candidates = group_visual_evidence(
+        evidence,
+        band="lower",
+        duration_us=7_000_000,
+        sample_interval_us=800_000,
+    )
+
+    result = finalize_ocr_candidates(
+        candidates,
+        video_duration_us=7_000_000,
+        evidence=evidence,
+    )
+
+    assert result.overlay_tokens == ()
+    assert [cue.text for cue in result.cues] == ["我也想看漫剧"]
+
+
+def test_finalizer_does_not_learn_edge_repeated_sentence_from_keyword_alone() -> None:
+    evidence = tuple(
+        _evidence(
+            f"dialogue-{index}",
+            f"frame-{index}",
+            "今天看漫剧",
+            0.99,
+            band="lower",
+            box=NormalizedBox(0.73, 0.84, 0.22, 0.07),
+        )
+        for index in range(8)
+    )
+    candidates = group_visual_evidence(
+        evidence,
+        band="lower",
+        duration_us=7_000_000,
+        sample_interval_us=800_000,
+    )
+
+    result = finalize_ocr_candidates(
+        candidates,
+        video_duration_us=7_000_000,
+        evidence=evidence,
+    )
+
+    assert result.overlay_tokens == ()
+    assert [cue.text for cue in result.cues] == ["今天看漫剧"]
 
 
 def test_finalizer_learns_reordered_alphanumeric_overlay_and_ocr_variants() -> None:

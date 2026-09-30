@@ -22,6 +22,7 @@ from ducai_studio.domain.project import (
     TimelineClip,
     TimelineTrack,
     TrackKind,
+    TranslationPreferences,
     VoiceConformState,
 )
 from ducai_studio.domain.timebase import SpeedRatio, TimeRange
@@ -766,6 +767,8 @@ def test_project_snapshot_round_trips_timeline_links_cues_and_overlays(
                 "zh",
                 confidence=0.91,
                 evidence_ids=("ocr-1",),
+                visual_box=(0.2, 0.8, 0.6, 0.1),
+                visual_box_source="ocr",
             ),
         ),
         overlays=(
@@ -779,12 +782,321 @@ def test_project_snapshot_round_trips_timeline_links_cues_and_overlays(
                 0.1,
                 "media",
             ),
+            Overlay(
+                "source-blur",
+                OverlayKind.BLUR,
+                TimeRange(0, 10_000_000),
+                0.04,
+                0.82,
+                0.92,
+                0.15,
+                tracking_mode="source_subtitle",
+                padding_x=0.012,
+                padding_y=0.008,
+                concealment_mode="cover",
+            ),
+            Overlay(
+                "overlay-ocr-watermark-1",
+                OverlayKind.BLUR,
+                TimeRange(0, 10_000_000),
+                0.72,
+                0.08,
+                0.26,
+                0.09,
+                tracking_mode="ocr_watermark",
+                padding_x=0.0,
+                padding_y=0.0,
+                concealment_mode="cover",
+            ),
+        ),
+        translation_preferences=TranslationPreferences(
+            "xianxia", "Tên đứng trước hậu tố thân mật."
         ),
     )
     projects = ProjectRepository(database)
     projects.save(project_path=tmp_path / "Đạo gia.ducai", snapshot=snapshot)
 
     assert projects.load(snapshot.id) == snapshot
+
+
+def test_project_snapshot_round_trips_scene_text_metadata_and_legacy_defaults(
+    database: Database, tmp_path: Path
+) -> None:
+    scene = SubtitleCue(
+        "scene-1",
+        1,
+        TimeRange(500_000, 2_500_000),
+        "海王兽",
+        "zh",
+        confidence=0.94,
+        evidence_ids=("scene-frame-1", "scene-frame-2"),
+        visual_box=(0.78, 0.24, 0.08, 0.31),
+        visual_box_source="ocr",
+        role="scene_text",
+        orientation="vertical",
+        style_hint="calligraphy",
+        panel_box=(0.73, 0.18, 0.18, 0.43),
+        background_color="#101010",
+        background_style="ink_splash",
+        review_state="accepted",
+        scene_font_scale=0.85,
+        text_font_size=23,
+        subtitle_track_id="S2",
+        background_padding_x=24,
+        background_padding_y=12,
+        fade_enabled=True,
+        fade_duration_ms=450,
+    )
+    snapshot = ProjectSnapshot(
+        "scene-project",
+        "Scene",
+        1,
+        source_cues=(scene,),
+        ocr_dialogue_region=(0.08, 0.74, 0.84, 0.22),
+        ocr_exclusion_regions=((0.82, 0.02, 0.16, 0.08),),
+    )
+    projects = ProjectRepository(database)
+    projects.save(project_path=tmp_path / "Scene.ducai", snapshot=snapshot)
+
+    assert projects.load(snapshot.id).source_cues == (scene,)
+
+    legacy = decode_project_snapshot(
+        {
+            "id": "legacy-cue-project",
+            "name": "Legacy cue",
+            "revision": 1,
+            "media": [],
+            "tracks": [],
+            "source_cues": [
+                {
+                    "id": "legacy",
+                    "index": 1,
+                    "range": {"start_us": 0, "end_us": 1_000_000},
+                    "text": "你好",
+                    "language": "zh",
+                }
+            ],
+            "translated_cues": [],
+            "overlays": [],
+            "schema_version": 1,
+        }
+    )
+    assert legacy.source_cues[0].role == "dialogue"
+    assert legacy.source_cues[0].orientation == "horizontal"
+    assert legacy.source_cues[0].scene_font_scale == 1.0
+    assert legacy.source_cues[0].text_font_size == 12
+    assert legacy.source_cues[0].subtitle_track_id == ""
+    assert legacy.source_cues[0].background_padding_x == 20
+    assert legacy.source_cues[0].background_padding_y == 10
+    assert legacy.source_cues[0].background_style == "solid"
+    assert legacy.source_cues[0].fade_enabled is False
+    assert legacy.source_cues[0].fade_duration_ms == 300
+    assert legacy.source_cues[0].panel_box is None
+    assert legacy.ocr_dialogue_region is None
+    assert legacy.ocr_exclusion_regions == ()
+
+
+def test_project_decoder_splits_legacy_overlapping_scene_text_into_visible_lanes() -> None:
+    def cue(
+        cue_id: str,
+        index: int,
+        text: str,
+        start_us: int,
+        end_us: int,
+        *,
+        source: str = "ocr_review",
+        track_id: str = "",
+        language: str = "zh",
+    ) -> dict[str, object]:
+        return {
+            "id": cue_id,
+            "index": index,
+            "range": {"start_us": start_us, "end_us": end_us},
+            "text": text,
+            "language": language,
+            "source": source,
+            "role": "scene_text",
+            "subtitle_track_id": track_id,
+        }
+
+    automatic = [
+        cue("scene-a", 1, "甲", 1_000_000, 2_000_000),
+        cue("scene-b", 2, "乙", 1_000_000, 2_000_000),
+        cue("scene-c", 3, "丙", 1_000_000, 2_000_000),
+        cue("scene-d", 4, "丁", 1_000_000, 2_000_000),
+        cue("scene-e", 5, "戊", 3_000_000, 4_000_000),
+    ]
+    manual = cue(
+        "manual-scene",
+        6,
+        "Tên thêm tay",
+        1_000_000,
+        2_000_000,
+        source="manual_scene_text",
+        track_id="S3",
+        language="vi",
+    )
+    translated = [
+        {**item, "id": item["id"] + "-vi", "text": f"VI {item['text']}", "language": "vi"}
+        for item in automatic
+    ] + [dict(manual)]
+
+    def clip(cue_id: str, cue_index: int, track_id: str) -> dict[str, object]:
+        return {
+            "id": f"clip-{cue_id}",
+            "track_id": track_id,
+            "timeline_range": {"start_us": 1_000_000, "end_us": 2_000_000},
+            "cue_id": cue_id,
+            "cue_index": cue_index,
+        }
+
+    decoded = decode_project_snapshot(
+        {
+            "id": "legacy-overlap-project",
+            "name": "Legacy overlap",
+            "revision": 7,
+            "media": [],
+            "tracks": [
+                {
+                    "id": "S2",
+                    "kind": "subtitle",
+                    "name": "Chữ trong cảnh",
+                    "clips": [
+                        clip(str(item["id"]), int(item["index"]), "S2")
+                        for item in automatic[:4]
+                    ],
+                },
+                {
+                    "id": "S3",
+                    "kind": "subtitle",
+                    "name": "Chữ thêm tay",
+                    "clips": [clip("manual-scene", 6, "S3")],
+                },
+            ],
+            "source_cues": [*automatic, manual],
+            "translated_cues": translated,
+            "overlays": [],
+            "schema_version": 1,
+        }
+    )
+
+    source_lanes = {item.id: item.subtitle_track_id for item in decoded.source_cues}
+    assert source_lanes == {
+        "scene-a": "S2",
+        "scene-b": "S4",
+        "scene-c": "S5",
+        "scene-d": "S6",
+        "scene-e": "S2",
+        "manual-scene": "S3",
+    }
+    translated_lanes = {
+        item.index: item.subtitle_track_id for item in decoded.translated_cues
+    }
+    assert translated_lanes == {
+        item.index: item.subtitle_track_id for item in decoded.source_cues
+    }
+    tracks = {track.id: track for track in decoded.tracks}
+    assert set(tracks) == {"S2", "S3", "S4", "S5", "S6"}
+    assert [clip.cue_id for clip in tracks["S2"].clips] == ["scene-a", "scene-e"]
+    assert tracks["S3"].clips[0].cue_id == "manual-scene"
+    assert tracks["S4"].clips[0].cue_id == "scene-b"
+    assert tracks["S5"].clips[0].cue_id == "scene-c"
+    assert tracks["S6"].clips[0].cue_id == "scene-d"
+
+
+def test_project_decoder_preserves_valid_scene_text_on_s1_and_repairs_collision() -> None:
+    def cue(
+        cue_id: str,
+        index: int,
+        start_us: int,
+        end_us: int,
+        *,
+        role: str,
+        track_id: str,
+    ) -> dict[str, object]:
+        return {
+            "id": cue_id,
+            "index": index,
+            "range": {"start_us": start_us, "end_us": end_us},
+            "text": cue_id,
+            "language": "vi",
+            "source": "manual_scene_text" if role == "scene_text" else "ocr",
+            "role": role,
+            "subtitle_track_id": track_id,
+        }
+
+    decoded = decode_project_snapshot(
+        {
+            "id": "explicit-s1-scene-project",
+            "name": "Explicit S1 scene",
+            "revision": 3,
+            "media": [],
+            "tracks": [],
+            "source_cues": [
+                cue("dialogue", 1, 0, 1_000_000, role="dialogue", track_id="S1"),
+                cue(
+                    "scene-safe",
+                    2,
+                    1_000_000,
+                    2_000_000,
+                    role="scene_text",
+                    track_id="S1",
+                ),
+                cue(
+                    "scene-collision",
+                    3,
+                    500_000,
+                    900_000,
+                    role="scene_text",
+                    track_id="S1",
+                ),
+            ],
+            "translated_cues": [],
+            "overlays": [],
+            "schema_version": 1,
+        }
+    )
+
+    lanes = {item.id: item.subtitle_track_id for item in decoded.source_cues}
+    assert lanes["dialogue"] == "S1"
+    assert lanes["scene-safe"] == "S1"
+    assert lanes["scene-collision"] == "S2"
+    assert decoded.source_cues[1].role == "scene_text"
+    assert decoded.source_cues[2].role == "scene_text"
+
+
+def test_project_decoder_defaults_legacy_blur_to_blur_only_concealment() -> None:
+    payload = {
+        "id": "legacy-project",
+        "name": "Legacy",
+        "revision": 1,
+        "media": [],
+        "tracks": [],
+        "source_cues": [],
+        "translated_cues": [],
+        "overlays": [
+            {
+                "id": "legacy-blur",
+                "kind": "blur",
+                "range": {"start_us": 0, "end_us": 1_000_000},
+                "x": 0.1,
+                "y": 0.8,
+                "width": 0.8,
+                "height": 0.1,
+                "enabled": True,
+                "opacity": 1.0,
+                "blur_radius": 22,
+                "tracking_mode": "source_subtitle",
+                "padding_x": 0.012,
+                "padding_y": 0.008,
+            }
+        ],
+        "schema_version": 1,
+    }
+
+    decoded = decode_project_snapshot(payload)
+
+    assert decoded.overlays[0].concealment_mode == "blur"
 
 
 def test_project_snapshot_round_trips_voice_conform_state(

@@ -25,6 +25,7 @@ Button {
     property string succeededText: "Đã hoàn tất"
     property string failedText: "Thao tác lỗi"
     property string disabledReason: "Chức năng này chưa sẵn sàng."
+    property string tooltipText: ""
 
     readonly property string displayText: {
         if (operationState === "start_requested") return startingText
@@ -59,7 +60,9 @@ Button {
     hoverEnabled: true
     scale: down ? 0.98 : 1
     Accessible.name: displayText
-    Accessible.description: enabled ? operationState : disabledReason
+    Accessible.description: enabled
+        ? (tooltipText.length > 0 ? tooltipText : operationState)
+        : disabledReason
     Accessible.role: Accessible.Button
     Accessible.focusable: true
 
@@ -152,6 +155,11 @@ Button {
     Behavior on scale {
         NumberAnimation { duration: Theme.motionFast; easing.type: Easing.OutQuart }
     }
+
+    ToolTip.visible: control.enabled && control.hovered
+        && Boolean(control.tooltipText)
+    ToolTip.text: control.tooltipText
+    ToolTip.delay: 350
 
     MouseArea {
         anchors.fill: parent

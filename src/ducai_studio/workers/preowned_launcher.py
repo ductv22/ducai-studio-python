@@ -16,7 +16,10 @@ def main() -> int:
     arguments = json.loads(encoded_arguments)
     if not isinstance(arguments, list) or not all(isinstance(item, str) for item in arguments):
         return 64
-    if sys.stdin.buffer.readline() != _LAUNCH_GATE:
+    # Do not read ahead: the child inherits the pipe, not this interpreter's
+    # BufferedReader. A command arriving with the gate must remain in the pipe.
+    gate = b"".join(os.read(sys.stdin.fileno(), 1) for _ in range(len(_LAUNCH_GATE)))
+    if gate != _LAUNCH_GATE:
         return 65
 
     child = subprocess.Popen(

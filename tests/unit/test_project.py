@@ -1,6 +1,7 @@
 import pytest
 
 from ducai_studio.domain.project import (
+    CUE_BACKGROUND_STYLES,
     MediaAsset,
     MediaKind,
     ProjectSnapshot,
@@ -30,4 +31,68 @@ def test_subtitle_cue_requires_text_and_valid_confidence() -> None:
         SubtitleCue("cue", 1, TimeRange(0, 1_000_000), "", "zh")
     with pytest.raises(ValueError, match="confidence"):
         SubtitleCue("cue", 1, TimeRange(0, 1_000_000), "你好", "zh", confidence=1.1)
+
+    with pytest.raises(ValueError, match="1 đến 100"):
+        SubtitleCue(
+            "cue",
+            1,
+            TimeRange(0, 1_000_000),
+            "你好",
+            "zh",
+            text_font_size=0,
+        )
+
+    cue = SubtitleCue(
+        "cue",
+        1,
+        TimeRange(0, 1_000_000),
+        "Xin chào",
+        "vi",
+        style_hint="calligraphy_bold",
+        background_style="ink_splash",
+        background_padding_x=24,
+        background_padding_y=12,
+    )
+    assert cue.style_hint == "calligraphy_bold"
+    assert cue.background_style == "ink_splash"
+    assert cue.background_padding_x == 24
+    assert cue.background_padding_y == 12
+
+    assert {
+        "solid",
+        "ink_splash",
+        "ink_wash",
+        "ink_cloud",
+        "brush_stroke",
+    } == CUE_BACKGROUND_STYLES
+    for style in CUE_BACKGROUND_STYLES:
+        styled = SubtitleCue(
+            f"cue-{style}",
+            1,
+            TimeRange(0, 1_000_000),
+            "Hồng Ly tỷ tỷ",
+            "vi",
+            background_style=style,
+        )
+        assert styled.background_style == style
+
+    with pytest.raises(ValueError, match="Background padding"):
+        SubtitleCue(
+            "cue",
+            1,
+            TimeRange(0, 1_000_000),
+            "Xin chào",
+            "vi",
+            background_padding_x=101,
+        )
+
+    with pytest.raises(ValueError, match="Background style"):
+        SubtitleCue(
+            "cue",
+            1,
+            TimeRange(0, 1_000_000),
+            "Xin chào",
+            "vi",
+            background_style="photocopy",
+        )
 

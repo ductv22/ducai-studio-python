@@ -7,9 +7,167 @@ import sys
 from hashlib import sha256
 from pathlib import Path
 
+import pytest
+
+from ducai_studio.domain.project import (
+    MediaAsset,
+    MediaKind,
+    ProjectSnapshot,
+    SubtitleCue,
+    TimelineClip,
+    TimelineTrack,
+    TrackKind,
+)
+from ducai_studio.domain.subtitles import NormalizedBox, RescueWindow, SubtitleEvidence
+from ducai_studio.domain.timebase import TimeRange
+from ducai_studio.job_manager.service import _apply_ocr_cue_regions
 from ducai_studio.workers import ocr_worker as ocr_worker_module
 from ducai_studio.workers.ocr_worker import EngineHostClient, OcrWorker
 from ducai_studio.workers.protocol import PROTOCOL_VERSION, WorkerMessage
+
+
+def test_ocr_scene_cues_are_projected_to_a_separate_s2_track() -> None:
+    first = TimeRange(0, 800_000)
+    second = TimeRange(900_000, 1_700_000)
+    media = MediaAsset("subtitle-media", "fixture.srt", MediaKind.SUBTITLE, 1_700_000)
+    snapshot = ProjectSnapshot(
+        "project",
+        "Fixture",
+        1,
+        media=(media,),
+        tracks=(
+            TimelineTrack(
+                "S1",
+                TrackKind.SUBTITLE,
+                "Phụ đề nguồn",
+                (
+                    TimelineClip("clip-1", "S1", first, first, media.id),
+                    TimelineClip("clip-2", "S1", second, second, media.id),
+                ),
+            ),
+        ),
+        source_cues=(
+            SubtitleCue("cue-1", 1, first, "走", "zh"),
+            SubtitleCue("cue-2", 2, second, "海王兽", "zh"),
+        ),
+    )
+
+    updated = _apply_ocr_cue_regions(
+        snapshot,
+        {
+            "cue_regions": [
+                {
+                    "index": 2,
+                    "start_us": second.start_us,
+                    "end_us": second.end_us,
+                    "box": [0.72, 0.22, 0.08, 0.31],
+                    "panel_box": [0.68, 0.18, 0.16, 0.39],
+                    "role": "scene_text",
+                    "orientation": "vertical",
+                    "style_hint": "calligraphy",
+                    "review_state": "accepted",
+                }
+            ]
+        },
+    )
+
+    assert [(track.id, track.name, len(track.clips)) for track in updated.tracks] == [
+        ("S1", "Phụ đề nguồn", 1),
+        ("S2", "Chữ trong cảnh", 1),
+    ]
+    assert updated.tracks[0].clips[0].id == "clip-1"
+    assert updated.tracks[1].clips[0].id == "clip-2"
+    assert updated.source_cues[1].role == "scene_text"
+
+
+def test_adaptive_rescue_is_bounded_without_a_second_video_decode_pass() -> None:
+    events = list(range(200_000, 60_000_000, 200_000))
+
+    burst, scene = OcrWorker._adaptive_timestamps_from_events(events, 60_000_000)
+
+    assert len(burst) <= 160
+    assert len(scene) <= 86
+    assert tuple(range(0, 60_000_000, 10_000_000)) == tuple(
+        timestamp for timestamp in scene if timestamp % 10_000_000 == 0
+    )
+
+
+def test_adaptive_event_bounding_is_stable_while_the_window_grows() -> None:
+    early = list(range(200_000, 10_000_000, 200_000))
+    complete = list(range(200_000, 30_000_000, 200_000))
+
+    early_burst, _ = OcrWorker._adaptive_timestamps_from_events(
+        early, 30_000_000
+    )
+    complete_burst, _ = OcrWorker._adaptive_timestamps_from_events(
+        complete, 30_000_000
+    )
+
+    assert set(early_burst).issubset(complete_burst)
+    assert len(complete_burst) <= 80
+
+
+def test_full_frame_events_extend_scene_scan_without_expanding_dialogue_bursts() -> None:
+    dialogue_events = [1_000_000]
+    full_frame_events = [1_000_000, 5_000_000]
+
+    burst, scene = OcrWorker._adaptive_timestamps_from_events(
+        dialogue_events,
+        12_000_000,
+        scene_events=full_frame_events,
+    )
+
+    assert 5_000_000 not in burst
+    assert 5_000_000 in scene
+    assert 5_240_000 in scene
+    assert {
+        900_000,
+        1_000_000,
+        1_100_000,
+        1_200_000,
+        1_300_000,
+        1_400_000,
+    }.issubset(burst)
+
+
+def test_worker_final_candidates_bridges_one_fast_and_one_quality_observation() -> None:
+    evidence = (
+        SubtitleEvidence(
+            "fast-dialogue",
+            "frame-232200000",
+            232_200_000,
+            "upper",
+            "在这呢",
+            0.999950,
+            "paddle-fast",
+            "PP-OCRv6-small",
+            NormalizedBox(0.46, 0.89, 0.09, 0.06),
+        ),
+        SubtitleEvidence(
+            "quality-dialogue",
+            "frame-232400000",
+            232_400_000,
+            "lower",
+            "在这呢",
+            0.999866,
+            "paddle-quality",
+            "PP-OCRv6-medium",
+            NormalizedBox(0.461, 0.895, 0.088, 0.058),
+        ),
+    )
+    worker = object.__new__(OcrWorker)
+    worker._load_evidence = lambda: evidence
+
+    candidates = worker._final_candidates(
+        (),
+        (RescueWindow(TimeRange(230_000_000, 235_000_000), ("coverage_gap",)),),
+        300_000_000,
+        800_000,
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].text == "在这呢"
+    assert candidates[0].source == "paddle-cross-pass-consensus"
 
 
 def test_ocr_engine_process_receives_portable_paddlex_cache(
@@ -329,6 +487,118 @@ def test_quality_checkpoint_resume_rewinds_overlap_without_dropping_fast_evidenc
     ]
     assert worker.cursor_us == 800_000
     assert retained == ["fast", "quality-0"]
+
+
+def test_fast_checkpoint_resume_restores_transition_history_before_rewind(
+    tmp_path: Path, monkeypatch
+) -> None:
+    staging = tmp_path / "artifacts" / "staging"
+    staging.mkdir(parents=True)
+    monkeypatch.setenv("DUCAI_ARTIFACT_STAGING_ROOT", str(staging))
+    artifact = tmp_path / "immutable.ndjson"
+    artifact.write_text("", encoding="utf-8")
+    worker = OcrWorker("resume-fast-events")
+    worker.config = {"sample_interval_us": 800_000}
+
+    worker._restore_checkpoint(
+        {
+            "payload": {
+                "stage": "fast",
+                "cursor_us": 5_000_000,
+                "change_events_us": [1_000_000, 3_000_000, 4_000_000],
+                "scene_change_events_us": [2_000_000, 3_200_000, 4_400_000],
+            },
+            "artifact": {"uri": str(artifact)},
+        }
+    )
+
+    assert worker.cursor_us == 3_400_000
+    assert worker._change_events == [1_000_000, 3_000_000]
+    assert worker._scene_change_events == [2_000_000, 3_200_000]
+
+
+def test_watermark_evidence_stays_out_of_cues_and_requires_persistent_edge_samples(
+    tmp_path: Path, monkeypatch
+) -> None:
+    staging = tmp_path / "artifacts" / "staging"
+    staging.mkdir(parents=True)
+    monkeypatch.setenv("DUCAI_ARTIFACT_STAGING_ROOT", str(staging))
+    worker = OcrWorker("watermark-regions")
+    worker.config = {"duration_us": 8_000_000}
+    rows = [
+        {
+            "id": "dialogue",
+            "frame_id": "frame-000000000000",
+            "timestamp_us": 0,
+            "band": "lower",
+            "text": "真正的台词",
+            "confidence": 0.99,
+            "provider_id": "paddle-fast",
+            "model_id": "PP-OCRv6-mobile",
+            "box": [0.2, 0.7, 0.6, 0.1],
+        },
+        {
+            "id": "watermark-1",
+            "frame_id": "frame-000000000000",
+            "timestamp_us": 0,
+            "band": "lower",
+            "text": "小李看漫剧bilibili",
+            "confidence": 0.98,
+            "provider_id": "paddle-fast",
+            "model_id": "PP-OCRv6-mobile",
+            "box": [0.78, 0.62, 0.2, 0.08],
+            "ignored_overlay": True,
+        },
+        {
+            "id": "watermark-2",
+            "frame_id": "frame-000000000800",
+            "timestamp_us": 800_000,
+            "band": "lower",
+            "text": "小李看漫剧bilibili",
+            "confidence": 0.97,
+            "provider_id": "paddle-fast",
+            "model_id": "PP-OCRv6-mobile",
+            "box": [0.79, 0.621, 0.19, 0.079],
+            "ignored_overlay": True,
+        },
+        {
+            "id": "watermark-3",
+            "frame_id": "frame-000000002000",
+            "timestamp_us": 2_000_000,
+            "band": "lower",
+            "text": "小李看漫剧bilibili",
+            "confidence": 0.97,
+            "provider_id": "paddle-fast",
+            "model_id": "PP-OCRv6-mobile",
+            "box": [0.785, 0.62, 0.195, 0.08],
+            "ignored_overlay": True,
+        },
+        {
+            "id": "single-observation",
+            "frame_id": "frame-000000001600",
+            "timestamp_us": 1_600_000,
+            "band": "upper",
+            "text": "bilibili",
+            "confidence": 0.96,
+            "provider_id": "paddle-fast",
+            "model_id": "PP-OCRv6-mobile",
+            "box": [0.02, 0.2, 0.12, 0.05],
+            "ignored_overlay": True,
+        },
+    ]
+    worker.evidence_path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    assert [item.id for item in worker._load_evidence()] == ["dialogue"]
+    regions = worker._watermark_regions()
+
+    assert len(regions) == 1
+    assert regions[0]["start_us"] == 0
+    assert regions[0]["end_us"] == 8_000_000
+    assert regions[0]["sample_count"] == 3
+    assert regions[0]["box"] == pytest.approx([0.772, 0.614, 0.216, 0.092])
 
 
 def _start_fake_whisper_worker(

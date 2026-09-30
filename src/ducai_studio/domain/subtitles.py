@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 from .timebase import TimeRange, TimeUs
 
+VIETNAMESE_SUBTITLE_WRAP_CHARS = 68
+
 
 @dataclass(frozen=True, slots=True)
 class NormalizedBox:
@@ -35,6 +37,12 @@ class SubtitleEvidence:
     provider_id: str
     model_id: str
     box: NormalizedBox | None = None
+    evidence_kind: str = "global"
+    orientation: str = "horizontal"
+    style_hint: str = "standard"
+    panel_box: NormalizedBox | None = None
+    background_color: str = ""
+    scene_confidence: float = 0.0
 
     def __post_init__(self) -> None:
         required = (
@@ -53,6 +61,22 @@ class SubtitleEvidence:
             raise TypeError("Evidence confidence must be numeric")
         if not 0 <= self.confidence <= 1:
             raise ValueError("Evidence confidence must be between zero and one")
+        if self.evidence_kind not in {"global", "burst", "scene"}:
+            raise ValueError("Evidence kind is invalid")
+        if self.orientation not in {"horizontal", "vertical"}:
+            raise ValueError("Evidence orientation is invalid")
+        if self.style_hint not in {"standard", "display", "calligraphy"}:
+            raise ValueError("Evidence style hint is invalid")
+        if self.background_color:
+            if len(self.background_color) != 7 or not self.background_color.startswith("#"):
+                raise ValueError("Evidence background color must use #RRGGBB")
+            int(self.background_color[1:], 16)
+        if (
+            isinstance(self.scene_confidence, bool)
+            or not isinstance(self.scene_confidence, (int, float))
+            or not 0 <= self.scene_confidence <= 1
+        ):
+            raise ValueError("Scene confidence must be between zero and one")
 
 
 @dataclass(frozen=True, slots=True)

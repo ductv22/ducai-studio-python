@@ -42,9 +42,51 @@ Item {
     property bool clipResizeSnapActive: false
     property bool clipResizeSpeedLimited: false
     property string clipResizeLimitText: ""
+    property bool sceneTimingActive: false
+    property bool sceneTimingPending: false
+    property string sceneTimingClipId: ""
+    property string sceneTimingCueId: ""
+    property string sceneTimingMode: ""
+    property real sceneTimingOriginalStartUs: 0
+    property real sceneTimingOriginalEndUs: 0
+    property real sceneTimingPreviewStartUs: 0
+    property real sceneTimingPreviewEndUs: 0
+    property real sceneTimingPointerOriginUs: 0
+    property real sceneTimingPointerOriginY: 0
+    property int sceneTimingTrackIndex: -1
+    property string sceneTimingTrackId: ""
+    property real sceneTimingPreviewDeltaUs: 0
+    property int sceneTimingLaneDelta: 0
+    property bool sceneTimingSnapActive: false
+    property string sceneTimingSnapEdge: ""
+    property real sceneTimingSnapTargetUs: -1
+    property string regionEditorMode: ""
+    property bool marqueeActive: false
+    property point marqueeStart: Qt.point(0, 0)
+    property point marqueeEnd: Qt.point(0, 0)
+    property bool clipMoveActive: false
+    property bool clipMovePending: false
+    property string clipMoveClipId: ""
+    property string clipMoveLinkGroupId: ""
+    property real clipMoveOriginalStartUs: 0
+    property real clipMoveOriginalEndUs: 0
+    property real clipMovePointerOriginUs: 0
+    property real clipMovePreviewDeltaUs: 0
+    property int clipMoveTrackIndex: -1
+    property bool clipMoveSnapActive: false
     activeFocusOnTab: true
     focus: true
     Accessible.name: "Timeline"
+
+    ManualSubtitleCueDialog {
+        id: manualCueDialog
+        appModel: root.appModel
+        onPlacementRequested: {
+            timelinePreview.pause()
+            root.regionEditorMode = "manual_text"
+        }
+        onCueSubmitted: root.regionEditorMode = ""
+    }
 
     // Let focused text fields consume editing shortcuts (Ctrl+A, Ctrl+C, ...)
     // before the timeline-level selection handler sees them.  Without this,
@@ -52,20 +94,45 @@ Item {
     // clip inspector, making per-cue editing appear unavailable.
     Keys.priority: Keys.AfterItem
     Keys.onPressed: function(event) {
-        if (event.key === Qt.Key_Escape && root.clipResizeActive) {
-            root.cancelClipResize()
+        if (event.key === Qt.Key_Escape
+                && (root.clipResizeActive || root.sceneTimingActive || root.clipMoveActive)) {
+            if (root.clipResizeActive) root.cancelClipResize()
+            if (root.sceneTimingActive) root.cancelSceneTiming()
+            if (root.clipMoveActive) root.cancelClipMove()
             event.accepted = true
             return
         }
         if (event.key === Qt.Key_A && (event.modifiers & Qt.ControlModifier)) {
-            root.appModel.selectAllTracks()
+            if (root.appModel.selectedCueCount > 0
+                    || root.appModel.selectedClipTrackKind === "subtitle")
+                root.appModel.selectAllSubtitleCues()
+            else
+                root.appModel.selectAllTracks()
             event.accepted = true
+            return
         }
     }
 
     function clipUsesResizePreview(clipId) {
         return clipResizeClipId === clipId
             && (clipResizeActive || clipResizePending)
+    }
+
+    function cueSelected(cueId) {
+        return root.appModel.selectedCueIds.indexOf(String(cueId || "")) >= 0
+    }
+
+    function clipUsesSceneTimingPreview(clipId, cueId) {
+        if (!(sceneTimingActive || sceneTimingPending)) return false
+        if (sceneTimingMode === "move") return cueSelected(cueId)
+        return sceneTimingClipId === clipId
+    }
+
+    function clipUsesMovePreview(clipId, linkGroupId) {
+        if (!(clipMoveActive || clipMovePending)) return false
+        if (clipMoveLinkGroupId)
+            return String(linkGroupId || "") === clipMoveLinkGroupId
+        return clipMoveClipId === clipId
     }
 
     function timingStateForRange(trackKind, startUs, endUs, slotStartUs, slotEndUs) {
@@ -124,6 +191,11 @@ Item {
     function clipLayerTimeAt(pointerX) {
         const ratio = Math.max(0, Math.min(1, pointerX / Math.max(1, clipLayer.width)))
         return root.viewportStartUs + ratio * root.viewportDurationUs
+    }
+
+    function seekTimelineAt(pointerX) {
+        const targetUs = root.clipLayerTimeAt(pointerX)
+        root.appModel.setPlayheadMs(targetUs / 1000)
     }
 
     function beginClipResize(clipId, edge, startUs, endUs, slotStartUs,
@@ -236,6 +308,238 @@ Item {
         root.clipResizeSpeedLimited = false
         root.clipResizeLimitText = ""
         root.clipResizeTrackIndex = -1
+    }
+
+    function beginSceneTiming(clipId, cueId, mode, startUs, endUs, trackIndex,
+                              trackId, pointerX, pointerY) {
+        if (!cueId || root.sceneTimingPending || root.appModel.subtitleBusy) return
+        root.forceActiveFocus()
+        root.appModel.selectClip(clipId)
+        if (!root.cueSelected(cueId))
+            root.appModel.selectCue(String(cueId), Number(startUs))
+        root.selectInspectorTab("clip")
+        root.sceneTimingClipId = String(clipId)
+        root.sceneTimingCueId = String(cueId)
+        root.sceneTimingMode = String(mode)
+        root.sceneTimingOriginalStartUs = Number(startUs)
+        root.sceneTimingOriginalEndUs = Number(endUs)
+        root.sceneTimingPreviewStartUs = Number(startUs)
+        root.sceneTimingPreviewEndUs = Number(endUs)
+        root.sceneTimingPointerOriginUs = root.clipLayerTimeAt(pointerX)
+        root.sceneTimingPointerOriginY = Number(pointerY)
+        root.sceneTimingTrackIndex = Number(trackIndex)
+        root.sceneTimingTrackId = String(trackId || "")
+        root.sceneTimingPreviewDeltaUs = 0
+        root.sceneTimingLaneDelta = 0
+        root.sceneTimingSnapActive = false
+        root.sceneTimingSnapEdge = ""
+        root.sceneTimingSnapTargetUs = -1
+        root.sceneTimingActive = true
+    }
+
+    function updateSceneTiming(pointerX, pointerY) {
+        if (!root.sceneTimingActive) return
+        const pointerUs = root.clipLayerTimeAt(pointerX)
+        const minimumDurationUs = 100_000
+        const eightPixelsUs = 8 * root.viewportDurationUs
+            / Math.max(1, clipLayer.width)
+        const snapThresholdUs = Math.min(
+            500_000, Math.max(80_000, eightPixelsUs)
+        )
+        const playheadUs = Number(root.appModel.playheadUs)
+        root.sceneTimingSnapActive = false
+        root.sceneTimingSnapEdge = ""
+        root.sceneTimingSnapTargetUs = -1
+        if (root.sceneTimingMode === "move") {
+            const rawDelta = pointerUs - root.sceneTimingPointerOriginUs
+            const minimumDelta = -root.sceneTimingOriginalStartUs
+            const maximumDelta = root.projectDurationUs - root.sceneTimingOriginalEndUs
+            let delta = Math.max(minimumDelta, Math.min(maximumDelta, rawDelta))
+            const rawStartUs = root.sceneTimingOriginalStartUs + delta
+            const rawEndUs = root.sceneTimingOriginalEndUs + delta
+            const startDistance = Math.abs(rawStartUs - playheadUs)
+            const endDistance = Math.abs(rawEndUs - playheadUs)
+            if (Math.min(startDistance, endDistance) <= snapThresholdUs) {
+                const snapStart = startDistance <= endDistance
+                const desiredDelta = playheadUs - (snapStart
+                    ? root.sceneTimingOriginalStartUs
+                    : root.sceneTimingOriginalEndUs)
+                delta = Math.max(
+                    minimumDelta, Math.min(maximumDelta, desiredDelta)
+                )
+                root.sceneTimingSnapActive = true
+                root.sceneTimingSnapEdge = snapStart ? "start" : "end"
+                root.sceneTimingSnapTargetUs = playheadUs
+            }
+            root.sceneTimingPreviewDeltaUs = delta
+            root.sceneTimingPreviewStartUs = root.sceneTimingOriginalStartUs + delta
+            root.sceneTimingPreviewEndUs = root.sceneTimingOriginalEndUs + delta
+            const currentLane = Number(root.sceneTimingTrackId.slice(1)) || 2
+            const rawLaneDelta = Math.round(
+                (Number(pointerY) - root.sceneTimingPointerOriginY) / 62
+            )
+            root.sceneTimingLaneDelta = Math.max(1 - currentLane, rawLaneDelta)
+        } else if (root.sceneTimingMode === "left") {
+            let startUs = Math.max(
+                0,
+                Math.min(root.sceneTimingOriginalEndUs - minimumDurationUs, pointerUs)
+            )
+            if (Math.abs(startUs - playheadUs) <= snapThresholdUs) {
+                startUs = Math.max(
+                    0,
+                    Math.min(
+                        root.sceneTimingOriginalEndUs - minimumDurationUs,
+                        playheadUs
+                    )
+                )
+                root.sceneTimingSnapActive = true
+                root.sceneTimingSnapEdge = "start"
+                root.sceneTimingSnapTargetUs = playheadUs
+            }
+            root.sceneTimingPreviewStartUs = startUs
+            root.sceneTimingPreviewEndUs = root.sceneTimingOriginalEndUs
+        } else {
+            root.sceneTimingPreviewStartUs = root.sceneTimingOriginalStartUs
+            let endUs = Math.min(
+                root.projectDurationUs,
+                Math.max(root.sceneTimingOriginalStartUs + minimumDurationUs, pointerUs)
+            )
+            if (Math.abs(endUs - playheadUs) <= snapThresholdUs) {
+                endUs = Math.min(
+                    root.projectDurationUs,
+                    Math.max(
+                        root.sceneTimingOriginalStartUs + minimumDurationUs,
+                        playheadUs
+                    )
+                )
+                root.sceneTimingSnapActive = true
+                root.sceneTimingSnapEdge = "end"
+                root.sceneTimingSnapTargetUs = playheadUs
+            }
+            root.sceneTimingPreviewEndUs = endUs
+        }
+        if (root.sceneTimingMode === "move")
+            root.appModel.previewSelectedSceneTextMove(root.sceneTimingPreviewDeltaUs)
+        else
+            root.appModel.previewSceneTextTiming(
+                root.sceneTimingCueId,
+                root.sceneTimingPreviewStartUs,
+                root.sceneTimingPreviewEndUs
+            )
+    }
+
+    function finishSceneTiming() {
+        if (!root.sceneTimingActive) return
+        const changed = Math.abs(
+            root.sceneTimingPreviewStartUs - root.sceneTimingOriginalStartUs
+        ) >= 1 || Math.abs(
+            root.sceneTimingPreviewEndUs - root.sceneTimingOriginalEndUs
+        ) >= 1 || (root.sceneTimingMode === "move"
+            && root.sceneTimingLaneDelta !== 0)
+        root.sceneTimingActive = false
+        if (!changed) {
+            root.resetSceneTiming()
+            return
+        }
+        root.sceneTimingPending = true
+        if (root.sceneTimingMode === "move")
+            root.appModel.moveSelectedSceneTexts(
+                root.sceneTimingPreviewDeltaUs,
+                root.sceneTimingLaneDelta
+            )
+        else
+            root.appModel.setSceneTextTiming(
+                root.sceneTimingCueId,
+                root.sceneTimingPreviewStartUs,
+                root.sceneTimingPreviewEndUs,
+                root.sceneTimingOriginalStartUs,
+                root.sceneTimingOriginalEndUs
+            )
+    }
+
+    function cancelSceneTiming() {
+        if (!root.sceneTimingActive) return
+        if (root.sceneTimingMode === "move")
+            root.appModel.previewSelectedSceneTextMove(0)
+        else
+            root.appModel.previewSceneTextTiming(
+                root.sceneTimingCueId,
+                root.sceneTimingOriginalStartUs,
+                root.sceneTimingOriginalEndUs
+            )
+        root.resetSceneTiming()
+    }
+
+    function resetSceneTiming() {
+        root.sceneTimingActive = false
+        root.sceneTimingPending = false
+        root.sceneTimingClipId = ""
+        root.sceneTimingCueId = ""
+        root.sceneTimingMode = ""
+        root.sceneTimingTrackIndex = -1
+        root.sceneTimingTrackId = ""
+        root.sceneTimingPreviewDeltaUs = 0
+        root.sceneTimingLaneDelta = 0
+        root.sceneTimingSnapActive = false
+        root.sceneTimingSnapEdge = ""
+        root.sceneTimingSnapTargetUs = -1
+    }
+
+    function beginClipMove(clipId, linkGroupId, startUs, endUs, trackIndex, pointerX) {
+        if (root.clipMovePending || root.appModel.timelineBusy) return
+        root.forceActiveFocus()
+        root.appModel.selectClip(clipId)
+        root.selectInspectorTab("clip")
+        root.clipMoveClipId = String(clipId)
+        root.clipMoveLinkGroupId = String(linkGroupId || "")
+        root.clipMoveOriginalStartUs = Number(startUs)
+        root.clipMoveOriginalEndUs = Number(endUs)
+        root.clipMovePointerOriginUs = root.clipLayerTimeAt(pointerX)
+        root.clipMovePreviewDeltaUs = 0
+        root.clipMoveTrackIndex = Number(trackIndex)
+        root.clipMoveSnapActive = false
+        root.clipMoveActive = true
+    }
+
+    function updateClipMove(pointerX) {
+        if (!root.clipMoveActive) return
+        const rawDelta = root.clipLayerTimeAt(pointerX) - root.clipMovePointerOriginUs
+        const minimumDelta = -root.clipMoveOriginalStartUs
+        const maximumDelta = root.projectDurationUs - root.clipMoveOriginalEndUs
+        let delta = Math.max(minimumDelta, Math.min(maximumDelta, rawDelta))
+        const candidateStartUs = root.clipMoveOriginalStartUs + delta
+        root.clipMoveSnapActive = candidateStartUs <= root.clipResizeSnapToleranceUs()
+        if (root.clipMoveSnapActive) delta = -root.clipMoveOriginalStartUs
+        root.clipMovePreviewDeltaUs = delta
+    }
+
+    function finishClipMove() {
+        if (!root.clipMoveActive) return
+        const changed = Math.abs(root.clipMovePreviewDeltaUs) >= 1
+        root.clipMoveActive = false
+        if (!changed) {
+            root.resetClipMove()
+            return
+        }
+        root.clipMovePending = true
+        root.appModel.moveSelectedClip(
+            root.clipMoveOriginalStartUs + root.clipMovePreviewDeltaUs
+        )
+    }
+
+    function cancelClipMove() {
+        if (!root.clipMoveActive) return
+        root.resetClipMove()
+    }
+
+    function resetClipMove() {
+        root.clipMoveActive = false
+        root.clipMovePending = false
+        root.clipMoveClipId = ""
+        root.clipMoveLinkGroupId = ""
+        root.clipMovePreviewDeltaUs = 0
+        root.clipMoveTrackIndex = -1
+        root.clipMoveSnapActive = false
     }
 
     function selectInspectorTab(value) {
@@ -358,6 +662,12 @@ Item {
         function onTimelineBusyChanged() {
             if (root.clipResizePending && !root.appModel.timelineBusy)
                 root.resetClipResize()
+            if (root.clipMovePending && !root.appModel.timelineBusy)
+                root.resetClipMove()
+        }
+        function onSubtitleBusyChanged() {
+            if (root.sceneTimingPending && !root.appModel.subtitleBusy)
+                root.resetSceneTiming()
         }
     }
 
@@ -433,20 +743,38 @@ Item {
                 SplitView.fillWidth: true
                 SplitView.preferredHeight: verticalTimelineSplit.height
                     * root.appModel.uiRealValue("timelinePreviewRatio", 0.55)
-                SplitView.minimumHeight: 260
-                SplitView.maximumHeight: Math.max(280, verticalTimelineSplit.height - 240)
+                SplitView.minimumHeight: 200
+                // Reserve enough room below for the persistent typography
+                // toolbar and a usable multi-track viewport at the supported
+                // 720 px window height.  The 10 px splitter handle is included
+                // in the 420 px reservation.
+                SplitView.maximumHeight: Math.max(
+                    200, verticalTimelineSplit.height - 420
+                )
                 color: Theme.canvas
                 onHeightChanged: persistPreviewRatio.restart()
                 TimelinePreview {
+                    id: timelinePreview
                     anchors.fill: parent
                     appModel: root.appModel
+                    ocrRegionEditorMode: root.regionEditorMode
+                    onColorPicked: function(target, color) {
+                        subtitleTextToolbar.applyPickedColor(target, color)
+                    }
+                    onRegionDrawn: function(mode, x, y, width, height) {
+                        if (mode !== "manual_text") return
+                        manualCueDialog.submitAtRegion(x, y, width, height)
+                        root.regionEditorMode = ""
+                    }
                 }
             }
 
             Item {
                 SplitView.fillWidth: true
                 SplitView.fillHeight: true
-                SplitView.minimumHeight: 230
+                // Keep at least one complete track row visible below the
+                // persistent grouped typography toolbar at 720p.
+                SplitView.minimumHeight: 410
 
                 ColumnLayout {
                     anchors.fill: parent
@@ -456,15 +784,27 @@ Item {
                 Layout.fillWidth: true
                 spacing: Theme.space8
                 DsButton {
+                    text: "T"
+                    compact: true
+                    primary: root.regionEditorMode === "manual_text"
+                    tooltipText: "Thêm cue thoại hoặc chữ trong cảnh tại playhead."
+                    enabled: root.appModel.currentProject.hasVideo
+                    disabledReason: "Cần mở video trước khi thêm chữ."
+                    onClicked: manualCueDialog.openForPlayhead(root.appModel.playheadUs)
+                    Accessible.name: "Thêm chữ vào video tại playhead"
+                }
+                DsButton {
                     text: "Tách"
                     compact: true
+                    tooltipText: "Tách clip đang chọn tại vị trí playhead."
                     enabled: root.appModel.hasSelectedClip && !root.appModel.timelineBusy
                     disabledReason: "Cần chọn clip và đặt playhead bên trong clip."
                     onClicked: root.appModel.splitSelected(true)
                 }
                 DsButton {
-                    text: "Khớp voice theo SRT"
+                    text: "Khớp D1"
                     compact: true
+                    tooltipText: "Mở công cụ cân thời lượng từng cue D1 theo mốc SRT."
                     enabled: root.appModel.currentProject.hasVoiceTrack
                     disabledReason: "Cần tạo D1 trước khi khớp từng cue theo timestamp SRT."
                     onClicked: root.selectInspectorTab("voice-sync")
@@ -472,6 +812,7 @@ Item {
                 DsButton {
                     text: "↶"
                     compact: true
+                    tooltipText: "Hoàn tác thay đổi Timeline gần nhất."
                     enabled: root.appModel.canUndoTimeline && !root.appModel.timelineBusy
                     disabledReason: "Chưa có thao tác để hoàn tác."
                     onClicked: root.appModel.undoTimeline()
@@ -479,14 +820,16 @@ Item {
                 DsButton {
                     text: "↷"
                     compact: true
+                    tooltipText: "Làm lại thay đổi Timeline vừa hoàn tác."
                     enabled: root.appModel.canRedoTimeline && !root.appModel.timelineBusy
                     disabledReason: "Chưa có thao tác để làm lại."
                     onClicked: root.appModel.redoTimeline()
                 }
                 Item { Layout.fillWidth: true }
                 DsButton {
-                    text: "Đầu 60s"
+                    text: "Đầu"
                     compact: true
+                    tooltipText: "Đưa khung nhìn Timeline về 60 giây đầu dự án."
                     enabled: root.appModel.currentProject.hasProject
                     disabledReason: "Timeline chưa có nội dung."
                     onClicked: root.showProjectStart()
@@ -499,7 +842,8 @@ Item {
                 }
                 Slider {
                     id: zoomSlider
-                    Layout.preferredWidth: 180
+                    Layout.preferredWidth: 120
+                    Layout.minimumWidth: 88
                     from: 0
                     to: 1
                     value: root.zoomLevel
@@ -511,11 +855,21 @@ Item {
                     Accessible.name: "Mức kéo dãn timeline"
                 }
                 DsButton {
-                    text: "Vừa khung"
+                    text: "Toàn bộ"
                     compact: true
+                    tooltipText: "Hiển thị toàn bộ thời lượng dự án trong Timeline."
                     enabled: root.appModel.currentProject.hasProject
                     disabledReason: "Timeline chưa có nội dung."
                     onClicked: root.fitProject()
+                }
+            }
+
+            SubtitleTextToolbar {
+                id: subtitleTextToolbar
+                Layout.fillWidth: true
+                appModel: root.appModel
+                onColorPickRequested: function(target) {
+                    timelinePreview.colorPickerTarget = target
                 }
             }
 
@@ -576,6 +930,9 @@ Item {
                             clip: true
                             spacing: Theme.space4
                             boundsBehavior: Flickable.StopAtBounds
+                            ScrollBar.vertical: ScrollBar {
+                                policy: ScrollBar.AsNeeded
+                            }
                             onContentYChanged: {
                                 if (!modelResetInProgress)
                                     contentYBeforeModelReset = contentY
@@ -782,19 +1139,111 @@ Item {
                             anchors.leftMargin: 188
                             anchors.rightMargin: Theme.space12
 
+                            MouseArea {
+                                id: subtitleMarqueeArea
+                                anchors.fill: parent
+                                z: 0
+                                acceptedButtons: Qt.LeftButton
+                                preventStealing: true
+                                property bool additive: false
+                                onPressed: function(mouse) {
+                                    root.forceActiveFocus()
+                                    root.marqueeActive = false
+                                    root.marqueeStart = Qt.point(mouse.x, mouse.y)
+                                    root.marqueeEnd = root.marqueeStart
+                                    additive = Boolean(mouse.modifiers & Qt.ControlModifier)
+                                }
+                                onPositionChanged: function(mouse) {
+                                    if (!pressed) return
+                                    root.marqueeEnd = Qt.point(mouse.x, mouse.y)
+                                    if (Math.abs(root.marqueeEnd.x - root.marqueeStart.x) >= 4
+                                            || Math.abs(root.marqueeEnd.y - root.marqueeStart.y) >= 4)
+                                        root.marqueeActive = true
+                                }
+                                onReleased: function(mouse) {
+                                    if (!root.marqueeActive) {
+                                        root.seekTimelineAt(mouse.x)
+                                        return
+                                    }
+                                    const left = Math.min(root.marqueeStart.x, root.marqueeEnd.x)
+                                    const right = Math.max(root.marqueeStart.x, root.marqueeEnd.x)
+                                    const top = Math.min(root.marqueeStart.y, root.marqueeEnd.y)
+                                        + trackList.contentY
+                                    const bottom = Math.max(root.marqueeStart.y, root.marqueeEnd.y)
+                                        + trackList.contentY
+                                    const startUs = root.clipLayerTimeAt(left)
+                                    const endUs = root.clipLayerTimeAt(right)
+                                    const firstTrack = Math.max(0, Math.floor(top / 62))
+                                    const lastTrack = Math.max(0, Math.floor(bottom / 62))
+                                    const ids = root.appModel.currentProject.subtitleCueIdsInRange(
+                                        startUs, endUs, firstTrack, lastTrack
+                                    )
+                                    root.appModel.selectSubtitleCueIds(ids, additive)
+                                    root.marqueeActive = false
+                                }
+                                onCanceled: root.marqueeActive = false
+                            }
+
+                            Rectangle {
+                                visible: root.marqueeActive
+                                z: 20
+                                x: Math.min(root.marqueeStart.x, root.marqueeEnd.x)
+                                y: Math.min(root.marqueeStart.y, root.marqueeEnd.y)
+                                width: Math.abs(root.marqueeEnd.x - root.marqueeStart.x)
+                                height: Math.abs(root.marqueeEnd.y - root.marqueeStart.y)
+                                color: Qt.rgba(0.20, 0.55, 0.95, 0.16)
+                                border.width: 1
+                                border.color: Theme.primary
+                            }
+
                             Repeater {
+                                z: 2
                                 model: root.appModel.currentProject.clipModel
                                 delegate: Rectangle {
                                     id: clipItem
                                     required property var model
+                                    // Repeater delegates are siblings of the
+                                    // Repeater, so its z value is not inherited.
+                                    // Keep clip gestures above the blank seek/
+                                    // marquee MouseArea at every scroll offset.
+                                    z: 2
                                     readonly property real laneWidth: clipLayer.width
                                     readonly property bool usesResizePreview: root.clipUsesResizePreview(
                                         model.clipId
                                     )
-                                    readonly property real effectiveStart: usesResizePreview
-                                        ? root.clipResizePreviewStartUs : model.startUs
-                                    readonly property real effectiveEnd: usesResizePreview
-                                        ? root.clipResizePreviewEndUs : model.endUs
+                                    readonly property bool usesSceneTimingPreview:
+                                        root.clipUsesSceneTimingPreview(
+                                            model.clipId, model.cueId
+                                        )
+                                    readonly property bool usesMovePreview: root.clipUsesMovePreview(
+                                        model.clipId, model.linkGroupId
+                                    )
+                                    readonly property bool isSceneTextClip:
+                                        model.trackKind === "subtitle"
+                                        && Boolean(model.cueId)
+                                    readonly property bool isSubtitleClip:
+                                        model.trackKind === "subtitle"
+                                        && Boolean(model.cueId)
+                                    readonly property bool isMovableMediaClip:
+                                        (model.trackKind === "video"
+                                            || model.trackKind === "original_audio")
+                                        && !model.trackLocked
+                                    readonly property real effectiveStart: usesSceneTimingPreview
+                                        ? (root.sceneTimingMode === "move"
+                                            ? model.startUs + root.sceneTimingPreviewDeltaUs
+                                            : root.sceneTimingPreviewStartUs)
+                                        : (usesMovePreview
+                                            ? model.startUs + root.clipMovePreviewDeltaUs
+                                            : (usesResizePreview
+                                                ? root.clipResizePreviewStartUs : model.startUs))
+                                    readonly property real effectiveEnd: usesSceneTimingPreview
+                                        ? (root.sceneTimingMode === "move"
+                                            ? model.endUs + root.sceneTimingPreviewDeltaUs
+                                            : root.sceneTimingPreviewEndUs)
+                                        : (usesMovePreview
+                                            ? model.endUs + root.clipMovePreviewDeltaUs
+                                            : (usesResizePreview
+                                                ? root.clipResizePreviewEndUs : model.endUs))
                                     readonly property real clippedStart: Math.max(
                                         root.viewportStartUs, effectiveStart
                                     )
@@ -822,7 +1271,11 @@ Item {
                                     visible: clippedEnd > clippedStart
                                     x: (clippedStart - root.viewportStartUs)
                                         / root.viewportDurationUs * laneWidth
-                                    y: model.trackIndex * 62 - trackList.contentY + 12
+                                    y: (model.trackIndex
+                                            + (usesSceneTimingPreview
+                                                && root.sceneTimingMode === "move"
+                                                ? root.sceneTimingLaneDelta : 0))
+                                        * 62 - trackList.contentY + 12
                                     width: Math.max(
                                         8,
                                         (clippedEnd - clippedStart)
@@ -841,7 +1294,8 @@ Item {
                                         : root.clipFillColor(
                                             effectiveTimingState,
                                             model.trackKind,
-                                            root.appModel.selectedClipId === model.clipId
+                                            root.cueSelected(model.cueId)
+                                                || root.appModel.selectedClipId === model.clipId
                                         )
                                     border.width: !model.isAggregate
                                         && effectiveTimingState === "overflow"
@@ -850,6 +1304,7 @@ Item {
                                             && (effectiveTimingState === "underflow"
                                                 || effectiveTimingState === "position_mismatch"
                                                 || effectiveTimingState === "matched"
+                                                || root.cueSelected(model.cueId)
                                                 || root.appModel.selectedClipId === model.clipId)
                                             ? 2 : 1)
                                     border.color: model.isAggregate
@@ -857,7 +1312,8 @@ Item {
                                         : root.clipBorderColor(
                                             effectiveTimingState,
                                             model.trackKind,
-                                            root.appModel.selectedClipId === model.clipId
+                                            root.cueSelected(model.cueId)
+                                                || root.appModel.selectedClipId === model.clipId
                                         )
                                     Accessible.name: model.isAggregate
                                         ? model.trackName + ", " + model.aggregateCount + " clip được gom khi thu nhỏ"
@@ -870,11 +1326,13 @@ Item {
                                         width: Math.max(0, parent.width - Theme.space12)
                                         text: clipItem.model.isAggregate
                                             ? clipItem.model.aggregateCount + " clip"
-                                            : ((clipItem.model.cueText || (clipItem.model.trackKind === "voice" ? "D1" : ""))
+                                            : (clipItem.isSubtitleClip
+                                                ? (clipItem.model.cueText || clipItem.model.trackId)
+                                                : ((clipItem.model.cueText || (clipItem.model.trackKind === "voice" ? "D1" : ""))
                                                 + "  "
                                                 + Number(clipItem.model.speedPercent / 100).toFixed(2)
                                                 + "×  |  "
-                                                + Math.round(clipItem.model.volume * 100) + "%")
+                                                + Math.round(clipItem.model.volume * 100) + "%"))
                                         color: Theme.textPrimary
                                         font.family: Theme.fontFamily
                                         font.pixelSize: 10
@@ -916,19 +1374,126 @@ Item {
                                         anchors.fill: parent
                                         enabled: !clipItem.model.isAggregate
                                         acceptedButtons: Qt.LeftButton | Qt.RightButton
-                                        onClicked: function(mouse) {
-                                            root.appModel.selectClip(clipItem.model.clipId)
-                                            root.selectInspectorTab("clip")
-                                            if (mouse.button === Qt.LeftButton)
-                                                root.appModel.setPlayheadMs(
-                                                    clipItem.model.startUs / 1000
+                                        cursorShape: clipItem.isSceneTextClip
+                                            || clipItem.isMovableMediaClip
+                                            ? Qt.SizeAllCursor : Qt.ArrowCursor
+                                        preventStealing: true
+                                        property real dragStartX: 0
+                                        property real dragStartY: 0
+                                        property bool dragStarted: false
+                                        property bool selectionHandledOnPress: false
+                                        onPressed: function(mouse) {
+                                            dragStarted = false
+                                            selectionHandledOnPress = false
+                                            if (mouse.button !== Qt.LeftButton
+                                                    || (!clipItem.isSceneTextClip
+                                                        && !clipItem.isMovableMediaClip))
+                                                return
+                                            if (clipItem.isSubtitleClip
+                                                    && !root.cueSelected(clipItem.model.cueId)) {
+                                                root.appModel.selectCueWithAdditive(
+                                                    String(clipItem.model.cueId),
+                                                    Number(clipItem.model.startUs),
+                                                    Boolean(
+                                                        mouse.modifiers
+                                                            & Qt.ControlModifier
+                                                    )
                                                 )
+                                                selectionHandledOnPress = true
+                                            }
+                                            const point = mapToItem(clipLayer, mouse.x, mouse.y)
+                                            dragStartX = point.x
+                                            dragStartY = point.y
+                                        }
+                                        onPositionChanged: function(mouse) {
+                                            if (!pressed || !(mouse.buttons & Qt.LeftButton)
+                                                    || (!clipItem.isSceneTextClip
+                                                        && !clipItem.isMovableMediaClip))
+                                                return
+                                            const point = mapToItem(clipLayer, mouse.x, mouse.y)
+                                            if (!dragStarted
+                                                    && (Math.abs(point.x - dragStartX) >= 4
+                                                        || Math.abs(point.y - dragStartY) >= 4)) {
+                                                dragStarted = true
+                                                if (clipItem.isSceneTextClip) {
+                                                    root.beginSceneTiming(
+                                                        clipItem.model.clipId,
+                                                        clipItem.model.cueId,
+                                                        "move",
+                                                        clipItem.model.startUs,
+                                                        clipItem.model.endUs,
+                                                        clipItem.model.trackIndex,
+                                                        clipItem.model.trackId,
+                                                        dragStartX,
+                                                        dragStartY
+                                                    )
+                                                } else {
+                                                    root.beginClipMove(
+                                                        clipItem.model.clipId,
+                                                        clipItem.model.linkGroupId,
+                                                        clipItem.model.startUs,
+                                                        clipItem.model.endUs,
+                                                        clipItem.model.trackIndex,
+                                                        dragStartX
+                                                    )
+                                                }
+                                            }
+                                            if (!dragStarted) return
+                                            if (clipItem.isSceneTextClip)
+                                                root.updateSceneTiming(point.x, point.y)
+                                            else
+                                                root.updateClipMove(point.x)
+                                        }
+                                        onReleased: function(mouse) {
+                                            if (!dragStarted || mouse.button !== Qt.LeftButton) return
+                                            if (clipItem.isSceneTextClip)
+                                                root.finishSceneTiming()
+                                            else
+                                                root.finishClipMove()
+                                        }
+                                        onCanceled: {
+                                            if (!dragStarted) return
+                                            if (clipItem.isSceneTextClip)
+                                                root.cancelSceneTiming()
+                                            else
+                                                root.cancelClipMove()
+                                        }
+                                        onClicked: function(mouse) {
+                                            if (dragStarted) {
+                                                dragStarted = false
+                                                return
+                                            }
+                                            root.appModel.selectClip(clipItem.model.clipId)
+                                            if (clipItem.isSubtitleClip
+                                                    && !selectionHandledOnPress) {
+                                                root.appModel.selectCueWithAdditive(
+                                                    String(clipItem.model.cueId),
+                                                    Number(clipItem.model.startUs),
+                                                    Boolean(
+                                                        mouse.modifiers
+                                                            & Qt.ControlModifier
+                                                    )
+                                                )
+                                            }
+                                            root.selectInspectorTab("clip")
+                                            if (mouse.button === Qt.LeftButton) {
+                                                const point = mapToItem(
+                                                    clipLayer, mouse.x, mouse.y
+                                                )
+                                                root.seekTimelineAt(point.x)
+                                            }
                                             if (mouse.button === Qt.RightButton) {
                                                 clipMenu.openAt(clipItem, mouse.x, mouse.y)
                                             }
                                         }
                                         onDoubleClicked: {
-                                            if (clipItem.model.trackKind === "voice" && clipItem.model.cueId)
+                                            if (clipItem.isSubtitleClip)
+                                                root.appModel.openSubtitleCueInEditor(
+                                                    String(clipItem.model.cueId),
+                                                    Number(clipItem.model.startUs),
+                                                    Number(clipItem.model.cueIndex)
+                                                )
+                                            else if (clipItem.model.trackKind === "voice" && clipItem.model.cueId)
                                                 root.appModel.openCueInEditor(
                                                     String(clipItem.model.cueId),
                                                     Number(clipItem.model.startUs),
@@ -940,66 +1505,122 @@ Item {
                                     MouseArea {
                                         objectName: "timelineClipLeftHandle-" + clipItem.model.clipId
                                         visible: clipItem.model.trackKind === "voice"
+                                            || clipItem.isSceneTextClip
                                         width: Math.min(14, parent.width / 3)
                                         anchors.left: parent.left
                                         anchors.top: parent.top
                                         anchors.bottom: parent.bottom
                                         cursorShape: Qt.SizeHorCursor
                                         preventStealing: true
+                                        z: 5
                                         onPressed: function(mouse) {
                                             const point = mapToItem(clipLayer, mouse.x, mouse.y)
-                                            root.beginClipResize(
-                                                clipItem.model.clipId,
-                                                "left",
-                                                clipItem.model.startUs,
-                                                clipItem.model.endUs,
-                                                clipItem.model.slotStartUs,
-                                                clipItem.model.slotEndUs,
-                                                clipItem.model.durationUs
-                                                    * clipItem.model.speedPercent / 100,
-                                                clipItem.model.trackIndex,
-                                                point.x
-                                            )
+                                            if (clipItem.isSceneTextClip)
+                                                root.beginSceneTiming(
+                                                    clipItem.model.clipId,
+                                                    clipItem.model.cueId,
+                                                    "left",
+                                                    clipItem.model.startUs,
+                                                    clipItem.model.endUs,
+                                                    clipItem.model.trackIndex,
+                                                    clipItem.model.trackId,
+                                                    point.x,
+                                                    point.y
+                                                )
+                                            else
+                                                root.beginClipResize(
+                                                    clipItem.model.clipId,
+                                                    "left",
+                                                    clipItem.model.startUs,
+                                                    clipItem.model.endUs,
+                                                    clipItem.model.slotStartUs,
+                                                    clipItem.model.slotEndUs,
+                                                    clipItem.model.durationUs
+                                                        * clipItem.model.speedPercent / 100,
+                                                    clipItem.model.trackIndex,
+                                                    point.x
+                                                )
                                         }
                                         onPositionChanged: function(mouse) {
                                             if (!pressed) return
                                             const point = mapToItem(clipLayer, mouse.x, mouse.y)
-                                            root.updateClipResize(point.x)
+                                            if (clipItem.isSceneTextClip)
+                                                root.updateSceneTiming(point.x, point.y)
+                                            else
+                                                root.updateClipResize(point.x)
                                         }
-                                        onReleased: root.finishClipResize()
-                                        onCanceled: root.cancelClipResize()
+                                        onReleased: {
+                                            if (clipItem.isSceneTextClip)
+                                                root.finishSceneTiming()
+                                            else
+                                                root.finishClipResize()
+                                        }
+                                        onCanceled: {
+                                            if (clipItem.isSceneTextClip)
+                                                root.cancelSceneTiming()
+                                            else
+                                                root.cancelClipResize()
+                                        }
                                     }
                                     MouseArea {
                                         objectName: "timelineClipRightHandle-" + clipItem.model.clipId
                                         visible: clipItem.model.trackKind === "voice"
+                                            || clipItem.isSceneTextClip
                                         width: Math.min(14, parent.width / 3)
                                         anchors.right: parent.right
                                         anchors.top: parent.top
                                         anchors.bottom: parent.bottom
                                         cursorShape: Qt.SizeHorCursor
                                         preventStealing: true
+                                        z: 5
                                         onPressed: function(mouse) {
                                             const point = mapToItem(clipLayer, mouse.x, mouse.y)
-                                            root.beginClipResize(
-                                                clipItem.model.clipId,
-                                                "right",
-                                                clipItem.model.startUs,
-                                                clipItem.model.endUs,
-                                                clipItem.model.slotStartUs,
-                                                clipItem.model.slotEndUs,
-                                                clipItem.model.durationUs
-                                                    * clipItem.model.speedPercent / 100,
-                                                clipItem.model.trackIndex,
-                                                point.x
-                                            )
+                                            if (clipItem.isSceneTextClip)
+                                                root.beginSceneTiming(
+                                                    clipItem.model.clipId,
+                                                    clipItem.model.cueId,
+                                                    "right",
+                                                    clipItem.model.startUs,
+                                                    clipItem.model.endUs,
+                                                    clipItem.model.trackIndex,
+                                                    clipItem.model.trackId,
+                                                    point.x,
+                                                    point.y
+                                                )
+                                            else
+                                                root.beginClipResize(
+                                                    clipItem.model.clipId,
+                                                    "right",
+                                                    clipItem.model.startUs,
+                                                    clipItem.model.endUs,
+                                                    clipItem.model.slotStartUs,
+                                                    clipItem.model.slotEndUs,
+                                                    clipItem.model.durationUs
+                                                        * clipItem.model.speedPercent / 100,
+                                                    clipItem.model.trackIndex,
+                                                    point.x
+                                                )
                                         }
                                         onPositionChanged: function(mouse) {
                                             if (!pressed) return
                                             const point = mapToItem(clipLayer, mouse.x, mouse.y)
-                                            root.updateClipResize(point.x)
+                                            if (clipItem.isSceneTextClip)
+                                                root.updateSceneTiming(point.x, point.y)
+                                            else
+                                                root.updateClipResize(point.x)
                                         }
-                                        onReleased: root.finishClipResize()
-                                        onCanceled: root.cancelClipResize()
+                                        onReleased: {
+                                            if (clipItem.isSceneTextClip)
+                                                root.finishSceneTiming()
+                                            else
+                                                root.finishClipResize()
+                                        }
+                                        onCanceled: {
+                                            if (clipItem.isSceneTextClip)
+                                                root.cancelSceneTiming()
+                                            else
+                                                root.cancelClipResize()
+                                        }
                                     }
 
                                     Popup {
@@ -1047,6 +1668,36 @@ Item {
                                             spacing: 0
                                             DsContextButton {
                                                 Layout.fillWidth: true
+                                                visible: clipItem.isSubtitleClip
+                                                text: "Mở trong Biên tập phụ đề"
+                                                onClicked: {
+                                                    clipMenu.close()
+                                                    root.appModel.openSubtitleCueInEditor(
+                                                        String(clipItem.model.cueId),
+                                                        Number(clipItem.model.startUs),
+                                                        Number(clipItem.model.cueIndex)
+                                                    )
+                                                }
+                                            }
+                                            DsContextButton {
+                                                Layout.fillWidth: true
+                                                visible: clipItem.isSubtitleClip
+                                                danger: true
+                                                text: "Xóa cue chữ và nền"
+                                                onClicked: {
+                                                    clipMenu.close()
+                                                    root.appModel.deleteSubtitleCue(
+                                                        String(clipItem.model.cueId)
+                                                    )
+                                                }
+                                            }
+                                            MenuSeparator {
+                                                Layout.fillWidth: true
+                                                visible: clipItem.isSubtitleClip
+                                            }
+                                            DsContextButton {
+                                                Layout.fillWidth: true
+                                                visible: !clipItem.isSubtitleClip
                                                 text: "Tách video và audio tại playhead"
                                                 onClicked: {
                                                     clipMenu.close()
@@ -1055,6 +1706,7 @@ Item {
                                             }
                                             DsContextButton {
                                                 Layout.fillWidth: true
+                                                visible: !clipItem.isSubtitleClip
                                                 text: "Cắt phần trước, cả linked clip"
                                                 onClicked: {
                                                     clipMenu.close()
@@ -1063,15 +1715,20 @@ Item {
                                             }
                                             DsContextButton {
                                                 Layout.fillWidth: true
+                                                visible: !clipItem.isSubtitleClip
                                                 text: "Cắt phần sau, cả linked clip"
                                                 onClicked: {
                                                     clipMenu.close()
                                                     root.appModel.trimSelectedTail(true)
                                                 }
                                             }
-                                            MenuSeparator { Layout.fillWidth: true }
+                                            MenuSeparator {
+                                                Layout.fillWidth: true
+                                                visible: !clipItem.isSubtitleClip
+                                            }
                                             DsContextButton {
                                                 Layout.fillWidth: true
+                                                visible: !clipItem.isSubtitleClip
                                                 text: "Cắt phần trước, chỉ clip này"
                                                 onClicked: {
                                                     clipMenu.close()
@@ -1080,15 +1737,20 @@ Item {
                                             }
                                             DsContextButton {
                                                 Layout.fillWidth: true
+                                                visible: !clipItem.isSubtitleClip
                                                 text: "Cắt phần sau, chỉ clip này"
                                                 onClicked: {
                                                     clipMenu.close()
                                                     root.appModel.trimSelectedTail(false)
                                                 }
                                             }
-                                            MenuSeparator { Layout.fillWidth: true }
+                                            MenuSeparator {
+                                                Layout.fillWidth: true
+                                                visible: !clipItem.isSubtitleClip
+                                            }
                                             DsContextButton {
                                                 Layout.fillWidth: true
+                                                visible: !clipItem.isSubtitleClip
                                                 text: "Tốc độ 85% cho clip liên kết"
                                                 onClicked: {
                                                     clipMenu.close()
@@ -1097,6 +1759,7 @@ Item {
                                             }
                                             DsContextButton {
                                                 Layout.fillWidth: true
+                                                visible: !clipItem.isSubtitleClip
                                                 text: "Tốc độ 100% cho clip liên kết"
                                                 onClicked: {
                                                     clipMenu.close()
@@ -1105,6 +1768,7 @@ Item {
                                             }
                                             DsContextButton {
                                                 Layout.fillWidth: true
+                                                visible: !clipItem.isSubtitleClip
                                                 text: "Tắt tiếng clip này"
                                                 onClicked: {
                                                     clipMenu.close()
@@ -1113,6 +1777,7 @@ Item {
                                             }
                                             DsContextButton {
                                                 Layout.fillWidth: true
+                                                visible: !clipItem.isSubtitleClip
                                                 text: "Đặt lại âm lượng 100%"
                                                 onClicked: {
                                                     clipMenu.close()
@@ -1121,6 +1786,7 @@ Item {
                                             }
                                             DsContextButton {
                                                 Layout.fillWidth: true
+                                                visible: !clipItem.isSubtitleClip
                                                 danger: true
                                                 text: "Xóa clip liên kết"
                                                 onClicked: {
@@ -1342,6 +2008,135 @@ Item {
                             }
 
                             Rectangle {
+                                id: sceneTimingSnapGuide
+                                visible: root.sceneTimingActive
+                                    && root.sceneTimingSnapActive
+                                    && root.sceneTimingSnapTargetUs >= root.viewportStartUs
+                                    && root.sceneTimingSnapTargetUs <= root.viewportEndUs
+                                x: (root.sceneTimingSnapTargetUs - root.viewportStartUs)
+                                    / root.viewportDurationUs * clipLayer.width
+                                    - width / 2
+                                y: 0
+                                width: 3
+                                height: clipLayer.height
+                                color: Theme.success
+                                opacity: 0.95
+                                z: 32
+                            }
+
+                            Rectangle {
+                                id: sceneTimingGuideLabel
+                                visible: root.sceneTimingActive
+                                x: Math.max(
+                                    Theme.space4,
+                                    Math.min(
+                                        clipLayer.width - width - Theme.space4,
+                                        (root.sceneTimingPreviewStartUs - root.viewportStartUs)
+                                            / root.viewportDurationUs * clipLayer.width
+                                    )
+                                )
+                                y: Math.max(
+                                    Theme.space4,
+                                    Math.min(
+                                        clipLayer.height - height - Theme.space4,
+                                        root.sceneTimingTrackIndex * 62
+                                            - trackList.contentY - height + 8
+                                    )
+                                )
+                                width: sceneTimingGuideText.implicitWidth + Theme.space16
+                                height: sceneTimingGuideText.implicitHeight + Theme.space8
+                                radius: Theme.radiusSmall
+                                color: Theme.surfaceRaised
+                                border.width: 1
+                                border.color: root.sceneTimingSnapActive
+                                    ? Theme.success : Theme.primary
+                                z: 33
+
+                                Text {
+                                    id: sceneTimingGuideText
+                                    anchors.centerIn: parent
+                                    text: (root.sceneTimingSnapActive
+                                        ? "Đã căn "
+                                            + (root.sceneTimingSnapEdge === "start"
+                                                ? "đầu" : "cuối") + " · "
+                                        : "")
+                                        + (root.sceneTimingPreviewStartUs / 1_000_000).toFixed(3)
+                                        + "s → "
+                                        + (root.sceneTimingPreviewEndUs / 1_000_000).toFixed(3)
+                                        + "s · "
+                                        + ((root.sceneTimingPreviewEndUs
+                                            - root.sceneTimingPreviewStartUs) / 1_000_000).toFixed(3)
+                                        + "s"
+                                    color: root.sceneTimingSnapActive
+                                        ? Theme.success : Theme.primary
+                                    font.family: Theme.timecodeFamily
+                                    font.pixelSize: 10
+                                    font.weight: Font.DemiBold
+                                }
+                            }
+
+                            Rectangle {
+                                id: clipMoveStartGuide
+                                visible: root.clipMoveActive
+                                    && root.clipMoveSnapActive
+                                    && root.viewportStartUs <= 0
+                                x: -width / 2
+                                y: 0
+                                width: 3
+                                height: clipLayer.height
+                                color: Theme.success
+                                opacity: 0.95
+                                z: 34
+                            }
+
+                            Rectangle {
+                                id: clipMoveGuideLabel
+                                visible: root.clipMoveActive
+                                x: Math.max(
+                                    Theme.space4,
+                                    Math.min(
+                                        clipLayer.width - width - Theme.space4,
+                                        (root.clipMoveOriginalStartUs
+                                            + root.clipMovePreviewDeltaUs
+                                            - root.viewportStartUs)
+                                            / root.viewportDurationUs * clipLayer.width
+                                    )
+                                )
+                                y: Math.max(
+                                    Theme.space4,
+                                    Math.min(
+                                        clipLayer.height - height - Theme.space4,
+                                        root.clipMoveTrackIndex * 62
+                                            - trackList.contentY - height + 8
+                                    )
+                                )
+                                width: clipMoveGuideText.implicitWidth + Theme.space16
+                                height: clipMoveGuideText.implicitHeight + Theme.space8
+                                radius: Theme.radiusSmall
+                                color: Theme.surfaceRaised
+                                border.width: root.clipMoveSnapActive ? 2 : 1
+                                border.color: root.clipMoveSnapActive
+                                    ? Theme.success : Theme.primary
+                                z: 35
+
+                                Text {
+                                    id: clipMoveGuideText
+                                    anchors.centerIn: parent
+                                    text: root.clipMoveSnapActive
+                                        ? "Đã căn 00:00"
+                                        : "Bắt đầu "
+                                            + ((root.clipMoveOriginalStartUs
+                                                + root.clipMovePreviewDeltaUs)
+                                                / 1_000_000).toFixed(3) + "s"
+                                    color: root.clipMoveSnapActive
+                                        ? Theme.success : Theme.primary
+                                    font.family: Theme.timecodeFamily
+                                    font.pixelSize: 10
+                                    font.weight: Font.DemiBold
+                                }
+                            }
+
+                            Rectangle {
                                 visible: root.appModel.playheadUs >= root.viewportStartUs
                                     && root.appModel.playheadUs <= root.viewportEndUs
                                 x: (root.appModel.playheadUs - root.viewportStartUs)
@@ -1423,9 +2218,11 @@ Item {
 
         Panel {
             id: inspector
+            objectName: "timelineInspector"
             SplitView.preferredWidth: root.width * root.appModel.uiRealValue("timelineInspectorRatio", 0.27)
             SplitView.minimumWidth: 272
             SplitView.maximumWidth: 370
+            clip: true
             onWidthChanged: persistWidth.restart()
             ColumnLayout {
                 anchors.fill: parent
@@ -1434,27 +2231,42 @@ Item {
                 RowLayout {
                     Layout.fillWidth: true
                     DsTabButton {
+                        Layout.fillWidth: true
+                        Layout.minimumWidth: 0
                         text: "Clip"
+                        tooltipText: "Thuộc tính clip đang chọn."
                         checked: root.inspectorTab === "clip"
                         onClicked: root.selectInspectorTab("clip")
                     }
                     DsTabButton {
+                        Layout.fillWidth: true
+                        Layout.minimumWidth: 0
                         text: "Track"
+                        tooltipText: "Khóa và âm thanh của track đang chọn."
                         checked: root.inspectorTab === "track"
                         onClicked: root.selectInspectorTab("track")
                     }
                     DsTabButton {
+                        Layout.fillWidth: true
+                        Layout.minimumWidth: 0
                         text: "Phụ đề"
+                        tooltipText: "Danh sách cue phụ đề của dự án."
                         checked: root.inspectorTab === "subtitles"
                         onClicked: root.selectInspectorTab("subtitles")
                     }
                     DsTabButton {
+                        Layout.fillWidth: true
+                        Layout.minimumWidth: 0
                         text: "Khớp"
+                        tooltipText: "Khớp thời lượng voice với timestamp SRT."
                         checked: root.inspectorTab === "voice-sync"
                         onClicked: root.selectInspectorTab("voice-sync")
                     }
                     DsTabButton {
+                        Layout.fillWidth: true
+                        Layout.minimumWidth: 0
                         text: "Dự án"
+                        tooltipText: "Thông tin và thao tác cấp dự án."
                         checked: root.inspectorTab === "project"
                         onClicked: root.selectInspectorTab("project")
                     }
@@ -1462,6 +2274,8 @@ Item {
                 StackLayout {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
+                    Layout.minimumWidth: 0
+                    clip: true
                     currentIndex: root.inspectorTab === "track"
                         ? 1 : (root.inspectorTab === "subtitles"
                             ? 2 : (root.inspectorTab === "voice-sync"
@@ -1596,6 +2410,7 @@ Item {
                                 Layout.fillWidth: true
                                 text: "Áp dụng tốc độ"
                                 primary: true
+                                tooltipText: "Áp dụng phần trăm tốc độ đã nhập cho clip đang chọn."
                                 enabled: speedField.valueIsValid && !root.appModel.timelineBusy
                                 disabledReason: root.appModel.selectedClipTrackKind === "voice"
                                     ? "Cue D1 chỉ cho phép 50% đến 300%."
@@ -1627,6 +2442,7 @@ Item {
                             DsButton {
                                 Layout.fillWidth: true
                                 text: "Áp dụng âm lượng clip này"
+                                tooltipText: "Áp dụng mức âm lượng đã nhập cho riêng clip đang chọn."
                                 enabled: volumeField.valueIsValid && !root.appModel.timelineBusy
                                 disabledReason: "Nhập âm lượng từ 0% đến 200%."
                                 onClicked: root.appModel.setSelectedVolume(volumeField.numericValue)
@@ -1728,10 +2544,14 @@ Item {
                                     width: ListView.view.width
                                     height: Math.max(88, cueContent.implicitHeight + Theme.space12)
                                     radius: Theme.radiusSmall
-                                    color: timelineCueRow.model.cueId === root.appModel.selectedCueId
+                                    color: root.appModel.isCueSelected(
+                                        timelineCueRow.model.cueId
+                                    )
                                         ? Theme.selectionFill
                                         : (cueHover.hovered ? Theme.surfaceHover : Theme.surfaceRaised)
-                                    border.width: timelineCueRow.model.cueId === root.appModel.selectedCueId
+                                    border.width: root.appModel.isCueSelected(
+                                        timelineCueRow.model.cueId
+                                    )
                                         ? 1 : 0
                                     border.color: Theme.primary
                                     Accessible.name: "Cue " + timelineCueRow.model.cueIndex
@@ -1754,11 +2574,31 @@ Item {
                                         spacing: 2
                                         Text {
                                             Layout.fillWidth: true
-                                            text: "#" + timelineCueRow.model.cueIndex
+                                            text: timelineCueRow.model.subtitleTrackId
+                                                + (timelineCueRow.model.cueRole === "scene_text"
+                                                    ? " · Chữ trong cảnh" : " · Hội thoại")
+                                                + "  #" + timelineCueRow.model.cueIndex
                                                 + "  " + timelineCueRow.model.startText
-                                            color: Theme.textMuted
+                                            color: timelineCueRow.model.cueRole === "scene_text"
+                                                ? Theme.info : Theme.textMuted
                                             font.family: Theme.timecodeFamily
                                             font.pixelSize: 9
+                                        }
+                                        Text {
+                                            Layout.fillWidth: true
+                                            visible: timelineCueRow.model.cueRole === "scene_text"
+                                            text: (timelineCueRow.model.orientation === "vertical"
+                                                ? "Dọc" : "Ngang")
+                                                + " · "
+                                                + (timelineCueRow.model.styleHint === "calligraphy"
+                                                    ? "Thư pháp" : "Chữ hiển thị")
+                                                + (timelineCueRow.model.reviewState === "review"
+                                                    ? " · Cần duyệt" : "")
+                                            color: timelineCueRow.model.reviewState === "review"
+                                                ? Theme.warning : Theme.textMuted
+                                            font.family: Theme.fontFamily
+                                            font.pixelSize: 9
+                                            elide: Text.ElideRight
                                         }
                                         Text {
                                             Layout.fillWidth: true

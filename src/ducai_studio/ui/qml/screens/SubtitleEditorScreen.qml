@@ -25,6 +25,9 @@ Item {
     property int contextCueIndex: 0
     property string contextCueStart: ""
     property string contextCueEnd: ""
+    property string contextCueRole: "dialogue"
+    property string contextCueReviewState: "accepted"
+    property string regionEditorMode: ""
     readonly property var translationProviderIds: [
         "gemini-web", "gemini-api", "gemini-cli", "deepseek-api",
         "tokenhub-api", "qwen-api", "glm-api", "openai-compatible"
@@ -46,6 +49,13 @@ Item {
         ["qwen3.7-flash", "qwen3.7-plus", "qwen3.8-max", "qwen-plus"],
         ["glm-5.2", "glm-5.1", "glm-4.7-flash", "glm-4.5-air"],
         []
+    ]
+    readonly property var translationStyleIds: [
+        "auto", "xianxia", "wuxia", "palace", "modern", "neutral"
+    ]
+    readonly property var translationStyleLabels: [
+        "Tự nhận diện", "Tu tiên cổ trang", "Võ hiệp",
+        "Cung đình/cổ trang", "Hiện đại", "Trung tính"
     ]
     readonly property var selectedTranslationCredentialReferences:
         providerBox.currentIndex === 1 ? appModel.geminiApiCredentialReferences
@@ -71,6 +81,17 @@ Item {
         var savedIndex = translationProviderIds.indexOf(savedProvider)
         if (savedIndex >= 0)
             providerBox.currentIndex = savedIndex
+        root.syncTranslationPreferences()
+    }
+    function syncTranslationPreferences() {
+        var styleIndex = translationStyleIds.indexOf(
+            appModel.currentProject.translationStylePreset
+        )
+        if (styleIndex < 0) styleIndex = 0
+        if (translationStyleBox.currentIndex !== styleIndex)
+            translationStyleBox.currentIndex = styleIndex
+        if (!translationRules.activeFocus)
+            translationRules.text = appModel.currentProject.translationCustomRules
     }
     readonly property string workspaceMode: appModel.currentWorkspace
     readonly property string workspaceTitle: workspaceMode === "transcribe"
@@ -107,6 +128,7 @@ Item {
         return labels[state] || "Chưa chạy"
     }
     activeFocusOnTab: true
+    focus: true
     Accessible.name: workspaceTitle
 
     FileDialog {
@@ -141,6 +163,16 @@ Item {
         onAccepted: root.appModel.setExportSubtitlePrimaryColor(
             selectedColor.toString()
         )
+    }
+
+    ManualSubtitleCueDialog {
+        id: manualCueDialog
+        appModel: root.appModel
+        onPlacementRequested: {
+            subtitlePreview.pause()
+            root.regionEditorMode = "manual_text"
+        }
+        onCueSubmitted: root.regionEditorMode = ""
     }
 
     Dialog {
@@ -225,6 +257,18 @@ Item {
             spacing: 0
             DsContextButton {
                 Layout.fillWidth: true
+                visible: root.contextCueRole === "scene_text"
+                    && root.contextCueReviewState === "review"
+                text: "Chấp nhận chữ trong cảnh"
+                enabled: root.contextCueId.length > 0 && !root.appModel.subtitleBusy
+                onClicked: {
+                    const cueId = root.contextCueId
+                    cueContextMenu.close()
+                    root.appModel.acceptSceneTextCue(cueId)
+                }
+            }
+            DsContextButton {
+                Layout.fillWidth: true
                 danger: true
                 text: "Xóa cue này"
                 enabled: root.contextCueId.length > 0 && !root.appModel.subtitleBusy
@@ -298,6 +342,8 @@ Item {
         root.contextCueIndex = row.model.cueIndex
         root.contextCueStart = row.model.startText
         root.contextCueEnd = row.model.endText
+        root.contextCueRole = row.model.cueRole
+        root.contextCueReviewState = row.model.reviewState
         cueContextMenu.openAt(row, localX, localY)
     }
 
@@ -367,7 +413,7 @@ Item {
 
             Panel {
                 Layout.fillWidth: true
-                Layout.preferredHeight: 112
+                Layout.preferredHeight: 164
                 visible: root.workspaceMode === "transcribe"
                 ColumnLayout {
                     anchors.fill: parent
@@ -560,13 +606,86 @@ Item {
                             onClicked: root.appModel.cancelOcr()
                         }
                     }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: Theme.space8
+                        Text {
+                            Layout.fillWidth: true
+                            text: root.appModel.currentProject.ocrDialogueRegion.length === 4
+                                ? "S1 dùng vùng thoại đã chọn · ngoài vùng là S2"
+                                : "Mặc định dùng vùng phụ đề hiện tại · ngoài vùng là S2"
+                            color: Theme.textSecondary
+                            font.family: Theme.fontFamily
+                            font.pixelSize: 10
+                            elide: Text.ElideRight
+                        }
+                        DsButton {
+                            text: root.regionEditorMode === "dialogue"
+                                ? "Đang chọn vùng S1…" : "Quét vùng OCR"
+                            compact: true
+                            primary: root.regionEditorMode === "dialogue"
+                            enabled: root.appModel.currentProject.hasVideo
+                                && !root.appModel.ocrBusy
+                            disabledReason: "Cần mở video và dừng tác vụ OCR trước."
+                            onClicked: {
+                                subtitlePreview.pause()
+                                root.regionEditorMode = "dialogue"
+                            }
+                        }
+                        DsButton {
+                            text: root.regionEditorMode === "exclusion"
+                                ? "Đang chọn vùng bỏ qua…" : "Vùng không OCR"
+                            compact: true
+                            warning: root.regionEditorMode === "exclusion"
+                            enabled: root.appModel.currentProject.hasVideo
+                                && !root.appModel.ocrBusy
+                            disabledReason: "Cần mở video và dừng tác vụ OCR trước."
+                            onClicked: {
+                                subtitlePreview.pause()
+                                root.regionEditorMode = "exclusion"
+                            }
+                        }
+                        DsButton {
+                            text: "Xóa vùng cuối"
+                            compact: true
+                            enabled: root.appModel.currentProject.ocrExclusionRegions.length > 0
+                                && !root.appModel.ocrBusy
+                            disabledReason: "Chưa có vùng không OCR để xóa."
+                            onClicked: {
+                                const values = root.appModel.currentProject.ocrExclusionRegions.slice()
+                                values.pop()
+                                root.appModel.setOcrRegions(
+                                    root.appModel.currentProject.ocrDialogueRegion,
+                                    values
+                                )
+                            }
+                        }
+                        DsButton {
+                            text: "Đặt lại vùng"
+                            compact: true
+                            enabled: (root.appModel.currentProject.ocrDialogueRegion.length === 4
+                                    || root.appModel.currentProject.ocrExclusionRegions.length > 0)
+                                && !root.appModel.ocrBusy
+                            disabledReason: "Đang dùng vùng OCR mặc định."
+                            onClicked: {
+                                root.regionEditorMode = ""
+                                root.appModel.setOcrRegions([], [])
+                            }
+                        }
+                        DsButton {
+                            text: "Hủy chọn vùng"
+                            compact: true
+                            visible: root.regionEditorMode.length > 0
+                            onClicked: root.regionEditorMode = ""
+                        }
+                    }
                 }
             }
 
             Panel {
                 Layout.fillWidth: true
                 Layout.preferredHeight: root.selectedTranslationProviderIsCustom()
-                    ? 208 : (root.selectedTranslationProviderIsApi() ? 172 : 144)
+                    ? 286 : (root.selectedTranslationProviderIsApi() ? 250 : 222)
                 visible: root.workspaceMode === "translate"
                 ColumnLayout {
                     anchors.fill: parent
@@ -626,6 +745,87 @@ Item {
                                 ? "Hãy tạm dừng hoặc hoàn tất tác vụ dịch trước."
                                 : "Chưa có cue nguồn để đối chiếu."
                             onClicked: translationImportDialog.open()
+                        }
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: Theme.space8
+                        Text {
+                            text: "Văn phong"
+                            color: Theme.textSecondary
+                            font.family: Theme.fontFamily
+                            font.pixelSize: 10
+                        }
+                        ComboBox {
+                            id: translationStyleBox
+                            Layout.preferredWidth: 174
+                            model: root.translationStyleLabels
+                            Accessible.name: "Văn phong dịch của project"
+                        }
+                        ScrollView {
+                            id: translationRulesScroll
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 76
+                            clip: true
+                            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+
+                            TextArea {
+                                id: translationRules
+                                width: translationRulesScroll.availableWidth
+                                height: Math.max(
+                                    translationRulesScroll.availableHeight,
+                                    contentHeight + topPadding + bottomPadding
+                                )
+                                placeholderText: "Quy tắc riêng cho project (tối đa 4.000 ký tự)"
+                                color: Theme.textPrimary
+                                placeholderTextColor: Theme.textMuted
+                                selectionColor: Theme.primary
+                                selectedTextColor: Theme.textPrimary
+                                font.family: Theme.fontFamily
+                                font.pixelSize: 12
+                                wrapMode: TextEdit.Wrap
+                                selectByMouse: true
+                                padding: 8
+                                Accessible.name: "Quy tắc dịch riêng"
+                                onTextChanged: {
+                                    if (text.length <= 4000) return
+                                    const position = cursorPosition
+                                    text = text.slice(0, 4000)
+                                    cursorPosition = Math.min(position, 4000)
+                                }
+                                background: Rectangle {
+                                    color: translationRules.enabled
+                                        ? Theme.surfaceRaised : Theme.surfaceDisabled
+                                    radius: Theme.radiusSmall
+                                    border.width: translationRules.activeFocus ? 2 : 1
+                                    border.color: translationRules.activeFocus
+                                        ? Theme.focusRing : Theme.borderSubtle
+                                }
+                            }
+                        }
+                        Text {
+                            text: translationRules.text.length + "/4000"
+                            color: Theme.textMuted
+                            font.family: Theme.fontFamily
+                            font.pixelSize: 9
+                        }
+                        DsButton {
+                            text: "Lưu văn phong"
+                            compact: true
+                            enabled: root.appModel.currentProject.hasProject
+                                && !root.appModel.translationBusy
+                                && !root.appModel.translationPreferencesBusy
+                            operationState: root.appModel.translationPreferencesBusy
+                                ? "running" : "idle"
+                            runningText: "Đang lưu…"
+                            disabledReason: root.appModel.translationPreferencesBusy
+                                ? "Văn phong đang được lưu."
+                                : "Hãy mở project và chờ tác vụ dịch dừng."
+                            onClicked: root.appModel.setTranslationPreferences(
+                                root.translationStyleIds[translationStyleBox.currentIndex]
+                                    || "auto",
+                                translationRules.text
+                            )
                         }
                     }
                     RowLayout {
@@ -790,6 +990,10 @@ Item {
                         apiCredentialInput.text = ""
                     }
                 }
+                Connections {
+                    target: root.appModel.currentProject
+                    function onChanged() { root.syncTranslationPreferences() }
+                }
             }
 
             Flow {
@@ -902,6 +1106,20 @@ Item {
                 }
             }
 
+            SubtitleTextToolbar {
+                id: subtitleTextToolbar
+                Layout.fillWidth: true
+                visible: root.workspaceMode === "subtitles"
+                appModel: root.appModel
+                allowManualPlacement: true
+                onManualPlacementRequested: manualCueDialog.openForPlayhead(
+                    root.appModel.playheadUs
+                )
+                onColorPickRequested: function(target) {
+                    subtitlePreview.colorPickerTarget = target
+                }
+            }
+
             RowLayout {
                 id: findBar
                 Layout.fillWidth: true
@@ -952,7 +1170,7 @@ Item {
                             anchors.rightMargin: Theme.space12
                             spacing: Theme.space12
                             Repeater {
-                                model: ["#", "Bắt đầu", "Kết thúc", "Nguồn Trung", "Bản dịch Việt", "Trạng thái"]
+                                model: ["Track", "Bắt đầu", "Kết thúc", "Nguồn Trung", "Bản dịch Việt", "Trạng thái"]
                                 Text {
                                     required property int index
                                     required property string modelData
@@ -993,7 +1211,7 @@ Item {
                             required property var model
                             width: ListView.view.width
                             height: model.qaIssueCode ? 76 : 66
-                            color: model.cueId === root.appModel.selectedCueId
+                            color: root.appModel.isCueSelected(model.cueId)
                                 ? Theme.selectionFill
                                 : (model.timingTooLong ? Theme.warningTint
                                     : (hoverHandler.hovered ? Theme.surfaceHover : Theme.surfaceBase))
@@ -1017,8 +1235,10 @@ Item {
 
                             TapHandler {
                                 acceptedButtons: Qt.LeftButton
-                                onTapped: root.appModel.selectCue(
-                                    cueRow.model.cueId, cueRow.model.startUs
+                                onTapped: root.appModel.selectCueWithAdditive(
+                                    cueRow.model.cueId,
+                                    cueRow.model.startUs,
+                                    Boolean(point.modifiers & Qt.ControlModifier)
                                 )
                             }
                             TapHandler {
@@ -1036,13 +1256,37 @@ Item {
                                 anchors.leftMargin: Theme.space8
                                 anchors.rightMargin: Theme.space8
                                 spacing: Theme.space8
-                                Text {
+                                ColumnLayout {
                                     Layout.preferredWidth: 34
-                                    text: cueRow.model.cueIndex
-                                    color: Theme.textMuted
-                                    font.family: Theme.timecodeFamily
-                                    font.pixelSize: 10
-                                    horizontalAlignment: Text.AlignHCenter
+                                    spacing: 0
+                                    Text {
+                                        Layout.alignment: Qt.AlignHCenter
+                                        text: cueRow.model.subtitleTrackId
+                                        color: cueRow.model.cueRole === "scene_text"
+                                            ? Theme.info : Theme.textMuted
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: 9
+                                        font.weight: Font.DemiBold
+                                    }
+                                    Text {
+                                        Layout.alignment: Qt.AlignHCenter
+                                        text: cueRow.model.cueIndex
+                                        color: Theme.textMuted
+                                        font.family: Theme.timecodeFamily
+                                        font.pixelSize: 9
+                                    }
+                                    Text {
+                                        Layout.alignment: Qt.AlignHCenter
+                                        visible: cueRow.model.cueRole === "scene_text"
+                                        text: cueRow.model.styleHint === "calligraphy"
+                                            ? "THƯ" : (cueRow.model.orientation === "vertical"
+                                                ? "DỌC" : "NGANG")
+                                        color: cueRow.model.reviewState === "review"
+                                            ? Theme.warning : Theme.textMuted
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: 7
+                                        font.weight: Font.DemiBold
+                                    }
                                 }
                                 Text {
                                     Layout.preferredWidth: 76
@@ -1072,8 +1316,9 @@ Item {
                                     Layout.minimumHeight: 32
                                     TextArea {
                                         id: sourceEditor
+                                        property string editTargetCueId: ""
+                                        property string editOriginalText: ""
                                         anchors.fill: parent
-                                        text: cueRow.model.sourceText
                                         enabled: !root.appModel.subtitleBusy
                                         color: Theme.textPrimary
                                         font.family: Theme.cjkFontFamily
@@ -1087,6 +1332,13 @@ Item {
                                             border.width: parent.activeFocus ? 1 : 0
                                             border.color: Theme.focusRing
                                         }
+                                        Binding {
+                                            target: sourceEditor
+                                            property: "text"
+                                            value: cueRow.model.sourceText
+                                            when: !sourceEditor.activeFocus
+                                            restoreMode: Binding.RestoreNone
+                                        }
                                         onPressed: {
                                             if (!activeFocus)
                                                 root.appModel.selectCue(
@@ -1095,10 +1347,20 @@ Item {
                                                 )
                                         }
                                         onActiveFocusChanged: {
-                                            if (!activeFocus && text !== cueRow.model.sourceText)
+                                            if (activeFocus) {
+                                                editTargetCueId = String(cueRow.model.cueId)
+                                                editOriginalText = String(cueRow.model.sourceText)
+                                            } else if (editTargetCueId.length > 0
+                                                    && text !== editOriginalText) {
                                                 root.appModel.updateSubtitleText(
-                                                    cueRow.model.cueId, text, "source"
+                                                    editTargetCueId, text, "source"
                                                 )
+                                                editTargetCueId = ""
+                                                editOriginalText = ""
+                                            } else {
+                                                editTargetCueId = ""
+                                                editOriginalText = ""
+                                            }
                                         }
                                     }
                                     MouseArea {
@@ -1127,9 +1389,9 @@ Item {
                                     Layout.minimumHeight: 32
                                     TextArea {
                                         id: translatedEditor
+                                        property string editTargetCueId: ""
+                                        property string editOriginalText: ""
                                         anchors.fill: parent
-                                        text: cueRow.model.translatedText
-                                            || "Chưa dịch"
                                         color: cueRow.model.translatedText
                                             ? Theme.textPrimary : Theme.textMuted
                                         font.family: Theme.fontFamily
@@ -1141,6 +1403,13 @@ Item {
                                         selectByMouse: true
                                         padding: 5
                                         background: Rectangle { color: "transparent" }
+                                        Binding {
+                                            target: translatedEditor
+                                            property: "text"
+                                            value: cueRow.model.translatedText || "Chưa dịch"
+                                            when: !translatedEditor.activeFocus
+                                            restoreMode: Binding.RestoreNone
+                                        }
                                         onPressed: {
                                             if (!activeFocus)
                                                 root.appModel.selectCue(
@@ -1149,14 +1418,26 @@ Item {
                                                 )
                                         }
                                         onActiveFocusChanged: {
-                                            if (!activeFocus
-                                                    && cueRow.model.translationCueId !== ""
-                                                    && text !== cueRow.model.translatedText)
+                                            if (activeFocus) {
+                                                editTargetCueId = String(
+                                                    cueRow.model.translationCueId || ""
+                                                )
+                                                editOriginalText = String(
+                                                    cueRow.model.translatedText || ""
+                                                )
+                                            } else if (editTargetCueId.length > 0
+                                                    && text !== editOriginalText) {
                                                 root.appModel.updateSubtitleText(
-                                                    cueRow.model.translationCueId,
+                                                    editTargetCueId,
                                                     text,
                                                     "translated"
                                                 )
+                                                editTargetCueId = ""
+                                                editOriginalText = ""
+                                            } else {
+                                                editTargetCueId = ""
+                                                editOriginalText = ""
+                                            }
                                         }
                                     }
                                     MouseArea {
@@ -1232,14 +1513,15 @@ Item {
 
             RowLayout {
                 Layout.fillWidth: true
-                Layout.preferredHeight: 210
+                Layout.preferredHeight: root.regionEditorMode.length > 0 ? 420 : 210
                 Layout.minimumHeight: 180
-                Layout.maximumHeight: 210
+                Layout.maximumHeight: root.regionEditorMode.length > 0 ? 420 : 210
                 spacing: Theme.space8
                 JobActivityPanel {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     Layout.minimumWidth: 280
+                    visible: root.regionEditorMode.length === 0
                     appModel: root.appModel
                     allowHistoryDeletion: true
                     jobModel: root.appModel.subtitleJobModel
@@ -1251,9 +1533,32 @@ Item {
                     Layout.fillHeight: true
                     Layout.minimumWidth: 280
                     TimelinePreview {
+                        id: subtitlePreview
                         anchors.fill: parent
                         anchors.margins: Theme.space8
                         appModel: root.appModel
+                        ocrRegionEditorMode: root.regionEditorMode
+                        onColorPicked: function(target, color) {
+                            subtitleTextToolbar.applyPickedColor(target, color)
+                        }
+                        onRegionDrawn: function(mode, x, y, width, height) {
+                            if (mode === "dialogue") {
+                                root.appModel.setOcrRegions(
+                                    [x, y, width, height],
+                                    root.appModel.currentProject.ocrExclusionRegions
+                                )
+                            } else if (mode === "exclusion") {
+                                const values = root.appModel.currentProject.ocrExclusionRegions.slice()
+                                values.push([x, y, width, height])
+                                root.appModel.setOcrRegions(
+                                    root.appModel.currentProject.ocrDialogueRegion,
+                                    values
+                                )
+                            } else if (mode === "manual_text") {
+                                manualCueDialog.submitAtRegion(x, y, width, height)
+                            }
+                            root.regionEditorMode = ""
+                        }
                     }
                 }
             }
@@ -1827,6 +2132,15 @@ Item {
         function onTranslationQaNavigationRequested(rowIndex) {
             Qt.callLater(function() {
                 if (cueList.count > rowIndex)
+                    cueList.positionViewAtIndex(rowIndex, ListView.Center)
+            })
+        }
+        function onSubtitleNavigationRequested(cueId) {
+            Qt.callLater(function() {
+                const rowIndex = root.appModel.currentProject.subtitleCueModel.rowForCueId(
+                    String(cueId)
+                )
+                if (rowIndex >= 0 && cueList.count > rowIndex)
                     cueList.positionViewAtIndex(rowIndex, ListView.Center)
             })
         }

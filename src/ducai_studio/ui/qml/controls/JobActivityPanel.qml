@@ -102,6 +102,10 @@ Panel {
             "qa_repair": "Sửa cue chưa đạt QA",
             "recovery_backoff": "Chờ tự khôi phục dịch vụ",
             "cache_restore": "Đang dò và khôi phục cache",
+            "runtime_check": "Đang kiểm tra bộ máy giọng nói",
+            "model_loading": "Đang nạp VieNeu lên GPU",
+            "voice_binding": "Đang chuẩn bị giọng đã chọn",
+            "warm_ready": "VieNeu đã sẵn sàng từ lượt trước",
             "synthesis": "Đang tổng hợp giọng",
             "targeted_retry": "Tạo lại cue lỗi",
             "timeline_assembly": "Đang ghép timeline giọng",
@@ -125,9 +129,16 @@ Panel {
 
     function progressSummary(model) {
         if (model.kind === "tts" && !model.phase && activeState(model.state)) {
-            return "Đang nạp VieNeu và chuẩn bị dò cache"
+            return "Đang khởi động tác vụ và chuẩn bị dò cache"
                 + " · chưa có batch cue hoàn tất"
                 + " · hoạt động " + durationLabel(model.progressAgeMs)
+        }
+        if (model.kind === "tts"
+                && ["runtime_check", "model_loading", "voice_binding", "warm_ready"]
+                    .indexOf(model.phase) >= 0) {
+            return (model.phaseDetail || phaseLabel(model.phase))
+                + " · đã hoàn tất " + model.current + "/" + model.total + " câu"
+                + " · đang chờ " + durationLabel(model.progressAgeMs)
         }
         if (model.kind === "tts" && model.phase === "cache_restore") {
             return "Đã kiểm tra cache " + model.phaseCurrent + "/" + model.phaseTotal

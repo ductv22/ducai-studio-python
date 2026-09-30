@@ -12,6 +12,7 @@ from types import MappingProxyType
 from ducai_studio.domain.fingerprint import stable_fingerprint
 from ducai_studio.domain.jobs import JsonValue
 from ducai_studio.domain.project import SubtitleCue
+from ducai_studio.domain.subtitles import VIETNAMESE_SUBTITLE_WRAP_CHARS
 from ducai_studio.providers.translation.contracts import TranslationPurpose, TranslationRequest
 
 _CJK = re.compile(
@@ -26,6 +27,13 @@ _VIETNAMESE_MARK = re.compile(
     r"[ăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩị"
     r"óòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ]",
     re.IGNORECASE,
+)
+_TRANSLATION_STYLE_PRESETS = frozenset(
+    {"legacy", "auto", "xianxia", "wuxia", "palace", "modern", "neutral"}
+)
+_ANCIENT_STYLE_PRESETS = frozenset({"xianxia", "wuxia", "palace"})
+STYLE_QA_CODES = frozenset(
+    {"ancient_modern_pronoun", "ancient_title_order", "ancient_alias_mismatch"}
 )
 
 
@@ -76,10 +84,18 @@ class FilmBible:
     synopsis: str = ""
     terms: tuple[FilmTerm, ...] = ()
     characters: tuple[str, ...] = ()
+    # Appended for positional compatibility with ledgers created before a105.
+    # ``legacy`` deliberately omits the new policy from prompts/fingerprints.
+    style_preset: str = "legacy"
+    custom_rules: str = ""
 
     def __post_init__(self) -> None:
         if not self.profile.strip():
             raise ValueError("Film Bible profile is required")
+        if self.style_preset not in _TRANSLATION_STYLE_PRESETS:
+            raise ValueError("Film Bible translation style is invalid")
+        if len(self.custom_rules) > 4_000:
+            raise ValueError("Film Bible custom translation rules are too long")
         if contains_cjk(self.synopsis) or any(contains_cjk(value) for value in self.characters):
             raise ValueError("Film Bible Vietnamese metadata must not contain CJK")
         sources = [term.source.casefold() for term in self.terms]
@@ -94,6 +110,15 @@ class FilmBible:
                 continue
             merged[item.source.casefold()] = item
         return replace(self, terms=tuple(merged[key] for key in sorted(merged)))
+
+    @property
+    def resolved_style(self) -> str:
+        """Resolve auto only after the Film Bible has classified the source."""
+
+        if self.style_preset == "auto":
+            profile = self.profile.strip().casefold()
+            return profile if profile in _ANCIENT_STYLE_PRESETS | {"modern"} else "neutral"
+        return self.style_preset
 
 
 @dataclass(frozen=True, slots=True)
@@ -344,22 +369,26 @@ def build_ledger(
     model_id: str,
     film_bible: FilmBible | None = None,
 ) -> TranslationLedger:
-    signature = stable_fingerprint(
-        {
-            "cues": [
-                {
-                    "id": cue.id,
-                    "index": cue.index,
-                    "start_us": cue.range.start_us,
-                    "end_us": cue.range.end_us,
-                    "text": cue.text,
-                }
-                for cue in cues
-            ],
-            "provider": provider_id,
-            "model": model_id,
+    signature_payload: dict[str, object] = {
+        "cues": [
+            {
+                "id": cue.id,
+                "index": cue.index,
+                "start_us": cue.range.start_us,
+                "end_us": cue.range.end_us,
+                "text": cue.text,
+            }
+            for cue in cues
+        ],
+        "provider": provider_id,
+        "model": model_id,
+    }
+    if film_bible is not None and film_bible.style_preset != "legacy":
+        signature_payload["translation_style"] = {
+            "preset": film_bible.style_preset,
+            "custom_rules": film_bible.custom_rules,
         }
-    )
+    signature = stable_fingerprint(signature_payload)
     return TranslationLedger(
         signature,
         provider_id,
@@ -370,7 +399,7 @@ def build_ledger(
 
 
 def _film_bible_payload(film_bible: FilmBible) -> dict[str, JsonValue]:
-    return {
+    payload: dict[str, JsonValue] = {
         "title": film_bible.title,
         "profile": film_bible.profile,
         "synopsis": film_bible.synopsis,
@@ -380,6 +409,50 @@ def _film_bible_payload(film_bible: FilmBible) -> dict[str, JsonValue]:
             for item in film_bible.terms
         ],
     }
+    if film_bible.style_preset != "legacy":
+        payload["translation_style"] = {
+            "preset": film_bible.style_preset,
+            "resolved": film_bible.resolved_style,
+            "custom_rules": film_bible.custom_rules,
+        }
+    return payload
+
+
+def _style_prompt(film_bible: FilmBible) -> str:
+    if film_bible.style_preset == "legacy":
+        return ""
+    labels = {
+        "auto": "Tự nhận diện theo Film Bible",
+        "xianxia": "Tu tiên cổ trang",
+        "wuxia": "Võ hiệp",
+        "palace": "Cung đình/cổ trang",
+        "modern": "Hiện đại",
+        "neutral": "Trung tính",
+    }
+    lines = [
+        "VĂN PHONG DỰ ÁN:",
+        f"- Preset: {labels[film_bible.style_preset]}; phong cách áp dụng: "
+        f"{film_bible.resolved_style}.",
+        "- Giữ nhất quán xưng hô, danh xưng, thuật ngữ và quan hệ xuyên suốt phim; "
+        "chỉ suy luận vai vế khi có bằng chứng trong nguồn/FILM_BIBLE.",
+    ]
+    if film_bible.resolved_style in _ANCIENT_STYLE_PRESETS:
+        lines.extend(
+            (
+                "- Tránh mày/tao, anh/em hiện đại khi ngữ cảnh không cho phép; ưu tiên "
+                "ta/ngươi, tại hạ, đạo hữu, tiền bối, bổn tọa, vi sư, đệ tử, sư huynh, "
+                "sư tỷ đúng vai vế.",
+                "- Tên riêng đứng trước hậu tố thân mật khi phù hợp: Hồng Ly tỷ tỷ, "
+                "không viết tỷ tỷ Hồng Ly.",
+                "- Với tên gọi/biệt danh trong nguồn: 阿狗 → A Cẩu, 阿猫 → A Miêu, "
+                "老狗 → Lão Cẩu. Không đổi từ chó/mèo chỉ động vật, câu chửi hoặc văn "
+                "cảnh hiện đại thành cẩu/miêu một cách máy móc.",
+            )
+        )
+    if film_bible.custom_rules.strip():
+        lines.append("- Quy tắc riêng của người dùng (ưu tiên nếu không làm sai nghĩa):")
+        lines.append(film_bible.custom_rules.strip())
+    return "\n".join(lines)
 
 
 def _film_term_schema() -> dict[str, JsonValue]:
@@ -499,6 +572,9 @@ def translation_request(
             "start_us": cue.range.start_us,
             "end_us": cue.range.end_us,
             "slot_duration_ms": round(cue.range.duration_us / 1_000),
+            "role": cue.role,
+            "orientation": cue.orientation,
+            "style_hint": cue.style_hint,
             "soft_max_chars": max(
                 6,
                 round(cue.range.duration_us / 1_000_000 * 18),
@@ -524,13 +600,19 @@ def translation_request(
         "Trước khi trả JSON, tự kiểm tra ngay trong cùng lượt từng câu với nguồn, "
         "CONTEXT và FILM_BIBLE; tự sửa mọi lỗi sai nghĩa, mất ý, tên không nhất quán, "
         "câu cụt/lặp và ký tự CJK. Sau khi đã tự sửa, issues chỉ ghi blocker thật sự "
-        "còn chưa thể tự giải quyết; nếu không còn blocker thì trả mảng rỗng."
+        "còn chưa thể tự giải quyết; nếu không còn blocker thì trả mảng rỗng. "
+        "Cue role=scene_text là chữ giới thiệu nhân vật, chiêu thức, pháp bảo hoặc địa danh "
+        "được đặt lại trực tiếp trong cảnh: dịch như nhãn ngắn gọn, không biến thành câu thoại, "
+        "giữ đúng danh xưng và ưu tiên độ gọn để khớp panel; orientation/style_hint chỉ mô tả "
+        "cách trình bày, không được thêm nội dung."
     )
     if compact_recovery:
         rules += " Đây là lượt cứu lỗi: chỉ trả JSON ngắn, không giải thích và đủ đúng mọi ID."
     prompt = "\n".join(
-        (
+        part
+        for part in (
             rules,
+            _style_prompt(film_bible),
             "Không xóa, gộp, tách hoặc đổi ID. Xuống dòng bên trong text khi câu dài.",
             'Trả đúng JSON: {"translations":[{"id":1,"text":"..."}],'
             '"glossary_updates":[{"source":"...","vi":"...","kind":"name|term|place"}],'
@@ -540,6 +622,7 @@ def translation_request(
             "CONTEXT=" + json.dumps(context, ensure_ascii=False),
             "CUES=" + json.dumps(rows, ensure_ascii=False),
         )
+        if part
     )
     return TranslationRequest(
         request_id=f"translate-{chunk.index}",
@@ -556,6 +639,8 @@ def film_bible_request(
     *,
     title: str = "",
     sample_size: int = 180,
+    style_preset: str = "legacy",
+    custom_rules: str = "",
 ) -> TranslationRequest:
     if sample_size <= 0:
         raise ValueError("Film Bible sample size must be positive")
@@ -565,17 +650,31 @@ def film_bible_request(
         third = max(1, sample_size // 3)
         middle = max(0, len(cues) // 2 - third // 2)
         sample = tuple(cues[:third]) + tuple(cues[middle : middle + third]) + tuple(cues[-third:])
+    if style_preset not in _TRANSLATION_STYLE_PRESETS:
+        raise ValueError("Film Bible translation style is invalid")
+    if len(custom_rules) > 4_000:
+        raise ValueError("Film Bible custom translation rules are too long")
     rows = [{"id": cue.index, "zh": cue.text} for cue in sample]
+    style_context = FilmBible(
+        title=title,
+        style_preset=style_preset,
+        custom_rules=custom_rules,
+    )
     prompt = "\n".join(
-        (
+        part
+        for part in (
             "Phân tích mẫu thoại để tạo Film Bible cho dịch phim Trung sang tiếng Việt. "
             "Không bịa cốt truyện ngoài dữ liệu. Chỉ ghi nhân vật/thuật ngữ có bằng chứng.",
+            _style_prompt(style_context),
+            "Nếu preset là Tự nhận diện, profile phải phản ánh đúng thể loại để các bước "
+            "dịch sau áp dụng xưng hô và danh xưng phù hợp.",
             'Trả đúng JSON: {"profile":"xianxia|wuxia|palace|modern|neutral",'
             '"synopsis":"...","characters":["..."],'
             '"terms":[{"source":"...","vi":"...","kind":"name|term|place"}]}',
             "TITLE=" + title,
             "CUES=" + json.dumps(rows, ensure_ascii=False),
         )
+        if part
     )
     return TranslationRequest(
         request_id="film-bible",
@@ -587,7 +686,13 @@ def film_bible_request(
     )
 
 
-def parse_film_bible_response(raw: str, *, title: str = "") -> FilmBible:
+def parse_film_bible_response(
+    raw: str,
+    *,
+    title: str = "",
+    style_preset: str = "legacy",
+    custom_rules: str = "",
+) -> FilmBible:
     payload = parse_json_object(raw)
     profile = payload.get("profile", "neutral")
     synopsis = payload.get("synopsis", "")
@@ -621,6 +726,8 @@ def parse_film_bible_response(raw: str, *, title: str = "") -> FilmBible:
         synopsis="" if contains_cjk(synopsis) else synopsis,
         terms=tuple(parsed_terms),
         characters=tuple(value for value in characters if not contains_cjk(value)),
+        style_preset=style_preset,
+        custom_rules=custom_rules,
     )
 
 
@@ -631,7 +738,7 @@ def repair_request(
     *,
     film_bible: FilmBible,
 ) -> TranslationRequest:
-    source_by_index = {cue.index: cue.text for cue in chunk.cues}
+    source_by_index = {cue.index: cue for cue in chunk.cues}
     issue_by_index: dict[int, list[dict[str, str]]] = {}
     for issue in issues:
         issue_by_index.setdefault(issue.index, []).append(
@@ -644,8 +751,11 @@ def repair_request(
     rows = [
         {
             "id": value.index,
-            "zh": source_by_index[value.index],
+            "zh": source_by_index[value.index].text,
             "vi": value.text,
+            "role": source_by_index[value.index].role,
+            "orientation": source_by_index[value.index].orientation,
+            "style_hint": source_by_index[value.index].style_hint,
             "issues": issue_by_index.get(value.index, []),
         }
         for value in values
@@ -659,10 +769,12 @@ def repair_request(
         else ""
     )
     prompt = "\n".join(
-        (
+        part
+        for part in (
             "Sửa đúng các lỗi QA trong bản dịch. Không thêm tình tiết, không xóa/gộp/tách/đổi ID. "
             "Giữ câu đã đúng; trả đủ mọi ID kể cả cue không cần sửa."
             + timing_rule,
+            _style_prompt(film_bible),
             "Tự kiểm tra lại ngay trong cùng lượt sau khi sửa. Không chạy một vòng QA riêng.",
             'Trả đúng JSON: {"translations":[{"id":1,"text":"..."}],'
             '"glossary_updates":[{"source":"...","vi":"...","kind":"name|term|place"}],'
@@ -670,6 +782,7 @@ def repair_request(
             "FILM_BIBLE=" + json.dumps(_film_bible_payload(film_bible), ensure_ascii=False),
             "CUES=" + json.dumps(rows, ensure_ascii=False),
         )
+        if part
     )
     return TranslationRequest(
         request_id=f"repair-{chunk.index}",
@@ -687,13 +800,21 @@ def qa_request(
     *,
     film_bible: FilmBible,
 ) -> TranslationRequest:
-    source_by_index = {cue.index: cue.text for cue in chunk.cues}
+    source_by_index = {cue.index: cue for cue in chunk.cues}
     rows = [
-        {"id": value.index, "zh": source_by_index[value.index], "vi": value.text}
+        {
+            "id": value.index,
+            "zh": source_by_index[value.index].text,
+            "vi": value.text,
+            "role": source_by_index[value.index].role,
+            "orientation": source_by_index[value.index].orientation,
+            "style_hint": source_by_index[value.index].style_hint,
+        }
         for value in values
     ]
     prompt = "\n".join(
-        (
+        part
+        for part in (
             "Bạn là QA độc lập. Chỉ đánh dấu lỗi thật: sai nghĩa/ngữ cảnh, tự thêm tình tiết, "
             "mất ý, tên/thuật ngữ không nhất quán, còn chữ Hán hoặc câu Việt vô nghĩa. "
             "Không viết lại nếu câu đã tự nhiên và đúng.",
@@ -702,12 +823,14 @@ def qa_request(
             '"warning" hoặc "blocker".',
             '"suggestion" chỉ được chứa nguyên văn câu tiếng Việt thay thế hoàn chỉnh, '
             'không chứa lời giải thích/hướng dẫn; nếu chưa có câu thay thế chắc chắn thì để "".',
+            _style_prompt(film_bible),
             "ID phải là số id nguyên văn của chính cue bị lỗi trong CUES, không đánh số thứ tự "
             'issue và không dùng ID minh họa. Nếu không có lỗi, trả {"issues":[]}.',
             "ALLOWED_IDS=" + json.dumps(list(chunk.ids)),
             "FILM_BIBLE=" + json.dumps(_film_bible_payload(film_bible), ensure_ascii=False),
             "CUES=" + json.dumps(rows, ensure_ascii=False),
         )
+        if part
     )
     return TranslationRequest(
         request_id=f"qa-{chunk.index}",
@@ -803,9 +926,11 @@ def local_translation_qa(
     *,
     banned_latin_terms: Sequence[str] = (),
     long_line_chars: int = 72,
+    scene_text_ids: Iterable[int] = (),
 ) -> tuple[TranslationQaIssue, ...]:
     issues: list[TranslationQaIssue] = []
     banned = tuple(term.strip() for term in banned_latin_terms if term.strip())
+    scene_ids = frozenset(scene_text_ids)
     for value in values:
         text = value.text.strip()
         if _CJK.search(text):
@@ -828,6 +953,8 @@ def local_translation_qa(
                     )
                 )
         longest_line = max((len(line) for line in text.splitlines()), default=0)
+        if value.index in scene_ids:
+            continue
         if longest_line > long_line_chars * 2:
             issues.append(
                 TranslationQaIssue(
@@ -902,7 +1029,98 @@ def film_bible_translation_qa(
     return tuple(issues)
 
 
-def wrap_vietnamese_subtitle(text: str, *, max_chars: int = 46) -> str:
+def translation_style_qa(
+    chunk: TranslationChunk,
+    values: Sequence[TranslationValue],
+    *,
+    film_bible: FilmBible,
+) -> tuple[TranslationQaIssue, ...]:
+    """Detect high-confidence style violations without rewriting user text.
+
+    The source cue is required for alias checks, which keeps ordinary animal
+    words and insults out of the Sino-Vietnamese conversion rule.
+    """
+
+    if film_bible.resolved_style not in _ANCIENT_STYLE_PRESETS:
+        return ()
+    source_by_index = {cue.index: cue.text for cue in chunk.cues}
+    issues: list[TranslationQaIssue] = []
+    modern_pronouns = re.compile(
+        r"(?<!\w)(?:mày|tao)(?!\w)|"
+        r"(?<!\w)(?:anh|em)(?!\s+(?:trai|gái|cả|hai|ba|hùng|bé|nhỏ)(?!\w))(?!\w)",
+        re.IGNORECASE,
+    )
+    reversed_title = re.compile(
+        r"(?<!\w)(?:tỷ\s+tỷ|sư\s+tỷ|sư\s+huynh)\s+"
+        r"(?P<name>[^\W\d_]+)",
+        re.IGNORECASE,
+    )
+    aliases = (("阿狗", "A Cẩu"), ("阿猫", "A Miêu"), ("老狗", "Lão Cẩu"))
+    for value in values:
+        text = " ".join(value.text.split())
+        if modern_pronouns.search(text):
+            issues.append(
+                TranslationQaIssue(
+                    value.index,
+                    "ancient_modern_pronoun",
+                    TranslationQaSeverity.BLOCKER,
+                    "Xưng hô hiện đại chưa phù hợp với văn phong cổ trang; cần sửa theo vai vế.",
+                )
+            )
+        reversed_title_match = reversed_title.search(text)
+        if (
+            reversed_title_match is not None
+            and reversed_title_match.group("name")[:1].isupper()
+        ):
+            issues.append(
+                TranslationQaIssue(
+                    value.index,
+                    "ancient_title_order",
+                    TranslationQaSeverity.BLOCKER,
+                    "Danh xưng cổ trang đang đứng trước tên; hãy đặt tên riêng trước hậu tố, "
+                    "ví dụ Hồng Ly tỷ tỷ.",
+                )
+            )
+        source = source_by_index.get(value.index, "")
+        for chinese, vietnamese in aliases:
+            if chinese not in source or _contains_normalized_phrase(text, vietnamese):
+                continue
+            issues.append(
+                TranslationQaIssue(
+                    value.index,
+                    "ancient_alias_mismatch",
+                    TranslationQaSeverity.BLOCKER,
+                    f"Biệt danh nguồn '{chinese}' cần dùng cách gọi '{vietnamese}' trong "
+                    "ngữ cảnh cổ trang.",
+                )
+            )
+    return tuple(issues)
+
+
+def downgrade_style_qa_issues(
+    issues: Sequence[TranslationQaIssue],
+) -> tuple[TranslationQaIssue, ...]:
+    """After the single remote style repair, keep evidence without blocking."""
+
+    return tuple(
+        replace(
+            issue,
+            severity=TranslationQaSeverity.WARNING,
+            original_severity=issue.original_severity or TranslationQaSeverity.BLOCKER,
+            message=issue.message + " Đã thử sửa văn phong một lần; cần rà soát thủ công.",
+        )
+        if issue.code in STYLE_QA_CODES
+        and issue.severity is TranslationQaSeverity.BLOCKER
+        else issue
+        for issue in issues
+    )
+
+
+def wrap_vietnamese_subtitle(
+    text: str,
+    *,
+    max_chars: int = VIETNAMESE_SUBTITLE_WRAP_CHARS,
+) -> str:
     """Wrap at spaces without changing or dropping any translated word."""
     normalized = " ".join(text.replace("\r", " ").replace("\n", " ").split())
     if not normalized or len(normalized) <= max_chars:
@@ -1169,6 +1387,12 @@ def ledger_from_dict(raw: Mapping[str, object]) -> TranslationLedger:
         else str(bible_raw.get("synopsis", "")),
         tuple(terms),
         tuple(str(value) for value in raw_characters if not contains_cjk(str(value))),
+        str(bible_raw.get("translation_style", {}).get("preset", "legacy"))
+        if isinstance(bible_raw.get("translation_style"), Mapping)
+        else "legacy",
+        str(bible_raw.get("translation_style", {}).get("custom_rules", ""))
+        if isinstance(bible_raw.get("translation_style"), Mapping)
+        else "",
     )
     raw_chunks = raw.get("chunks")
     if not isinstance(raw_chunks, Sequence) or isinstance(raw_chunks, (str, bytes)):

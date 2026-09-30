@@ -119,6 +119,42 @@ def test_speed_and_trim_can_apply_to_video_only_or_linked_pair() -> None:
     assert video_only.tracks[1].clips[0].timeline_range.end_us > 30 * SECOND
 
 
+def test_move_linked_trimmed_av_to_timeline_start_preserves_source_and_duration() -> None:
+    editor = TimelineEditor(_linked_snapshot())
+    trimmed = editor.trim_head("video-1", 10 * SECOND, apply_linked=True)
+    assert trimmed.tracks[0].clips[0].timeline_range == TimeRange(10 * SECOND, 60 * SECOND)
+
+    moved = editor.move("video-1", 0, apply_linked=True)
+
+    for track in moved.tracks:
+        clip = track.clips[0]
+        assert clip.timeline_range == TimeRange(0, 50 * SECOND)
+        assert clip.source_range == TimeRange(10 * SECOND, 60 * SECOND)
+    undone = editor.undo()
+    assert undone.tracks[0].clips[0].timeline_range == TimeRange(10 * SECOND, 60 * SECOND)
+    assert editor.redo().tracks[1].clips[0].timeline_range == TimeRange(0, 50 * SECOND)
+
+
+def test_move_rejects_negative_locked_and_non_media_clips() -> None:
+    editor = TimelineEditor(_linked_snapshot())
+    with pytest.raises(TimelineEditError, match="không hợp lệ"):
+        editor.move("video-1", -1)
+
+    editor.set_track_locked("V1", True)
+    with pytest.raises(TimelineEditError, match="locked track"):
+        editor.move("video-1", 1 * SECOND)
+
+    subtitle = TimelineClip("subtitle-1", "S1", TimeRange(0, SECOND))
+    snapshot = ProjectSnapshot(
+        "subtitle-project",
+        "Subtitle",
+        1,
+        tracks=(TimelineTrack("S1", TrackKind.SUBTITLE, "Phụ đề", (subtitle,)),),
+    )
+    with pytest.raises(TimelineEditError, match="video hoặc âm thanh gốc"):
+        TimelineEditor(snapshot).move("subtitle-1", 1 * SECOND)
+
+
 def test_undo_redo_create_new_monotonic_project_revisions() -> None:
     editor = TimelineEditor(_linked_snapshot())
     edited = editor.set_volume("audio-1", 0.4)

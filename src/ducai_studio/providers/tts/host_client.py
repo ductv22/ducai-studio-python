@@ -6,6 +6,7 @@ import queue
 import subprocess
 import threading
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -14,6 +15,8 @@ from ducai_studio.external_runtime import (
     isolated_python_environment,
     isolated_python_working_directory,
 )
+from ducai_studio.infrastructure.runtime_program import runtime_program_path
+from ducai_studio.workers import preowned_launcher
 
 
 class EngineHostError(RuntimeError):
@@ -31,6 +34,7 @@ class EngineHostClient:
         engine: str,
         timeout_seconds: float = 600,
         environment: dict[str, str] | None = None,
+        process_started: Callable[[int], None] | None = None,
     ) -> None:
         self.python_executable = python_executable.expanduser().resolve()
         self.host_script = host_script.expanduser().resolve()
@@ -41,6 +45,7 @@ class EngineHostClient:
         self.engine = engine
         self.timeout_seconds = float(timeout_seconds)
         self.environment = dict(environment or {})
+        self._process_started = process_started
         self._process: subprocess.Popen[str] | None = None
         self._responses: queue.Queue[dict[str, Any] | BaseException] = queue.Queue()
         self._stderr: deque[str] = deque(maxlen=80)
@@ -51,8 +56,17 @@ class EngineHostClient:
             return
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         env = isolated_python_environment(self.environment)
-        self._process = subprocess.Popen(
-            [str(self.python_executable), str(self.host_script), self.engine],
+        self._responses = queue.Queue()
+        command = [str(self.python_executable), str(self.host_script), self.engine]
+        if self._process_started is not None:
+            env["DUCAI_WORKER_PROGRAM"] = str(self.python_executable)
+            env["DUCAI_WORKER_ARGUMENTS_JSON"] = json.dumps([str(self.host_script), self.engine])
+            command = [str(runtime_program_path()), "-m", "ducai_studio.workers.preowned_launcher"]
+            launcher_source = Path(preowned_launcher.__file__)
+            if "__compiled__" not in globals() and launcher_source.is_file():
+                command = [str(runtime_program_path()), str(launcher_source)]
+        process = subprocess.Popen(
+            command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -64,8 +78,27 @@ class EngineHostClient:
             env=env,
             cwd=isolated_python_working_directory(self.python_executable),
         )
-        threading.Thread(target=self._read_stdout, daemon=True).start()
-        threading.Thread(target=self._read_stderr, daemon=True).start()
+        self._process = process
+        if self._process_started is not None:
+            try:
+                self._process_started(process.pid)
+                assert process.stdin is not None
+                process.stdin.reconfigure(newline="\n")
+                process.stdin.write("DUCAI_LAUNCH\n")
+                process.stdin.flush()
+            except BaseException:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
+                self._process = None
+                raise
+        threading.Thread(
+            target=self._read_stdout, args=(process, self._responses), daemon=True
+        ).start()
+        threading.Thread(target=self._read_stderr, args=(process,), daemon=True).start()
 
     def request(self, action: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         with self._lock:
@@ -115,6 +148,7 @@ class EngineHostClient:
         self._process = None
         if process is None:
             return
+        self._responses.put(EOFError("TTS host was closed"))
         if process.poll() is None and not force:
             try:
                 if process.stdin is not None:
@@ -137,8 +171,7 @@ class EngineHostClient:
                 process.kill()
                 process.wait(timeout=3)
 
-    def _read_stdout(self) -> None:
-        process = self._process
+    def _read_stdout(self, process, responses) -> None:
         if process is None or process.stdout is None:
             return
         try:
@@ -148,12 +181,12 @@ class EngineHostClient:
                 raw = json.loads(line)
                 if not isinstance(raw, dict) or raw.get("protocol_version") != 1:
                     raise ValueError("Invalid TTS host response")
-                self._responses.put(raw)
+                responses.put(raw)
+            responses.put(EOFError("TTS host closed its response stream"))
         except BaseException as exc:
-            self._responses.put(exc)
+            responses.put(exc)
 
-    def _read_stderr(self) -> None:
-        process = self._process
+    def _read_stderr(self, process) -> None:
         if process is None or process.stderr is None:
             return
         for line in process.stderr:

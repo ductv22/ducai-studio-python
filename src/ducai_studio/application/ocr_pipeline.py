@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from bisect import bisect_left, bisect_right
 from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, replace
@@ -8,7 +9,14 @@ from difflib import SequenceMatcher
 from hashlib import sha256
 from typing import Any
 
-from ducai_studio.domain.project import SubtitleCue
+from ducai_studio.domain.project import (
+    SCENE_TEXT_DEFAULT_BACKGROUND_COLOR,
+    SCENE_TEXT_DEFAULT_BACKGROUND_OPACITY_PERCENT,
+    SCENE_TEXT_DEFAULT_BACKGROUND_STYLE,
+    SCENE_TEXT_DEFAULT_STYLE_HINT,
+    SCENE_TEXT_DEFAULT_TEXT_COLOR,
+    SubtitleCue,
+)
 from ducai_studio.domain.subtitles import RescueWindow, SubtitleCandidate, SubtitleEvidence
 from ducai_studio.domain.timebase import TimeRange
 
@@ -130,6 +138,9 @@ def measure_hard_sub_coverage(
     by_timestamp: dict[int, set[str]] = {}
     for item in evidence:
         if (
+            item.evidence_kind == "scene"
+            or item.band == "scene"
+            or
             item.confidence < 0.62
             or cjk_count(item.text) < 2
             or _probable_edge_overlay(item)
@@ -203,7 +214,7 @@ def consensus_candidate(
     valid = [
         item
         for item in evidence
-        if item.confidence >= minimum_frame_confidence and cjk_count(item.text) >= 2
+        if item.confidence >= minimum_frame_confidence and cjk_count(item.text) >= 1
     ]
     best_cluster: list[SubtitleEvidence] = []
     for seed in valid:
@@ -218,8 +229,20 @@ def consensus_candidate(
     frame_ids = {item.frame_id for item in best_cluster}
     if len(frame_ids) < 2:
         return None
+    shortest = min(cjk_count(item.text) for item in best_cluster)
+    if shortest == 1:
+        burst_cluster = [item for item in best_cluster if item.evidence_kind == "burst"]
+        if (
+            len({item.frame_id for item in burst_cluster}) < 2
+            or not _short_burst_geometry_stable(burst_cluster)
+        ):
+            return None
     confidence = sum(item.confidence for item in best_cluster) / len(best_cluster)
-    if confidence < minimum_consensus_confidence:
+    required_confidence = max(
+        minimum_consensus_confidence,
+        0.90 if shortest == 1 else minimum_consensus_confidence,
+    )
+    if confidence < required_confidence:
         return None
     winner = max(
         best_cluster,
@@ -236,6 +259,386 @@ def consensus_candidate(
         confidence=round(confidence, 4),
         evidence_ids=tuple(sorted(item.id for item in best_cluster)),
         source=f"{winner.provider_id}:{winner.band}",
+    )
+
+
+def _short_burst_geometry_stable(items: list[SubtitleEvidence]) -> bool:
+    boxes = [item.box for item in items if item.box is not None]
+    if len(boxes) < 2:
+        return False
+    reference = boxes[0]
+    for box in boxes[1:]:
+        left = max(reference.x, box.x)
+        top = max(reference.y, box.y)
+        right = min(reference.x + reference.width, box.x + box.width)
+        bottom = min(reference.y + reference.height, box.y + box.height)
+        intersection = max(0.0, right - left) * max(0.0, bottom - top)
+        minimum_area = min(
+            reference.width * reference.height,
+            box.width * box.height,
+        )
+        if intersection / max(1e-9, minimum_area) < 0.72:
+            return False
+    return True
+
+
+def _subtitle_geometry_agrees(
+    left: SubtitleEvidence,
+    right: SubtitleEvidence,
+) -> bool:
+    if left.box is None or right.box is None:
+        return False
+    intersection_left = max(left.box.x, right.box.x)
+    intersection_top = max(left.box.y, right.box.y)
+    intersection_right = min(
+        left.box.x + left.box.width,
+        right.box.x + right.box.width,
+    )
+    intersection_bottom = min(
+        left.box.y + left.box.height,
+        right.box.y + right.box.height,
+    )
+    intersection = max(0.0, intersection_right - intersection_left) * max(
+        0.0, intersection_bottom - intersection_top
+    )
+    smaller_area = min(
+        left.box.width * left.box.height,
+        right.box.width * right.box.height,
+    )
+    if intersection / max(1e-9, smaller_area) >= 0.55:
+        return True
+    left_center = (
+        left.box.x + left.box.width / 2,
+        left.box.y + left.box.height / 2,
+    )
+    right_center = (
+        right.box.x + right.box.width / 2,
+        right.box.y + right.box.height / 2,
+    )
+    return (
+        abs(left_center[0] - right_center[0])
+        <= max(left.box.width, right.box.width) * 0.60
+        and abs(left_center[1] - right_center[1])
+        <= max(left.box.height, right.box.height) * 0.80
+    )
+
+
+def cross_pass_consensus_candidates(
+    evidence: Iterable[SubtitleEvidence],
+    *,
+    video_duration_us: int,
+    evidence_half_interval_us: int,
+    maximum_gap_us: int = 1_000_000,
+) -> tuple[SubtitleCandidate, ...]:
+    """Recover a short dialogue seen once by each independent OCR pass.
+
+    Fast and Quality are intentionally grouped independently elsewhere.  A
+    short-lived subtitle can therefore land on one timestamp in each pass and
+    fail both two-frame gates.  This narrow bridge accepts only high-confidence
+    multi-character readings corroborated by the other pass at a nearby time
+    and the same full-frame geometry.
+    """
+
+    if video_duration_us <= 0 or evidence_half_interval_us <= 0 or maximum_gap_us <= 0:
+        raise ValueError("Cross-pass OCR timing values must be positive")
+    fast_providers = {"paddle-fast", "rapid-compatibility"}
+    quality_providers = {"paddle-quality", "rapid-quality-fallback"}
+    valid = sorted(
+        (
+            item
+            for item in evidence
+            if item.provider_id in fast_providers | quality_providers
+            and item.band in {"upper", "lower"}
+            and item.box is not None
+            and item.confidence >= 0.90
+            and cjk_count(item.text) >= 2
+            and item.evidence_kind != "scene"
+            and not _probable_edge_overlay(item)
+            and not _probable_vertical_scene_text(item)
+        ),
+        key=lambda item: (item.timestamp_us, item.id),
+    )
+    used_pairs: set[tuple[str, str]] = set()
+    candidates: list[SubtitleCandidate] = []
+    quality_rows = tuple(
+        item for item in valid if item.provider_id in quality_providers
+    )
+    quality_timestamps = tuple(item.timestamp_us for item in quality_rows)
+    for fast in (item for item in valid if item.provider_id in fast_providers):
+        window_start = bisect_left(
+            quality_timestamps,
+            fast.timestamp_us - maximum_gap_us,
+        )
+        window_end = bisect_right(
+            quality_timestamps,
+            fast.timestamp_us + maximum_gap_us,
+        )
+        matches = [
+            quality
+            for quality in quality_rows[window_start:window_end]
+            if quality.frame_id != fast.frame_id
+            and abs(quality.timestamp_us - fast.timestamp_us) <= maximum_gap_us
+            and _same_visual_reading(fast.text, quality.text)
+            and _subtitle_geometry_agrees(fast, quality)
+        ]
+        if not matches:
+            continue
+        quality = max(
+            matches,
+            key=lambda item: (
+                text_similarity(fast.text, item.text),
+                item.confidence,
+                -abs(item.timestamp_us - fast.timestamp_us),
+            ),
+        )
+        pair_key = tuple(sorted((fast.id, quality.id)))
+        if pair_key in used_pairs:
+            continue
+        used_pairs.add(pair_key)
+        rows = (fast, quality)
+        winner = max(rows, key=lambda item: (cjk_count(item.text), item.confidence))
+        start_us = max(
+            0,
+            min(item.timestamp_us for item in rows) - evidence_half_interval_us,
+        )
+        end_us = min(
+            video_duration_us,
+            max(item.timestamp_us for item in rows) + evidence_half_interval_us,
+        )
+        if end_us <= start_us:
+            continue
+        digest = sha256("|".join(pair_key).encode("utf-8")).hexdigest()[:20]
+        candidates.append(
+            SubtitleCandidate(
+                id=f"cross-pass-{digest}",
+                range=TimeRange(start_us, end_us),
+                text=winner.text.strip(),
+                confidence=round(sum(item.confidence for item in rows) / len(rows), 4),
+                evidence_ids=pair_key,
+                source="paddle-cross-pass-consensus",
+            )
+        )
+    return tuple(
+        sorted(candidates, key=lambda item: (item.range.start_us, item.range.end_us))
+    )
+
+
+def scene_text_cues_from_evidence(
+    evidence: Iterable[SubtitleEvidence],
+    *,
+    video_duration_us: int,
+    first_index: int,
+    dialogue_cues: Iterable[SubtitleCue] = (),
+) -> tuple[SubtitleCue, ...]:
+    """Build stable non-dialogue text cues from sparse full-frame evidence."""
+
+    def scene_score(item: SubtitleEvidence) -> float:
+        if item.scene_confidence > 0:
+            return float(item.scene_confidence)
+        return 0.86 if item.orientation == "vertical" else 0.55
+
+    dialogue = tuple(cue for cue in dialogue_cues if cue.is_dialogue)
+    scene = [
+        item
+        for item in evidence
+        if item.evidence_kind == "scene"
+        and item.band == "scene"
+        and item.box is not None
+        and item.confidence >= 0.55
+        and cjk_count(item.text) >= 2
+        and scene_score(item) >= 0.65
+        and not _scene_platform_badge(item)
+        and not _scene_duplicate_of_dialogue(item, dialogue)
+    ]
+    clusters: list[list[SubtitleEvidence]] = []
+    for item in sorted(scene, key=lambda row: (row.timestamp_us, row.id)):
+        match = next(
+            (
+                cluster
+                for cluster in clusters
+                if any(
+                    _scene_text_agrees(member, item)
+                    and _scene_geometry_agrees(member, item)
+                    for member in cluster
+                )
+                and item.timestamp_us - cluster[-1].timestamp_us <= 12_000_000
+            ),
+            None,
+        )
+        if match is None:
+            clusters.append([item])
+        else:
+            match.append(item)
+    cues: list[SubtitleCue] = []
+    for cluster in clusters:
+        if max(item.confidence for item in cluster) < 0.82:
+            continue
+        confidence = sum(item.confidence for item in cluster) / len(cluster)
+        visual_confidence = sum(scene_score(item) for item in cluster) / len(cluster)
+        first = cluster[0]
+        last = cluster[-1]
+        assert first.box is not None
+        winner = max(cluster, key=lambda item: (item.confidence, cjk_count(item.text)))
+        assert winner.box is not None
+        winner_has_extremely_strong_visual_evidence = bool(
+            winner.confidence >= 0.97
+            and scene_score(winner) >= 0.95
+        )
+        winner_is_safe_single_frame = bool(
+            winner_has_extremely_strong_visual_evidence
+            and not _scene_corner_overlay(winner)
+        )
+        frame_count = len({item.frame_id for item in cluster})
+        if frame_count < 2 and not winner_is_safe_single_frame:
+            continue
+        timeline_span = last.timestamp_us - first.timestamp_us
+        corner = (
+            first.box.x <= 0.12
+            or first.box.x + first.box.width >= 0.88
+        ) and (
+            first.box.y <= 0.16
+            or first.box.y + first.box.height >= 0.84
+        )
+        if corner and len({item.frame_id for item in cluster}) >= 4 and timeline_span >= max(
+            5_000_000, int(video_duration_us * 0.12)
+        ):
+            continue
+        panel = winner.panel_box or winner.box
+        digest = sha256(
+            "|".join(sorted(item.id for item in cluster)).encode("utf-8")
+        ).hexdigest()[:20]
+        start_us = max(0, first.timestamp_us - 100_000)
+        end_us = min(video_duration_us, max(start_us + 300_000, last.timestamp_us + 1_500_000))
+        cues.append(
+            SubtitleCue(
+                id=f"ocr-scene-{digest}",
+                index=first_index + len(cues),
+                range=TimeRange(start_us, end_us),
+                text=winner.text.strip(),
+                language="zh",
+                source=f"{winner.provider_id}:scene",
+                confidence=round(confidence, 4),
+                evidence_ids=tuple(sorted(item.id for item in cluster)),
+                visual_box=(
+                    winner.box.x,
+                    winner.box.y,
+                    winner.box.width,
+                    winner.box.height,
+                ),
+                visual_box_source="ocr",
+                role="scene_text",
+                orientation=winner.orientation,
+                style_hint=SCENE_TEXT_DEFAULT_STYLE_HINT,
+                panel_box=(panel.x, panel.y, panel.width, panel.height),
+                background_color=SCENE_TEXT_DEFAULT_BACKGROUND_COLOR,
+                text_color=SCENE_TEXT_DEFAULT_TEXT_COLOR,
+                background_style=SCENE_TEXT_DEFAULT_BACKGROUND_STYLE,
+                background_opacity_percent=(
+                    SCENE_TEXT_DEFAULT_BACKGROUND_OPACITY_PERCENT
+                ),
+                review_state=(
+                    "accepted"
+                    if winner_is_safe_single_frame
+                    or (frame_count >= 2 and winner_has_extremely_strong_visual_evidence)
+                    or (confidence >= 0.88 and visual_confidence >= 0.82)
+                    else "review"
+                ),
+            )
+        )
+    return tuple(cues)
+
+
+def _scene_duplicate_of_dialogue(
+    item: SubtitleEvidence,
+    dialogue_cues: tuple[SubtitleCue, ...],
+) -> bool:
+    """Discard full-frame OCR readings already owned by the S1 dialogue track.
+
+    The sparse scene scanner sees the whole frame, including the ordinary
+    hard-subtitle band.  Text and time alone are not enough because a name card
+    may deliberately repeat a spoken name.  Requiring the OCR boxes to occupy
+    the same region removes the duplicated S1 reading while preserving a real
+    label elsewhere in the picture.
+    """
+
+    if item.box is None:
+        return False
+    item_box = (item.box.x, item.box.y, item.box.width, item.box.height)
+    for cue in dialogue_cues:
+        if not cue.range.start_us - 250_000 <= item.timestamp_us <= cue.range.end_us + 250_000:
+            continue
+        if text_similarity(item.text, cue.text) < 0.72:
+            continue
+        if cue.visual_box is not None and _same_visual_region(item_box, cue.visual_box):
+            return True
+    return False
+
+
+def _same_visual_region(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> bool:
+    left_x, left_y, left_width, left_height = left
+    right_x, right_y, right_width, right_height = right
+    intersection_width = max(
+        0.0,
+        min(left_x + left_width, right_x + right_width) - max(left_x, right_x),
+    )
+    intersection_height = max(
+        0.0,
+        min(left_y + left_height, right_y + right_height) - max(left_y, right_y),
+    )
+    intersection = intersection_width * intersection_height
+    smaller_area = min(left_width * left_height, right_width * right_height)
+    return smaller_area > 0 and intersection / smaller_area >= 0.50
+
+
+def _scene_text_agrees(left: SubtitleEvidence, right: SubtitleEvidence) -> bool:
+    similarity = text_similarity(left.text, right.text)
+    if similarity >= 0.88:
+        return True
+    return similarity >= 0.64 and abs(left.timestamp_us - right.timestamp_us) <= 2_000_000
+
+
+def _scene_corner_overlay(item: SubtitleEvidence) -> bool:
+    if item.box is None:
+        return True
+    horizontal_edge = item.box.x <= 0.08 or item.box.x + item.box.width >= 0.92
+    vertical_edge = item.box.y <= 0.12 or item.box.y + item.box.height >= 0.88
+    return horizontal_edge and vertical_edge
+
+
+def _scene_platform_badge(item: SubtitleEvidence) -> bool:
+    """Reject compact platform badges even when their anchor was missed.
+
+    Paddle sometimes detects the Chinese ``独播`` companion in two frames but
+    misses the adjacent Bilibili wordmark.  Persistence therefore cannot make
+    that corner badge safe scene text.  Keep the rule deliberately narrow and
+    geometry-bound so ordinary dialogue containing the same word is preserved.
+    """
+
+    value = compact_text(item.text)
+    return bool(
+        _scene_corner_overlay(item)
+        and value in {"独播", "全网独播", "平台独播"}
+    )
+
+
+def _scene_geometry_agrees(left: SubtitleEvidence, right: SubtitleEvidence) -> bool:
+    if left.box is None or right.box is None:
+        return False
+    left_center = (
+        left.box.x + left.box.width / 2,
+        left.box.y + left.box.height / 2,
+    )
+    right_center = (
+        right.box.x + right.box.width / 2,
+        right.box.y + right.box.height / 2,
+    )
+    return (
+        abs(left_center[0] - right_center[0]) <= max(left.box.width, right.box.width) * 0.65
+        and abs(left_center[1] - right_center[1])
+        <= max(left.box.height, right.box.height) * 0.65
     )
 
 

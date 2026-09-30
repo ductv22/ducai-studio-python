@@ -17,7 +17,9 @@ from ducai_studio.domain.project import (
     TimelineClip,
     TimelineTrack,
     TrackKind,
+    TranslationPreferences,
     VoiceConformState,
+    normalize_legacy_subtitle_lanes,
 )
 from ducai_studio.domain.timebase import SpeedRatio, TimeRange
 from ducai_studio.domain.voice_conform import decode_voice_conform_plan
@@ -88,6 +90,18 @@ def _range(value: Any, name: str) -> TimeRange:
     )
 
 
+def _optional_box(value: Any, name: str) -> tuple[float, float, float, float] | None:
+    if value is None:
+        return None
+    result = tuple(
+        _number(item, name)
+        for item in _sequence(value, name)
+    )
+    if len(result) != 4:
+        raise ValueError(f"Project {name} must contain four values")
+    return result
+
+
 def _cue(value: Any) -> SubtitleCue:
     raw = _object(value, "cue")
     confidence = raw.get("confidence")
@@ -102,6 +116,57 @@ def _cue(value: Any) -> SubtitleCue:
         source=_string(raw.get("source", "manual"), "cue.source"),
         confidence=None if confidence is None else _number(confidence, "cue.confidence"),
         evidence_ids=tuple(_string(item, "cue.evidence_id") for item in evidence),
+        visual_box=_optional_box(raw.get("visual_box"), "cue.visual_box"),
+        visual_box_source=_string(
+            raw.get("visual_box_source", ""), "cue.visual_box_source"
+        ),
+        role=_string(raw.get("role", "dialogue"), "cue.role"),
+        orientation=_string(
+            raw.get("orientation", "horizontal"), "cue.orientation"
+        ),
+        style_hint=_string(raw.get("style_hint", "standard"), "cue.style_hint"),
+        panel_box=_optional_box(raw.get("panel_box"), "cue.panel_box"),
+        background_color=_string(
+            raw.get("background_color", ""), "cue.background_color"
+        ),
+        text_color=_string(raw.get("text_color", ""), "cue.text_color"),
+        review_state=_string(
+            raw.get("review_state", "accepted"), "cue.review_state"
+        ),
+        scene_font_scale=_number(
+            raw.get("scene_font_scale", 1.0), "cue.scene_font_scale"
+        ),
+        text_font_size=_integer(
+            raw.get("text_font_size", 12), "cue.text_font_size"
+        ),
+        subtitle_track_id=_string(
+            raw.get("subtitle_track_id", ""), "cue.subtitle_track_id"
+        ),
+        background_padding_x=_integer(
+            raw.get("background_padding_x", 20), "cue.background_padding_x"
+        ),
+        background_padding_y=_integer(
+            raw.get("background_padding_y", 10), "cue.background_padding_y"
+        ),
+        background_style=_string(
+            raw.get("background_style", "solid"), "cue.background_style"
+        ),
+        letter_spacing_percent=_integer(
+            raw.get("letter_spacing_percent", 0), "cue.letter_spacing_percent"
+        ),
+        font_bold=_boolean(raw.get("font_bold", False), "cue.font_bold"),
+        font_italic=_boolean(raw.get("font_italic", False), "cue.font_italic"),
+        text_opacity_percent=_integer(
+            raw.get("text_opacity_percent", 100), "cue.text_opacity_percent"
+        ),
+        background_opacity_percent=_integer(
+            raw.get("background_opacity_percent", 90),
+            "cue.background_opacity_percent",
+        ),
+        fade_enabled=_boolean(raw.get("fade_enabled", False), "cue.fade_enabled"),
+        fade_duration_ms=_integer(
+            raw.get("fade_duration_ms", 300), "cue.fade_duration_ms"
+        ),
     )
 
 
@@ -197,6 +262,14 @@ def decode_project_snapshot(value: Any) -> ProjectSnapshot:
             enabled=_boolean(item.get("enabled", True), "overlay.enabled"),
             opacity=_number(item.get("opacity", 1.0), "overlay.opacity"),
             blur_radius=_integer(item.get("blur_radius", 18), "overlay.blur_radius"),
+            tracking_mode=_string(
+                item.get("tracking_mode", "fixed"), "overlay.tracking_mode"
+            ),
+            padding_x=_number(item.get("padding_x", 0.012), "overlay.padding_x"),
+            padding_y=_number(item.get("padding_y", 0.008), "overlay.padding_y"),
+            concealment_mode=_string(
+                item.get("concealment_mode", "blur"), "overlay.concealment_mode"
+            ),
         )
         for item in (
             _object(entry, "overlay item")
@@ -220,7 +293,10 @@ def decode_project_snapshot(value: Any) -> ProjectSnapshot:
                 conform.get("parent_tts_job_id"), "voice_conform.parent_tts_job_id"
             ),
         )
-    return ProjectSnapshot(
+    preferences = _object(
+        raw.get("translation_preferences", {}), "translation_preferences"
+    )
+    snapshot = ProjectSnapshot(
         id=_string(raw.get("id"), "id"),
         name=_string(raw.get("name"), "name"),
         revision=_integer(raw.get("revision"), "revision"),
@@ -235,8 +311,32 @@ def decode_project_snapshot(value: Any) -> ProjectSnapshot:
         ),
         overlays=overlays,
         voice_conform=voice_conform,
+        translation_preferences=TranslationPreferences(
+            preset=_string(
+                preferences.get("preset", "auto"),
+                "translation_preferences.preset",
+            ),
+            custom_rules=_string(
+                preferences.get("custom_rules", ""),
+                "translation_preferences.custom_rules",
+            ),
+        ),
+        ocr_dialogue_region=_optional_box(
+            raw.get("ocr_dialogue_region"), "ocr_dialogue_region"
+        ),
+        ocr_exclusion_regions=tuple(
+            box
+            for index, item in enumerate(
+                _sequence(raw.get("ocr_exclusion_regions", []), "ocr_exclusion_regions")
+            )
+            for box in (
+                _optional_box(item, f"ocr_exclusion_regions[{index}]"),
+            )
+            if box is not None
+        ),
         schema_version=_integer(raw.get("schema_version", 1), "schema_version"),
     )
+    return normalize_legacy_subtitle_lanes(snapshot)
 
 
 class ProjectRepository:

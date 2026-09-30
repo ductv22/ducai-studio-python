@@ -26,6 +26,24 @@ for path in (*font_root.glob("*.ttf"), *font_root.glob("*.otf")):
 vietnamese = QRawFont.fromFont(QFont("Be Vietnam Pro"))
 if not all(vietnamese.supportsCharacter(ord(character)) for character in "Đạo Việt ngữ"):
     raise SystemExit("Bundled Vietnamese coverage is incomplete")
+for family in (
+    "Playwrite VN",
+    "Dancing Script",
+    "Lobster",
+    "Agbalumo",
+    "Comforter Brush",
+    "Water Brush",
+    "Splash",
+    "Hurricane",
+):
+    calligraphy = QRawFont.fromFont(QFont(family))
+    if calligraphy.familyName() != family:
+        raise SystemExit(f"Bundled calligraphy family is unavailable: {family}")
+    if not all(
+        calligraphy.supportsCharacter(ord(character))
+        for character in "Hồng Ly tỷ tỷ"
+    ):
+        raise SystemExit(f"Bundled calligraphy coverage is incomplete: {family}")
 cjk = QRawFont.fromFont(QFont("Noto Sans CJK SC"))
 if not all(cjk.supportsCharacter(ord(character)) for character in "中文字幕"):
     raise SystemExit("Bundled CJK coverage is incomplete")

@@ -45,6 +45,7 @@ from ducai_studio.providers.tts.contracts import (
     TtsProvider,
     TtsRuntimeUnavailable,
 )
+from ducai_studio.providers.tts.host_client import EngineHostError
 from ducai_studio.workers.protocol import PROTOCOL_VERSION, WorkerMessage
 
 
@@ -53,6 +54,15 @@ class WorkerStopped(RuntimeError):
 
 
 def _tts_failure_payload(exc: Exception) -> dict[str, object]:
+    if isinstance(exc, EngineHostError):
+        return {
+            "code": exc.code,
+            "message": (
+                "Bộ máy giọng nói không phản hồi hoặc phiên kết nối đã kết thúc. "
+                "Các câu đã lưu cache vẫn được giữ. Hãy bấm Tiếp tục từ cache; "
+                "nếu lỗi lặp lại, đóng tool rồi mở lại để nạp lại bộ máy."
+            ),
+        }
     if isinstance(exc, TtsRuntimeUnavailable):
         message = str(exc).strip() or "Bộ máy lồng tiếng chưa sẵn sàng."
         return {
@@ -142,9 +152,7 @@ class TtsWorker:
         self._raw_job_identity_cache: dict[Path, bool] = {}
         self._matching_prior_ledger_cache: tuple[dict[str, Any], ...] | None = None
         self._prior_raw_index: dict[str, tuple[Path, ...]] | None = None
-        self._global_cache_index: dict[
-            tuple[str, str], tuple[dict[str, Any], ...]
-        ] | None = None
+        self._global_cache_index: dict[tuple[str, str], tuple[dict[str, Any], ...]] | None = None
         self._next_start_us: dict[int, int | None] = {}
         self.ineligible: dict[str, str] = {}
         self.ledger: dict[str, Any] = {}
@@ -184,16 +192,24 @@ class TtsWorker:
         self.acknowledgements[command_id] = message
 
     def _read_commands(self) -> None:
+        pending = bytearray()
         while True:
-            line = sys.stdin.buffer.readline()
-            if not line:
+            # The manager keeps stdin open after success until the worker exits.
+            # A daemon blocked in BufferedReader.readline holds its lock during
+            # interpreter finalization and can abort a healthy frozen worker.
+            chunk = os.read(sys.stdin.fileno(), 65_536)
+            if not chunk:
                 return
-            try:
-                message = WorkerMessage.from_json_line(line)
-            except Exception:
-                continue
-            if message.job_id == self.job_id:
-                self.commands.put(message)
+            pending.extend(chunk)
+            while b"\n" in pending:
+                line, _, remainder = pending.partition(b"\n")
+                pending = bytearray(remainder)
+                try:
+                    message = WorkerMessage.from_json_line(line)
+                except Exception:
+                    continue
+                if message.job_id == self.job_id:
+                    self.commands.put(message)
 
     def run(self) -> int:
         self._reader.start()
@@ -234,9 +250,8 @@ class TtsWorker:
         if not isinstance(raw_cues, list) or not raw_cues:
             raise ValueError("tts_cues_missing")
         raw_force_cue_ids = config.get("force_cue_ids", [])
-        if (
-            not isinstance(raw_force_cue_ids, list)
-            or not all(isinstance(value, str) and value.strip() for value in raw_force_cue_ids)
+        if not isinstance(raw_force_cue_ids, list) or not all(
+            isinstance(value, str) and value.strip() for value in raw_force_cue_ids
         ):
             raise ValueError("tts_force_cue_ids_invalid")
         self.force_cue_ids = frozenset(value.strip() for value in raw_force_cue_ids)
@@ -271,7 +286,7 @@ class TtsWorker:
         voice_identity = str(config.get("voice_identity", ""))
         synthesis_speed = (
             1.0
-            if str(spec.get("provider_id", "")) == "vieneu-3.3"
+            if str(spec.get("provider_id", "")) == "vieneu-3.8"
             else float(config.get("engine_speed", 1.0))
         )
         prepared: list[TtsCueRequest] = []
@@ -443,9 +458,7 @@ class TtsWorker:
         for raw in raw_cues:
             if not isinstance(raw, dict):
                 raise ValueError("voice_conform_cue_invalid")
-            base_path = Path(str(raw.get("base_wav_path", ""))).expanduser().resolve(
-                strict=True
-            )
+            base_path = Path(str(raw.get("base_wav_path", ""))).expanduser().resolve(strict=True)
             base_sha256 = str(raw.get("base_wav_sha256", ""))
             if not base_sha256 or file_sha256(base_path) != base_sha256:
                 raise ValueError("voice_conform_base_cache_mismatch")
@@ -500,26 +513,17 @@ class TtsWorker:
         data_root = Path(str(self.config["data_root"]))
         managed_host = os.environ.get("DUCAI_TTS_ENGINE_HOST_MANAGED", "") == "1"
         runtime_host = (
-            os.environ.get("DUCAI_TTS_ENGINE_HOST_PATH", "").strip()
-            if managed_host
-            else ""
+            os.environ.get("DUCAI_TTS_ENGINE_HOST_PATH", "").strip() if managed_host else ""
         )
-        host_script = Path(
-            runtime_host or str(self.config["engine_host_path"])
-        ).expanduser().resolve()
+        host_script = (
+            Path(runtime_host or str(self.config["engine_host_path"])).expanduser().resolve()
+        )
         runtime_host_hash = (
-            os.environ.get("DUCAI_TTS_ENGINE_HOST_SHA256", "").strip()
-            if managed_host
-            else ""
+            os.environ.get("DUCAI_TTS_ENGINE_HOST_SHA256", "").strip() if managed_host else ""
         )
         if not host_script.is_file():
-            raise TtsRuntimeUnavailable(
-                f"Không tìm thấy bộ điều phối TTS tại: {host_script}"
-            )
-        if (
-            runtime_host_hash
-            and sha256(host_script.read_bytes()).hexdigest() != runtime_host_hash
-        ):
+            raise TtsRuntimeUnavailable(f"Không tìm thấy bộ điều phối TTS tại: {host_script}")
+        if runtime_host_hash and sha256(host_script.read_bytes()).hexdigest() != runtime_host_hash:
             raise TtsRuntimeUnavailable(
                 "Bộ điều phối TTS của bản DUCAI hiện tại không khớp manifest runtime."
             )
@@ -530,11 +534,12 @@ class TtsWorker:
                 host_script=host_script,
                 timeout_seconds=float(self.config.get("provider_timeout_seconds", 300)),
             )
-        if provider_id == "vieneu-3.3":
+        if provider_id == "vieneu-3.8":
+            profile_path = str(self.config.get("profile_path", "")).strip()
             return VieNeuTtsProvider(
                 runtime_python=runtime_python,
                 data_root=data_root,
-                profile_path=Path(str(self.config["profile_path"])),
+                profile_path=Path(profile_path) if profile_path else None,
                 reference_audio_path=(
                     Path(str(self.config["reference_audio_path"]))
                     if self.config.get("reference_audio_path")
@@ -543,9 +548,15 @@ class TtsWorker:
                 reference_denoise=self.config.get("reference_denoise") is True,
                 host_script=host_script,
                 timeout_seconds=float(self.config.get("provider_timeout_seconds", 1_800)),
-                batch_size=int(self.config.get("batch_size", 64)),
+                batch_size=int(self.config.get("batch_size", 32)),
+                progress_callback=self._provider_progress,
             )
         raise ValueError("tts_provider_not_supported")
+
+    def _provider_progress(self, phase: str, detail: str) -> None:
+        self._phase = phase
+        self._phase_detail = detail
+        self._send_progress()
 
     def _restore_checkpoint(
         self,
@@ -561,10 +572,10 @@ class TtsWorker:
             return None
         source = Path(str(artifact["uri"])).expanduser().resolve(strict=True)
         raw = json.loads(source.read_text(encoding="utf-8-sig"))
-        if (
-            not isinstance(raw, dict)
-            or raw.get("signature") not in {signature, *compatible_signatures}
-        ):
+        if not isinstance(raw, dict) or raw.get("signature") not in {
+            signature,
+            *compatible_signatures,
+        }:
             raise ValueError("tts_checkpoint_signature_mismatch")
         entries = raw.get("entries")
         if not isinstance(entries, dict):
@@ -597,6 +608,7 @@ class TtsWorker:
         reused_processed = 0
         reused_raw = 0
         cache_started = time.monotonic()
+        cache_progress_at = cache_started
         self._send_stage_progress(
             "cache_restore",
             phase_current=0,
@@ -612,9 +624,7 @@ class TtsWorker:
         )
         for checked, cue in enumerate(self.cues, 1):
             self._control_point()
-            self._phase_detail = (
-                f"Đang đối chiếu cache cue {cue.index}/{len(self.cues)}"
-            )
+            self._phase_detail = f"Đang đối chiếu cache cue {cue.index}/{len(self.cues)}"
             if cue.cue_id in entries:
                 pass
             elif cue.cue_id in self.force_cue_ids:
@@ -635,10 +645,10 @@ class TtsWorker:
                         missing.append(cue)
                 else:
                     missing.append(cue)
-            if checked == len(self.cues) or checked % 16 == 0:
-                phase_elapsed_ms = max(
-                    1, int((time.monotonic() - cache_started) * 1_000)
-                )
+            now = time.monotonic()
+            if checked == len(self.cues) or now - cache_progress_at >= 1.0:
+                cache_progress_at = now
+                phase_elapsed_ms = max(1, int((time.monotonic() - cache_started) * 1_000))
                 rate = checked / (phase_elapsed_ms / 1_000)
                 remaining = max(0, len(self.cues) - checked)
                 cache_eta_ms = int(remaining / rate * 1_000) if rate > 0 else None
@@ -665,14 +675,12 @@ class TtsWorker:
         )
         self._synthesis_started = time.monotonic()
         self._synthesis_baseline_terminal = terminal
-        self._phase_detail = (
-            f"Đã dò cache; còn {len(missing)} cue cần tổng hợp"
-        )
-        provider_limit = 64 if str(self.spec.get("provider_id", "")) == "vieneu-3.3" else 32
+        self._phase_detail = f"Đã dò cache; còn {len(missing)} cue cần tổng hợp"
+        provider_limit = 32
         batch_size = max(1, min(provider_limit, int(self.config.get("batch_size", 16))))
         provider_speed = (
             1.0
-            if str(self.spec.get("provider_id", "")) == "vieneu-3.3"
+            if str(self.spec.get("provider_id", "")) == "vieneu-3.8"
             else float(self.config.get("engine_speed", 1.0))
         )
         for offset in range(0, len(missing), batch_size):
@@ -681,7 +689,7 @@ class TtsWorker:
             self._phase = "synthesis"
             provider_label = (
                 "VieNeu ở 1,00×"
-                if str(self.spec.get("provider_id", "")) == "vieneu-3.3"
+                if str(self.spec.get("provider_id", "")) == "vieneu-3.8"
                 else f"Piper ở {provider_speed:.2f}×"
             )
             self._phase_detail = (
@@ -742,9 +750,11 @@ class TtsWorker:
         if plan is None:
             raise ValueError("voice_conform_plan_missing")
         self._job_started = time.monotonic()
-        qa_path = Path(
-            str(self.config.get("staging_qa_path", self.config["qa_path"]))
-        ).expanduser().resolve()
+        qa_path = (
+            Path(str(self.config.get("staging_qa_path", self.config["qa_path"])))
+            .expanduser()
+            .resolve()
+        )
         if not plan.applicable:
             issues = [
                 {
@@ -787,9 +797,7 @@ class TtsWorker:
         if not isinstance(raw_base_entries, list):
             raise ValueError("voice_conform_base_entries_invalid")
         base_by_id = {
-            str(item.get("cue_id", "")): item
-            for item in raw_base_entries
-            if isinstance(item, dict)
+            str(item.get("cue_id", "")): item for item in raw_base_entries if isinstance(item, dict)
         }
         entries = self.ledger.setdefault("entries", {})
         if not isinstance(entries, dict):
@@ -969,9 +977,11 @@ class TtsWorker:
         )
         if int(mix["overlap_count"]) > 0:
             raise ValueError("voice_conform_timeline_overlap_guard_failed")
-        output_path = Path(
-            str(self.config.get("staging_output_path", self.config["output_path"]))
-        ).expanduser().resolve()
+        output_path = (
+            Path(str(self.config.get("staging_output_path", self.config["output_path"])))
+            .expanduser()
+            .resolve()
+        )
         self._phase = "conform_final_master"
         self._phase_detail = "Đang chuẩn hóa loudness D1 đã đồng bộ"
 
@@ -1079,9 +1089,7 @@ class TtsWorker:
         base_sha256 = file_sha256(base_path)
         base_cache_path = cache_root / f"{cue.request_fingerprint}.base.wav"
         if not base_cache_path.is_file() or file_sha256(base_cache_path) != base_sha256:
-            temp_base = base_cache_path.with_name(
-                base_cache_path.name + f".{uuid4().hex}.tmp"
-            )
+            temp_base = base_cache_path.with_name(base_cache_path.name + f".{uuid4().hex}.tmp")
             shutil.copyfile(base_path, temp_base)
             os.replace(temp_base, base_cache_path)
         base_sha256 = file_sha256(base_cache_path)
@@ -1150,9 +1158,7 @@ class TtsWorker:
                 if self._phase == "cue_timing_fit"
                 else f"Đang tạo WAV tốc độ gốc {self.settings.voice_read_speed:.2f}×"
             )
-            temp_variant = cache_path.with_name(
-                cache_path.name + f".{uuid4().hex}.tmp.wav"
-            )
+            temp_variant = cache_path.with_name(cache_path.name + f".{uuid4().hex}.tmp.wav")
             if processor is None:
                 shutil.copyfile(base_cache_path, temp_variant)
             else:
@@ -1278,9 +1284,7 @@ class TtsWorker:
                 if raw is None:
                     continue
                 base_path_raw = raw.get("base_cache_path", raw.get("cache_path"))
-                base_sha256 = str(
-                    raw.get("base_cache_sha256", raw.get("cache_sha256", ""))
-                )
+                base_sha256 = str(raw.get("base_cache_sha256", raw.get("cache_sha256", "")))
                 base_qa_raw = raw.get("base_qa", raw.get("qa"))
                 if not isinstance(base_path_raw, str) or not isinstance(base_qa_raw, dict):
                     continue
@@ -1346,9 +1350,7 @@ class TtsWorker:
             fingerprint = raw.get("request_fingerprint")
             if isinstance(cue_id, str) and cue_id and isinstance(fingerprint, str) and fingerprint:
                 collected.setdefault((cue_id, fingerprint), []).append(raw)
-        self._global_cache_index = {
-            key: tuple(values) for key, values in collected.items()
-        }
+        self._global_cache_index = {key: tuple(values) for key, values in collected.items()}
         return self._global_cache_index
 
     def _read_global_cache_metadata(
@@ -1423,17 +1425,12 @@ class TtsWorker:
             key=lambda candidate: candidate.stat().st_mtime_ns if candidate.is_file() else 0,
             reverse=True,
         ):
-            if (
-                not path.is_file()
-                or not path.is_relative_to(self.staging_root)
-            ):
+            if not path.is_file() or not path.is_relative_to(self.staging_root):
                 continue
             try:
                 with wave.open(str(path), "rb") as stream:
                     sample_rate = stream.getframerate()
-                    duration_us = int(
-                        round(stream.getnframes() * 1_000_000 / sample_rate)
-                    )
+                    duration_us = int(round(stream.getnframes() * 1_000_000 / sample_rate))
             except (OSError, EOFError, wave.Error, ZeroDivisionError):
                 continue
             return TtsCueArtifact(
@@ -1565,10 +1562,7 @@ class TtsWorker:
                 raw = json.loads(ledger_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
-            if (
-                isinstance(raw, dict)
-                and raw.get("signature") in self._allowed_prior_raw_signatures
-            ):
+            if isinstance(raw, dict) and raw.get("signature") in self._allowed_prior_raw_signatures:
                 ledgers.append(raw)
         self._matching_prior_ledger_cache = tuple(ledgers)
         return self._matching_prior_ledger_cache
@@ -1630,14 +1624,10 @@ class TtsWorker:
             if isinstance(entry, dict)
         ]
         adjusted_cue_count = sum(
-            speed > self.settings.voice_read_speed + 1e-9
-            for speed in applied_total_speeds
+            speed > self.settings.voice_read_speed + 1e-9 for speed in applied_total_speeds
         )
         maximum_additional_factor = max(
-            (
-                speed / self.settings.voice_read_speed
-                for speed in applied_total_speeds
-            ),
+            (speed / self.settings.voice_read_speed for speed in applied_total_speeds),
             default=1.0,
         )
         coverage.update(
@@ -1660,9 +1650,11 @@ class TtsWorker:
         coverage["timing_issue_count"] = len(timing_issues)
         coverage["timing_warning_count"] = len(timing_issues)
         coverage["timing_issues"] = timing_issues
-        qa_path = Path(
-            str(self.config.get("staging_qa_path", self.config["qa_path"]))
-        ).expanduser().resolve()
+        qa_path = (
+            Path(str(self.config.get("staging_qa_path", self.config["qa_path"])))
+            .expanduser()
+            .resolve()
+        )
         if blockers or len(entries) != len(self.cues):
             coverage["status"] = "REVIEW"
             atomic_write_json(qa_path, coverage)
@@ -1697,13 +1689,10 @@ class TtsWorker:
         # override only enabled duration growth, leaving this guard to reject
         # the otherwise valid cached WAVs.  Treat the explicit overflow
         # option as opting into the same serialized timeline policy.
-        defer_timing = (
-            self.config.get("purpose") == "production"
-            and (
-                self.config.get("defer_timing_conform") is True
-                or self.config.get("allow_timeline_overflow") is True
-                or self.qa_non_blocking
-            )
+        defer_timing = self.config.get("purpose") == "production" and (
+            self.config.get("defer_timing_conform") is True
+            or self.config.get("allow_timeline_overflow") is True
+            or self.qa_non_blocking
         )
         for cue in self.cues:
             entry = entries[cue.cue_id]
@@ -1848,9 +1837,7 @@ class TtsWorker:
             if current != total and current - last_assembly_report < 64:
                 return
             last_assembly_report = current
-            phase_elapsed_ms = max(
-                1, int((time.monotonic() - assembly_started) * 1_000)
-            )
+            phase_elapsed_ms = max(1, int((time.monotonic() - assembly_started) * 1_000))
             rate = current / (phase_elapsed_ms / 1_000)
             remaining = max(0, total - current)
             eta_ms = int(remaining / rate * 1_000) if rate > 0 else None
@@ -1860,9 +1847,12 @@ class TtsWorker:
                 phase_total=total,
                 eta_ms=eta_ms,
             )
-        output_path = Path(
-            str(self.config.get("staging_output_path", self.config["output_path"]))
-        ).expanduser().resolve()
+
+        output_path = (
+            Path(str(self.config.get("staging_output_path", self.config["output_path"])))
+            .expanduser()
+            .resolve()
+        )
         target_lufs = float(self.config.get("target_lufs", -18.0))
         audio_processor = self.audio_processor_factory()
 
@@ -1887,9 +1877,7 @@ class TtsWorker:
                 eta_ms=eta_ms,
             )
 
-        open_stream_measure = getattr(
-            audio_processor, "open_pcm16_ebu_r128_measure", None
-        )
+        open_stream_measure = getattr(audio_processor, "open_pcm16_ebu_r128_measure", None)
         apply_master = getattr(audio_processor, "apply_ebu_r128", None)
         if callable(open_stream_measure) and callable(apply_master):
             self._phase_detail = "Đang ghép timeline và đo EBU R128 đồng thời"
@@ -1986,9 +1974,7 @@ class TtsWorker:
                 "voice_read_speed": self.settings.voice_read_speed,
                 "cue_max_total_speed": self.settings.max_absolute_speed,
                 "adjusted_cue_count": adjusted_cue_count,
-                "maximum_total_speed_applied": coverage[
-                    "maximum_total_speed_applied"
-                ],
+                "maximum_total_speed_applied": coverage["maximum_total_speed_applied"],
                 "maximum_additional_factor": maximum_additional_factor,
                 "unresolved_timing_cue_count": len(timing_issues),
                 "timing_warning_count": len(timing_issues),
@@ -2044,9 +2030,7 @@ class TtsWorker:
         blockers = self.ledger.get("blockers", {})
         terminal = completed + (len(blockers) if isinstance(blockers, dict) else 0)
         elapsed_ms = max(1, int((time.monotonic() - self._job_started) * 1_000))
-        synthesis_elapsed_ms = max(
-            1, int((time.monotonic() - self._synthesis_started) * 1_000)
-        )
+        synthesis_elapsed_ms = max(1, int((time.monotonic() - self._synthesis_started) * 1_000))
         synthesis_terminal = max(0, terminal - self._synthesis_baseline_terminal)
         rate = synthesis_terminal / (synthesis_elapsed_ms / 1_000)
         remaining = max(0, len(self.cues) - terminal)
@@ -2061,9 +2045,7 @@ class TtsWorker:
                 "elapsed_ms": elapsed_ms,
                 "eta_ms": eta_ms,
                 "phase_current": synthesis_terminal,
-                "phase_total": max(
-                    0, len(self.cues) - self._synthesis_baseline_terminal
-                ),
+                "phase_total": max(0, len(self.cues) - self._synthesis_baseline_terminal),
                 "ineligible_cues": len(self.ineligible),
                 "blocked_cues": len(self.ledger.get("blockers", {})),
             },
@@ -2091,9 +2073,7 @@ class TtsWorker:
                 "phase_detail": str((extra or {}).get("phase_detail", self._phase_detail)),
                 "current": terminal,
                 "total": len(self.cues),
-                "elapsed_ms": max(
-                    1, int((time.monotonic() - self._job_started) * 1_000)
-                ),
+                "elapsed_ms": max(1, int((time.monotonic() - self._job_started) * 1_000)),
                 "eta_ms": eta_ms,
                 "phase_current": phase_current,
                 "phase_total": phase_total,

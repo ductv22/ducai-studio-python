@@ -5,6 +5,7 @@ import subprocess
 import sys
 import time
 import zlib
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -14,7 +15,17 @@ from PySide6.QtCore import QCoreApplication, QTimer
 from PySide6.QtNetwork import QLocalSocket
 
 from ducai_studio.domain.jobs import JobKind, JobSpec, JobState
-from ducai_studio.domain.project import MediaAsset, MediaKind, ProjectSnapshot, SubtitleCue
+from ducai_studio.domain.project import (
+    MediaAsset,
+    MediaKind,
+    Overlay,
+    OverlayKind,
+    ProjectSnapshot,
+    SubtitleCue,
+    TimelineClip,
+    TimelineTrack,
+    TrackKind,
+)
 from ducai_studio.domain.timebase import TimeRange
 from ducai_studio.infrastructure.checkpoint_repository import CheckpointRepository
 from ducai_studio.infrastructure.database import Database
@@ -40,6 +51,221 @@ class StaticMediaProbe:
         return MediaProbeResult(5_000_000, True, True, 1280, 720, "mp4")
 
 
+def test_ocr_regions_replace_repeat_proven_watermark_masks_without_touching_manual_blur(
+) -> None:
+    manual = Overlay(
+        "manual-blur",
+        OverlayKind.BLUR,
+        TimeRange(0, 5_000_000),
+        0.1,
+        0.8,
+        0.8,
+        0.1,
+    )
+    old_generated = Overlay(
+        "overlay-ocr-watermark-1",
+        OverlayKind.BLUR,
+        TimeRange(0, 5_000_000),
+        0.01,
+        0.1,
+        0.2,
+        0.08,
+        tracking_mode="ocr_watermark",
+        concealment_mode="cover",
+    )
+    manual_with_reserved_prefix = Overlay(
+        "overlay-ocr-watermark-user",
+        OverlayKind.BLUR,
+        TimeRange(0, 5_000_000),
+        0.2,
+        0.2,
+        0.2,
+        0.08,
+        tracking_mode="fixed",
+    )
+    project = ProjectSnapshot(
+        "ocr-mask-project",
+        "OCR mask project",
+        1,
+        source_cues=(
+            SubtitleCue("cue-1", 1, TimeRange(0, 1_000_000), "第一句", "zh"),
+        ),
+        overlays=(manual, manual_with_reserved_prefix, old_generated),
+    )
+
+    legacy = service_module._apply_ocr_cue_regions(project, {"cue_regions": []})
+    assert legacy.overlays == project.overlays
+
+    updated = service_module._apply_ocr_cue_regions(
+        project,
+        {
+            "cue_regions": [],
+            "watermark_regions": [
+                {
+                    "start_us": 0,
+                    "end_us": 5_000_000,
+                    "box": [0.72, 0.08, 0.26, 0.09],
+                    "sample_count": 3,
+                    "source": "ocr_bilibili_anchor",
+                }
+            ],
+        },
+    )
+
+    assert updated.overlays[0] == manual
+    assert updated.overlays[1] == manual_with_reserved_prefix
+    assert len(updated.overlays) == 3
+    generated = updated.overlays[2]
+    assert generated.id == "overlay-ocr-watermark-1"
+    assert generated.tracking_mode == "ocr_watermark"
+    assert generated.concealment_mode == "cover"
+    assert generated.blur_radius == 46
+    assert (generated.x, generated.y, generated.width, generated.height) == (
+        0.72,
+        0.08,
+        0.26,
+        0.09,
+    )
+
+    cleared = service_module._apply_ocr_cue_regions(
+        updated,
+        {"cue_regions": [], "watermark_regions": []},
+    )
+    assert cleared.overlays == (manual, manual_with_reserved_prefix)
+
+
+def test_ocr_regions_reject_unproven_watermark_masks() -> None:
+    project = ProjectSnapshot("ocr-mask-proof", "OCR proof", 1)
+
+    for row in (
+        {
+            "start_us": 0,
+            "end_us": 5_000_000,
+            "box": [0.72, 0.08, 0.26, 0.09],
+            "sample_count": 1,
+            "source": "ocr_bilibili_anchor",
+        },
+        {
+            "start_us": 0,
+            "end_us": 5_000_000,
+            "box": [0.72, 0.08, 0.26, 0.09],
+            "sample_count": 2,
+            "source": "ocr_bilibili_anchor",
+        },
+        {
+            "start_us": 0,
+            "end_us": 5_000_000,
+            "box": [0.72, 0.08, 0.26, 0.09],
+            "sample_count": 3,
+            "source": "untrusted",
+        },
+    ):
+        updated = service_module._apply_ocr_cue_regions(
+            project,
+            {"cue_regions": [], "watermark_regions": [row]},
+        )
+        assert updated.overlays == ()
+
+
+def test_effect_command_returns_only_compact_overlay_patch(tmp_path: Path) -> None:
+    service = JobManagerService(
+        database_path=tmp_path / "state.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+    overlay = Overlay(
+        "overlay-default-blur",
+        OverlayKind.BLUR,
+        TimeRange(0, 5_000_000),
+        0.05,
+        0.8,
+        0.9,
+        0.15,
+        blur_radius=22,
+    )
+    snapshot = ProjectSnapshot(
+        "project-effect-patch",
+        "Effect patch",
+        1,
+        source_cues=(
+            SubtitleCue("cue-1", 1, TimeRange(0, 1_000_000), "第一句", "zh"),
+        ),
+        overlays=(overlay,),
+    )
+    service.projects.save(project_path=tmp_path / "effect.ducai", snapshot=snapshot)
+
+    result = service.effect_command(
+        project_id=snapshot.id,
+        command="update",
+        overlay_id=overlay.id,
+        values={"blur_radius": 31, "concealment_mode": "cover"},
+    )
+
+    assert result == {
+        "_effect_patch": True,
+        "id": snapshot.id,
+        "revision": 2,
+        "overlay_upserts": [
+            {
+                "id": overlay.id,
+                "kind": "blur",
+                "range": {"start_us": 0, "end_us": 5_000_000},
+                "x": 0.05,
+                "y": 0.8,
+                "width": 0.9,
+                "height": 0.15,
+                "asset_id": None,
+                "enabled": True,
+                "opacity": 1.0,
+                "blur_radius": 31,
+                "tracking_mode": "fixed",
+                "padding_x": 0.012,
+                "padding_y": 0.008,
+                "concealment_mode": "cover",
+            }
+        ],
+        "removed_overlay_ids": [],
+        "media_upserts": [],
+        "removed_media_ids": [],
+    }
+    assert "source_cues" not in result
+    assert "tracks" not in result
+
+
+def test_progress_event_never_decodes_full_job_and_multi_broadcasts_once(tmp_path, monkeypatch):
+    _application = QCoreApplication.instance() or QCoreApplication([])
+    service = JobManagerService(database_path=tmp_path / "state.db",
+                                artifact_root=tmp_path / "artifacts")
+    created = service.create_job({
+        "kind": "tts", "project_id": "project", "input_revision": 1,
+        "provider_id": "vieneu-3.8", "provider_version": "3.8.1",
+        "model_id": "v3turbo", "input_fingerprint": "fixture",
+        "settings_fingerprint": "fixture", "provider_config": {},
+    })
+    job_id = str(created["id"])
+    server = JobManagerServer(name=f"progress-{uuid4()}", service=service)
+    try:
+        def forbidden(*args, **kwargs):
+            pytest.fail("progress must not decode full job configuration")
+
+        monkeypatch.setattr(service.jobs, "get", forbidden)
+        server._worker_event(job_id, WorkerMessage(1, job_id, "manual", "progress", {
+            "current": 32, "total": 8587, "phase": "synthesis",
+        }))
+        assert service.jobs.list_events(job_id)[-1].kind == "progress"
+        calls = []
+        monkeypatch.setattr(
+            server.multi, "on_worker_event", lambda *args: calls.append(args) or True
+        )
+        monkeypatch.setattr(server.multi, "_publish_status", forbidden)
+        server._worker_event(job_id, WorkerMessage(1, job_id, "multi", "progress", {
+            "current": 64, "total": 8587, "phase": "synthesis",
+        }))
+        assert len(calls) == 1
+        assert service.jobs.list_events(job_id)[-1].payload["current"] == 64
+    finally:
+        server.close()
+
+
 def test_export_subtitle_srt_uses_latest_snapshot_and_does_not_mutate_project(
     tmp_path: Path,
 ) -> None:
@@ -62,12 +288,23 @@ def test_export_subtitle_srt_uses_latest_snapshot_and_does_not_mutate_project(
         "vi",
         revision=2,
     )
+    scene_source = SubtitleCue(
+        "scene-2",
+        8,
+        TimeRange(2_000_000, 3_000_000),
+        "海王兽",
+        "zh",
+        role="scene_text",
+        orientation="vertical",
+        style_hint="calligraphy",
+    )
+    scene_translated = replace(scene_source, text="Hải Vương Thú", language="vi")
     snapshot = ProjectSnapshot(
         "project-srt-export",
         "SRT export",
         4,
-        source_cues=(source,),
-        translated_cues=(translated,),
+        source_cues=(source, scene_source),
+        translated_cues=(translated, scene_translated),
     )
     project_path = tmp_path / "project.ducai"
     service.projects.save(project_path=project_path, snapshot=snapshot)
@@ -182,14 +419,16 @@ def test_start_tts_job_rebases_packaged_release_host_without_changing_checkpoint
             JobKind.TTS,
             "project",
             1,
-            "vieneu-3.3",
-            "3.3.0",
+            "vieneu-3.8",
+            "3.8.1",
             "v3turbo",
             "tts-source",
             "tts-settings",
             {
                 "engine_host_path": str(old_host),
                 "engine_host_sha256": "old-release-host",
+                "runtime_python": sys.executable,
+                "data_root": str(tmp_path),
             },
         )
     )
@@ -229,6 +468,9 @@ def test_start_tts_job_rebases_packaged_release_host_without_changing_checkpoint
         runtime_host.read_bytes()
     ).hexdigest()
     assert environment["DUCAI_TTS_ENGINE_HOST_MANAGED"] == "1"
+    assert environment["DUCAI_TTS_WARM_PROTOCOL"] == "1"
+    assert environment["DUCAI_TTS_WARM_ENDPOINT"].startswith("127.0.0.1:")
+    assert len(environment["DUCAI_TTS_WARM_TOKEN"]) >= 32
     preserved = service.load_worker_checkpoint(
         job.id, stage_key="tts", checkpoint_key="latest"
     )
@@ -260,8 +502,8 @@ def test_start_tts_job_keeps_custom_engine_host(
             JobKind.TTS,
             "project",
             1,
-            "vieneu-3.3",
-            "3.3.0",
+            "vieneu-3.8",
+            "3.8.1",
             "v3turbo",
             "tts-source",
             "tts-settings",
@@ -295,7 +537,85 @@ def test_start_tts_job_keeps_custom_engine_host(
     assert "DUCAI_TTS_ENGINE_HOST_PATH" not in environment
     assert "DUCAI_TTS_ENGINE_HOST_SHA256" not in environment
     assert environment["DUCAI_TTS_ENGINE_HOST_MANAGED"] == "0"
+    assert environment["DUCAI_TTS_WARM_PROTOCOL"] == ""
+    assert environment["DUCAI_TTS_WARM_TOKEN"] == ""
     assert service.jobs.get(job.id).spec.provider_config["engine_host_path"] == str(custom_host)
+
+
+def test_start_tts_job_rejects_legacy_vieneu_checkpoint(tmp_path: Path) -> None:
+    application = QCoreApplication.instance() or QCoreApplication([])
+    assert application is not None
+    service = JobManagerService(
+        database_path=tmp_path / "state.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+    job = service.jobs.create(
+        JobSpec(
+            JobKind.TTS,
+            "project",
+            1,
+            "vieneu-3.3",
+            "3.3.0",
+            "v3turbo",
+            "tts-source",
+            "tts-settings",
+            {},
+        )
+    )
+    server = JobManagerServer(name=f"unused-legacy-vieneu-{uuid4()}", service=service)
+    try:
+        with pytest.raises(ValueError, match="không thể tiếp tục bằng engine 3.8.1"):
+            server._start_job(
+                {
+                    "job_id": job.id,
+                    "program": sys.executable,
+                    "arguments": ["-m", "ducai_studio.workers.tts_worker", job.id],
+                }
+            )
+    finally:
+        server.close()
+
+
+def test_retry_tts_job_rejects_legacy_vieneu_without_mutating_state(
+    tmp_path: Path,
+) -> None:
+    application = QCoreApplication.instance() or QCoreApplication([])
+    assert application is not None
+    service = JobManagerService(
+        database_path=tmp_path / "state.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+    job = service.jobs.create(
+        JobSpec(
+            JobKind.TTS,
+            "project",
+            1,
+            "vieneu-3.3",
+            "3.3.0",
+            "v3turbo",
+            "tts-source",
+            "tts-settings",
+            {},
+        )
+    )
+    service.transition_job(job.id, JobState.START_REQUESTED.value)
+    service.jobs.append_worker_event(
+        event_id=str(uuid4()),
+        job_id=job.id,
+        kind="fixture_failed",
+        payload={"message": "fixture"},
+        transitions={JobState.START_REQUESTED: JobState.FAILED},
+        error_code="fixture",
+        error_payload={"message": "fixture"},
+    )
+    server = JobManagerServer(name=f"unused-legacy-vieneu-retry-{uuid4()}", service=service)
+    try:
+        with pytest.raises(ValueError, match="không thể tiếp tục bằng engine 3.8.1"):
+            server._retry_job(job.id)
+    finally:
+        server.close()
+
+    assert service.jobs.get(job.id).state is JobState.FAILED
 
 
 def test_output_promotion_uses_active_volume_temp_and_rolls_back_cross_volume(
@@ -1548,8 +1868,8 @@ def test_start_retry_waits_for_slow_live_worker_without_sending_stop(
             "kind": "tts",
             "project_id": "project",
             "input_revision": 1,
-            "provider_id": "vieneu-3.3",
-            "provider_version": "3.3",
+            "provider_id": "vieneu-3.8",
+            "provider_version": "3.8.1",
             "model_id": "voice",
             "input_fingerprint": "fixture",
             "settings_fingerprint": "settings-fixture",
@@ -1657,6 +1977,45 @@ def test_failed_control_dispatch_does_not_change_durable_state(tmp_path: Path) -
         assert "manager_reconciled_missing_worker" in {
             event.kind for event in service.jobs.list_events(active_without_worker)
         }
+    finally:
+        server.close()
+
+
+def test_update_install_reservation_is_global_and_blocks_work_admission(
+    tmp_path: Path,
+) -> None:
+    service = JobManagerService(
+        database_path=tmp_path / "state.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+    server = JobManagerServer(name=f"unused-update-reservation-{uuid4()}", service=service)
+    raw_job = {
+        "kind": "ocr",
+        "project_id": "project",
+        "input_revision": 1,
+        "provider_id": "paddle-fast",
+        "provider_version": "3.2.0",
+        "model_id": "PP-OCRv5-server",
+        "input_fingerprint": "fixture",
+        "settings_fingerprint": "settings-fixture",
+        "provider_config": {},
+    }
+    try:
+        reserved = server._dispatch("reserve_update_install", {})
+        assert reserved["eligible"] is True
+        assert reserved["reserved"] is True
+        token = str(reserved["token"])
+        with pytest.raises(ValueError, match="bản cập nhật"):
+            server._dispatch("create_job", raw_job)
+
+        assert server._dispatch("release_update_install", {"token": token}) == {
+            "released": True
+        }
+        server._dispatch("create_job", raw_job)
+        blocked = server._dispatch("reserve_update_install", {})
+        assert blocked["eligible"] is False
+        assert blocked["active_job_count"] == 1
+        assert blocked["reserved"] is False
     finally:
         server.close()
 
@@ -2162,6 +2521,40 @@ def test_ocr_rerun_promotes_candidate_over_existing_s1_without_duplicate_track(
     )
     service.import_media(project_id=project["id"], media_path=str(video))
     service.import_media(project_id=project["id"], media_path=str(active))
+    manual = service.subtitle_command(
+        project_id=project["id"],
+        command="add_scene_text",
+        params={
+            "text": "Bí cảnh",
+            "start_us": 2_000_000,
+            "end_us": 3_000_000,
+            "visual_box": [0.72, 0.20, 0.16, 0.22],
+            "font_size": 21,
+            "orientation": "vertical",
+            "background_color": "#111111",
+        },
+    )
+    manual_cue_id = next(
+        cue["id"]
+        for cue in manual["source_cues"]
+        if cue["source"] == "manual_scene_text"
+    )
+    manual = service.subtitle_command(
+        project_id=project["id"],
+        command="add_subtitle_cue",
+        params={
+            "text": "Câu thoại bù thủ công",
+            "start_us": 4_000_000,
+            "end_us": 5_000_000,
+            "visual_box": [0.10, 0.74, 0.80, 0.16],
+            "cue_role": "dialogue",
+        },
+    )
+    manual_dialogue_id = next(
+        cue["id"]
+        for cue in manual["source_cues"]
+        if cue["source"] == "manual_dialogue"
+    )
     job = service.create_ocr_job(
         project_id=project["id"],
         sample_interval_us=800_000,
@@ -2203,8 +2596,76 @@ def test_ocr_rerun_promotes_candidate_over_existing_s1_without_duplicate_track(
 
     assert "新字幕完整" in active.read_text(encoding="utf-8-sig")
     assert len([track for track in imported["tracks"] if track["id"] == "S1"]) == 1
-    assert [cue["text"] for cue in imported["source_cues"]] == ["新字幕完整"]
+    assert [cue["text"] for cue in imported["source_cues"]] == [
+        "新字幕完整",
+        "Bí cảnh",
+        "Câu thoại bù thủ công",
+    ]
+    preserved = next(cue for cue in imported["source_cues"] if cue["id"] == manual_cue_id)
+    assert preserved["index"] == 2
+    assert preserved["text_font_size"] == 21
+    assert preserved["orientation"] == "vertical"
+    assert preserved["background_color"] == "#111111"
+    assert any(
+        track["id"] == "S2"
+        and any(clip["cue_id"] == manual_cue_id for clip in track["clips"])
+        for track in imported["tracks"]
+    )
+    preserved_dialogue = next(
+        cue for cue in imported["source_cues"] if cue["id"] == manual_dialogue_id
+    )
+    assert preserved_dialogue["role"] == "dialogue"
+    assert preserved_dialogue["subtitle_track_id"] == "S1"
+    assert any(
+        track["id"] == "S1"
+        and any(clip["cue_id"] == manual_dialogue_id for clip in track["clips"])
+        for track in imported["tracks"]
+    )
     assert not candidate.exists()
+
+
+def test_ocr_job_uses_project_dialogue_and_exclusion_regions(
+    tmp_path: Path,
+) -> None:
+    service = JobManagerService(
+        database_path=tmp_path / "state.db",
+        artifact_root=tmp_path / "artifacts",
+        media_probe=StaticMediaProbe(),
+    )
+    video = tmp_path / "phim.mp4"
+    video.write_bytes(b"fixture")
+    project = service.create_project(
+        project_path=str(tmp_path / "project.ducai"),
+        name="Phim thử",
+    )
+    service.import_media(project_id=project["id"], media_path=str(video))
+    service.subtitle_command(
+        project_id=project["id"],
+        command="set_ocr_regions",
+        params={
+            "dialogue_region": [0.10, 0.72, 0.80, 0.20],
+            "exclusion_regions": [[0.82, 0.02, 0.16, 0.08]],
+        },
+    )
+
+    job = service.create_ocr_job(
+        project_id=project["id"],
+        sample_interval_us=800_000,
+        engine_python=sys.executable,
+    )
+
+    config = job["spec"]["provider_config"]
+    assert config["dialogue_region"] == [0.10, 0.72, 0.80, 0.20]
+    assert config["exclusion_regions"] == [[0.82, 0.02, 0.16, 0.08]]
+    assert len(config["bands"]) == 1
+    band = config["bands"][0]
+    assert band["name"] == "upper"
+    assert band["reading_mode"] == "dialogue"
+    assert band["scale"] == 1.0
+    assert band["x1"] == pytest.approx(0.10)
+    assert band["y1"] == pytest.approx(0.72)
+    assert band["x2"] == pytest.approx(0.90)
+    assert band["y2"] == pytest.approx(0.92)
 
 
 def test_job_manager_rejects_final_ocr_srt_without_matching_coverage_qa(
@@ -2380,6 +2841,151 @@ def test_subtitle_commands_persist_split_text_time_and_undo(tmp_path: Path) -> N
         assert redone["source_cues"][0]["text"] == "我要认真修炼"
         assert redone["revision"] > undone["revision"]
         assert service.projects.load(project["id"]).revision == redone["revision"]
+    finally:
+        server.close()
+
+
+def test_scene_text_font_scale_command_persists_paired_compact_patch(
+    tmp_path: Path,
+) -> None:
+    application = QCoreApplication.instance() or QCoreApplication([])
+    assert application is not None
+    service = JobManagerService(
+        database_path=tmp_path / "state.db",
+        artifact_root=tmp_path / "artifacts",
+        media_probe=StaticMediaProbe(),
+    )
+    source = SubtitleCue(
+        "scene-1",
+        1,
+        TimeRange(0, 2_000_000),
+        "韩立",
+        "zh",
+        role="scene_text",
+        visual_box=(0.3, 0.2, 0.1, 0.08),
+        visual_box_source="ocr",
+    )
+    snapshot = ProjectSnapshot(
+        "project-scene-scale",
+        "Scene scale",
+        1,
+        source_cues=(source,),
+        translated_cues=(replace(source, text="Hàn Lập", language="vi"),),
+    )
+    service.projects.save(project_path=tmp_path / "scene.ducai", snapshot=snapshot)
+    server = JobManagerServer(name=f"unused-scene-scale-{uuid4()}", service=service)
+    try:
+        result = server._dispatch(
+            "subtitle_command",
+            {
+                "project_id": snapshot.id,
+                "command": "set_scene_text_font_scale",
+                "cue_id": source.id,
+                "compact": True,
+                "values": {"scale": 1.25},
+            },
+        )
+
+        assert result["_subtitle_patch"] is True
+        assert result["source_cues"][0]["scene_font_scale"] == 1.25
+        assert result["translated_cues"][0]["scene_font_scale"] == 1.25
+        persisted = service.projects.load(snapshot.id)
+        assert persisted.source_cues[0].scene_font_scale == 1.25
+
+        undone = server._dispatch(
+            "subtitle_command",
+            {"project_id": snapshot.id, "command": "undo", "compact": True},
+        )
+        assert undone["source_cues"][0]["scene_font_scale"] == 1.0
+    finally:
+        server.close()
+
+
+def test_scene_text_timing_command_persists_compact_clip_patch_and_undo(
+    tmp_path: Path,
+) -> None:
+    application = QCoreApplication.instance() or QCoreApplication([])
+    assert application is not None
+    service = JobManagerService(
+        database_path=tmp_path / "state.db",
+        artifact_root=tmp_path / "artifacts",
+        media_probe=StaticMediaProbe(),
+    )
+    source = SubtitleCue(
+        "scene-1",
+        1,
+        TimeRange(1_000_000, 3_000_000),
+        "韩立",
+        "zh",
+        role="scene_text",
+    )
+    video = TimelineClip("video-1", "V1", TimeRange(0, 10_000_000))
+    scene = TimelineClip(
+        "scene-clip-1",
+        "S2",
+        source.range,
+        source.range,
+        cue_id=source.id,
+        cue_index=source.index,
+        cue_text="Hàn Lập",
+    )
+    snapshot = ProjectSnapshot(
+        "project-scene-timing",
+        "Scene timing",
+        1,
+        tracks=(
+            TimelineTrack("V1", TrackKind.VIDEO, "Video", (video,)),
+            TimelineTrack("S2", TrackKind.SUBTITLE, "Chữ trong cảnh", (scene,)),
+        ),
+        source_cues=(source,),
+        translated_cues=(replace(source, text="Hàn Lập", language="vi"),),
+    )
+    service.projects.save(project_path=tmp_path / "scene-timing.ducai", snapshot=snapshot)
+    server = JobManagerServer(name=f"unused-scene-timing-{uuid4()}", service=service)
+    try:
+        result = server._dispatch(
+            "subtitle_command",
+            {
+                "project_id": snapshot.id,
+                "command": "set_scene_text_timing",
+                "cue_id": source.id,
+                "compact": True,
+                "values": {"start_us": 500_000, "end_us": 4_000_000},
+            },
+        )
+
+        assert result["_subtitle_patch"] is True
+        assert result["source_cues"][0]["range"] == {
+            "start_us": 500_000,
+            "end_us": 4_000_000,
+        }
+        assert result["translated_cues"][0]["range"] == {
+            "start_us": 500_000,
+            "end_us": 4_000_000,
+        }
+        assert result["subtitle_clip_upserts"][0]["id"] == scene.id
+        assert result["subtitle_clip_upserts"][0]["timeline_range"] == {
+            "start_us": 500_000,
+            "end_us": 4_000_000,
+        }
+        persisted = service.projects.load(snapshot.id)
+        assert persisted.tracks[1].clips[0].timeline_range == TimeRange(
+            500_000,
+            4_000_000,
+        )
+
+        undone = server._dispatch(
+            "subtitle_command",
+            {"project_id": snapshot.id, "command": "undo", "compact": True},
+        )
+        assert undone["source_cues"][0]["range"] == {
+            "start_us": 1_000_000,
+            "end_us": 3_000_000,
+        }
+        assert undone["subtitle_clip_upserts"][0]["timeline_range"] == {
+            "start_us": 1_000_000,
+            "end_us": 3_000_000,
+        }
     finally:
         server.close()
 

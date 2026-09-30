@@ -22,6 +22,7 @@ def _wav_info(path):
 
 def _profile_receipt(path):
     import numpy as np
+    from vieneu_utils.core_utils import strip_encoder_pad_frame
 
     profile = Path(path).expanduser().resolve(strict=True)
     with np.load(profile, allow_pickle=False) as values:
@@ -29,6 +30,8 @@ def _profile_receipt(path):
             raise ValueError("vieneu_profile_fields_invalid")
         speaker = np.asarray(values["speaker_emb"], dtype=np.float32).reshape(-1)
         codes = np.asarray(values["codes"], dtype=np.int64)
+    original_codes_shape = [int(value) for value in codes.shape]
+    codes = np.asarray(strip_encoder_pad_frame(codes), dtype=np.int64)
     if speaker.size != 192:
         raise ValueError("vieneu_speaker_embedding_not_192d")
     if codes.ndim != 2 or codes.shape[0] <= 0 or codes.shape[1] <= 0:
@@ -37,7 +40,9 @@ def _profile_receipt(path):
         "profile_path": str(profile),
         "speaker_embedding_size": int(speaker.size),
         "reference_codes_shape": [int(value) for value in codes.shape],
-        "binding": "explicit_v330_speaker_embedding_192d_ref_codes",
+        "stored_reference_codes_shape": original_codes_shape,
+        "legacy_pad_frame_removed": original_codes_shape != list(codes.shape),
+        "binding": "explicit_v381_speaker_embedding_192d_ref_codes",
     }, {"speaker_emb": speaker, "codes": codes}
 
 
@@ -76,36 +81,40 @@ class TtsEngineHost:
 
         expected = str(payload.get("runtime_version", ""))
         installed = importlib.metadata.version("vieneu")
-        if expected != "3.3.0" or installed != "3.3.0":
+        if expected != "3.8.1" or installed != "3.8.1":
             raise ValueError("vieneu_runtime_version_mismatch")
+        reused = self.engine is not None
         if self.engine is None:
             with contextlib.redirect_stdout(sys.stderr):
+                import torch
                 from vieneu import Vieneu
 
-                try:
-                    from vieneu_v330_optimization import (
-                        install_vieneu_v330_optimizations,
-                    )
-                except ImportError:
-                    from ducai_studio.engine_hosts.vieneu_v330_optimization import (
-                        install_vieneu_v330_optimizations,
-                    )
-
+                if (
+                    not torch.cuda.is_available()
+                    or str(torch.version.cuda or "") != "12.8"
+                    or not str(torch.cuda.get_device_name(0) or "")
+                ):
+                    raise ValueError("vieneu_cuda_runtime_unavailable")
                 self.engine = Vieneu(
                     mode="v3turbo",
-                    max_batch_size=max(1, min(64, int(payload.get("max_batch_size", 64)))),
-                )
-                optimization = install_vieneu_v330_optimizations(
-                    self.engine,
-                    runtime_version=installed,
+                    device="cuda",
+                    backend="pytorch",
+                    max_batch_size=max(1, min(32, int(payload.get("max_batch_size", 32)))),
                 )
             self.identity = {
                 "runtime_version": installed,
                 "mode": "v3turbo",
-                "optimization": optimization,
+                "backend": str(getattr(self.engine, "backend", "pytorch")),
+                "optimization": "upstream_v381_fused_cuda_graph",
             }
             self.safe_batch_size = None
-        return {"loaded": True, **self.identity}
+        return {"loaded": True, "reused": reused, **self.identity}
+
+    def reset_session(self):
+        """Clear mutable voice state while retaining the expensive model."""
+
+        self.voice = None
+        return {"reset": True}
 
     def inspect_profile(self, payload):
         receipt, _voice = _profile_receipt(payload["profile_path"])
@@ -120,6 +129,24 @@ class TtsEngineHost:
             raise ValueError("vieneu_speaker_embedding_size_mismatch")
         self.voice = voice
         return receipt
+
+    def bind_preset(self, payload):
+        if self.engine_name != "vieneu" or self.engine is None:
+            raise ValueError("vieneu_engine_must_be_loaded_before_preset_binding")
+        preset_name = str(payload.get("preset_name", "")).strip()
+        if not preset_name:
+            raise ValueError("vieneu_preset_name_missing")
+        with contextlib.redirect_stdout(sys.stderr):
+            voice = self.engine.get_preset_voice(preset_name)
+        if not isinstance(voice, dict):
+            raise ValueError("vieneu_preset_invalid")
+        if voice.get("speaker_emb") is None and voice.get("codes") is None:
+            raise ValueError("vieneu_preset_voice_data_missing")
+        self.voice = voice
+        return {
+            "binding": "vieneu_v381_builtin_preset",
+            "preset_name": preset_name,
+        }
 
     def enroll_profile(self, payload):
         if self.engine_name != "vieneu" or self.engine is None:
@@ -145,10 +172,10 @@ class TtsEngineHost:
         temp.replace(output)
         metadata = {
             "identity": {
-                "schema": "ducai-vieneu-v330-reference-v1",
-                "clone_engine": "v3_3_turbo_192d_batch_qa",
+                "schema": "ducai-vieneu-v381-reference-v1",
+                "clone_engine": "v3_8_turbo_192d_fused_batch_qa",
                 "mode": "v3turbo",
-                "runtime_version": "3.3.0",
+                "runtime_version": "3.8.1",
                 "reference_sha256": hashlib.sha256(reference.read_bytes()).hexdigest(),
                 "reference_denoise": payload.get("denoise") is True,
                 "reference_max_seconds": 8.0,
@@ -217,10 +244,11 @@ class TtsEngineHost:
         import soundfile as sf
 
         texts = [str(job["text"]) for job in jobs]
-        requested = max(1, min(64, int(payload.get("batch_size", 64))))
+        requested = max(1, min(32, int(payload.get("batch_size", 32))))
         if self.safe_batch_size is not None:
             requested = min(requested, self.safe_batch_size)
         current = requested
+        oom_reduced = False
         while True:
             try:
                 with contextlib.redirect_stdout(sys.stderr):
@@ -236,6 +264,7 @@ class TtsEngineHost:
             except RuntimeError as exc:
                 if "out of memory" not in str(exc).casefold() or current <= 1:
                     raise
+                oom_reduced = True
                 current = max(1, current // 2)
                 try:
                     import torch
@@ -243,7 +272,8 @@ class TtsEngineHost:
                     torch.cuda.empty_cache()
                 except Exception:
                     pass
-        self.safe_batch_size = current
+        if oom_reduced:
+            self.safe_batch_size = current
         if len(audio) != len(jobs):
             raise ValueError("vieneu_result_count_mismatch")
         sample_rate = int(getattr(self.engine, "sample_rate", 48_000))
@@ -311,10 +341,14 @@ def serve(engine, input_stream=None, output_stream=None):
                     result = host.health()
                 elif action == "load":
                     result = host.load(payload)
+                elif action == "reset_session":
+                    result = host.reset_session()
                 elif action == "inspect_profile":
                     result = host.inspect_profile(payload)
                 elif action == "bind_profile":
                     result = host.bind_profile(payload)
+                elif action == "bind_preset":
+                    result = host.bind_preset(payload)
                 elif action == "enroll_profile":
                     result = host.enroll_profile(payload)
                 elif action == "synthesize_batch":

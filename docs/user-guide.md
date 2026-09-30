@@ -4,7 +4,7 @@
 
 Mở **Cài đặt → Chẩn đoán runtime** và chỉ chạy phim khi các mục bắt buộc đều
 `ready`: Python GUI 3.12, FFmpeg/ffprobe, PaddleOCR, một transport dịch (Gemini,
-DeepSeek, Hy3/TokenHub, Qwen, GLM hoặc API tương thích), Piper và VieNeu 3.3 nếu
+DeepSeek, Hy3/TokenHub, Qwen, GLM hoặc API tương thích), Piper và VieNeu 3.8 nếu
 dùng clone. NVENC có thể ở trạng thái không khả dụng; tool sẽ dùng CPU khi
 backend là `auto`.
 
@@ -14,6 +14,31 @@ Model, cache và giọng không nằm trong EXE. Chúng ở `DUCAI_STUDIO_DATA`;
 Bản phát hành Windows nằm trong thư mục `outputs/DUCAI-STUDIO-<version>-win64`.
 Mở `DucaiStudio2.exe` trực tiếp; bản production dùng GUI subsystem nên không mở
 thêm cửa sổ CMD.
+
+## Cập nhật ứng dụng từ GitHub
+
+Từ bản `2.0.0a118`, mở **Cài đặt → Cập nhật DUCAI STUDIO** để kiểm tra thủ công.
+Kênh **Ổn định** chỉ nhận bản chính thức; kênh **Thử nghiệm** nhận cả alpha, beta
+và RC. Tool không tự kiểm tra, tự tải hoặc tự cài khi chưa có thao tác của người
+dùng. Tiến độ tải là số byte thật, không phải bộ đếm ước lượng.
+
+Mỗi bản cập nhật gồm gói ứng dụng nhị phân, manifest SHA-256 và chữ ký Ed25519.
+Tool chỉ cho cài sau khi chữ ký, tên file, kích thước và toàn bộ hash khớp. Khi
+bấm **Cài đặt**, mọi OCR, dịch, TTS, export và Multi video phải kết thúc trước;
+nếu còn tác vụ, gói đã tải được giữ lại nhưng người dùng vẫn phải xác nhận lần
+nữa trước khi khởi động lại. Updater không dừng cưỡng bức công việc đang chạy.
+
+Trình cài chỉ thay các file ứng dụng có tên trong manifest đã ký. Project, media,
+credential, QSettings, model, cache, runtime ngoài và toàn bộ
+`DUCAI_STUDIO_DATA` không thuộc gói cập nhật. Sau khi mở bản mới, tool chỉ xác
+nhận thành công khi đúng PID, phiên cài, version, thư mục cài và Job Manager đã
+sẵn sàng; nếu không, helper khôi phục file cũ và mở lại bản cũ. Gói tải lớn được
+dọn sau khi cài hoặc rollback.
+
+Giới hạn bootstrap: a117 và các bản cũ chưa có updater nên phải cài a118 thủ
+công đúng một lần. Từ a118 trở đi mới có thể nâng cấp ngay trong tool. Bản
+portable dùng vùng staging trong LocalAppData để không tự ghi gói tải vào cây
+ứng dụng đang được thay; thư mục dữ liệu portable cạnh EXE vẫn được giữ nguyên.
 
 ## Quy trình sản xuất an toàn
 
@@ -33,6 +58,108 @@ thêm cửa sổ CMD.
    video chỉ để áp dụng bản sửa pipeline mới.
    Kết quả Whisper dùng QA riêng theo hash/fingerprint/cue count và không bị ép
    qua coverage khung hình. Hai phương thức có fingerprint/cache tách biệt.
+   OCR khung hình tự loại cụm watermark Bilibili và tên kênh/số đi kèm như
+   `4K超清漫剧|3473`, `呼啦呼啦2313` hoặc `小李看漫剧` trước khi tạo SRT. Bộ lọc
+   cần đồng thời có neo logo, vị trí gần nhau hoặc bằng chứng lặp xuyên video;
+   câu thoại thật có số hay chữ `漫剧` không bị loại chỉ vì trùng từ. Khi cùng
+   một cụm ở mép hình có box hợp lệ xuất hiện ở ít nhất ba frame Fast và trải
+   qua một khoảng thời gian đủ dài, tool còn tạo một vùng
+   **Che watermark OCR** phủ đúng union-box đó trong preview và video xuất. Một
+   lần nhận nhầm đơn lẻ không đủ để tự che và không tạo cue rỗng trong SRT.
+   Paddle Fast còn dùng mẫu ảnh xám nhẹ mỗi 200 ms trong cùng một lượt decode để
+   quét burst quanh câu chỉ một hoặc hai chữ; các mẫu trung gian không gọi Paddle.
+   Một chữ chỉ được giữ khi hai frame
+   burst có confidence cao và box ổn định, nên không hạ cổng chống nhiễu cho toàn
+   video. Với câu từ hai chữ trở lên xuất hiện quá nhanh, một frame Fast và một
+   frame Quality vẫn có thể xác nhận lẫn nhau khi khác timestamp nhưng cùng chữ,
+   gần thời gian và trùng box; một kết quả đơn lẻ hoặc lệch vị trí vẫn bị loại.
+   Lượt sparse toàn khung nhận tên nhân vật, chiêu thức, pháp bảo và địa danh:
+   hội thoại vẫn ở **S1**. Các chữ trong cảnh xuất hiện đồng thời được tách tự
+   động sang **S2, S3, S4… · Chữ trong cảnh**; cue không trùng thời gian tái dùng
+   lane thấp nhất. Người dùng có thể kéo một chữ cảnh lên S1 khi khoảng thời gian
+   đó không có cue khác; đây là thao tác chủ động đổi cue thành **thoại chính**, vì
+   vậy cue sẽ đi vào SRT thoại, TTS và D1 ở lần tạo tiếp theo. Kéo một cue thoại
+   xuống S2/S3… chỉ đổi vị trí hiển thị, không làm mất vai trò thoại và vẫn được
+   lồng tiếng. Nếu đè cue đang có trên lane đích, tool tự tìm lane trống hoặc báo
+   rõ lý do khi S1 không thể nhận cue.
+   Chữ cảnh đã dịch xuất hiện trực tiếp theo playhead trong Timeline Preview, không cần
+    xuất video trước. Lượt OCR toàn khung đối chiếu chữ, timestamp và vùng ảnh với
+    S1 để không đưa lại hội thoại thường vào S2.
+   Các cách đọc OCR gần giống nhau ở cùng vùng được gom trước khi quyết định;
+   cluster phải có ít nhất một frame rõ. Một thẻ cảnh chỉ xuất hiện đúng một
+   frame vẫn được chấp nhận khi confidence/độ tin cậy hình ảnh đặc biệt cao và
+   không nằm ở góc watermark.
+   Cue S2 được dịch cùng Film Bible nhưng không vào SRT hội thoại, VieNeu hoặc D1.
+   Khi cue S2 đã được chấp nhận, preview/export chỉ làm mờ-phủ vùng glyph Trung,
+   giữ panel/viền trang trí rồi tự đặt chữ Việt ngang hoặc dọc vào panel. Nguồn
+   được nhận diện là thư pháp dùng font Playwrite VN có dấu; cue chưa đủ chắc chỉ
+   hiện **Cần duyệt** và không tự ghi vào video. Sau khi sửa đúng chữ Việt, nhấp
+   phải cue S2 rồi chọn **Chấp nhận chữ trong cảnh** để cho phép preview/export.
+   Chọn một cue trên S1/S2/S3… để mở bảng chữ gọn kiểu trình soạn thảo. Click
+   thường luôn thu lựa chọn về đúng một cue; chỉ Ctrl+click mới cộng hoặc bỏ từng
+   cue khỏi nhóm. Việc focus hoặc đúp chuột vào ô nguồn/Việt không xóa nội dung
+   đang có. Bảng này
+   sửa nội dung tiếng Việt, cỡ chữ từ 1–100, hướng ngang/dọc, kiểu chữ, màu chữ và
+   màu nền. Cỡ chữ là giá trị chủ động: kéo chữ lên cao hoặc thu khung đặt không
+   tự làm chữ nhỏ lại. Chữ trong cảnh có thêm **Nền ngang/Nền dọc** để nền ôm
+   theo chữ thay vì phủ cả khung kéo. Các font thư pháp Playwrite VN, Dancing
+   Script, Lobster, Agbalumo, Comforter Brush, Water Brush, Splash và Hurricane
+   đều có dấu tiếng Việt và được đóng gói cùng bản phát hành. Bốn font bổ sung là
+   các họ OFL có nét gần những mẫu thư pháp Việt; tool hiển thị tên thật thay vì
+   giả danh các font VNI/HL/UVN/SVN không có giấy phép phân phối rõ ràng.
+   **Preset mực tàu** tạo nền mực bất quy tắc dưới chữ. Danh sách nền cho phép
+   chọn **Mực loang**, **Mực đại mặc**, **Mực tụ** hoặc **Nét cọ**. Hai đầu cọ giữ
+   tỷ lệ theo bề dày, chỉ thân giữa co giãn nên nền không bị kéo méo với chữ ngắn
+    hoặc dài; **Nền ngang/Nền dọc** tiếp tục điều chỉnh kích thước bao quanh chữ.
+    Chữ trong cảnh mới, gồm cue OCR và cue thêm bằng nút **T**, mặc định dùng
+    **Bút lông Comforter**, chữ trắng, nền đen **Mực loang** với độ đục 100%; cue cũ
+    giữ nguyên định dạng đã lưu. Các nút định dạng và bộ nhập số hiển thị mô tả khi
+    trỏ chuột; dấu giảm, giá trị và dấu tăng luôn được tách thành ba vùng rõ ràng.
+   Cue/project cũ vẫn giữ nền phẳng cho tới khi người dùng tự chọn. Từng cue còn chỉnh
+   được giãn chữ, đậm/nghiêng và độ đục riêng của chữ/nền. Chữ trong cảnh có thêm
+   **Mờ vào/ra**: đặt thời lượng 50–2.000 ms cho mỗi đầu; mặc định 300 ms và cue
+   ngắn tự kẹp tối đa nửa thời lượng để không biến mất hoàn toàn. Preview và video
+   xuất dùng cùng hiệu ứng, còn vùng che chữ Trung luôn phủ đầy đủ để chữ gốc không
+   ló lại trong lúc fade. Hai nút **Ống hút**
+   lấy trực tiếp màu chữ hoặc màu nền từ frame đang thấy trên Preview; nhấp phải
+   khi đang lấy màu để hủy.
+   Preview và bản xuất dùng cùng giá trị đã lưu. Click, Ctrl+click, kéo
+   vùng quét hoặc Ctrl+A chọn nhiều cue để chỉnh/kéo theo nhóm. Kéo ngang đổi thời
+   gian, kéo dọc chuyển lane; nếu lane đích đang bận, tool dùng lane trống kế tiếp.
+   Trên Preview, cue đã chọn có thể kéo vị trí và resize độc lập theo khung video.
+   Đúp chuột cue ở Preview hoặc Timeline sẽ
+   mở đúng dòng trong **Biên tập phụ đề** và tua đến đầu câu. Nhấp phải cho phép
+   xóa cue ở cả hai nơi; thao tác xóa bỏ đồng thời chữ dịch, nền/cover do tool tạo
+   và clip Timeline, đồng thời vẫn hoàn tác được. Đây là phép che/thay chữ, không
+   phải khôi phục pixel đã bị hard-sub ghi sẵn vào video nguồn.
+
+   Dùng biểu tượng **T** trên Timeline hoặc Biên tập phụ đề để bổ sung cue bị sót
+   tại playhead hiện tại. Chọn **Thoại chính · có lồng tiếng** hoặc **Chữ trong
+   cảnh · không đọc**, rồi đặt nội dung, thời lượng, font, cỡ, hướng, màu, nền,
+   padding, giãn chữ, đậm/nghiêng, độ đục và fade ngay trong một hộp dùng chung.
+   Thoại mới tự kế thừa vị trí và kiểu chữ của thoại gần playhead, ưu tiên S1 và
+   dùng lane trống tiếp theo nếu S1 đang bận nhưng vẫn được lồng tiếng. Chữ cảnh
+   mới cho kéo vùng trên frame thật và tạo một S mới dưới các lane hiện có. Cue mới
+   có thể di chuyển, kéo mép, sửa hoặc xóa như cue OCR và được giữ nguyên khi chạy
+   lại OCR hoặc dịch.
+   Nếu một thao tác lưu phụ đề ngắn đang chạy, nút **T** vẫn nhận yêu
+   cầu và tự thêm chữ ngay sau khi lần lưu đó hoàn tất. Timeline có thanh cuộn dọc
+   nhưng không tự cuộn khi đổi cue: vị trí dọc chỉ thay đổi khi người dùng lăn
+   chuột hoặc kéo scrollbar. Project cũ có nhiều chữ
+   cảnh cùng giờ trên S2 được tách an toàn sang các lane trống khi mở, không đổi
+   text, timestamp, cue ID hoặc lane chữ thủ công.
+
+   Trước khi trích xuất, **Quét vùng OCR** cho phép kéo vùng hội thoại trên một
+   frame hiện tại của chính video. Chữ giao vùng này được đưa vào S1; chữ ngoài
+   vùng được đánh giá riêng cho S2. **Vùng không OCR** cho phép thêm nhiều hình
+   chữ nhật loại trừ watermark, logo hoặc chữ không được gửi vào OCR. Vùng loại
+   trừ luôn có ưu tiên cao hơn hai lượt quét. Nếu không cấu hình vùng hội thoại,
+   tool dùng các dải phụ đề mặc định hiện có; nếu không có vùng loại trừ thì không
+   che vùng nào. Nút đặt lại xóa toàn bộ cấu hình tùy chỉnh này.
+
+   Hội thoại một chữ xuất hiện rất nhanh như `爹` hoặc `娘` được lấy thêm một
+   burst cục bộ quanh thời điểm chuyển cảnh. Vẫn cần hai quan sát rõ ở cùng vị
+   trí nên độ phủ tăng mà không tăng tần suất OCR và nhiễu trên toàn video.
    Sau khi có S1 hoặc bản dịch Việt, dùng **Xuất SRT nguồn** hoặc
    **Xuất SRT tiếng Việt** để lưu đúng cue/timestamp đã sửa gần nhất dưới dạng
    UTF-8 BOM. Xuất SRT không sửa project, job hoặc cache.
@@ -43,6 +170,19 @@ thêm cửa sổ CMD.
    tự QA ngay trong cùng lượt; không còn một request Gemini QA thứ hai cho từng chunk.
    Film Bible, dịch và các cue thật sự cần sửa đều được tính là lần gửi lên Gemini.
    Tool chỉ chạy một browser/tab tuần tự và cache theo cue ID.
+   Mỗi project có mục **Văn phong dịch** gồm **Tự nhận diện**, **Tu tiên cổ
+   trang**, **Võ hiệp**, **Cung đình/cổ trang**, **Hiện đại**, **Trung tính** và
+   ô **Quy tắc riêng** tối đa 4.000 ký tự. Cùng một preset, Film Bible và quy tắc
+   được đưa vào mọi transport dịch, prompt sửa và QA. Với preset cổ trang, tool
+   ưu tiên xưng hô theo vai vế, đặt tên trước hậu tố như `Hồng Ly tỷ tỷ`, và chỉ
+   dùng `A Cẩu/A Miêu/Lão Cẩu` khi chữ nguồn là tên gọi `阿狗/阿猫/老狗`; từ
+   chó/mèo chỉ động vật hoặc câu chửi không bị thay máy móc. Cue vi phạm được sửa
+   đúng một lượt; nếu vẫn chưa đạt thì giữ bản dịch, báo warning và vẫn cho qua
+   TTS/Multi. CJK còn sót vẫn theo blocker hiện có. Đổi preset/quy tắc tạo cache
+   dịch riêng nhưng không làm mất cache OCR. Multi đóng băng lựa chọn của từng
+   project khi bắt đầu lượt chạy. Tool chỉ tự xuống dòng bản dịch khi nội dung
+   vượt 68 ký tự; dòng ngắn hơn được giữ nguyên trừ khi người dùng chủ động chèn
+   xuống dòng trong Biên tập phụ đề.
    Lỗi 1095/1905/about:blank chỉ được nhận từ bề mặt lỗi đã xác minh; mã cue như
    `id:1095` trong JSON không bị coi là lỗi. Phiên sẽ đóng, backoff có giới hạn
    và gửi lại đúng chunk chưa xong. Với API, chọn **Gemini API**, **DeepSeek API**,
@@ -61,12 +201,13 @@ thêm cửa sổ CMD.
    SRT cuối). Nút dịch chính hoạt động giống nút OCR: **Bắt đầu dịch** khi chưa có
    job, **Tạm dừng dịch** khi đang chạy, **Tiếp tục dịch** khi đã tạm dừng và
    **Tiếp tục dịch từ cache** khi cache được chọn đang ở trạng thái đã hủy, lỗi,
-   gián đoạn hoặc cần rà soát. Thao tác tiếp tục luôn retry đúng job/ledger đã
-   chọn, không tạo job mới và không gửi lại các cue đã checkpoint.
-   Khi mở tool, danh sách tên key được đối chiếu lại với Windows Credential
-   Manager để khôi phục key còn trong vault nhưng thiếu khỏi cài đặt UI. Nút
-   Nút dịch chính cập nhật pool key mới cho chính job cũ khi tiếp tục cache mà không làm mất
-   checkpoint. Có thể dùng **Nhập SRT Việt** để nạp bản dịch từ bên ngoài; tool
+   gián đoạn hoặc cần rà soát. Tool chỉ retry đúng job/ledger đã chọn khi provider
+   và model trên giao diện vẫn khớp job đó; đổi provider hoặc model sẽ tạo job mới
+   để không chạy nhầm transport cũ. Các cue đã checkpoint không bị gửi lại.
+   Khi mở tool, mỗi pool chỉ giữ các tên key đã gán cho đúng provider và vẫn còn
+   trong Windows Credential Manager; tên key chưa gán không tự bị nhận làm Gemini.
+   Nếu dán key mới trong lúc tiếp tục cùng job API, tool cập nhật pool cho chính
+   job đó rồi retry từ checkpoint hiện có. Có thể dùng **Nhập SRT Việt** để nạp bản dịch từ bên ngoài; tool
    chỉ ghi vào dự án khi số cue, index và toàn bộ timestamp khớp SRT Trung.
    Gemini Web phải bắt đầu trả lời trong 30 giây; nếu không, tool đóng phiên và
    thử lại bằng tab sạch thay vì đứng im nhiều phút. Nếu Gemini đã trả nhưng để
@@ -104,11 +245,18 @@ thêm cửa sổ CMD.
    cập nhật nội dung; trạng thái vẫn là **Cần sửa** cho tới khi worker chạy QA lại.
    Khi không còn blocker và toàn bộ cue đã được kiểm tra, bảng chuyển sang **Đạt**;
    **Đang QA** nghĩa là chưa được phép kết luận đạt.
-5. **Tạo giọng:** Piper là lựa chọn nhanh. VieNeu 3.3 dùng profile clone 192D và
-   reference codes, ưu tiên chất lượng. VieNeu gửi tối đa 64 cue trong một batch,
-   tự hạ batch nếu GPU hết VRAM và giữ host/model nóng. Từ bản a49, đường CUDA
-   giữ lịch sử chống lặp trên GPU và giải mã codec theo nhóm để giảm thời gian
-   chờ CPU; nếu runtime/codec không tương thích, host tự dùng đường VieNeu gốc.
+5. **Tạo giọng:** Trong **Thư viện giọng**, bấm **Nghe thử** để nghe mẫu 5-8 giây
+   ngay cả khi chưa mở dự án hoặc chưa cài model. Với giọng Piper có nguồn đã xác
+   minh, bấm **Cài** và theo dõi phần trăm ngay trên thẻ; model chỉ chuyển sang
+   **Đã cài** sau khi kiểm tra xong. VieNeu v3 Turbo có 25 preset dựng sẵn để chọn
+   trực tiếp, ngoài mục **Giọng clone của bạn**. Các preset VieNeu và VIVOS mang
+   giấy phép phi thương mại, vì vậy cần kiểm tra quyền trước khi xuất bản nội dung.
+   Piper là lựa chọn nhanh. VieNeu-TTS v3 Turbo 3.8.1 dùng profile
+   clone 192D và reference codes, ưu tiên chất lượng. VieNeu gửi tối đa 32 cue
+   trong một batch, tự hạ batch nếu GPU hết VRAM và giữ host/model nóng. Đường
+   fused CUDA Graph do chính VieNeu 3.8.1 cung cấp; tool không còn vá API nội bộ
+   của runtime. Profile 3.3 được giữ nguyên trên đĩa và chỉ bỏ frame pad cũ trong
+   RAM khi bind vào engine mới.
    QA/fit vẫn chạy riêng từng cue. **Tốc độ giọng gốc** áp dụng cho toàn bộ D1,
    chọn từ 1,10× đến 3,00× và mặc định 1,30× cho job mới. VieNeu vẫn inference ở
    1,00×; tool tạo WAV nhanh hơn bằng FFmpeg giữ cao độ từ WAV cache nền. Đổi tốc
@@ -157,7 +305,7 @@ thêm cửa sổ CMD.
    và đã kiểm tra bao nhiêu; ETA của pha khôi phục tách riêng với ETA tổng để
    không bị hiểu nhầm là worker đứng ở một mốc. Trước event cache đầu tiên, thẻ
    ghi rõ VieNeu đang nạp model và chuẩn bị dò cache thay cho nhãn chờ chung.
-   Số cue luôn là số đã hoàn tất thật; trong một batch 64 cue, đồng hồ hoạt động
+   Số cue luôn là số đã hoàn tất thật; trong một batch 32 cue, đồng hồ hoạt động
    tăng mỗi giây và thanh tiến trình chuyển mượt tới checkpoint mới thay vì báo
    trước những cue GPU chưa trả kết quả.
    Sau tổng hợp, timeline giọng được ghi WAV streaming thay vì tạo một mảng float
@@ -201,13 +349,22 @@ thêm cửa sổ CMD.
 6. **Preview:** kiểm tra đầu/giữa/cuối và các gap nghi vấn với video, sub và D1
    đồng bộ trước khi xuất. Pause rồi tua hoặc kéo playhead sẽ neo lại D1 đúng mốc
    trước khi phát, không hard-seek giọng liên tục. Nút âm lượng preview được lưu
-   lại; `←/→` và `−5s/+5s` tua đúng 5 giây, không chiếm phím khi đang gõ trong ô
+   lại; `Space` hoặc click vùng video trống phát/tạm dừng tức thì, còn `←/→` và
+   `−5s/+5s` tua đúng 5 giây. Các phím này không chiếm thao tác khi đang gõ trong ô
    chữ. Ô tốc độ và âm lượng clip nhận cả dấu chấm lẫn dấu phẩy thập phân. Bấm cue nguồn hoặc
-   bản dịch sẽ chọn cue và đưa video/playhead tới đầu cue. Timeline có tab
+   bản dịch sẽ chọn cue và đưa video/playhead tới đầu cue. Bấm một vị trí trống
+   hoặc bấm trực tiếp lên clip trong Timeline sẽ tua Preview tới đúng timestamp
+   dưới con trỏ; kéo clip, kéo mép và quét chọn vẫn giữ chức năng riêng, không tua
+   nhầm. Thanh điều khiển Preview chỉ hiện khi con trỏ nằm trên Preview và ẩn ngay
+   khi rời ra, kể cả lúc video đang pause. Timeline có tab
    **Phụ đề** riêng để xem và bấm trực tiếp cả chữ nguồn lẫn bản Việt. Tab
    **Kiểu sub** cho chọn bảng màu chữ, màu viền, độ dày viền, độ mờ, font, cỡ,
    căn ngang và khoảng cách đáy. Chữ Việt tại playhead xuất hiện trực tiếp trên
    mọi preview, gồm cả Timeline, và dùng đúng cùng style khi FFmpeg đóng cứng.
+   Khi kéo hoặc resize cue chữ trong cảnh gần playhead tím, mép đầu/cuối tự hút
+   trong vùng 8 px (tối thiểu 80 ms, tối đa 500 ms); kéo tiếp quá vùng hút sẽ đi
+   xuyên qua bình thường. Thanh định dạng luôn giữ nguyên chiều cao và cue gần
+   nhất, nên click vùng trống để seek không làm bảng hoặc Timeline nhảy dọc.
    Màn **Hiệu ứng** hiển thị logo, nhiều vùng blur và filter màu trực tiếp trên
    video tại playhead; kéo khung hoặc
    nút neo để đổi vị trí/kích thước mà không cần render. Khung bám theo vùng video
@@ -215,6 +372,24 @@ thêm cửa sổ CMD.
    vị trí cũ khi cửa sổ thay đổi kích thước. Riêng màn **Hiệu ứng** dùng canvas
    tĩnh toàn khung và ẩn transport để không che hoặc tranh chuột với logo/blur;
    bốn góc neo có vùng bắt chuột lớn và tự chọn góc phục hồi khi overlay quá nhỏ.
+   **Blur theo phụ đề nguồn** bám timestamp SRT và box chữ Trung do OCR ghi lại;
+   nếu cue không có box, preview ghi rõ **Ước lượng** và tính vùng từ dòng chữ.
+   Hai cue cùng thời điểm được che đồng thời. Project mới dùng blur mạnh với
+   bán kính 46 và padding rộng hơn. Nút **Che kín** phủ thêm lớp tối 90% đúng
+   vùng/timestamp chữ gốc để nét chữ không còn đọc được nhưng vẫn giữ phụ đề
+   Việt ở lớp trên; tắt Che kín vẫn giữ blur tự động. Có thể chỉnh padding và bán kính,
+   còn **Blur thủ công** vẫn thêm/xóa, kéo, resize và đặt khoảng thời gian độc lập.
+   Watermark Bilibili lặp lại mà OCR đã loại khỏi SRT được hiển thị riêng là
+   **CHE WATERMARK OCR** và dùng cùng blur mạnh + lớp tối 90%; trạng thái Hiệu
+   ứng ghi rõ số vùng được tự che. Vùng tự động này không nằm trong danh sách
+   Blur thủ công nên không thể bị kéo nhầm như một hiệu ứng do người dùng thêm.
+   Project mới bật chế độ tự bám mặc định; project cũ giữ blur cố định cho tới khi
+   bấm chuyển đổi. Khi kéo logo/blur, hình bám chuột cục bộ ngay và chỉ gửi một
+   lệnh khi thả; bật/tắt, opacity, bán kính, thêm/xóa cũng hiện tức thì. Nếu lưu
+   thất bại, tool trả về giá trị đã xác nhận gần nhất và báo nguyên nhân.
+   Video nguồn không bị sửa. Với hard-sub đã cháy vào hình, Che kín chỉ làm
+   chữ biến mất khỏi video xuất bằng blur và lớp phủ; nó không tái tạo chính xác
+   phần nền vốn đã bị chữ gốc thay thế.
    Các preview khác dùng thanh điều khiển trong suốt như YouTube: mặc định ẩn,
    hiện khi con trỏ nằm trên video, bắt đầu mờ đi ngay khi rời video, hiển thị
    playhead/thời lượng và mở thanh âm lượng khi rê vào biểu tượng loa. Blur/logo
@@ -487,7 +662,8 @@ thay model một lần; response cũ hoặc lỗi tải không thể ghi đè pr
 - Trên **Timeline**, chỉ vùng đầu dòng `V1/A1/D1/S1…` chọn toàn bộ track. Click
   một clip/cue trong phần nội dung sẽ bỏ lựa chọn track trước đó và chuyển về
   điều khiển riêng clip, nên speed, volume và kéo mép không bị khoá sau khi đã
-  dùng Chọn tất cả hoặc `Ctrl+A`.
+  dùng Chọn tất cả. Với phụ đề, lựa chọn được giữ theo cue ID ổn định nên editor
+  không thể lưu nội dung đang gõ sang cue khác khi model sắp xếp lại.
 - **Hiệu ứng**, **Trộn âm**, **Xuất video** và **Hàng đợi** dùng chung snapshot
   export nhưng đưa đúng khu vực đang chọn vào trọng tâm; Hàng đợi có màn theo
   dõi progress/elapsed/ETA riêng.
@@ -540,6 +716,30 @@ profile đăng nhập hoặc profile clone giọng. Người nhận phải tự 
 giọng clone nếu dùng VieNeu. Gemini Web vẫn cần Chrome hoặc Edge trên máy nhận.
 PaddleOCR GPU và VieNeu cần GPU NVIDIA cùng driver tương thích để đạt hiệu năng
 như máy đóng gói; chuyển sang CPU không phải là chế độ tối ưu của gói này.
+
+Runtime clone được cài/sửa bằng `scripts/setup-vieneu-runtime.ps1`. Script ghim
+VieNeu 3.8.1 cùng PyTorch/Torchaudio CUDA 12.8 và dừng ngay nếu máy không nhận
+CUDA. Job VieNeu 3.3 đang dang dở không được tiếp tục bằng 3.8.1 để tránh trộn
+giọng từ hai engine; hãy tạo tác vụ voice mới, còn project/profile/cache cũ vẫn
+được giữ.
+
+Kiểm tra VieNeu cho phép tối đa 90 giây để nạp PyTorch/CUDA khi máy khởi động
+nguội. Hết thời gian kiểm tra không đồng nghĩa runtime bị hỏng; thông báo sẽ
+phân biệt trường hợp này và bạn có thể bấm Tiếp tục khi máy bớt tải. Kết quả
+kiểm tra thất bại tạm thời không bị lưu cache; kiểm tra thành công được tái dùng
+khi runtime/profile không đổi. Không cần cài lại model chỉ vì kiểm tra hết giờ.
+
+Từ a104, tiến độ lồng tiếng phân biệt kiểm tra cache, kiểm tra bộ máy, nạp model,
+chuẩn bị giọng và tổng hợp. Số câu chỉ tăng khi đã xử lý thật; một batch có thể
+gồm 32 câu nên không phải cứ chưa tăng phần trăm là tác vụ đứng. Tiến độ cũ được
+gộp để tránh giao diện chậm hơn worker, nhưng checkpoint và các câu đã làm vẫn
+được giữ nguyên.
+
+Sau khi một tác vụ VieNeu hoàn thành, tool giữ model tối đa 2 phút để job tiếp
+theo bắt đầu nhanh hơn, vẫn gắn lại đúng giọng đã chọn. Model được giải phóng
+khi hết thời gian chờ, khi chạy OCR hoặc khi đóng tool; job bị lỗi/hủy không để
+lại model dùng dở. Lượt đầu sau khi mở tool vẫn cần nạp model. Cơ chế này không
+đổi chất lượng, tốc độ đọc hoặc cache giọng.
 
 Trong Trích xuất/Dịch thuật/Biên tập, phần đầu chỉ hiển thị tác vụ và điều khiển
 cần thiết. Tên engine Paddle, mô tả pipeline, note kỹ thuật, nút Web nổi và chế

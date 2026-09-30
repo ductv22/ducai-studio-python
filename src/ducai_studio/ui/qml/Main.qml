@@ -91,6 +91,63 @@ ApplicationWindow {
         }
     }
 
+    Connections {
+        target: window.appModel.updater
+        function onInstallConfirmationRequested() {
+            updateInstallDialog.open()
+        }
+    }
+
+    Dialog {
+        id: updateInstallDialog
+        parent: Overlay.overlay
+        anchors.centerIn: parent
+        width: Math.min(520, window.width - Theme.space32)
+        modal: true
+        title: "Xác nhận cài đặt bản cập nhật"
+        standardButtons: Dialog.NoButton
+
+        contentItem: ColumnLayout {
+            spacing: Theme.space16
+            Text {
+                Layout.fillWidth: true
+                text: "DUCAI STUDIO sẽ xác nhận mọi tác vụ đã kết thúc, sau đó đóng và khởi động lại để cài v"
+                    + window.appModel.updater.version + ". Nếu còn tác vụ, bản tải sẽ được giữ lại."
+                color: Theme.textSecondary
+                font.family: Theme.fontFamily
+                font.pixelSize: 12
+                wrapMode: Text.Wrap
+                textFormat: Text.PlainText
+            }
+            Text {
+                Layout.fillWidth: true
+                text: "Dự án, media, DUCAI_STUDIO_DATA, model và runtime ngoài không bị thay thế."
+                color: Theme.textMuted
+                font.family: Theme.fontFamily
+                font.pixelSize: 11
+                wrapMode: Text.Wrap
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                Item { Layout.fillWidth: true }
+                DsButton {
+                    text: "Để sau"
+                    feedbackEnabled: false
+                    onClicked: updateInstallDialog.close()
+                }
+                DsButton {
+                    text: "Cài đặt và khởi động lại"
+                    primary: true
+                    feedbackEnabled: false
+                    onClicked: {
+                        updateInstallDialog.close()
+                        window.appModel.updater.installConfirmed()
+                    }
+                }
+            }
+        }
+    }
+
     Dialog {
         id: parallelJobDialog
         parent: Overlay.overlay

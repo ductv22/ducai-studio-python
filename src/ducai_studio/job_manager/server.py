@@ -25,6 +25,7 @@ from ducai_studio.infrastructure.ipc.messages import (
     IpcMessage,
     encode_frame,
 )
+from ducai_studio.providers.tts.warm_host import WarmTtsHostConfig, WarmTtsHostPool
 from ducai_studio.workers.protocol import WorkerMessage
 
 from .multi_video_coordinator import MultiVideoCoordinator
@@ -70,6 +71,27 @@ _MANAGED_ENGINE_HOSTS = {
         "DUCAI_TTS_ENGINE_HOST_SHA256",
     ),
 }
+_UPDATE_BLOCKED_ACTIONS = frozenset(
+    {
+        "create_job",
+        "create_ocr_job",
+        "create_ocr_rescan_job",
+        "create_translation_job",
+        "create_tts_job",
+        "prepare_tts_rerun",
+        "estimate_voice_conform",
+        "create_voice_conform_job",
+        "create_voice_timing_repair_job",
+        "create_tts_timing_retry_job",
+        "create_tts_timing_override_job",
+        "create_export_job",
+        "start_job",
+        "retry_job",
+        "resume_job",
+        "multi_start",
+        "multi_resume",
+    }
+)
 
 
 def _managed_engine_host_contract(job: Any) -> tuple[str, str, str] | None:
@@ -90,7 +112,8 @@ def _is_managed_release_engine_host(path: Path | None, filename: str) -> bool:
 
     return (
         path is not None
-        and path.name.casefold() == filename.casefold()
+        and path.stem.casefold() == Path(filename).stem.casefold()
+        and path.suffix.casefold() in {".py", ".pyc"}
         and path.parent.name.casefold() == "engine_hosts"
         and path.parent.parent.name.casefold().startswith("ducai-studio-")
     )
@@ -164,8 +187,10 @@ class JobManagerServer(QObject):
         self._control_retry_started_at: dict[str, float] = {}
         self._slow_start_controls_reported: set[str] = set()
         self._pending_history_deletions: set[str] = set()
+        self._update_install_reservation = ""
         self._shutting_down = False
         self._shutdown_deadline = 0.0
+        self._warm_tts = WarmTtsHostPool(idle_timeout_seconds=120)
         self.multi = MultiVideoCoordinator(self)
         self.server.newConnection.connect(self._accept_connections)
         self.workers.eventReceived.connect(self._worker_event)
@@ -179,6 +204,7 @@ class JobManagerServer(QObject):
 
     def close(self) -> None:
         self.workers.force_shutdown()
+        self._warm_tts.close()
         for socket in tuple(self._decoders):
             socket.abort()
         self.server.close()
@@ -279,6 +305,18 @@ class JobManagerServer(QObject):
     def _dispatch(self, action: str, params: dict[str, Any]) -> Any:
         if action == "ping":
             return {"status": "ready"}
+        if action == "get_update_install_eligibility":
+            return self._update_install_eligibility()
+        if action == "reserve_update_install":
+            return self._reserve_update_install()
+        if action == "release_update_install":
+            token = _required_string(params, "token")
+            if not self._update_install_reservation or token != self._update_install_reservation:
+                raise ValueError("Phiên cài đặt cập nhật không còn hợp lệ")
+            self._update_install_reservation = ""
+            return {"released": True}
+        if action in _UPDATE_BLOCKED_ACTIONS:
+            self._ensure_update_admission_open()
         if action == "create_job":
             return self.service.create_job(params)
         if action == "store_credential":
@@ -665,6 +703,19 @@ class JobManagerServer(QObject):
                 ),
                 staging_root=self.service.checkpoints.staging_root,
             )
+        if action == "set_translation_preferences":
+            preset = _required_string(params, "preset")
+            custom_rules = params.get("custom_rules", "")
+            if not isinstance(custom_rules, str):
+                raise ValueError("Translation custom rules must be a string")
+            return _project_transport_payload(
+                self.service.set_translation_preferences(
+                    project_id=_required_string(params, "project_id"),
+                    preset=preset,
+                    custom_rules=custom_rules,
+                ),
+                staging_root=self.service.checkpoints.staging_root,
+            )
         if action == "subtitle_command":
             language = params.get("language", "source")
             if language not in {"source", "translated"}:
@@ -721,9 +772,46 @@ class JobManagerServer(QObject):
             return {"status": "stopping"}
         raise LookupError(f"Unknown Job Manager action: {action}")
 
+    def _update_install_eligibility(self) -> dict[str, Any]:
+        active_jobs = self.service.jobs.active_jobs()
+        batch = self.service.multi_videos.get_batch()
+        batch_state = str(batch.get("state", "idle"))
+        multi_active = batch_state in {"running", "pause_requested"}
+        eligible = not active_jobs and not multi_active and not self._update_install_reservation
+        return {
+            "eligible": eligible,
+            "active_job_count": len(active_jobs),
+            "active_job_ids": [job_id for job_id, _state in active_jobs],
+            "multi_state": batch_state,
+            "reserved": bool(self._update_install_reservation),
+        }
+
+    def _reserve_update_install(self) -> dict[str, Any]:
+        eligibility = self._update_install_eligibility()
+        if not eligibility["eligible"]:
+            return eligibility
+        token = str(uuid4())
+        self._update_install_reservation = token
+        return {**eligibility, "eligible": True, "reserved": True, "token": token}
+
+    def _ensure_update_admission_open(self) -> None:
+        if self._update_install_reservation:
+            raise ValueError(
+                "DUCAI STUDIO đang chuẩn bị cài bản cập nhật; không thể chạy tác vụ mới"
+            )
+
     def _start_job(self, params: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_update_admission_open()
         job_id = _required_string(params, "job_id")
         job = self.service.jobs.get(job_id)
+        if (
+            job.spec.kind is JobKind.TTS
+            and job.spec.provider_id == "vieneu-3.3"
+        ):
+            raise ValueError(
+                "Tác vụ VieNeu 3.3 cũ không thể tiếp tục bằng engine 3.8.1. "
+                "Hãy tạo tác vụ voice mới; profile clone và cache cũ không bị xóa."
+            )
         self._ensure_no_other_active_stage(job)
         intent = control_intent("start", job.state)
         program = Path(_required_string(params, "program")).expanduser().resolve(strict=True)
@@ -763,6 +851,9 @@ class JobManagerServer(QObject):
         worker_environment["DUCAI_ARTIFACT_STAGING_ROOT"] = str(
             self.service.checkpoints.staging_root
         )
+        # Only the manager grants a session. Ignore stale ambient/IPC settings.
+        for key in ("PROTOCOL", "ENDPOINT", "TOKEN"):
+            worker_environment[f"DUCAI_TTS_WARM_{key}"] = ""
         if job.spec.kind is JobKind.TTS:
             # A stale system environment must never override a custom host.
             worker_environment["DUCAI_TTS_ENGINE_HOST_MANAGED"] = "0"
@@ -797,6 +888,31 @@ class JobManagerServer(QObject):
                         },
                     )
         try:
+            if job.spec.kind is JobKind.OCR:
+                self._warm_tts.discard_idle()
+            elif (
+                job.spec.kind is JobKind.TTS
+                and job.spec.provider_id == "vieneu-3.8"
+                and job.spec.provider_config.get("job_mode") != "voice_conform"
+            ):
+                config = job.spec.provider_config
+                current_host = _engine_host_path("tts_engine_host.py").resolve()
+                selected_host = Path(worker_environment.get("DUCAI_TTS_ENGINE_HOST_PATH")
+                                     or str(config.get("engine_host_path", ""))).resolve()
+                if selected_host == current_host and config.get("runtime_python"):
+                    try:
+                        warm_config = WarmTtsHostConfig(
+                            runtime_python=Path(str(config["runtime_python"])),
+                            host_script=current_host,
+                            data_root=Path(str(config["data_root"])),
+                            timeout_seconds=float(config.get("provider_timeout_seconds", 1800)),
+                            batch_size=int(config.get("batch_size", 32)),
+                        )
+                        worker_environment.update(self._warm_tts.register(job_id, warm_config))
+                    except (OSError, ValueError, KeyError):
+                        # Warm reuse is optional; standalone keeps existing runtime
+                        # validation/error messages for old or unavailable installs.
+                        self._warm_tts.release(job_id, healthy=False)
             self.workers.start(
                 job_id=job_id,
                 program=str(program),
@@ -804,6 +920,7 @@ class JobManagerServer(QObject):
                 environment=worker_environment,
             )
         except Exception as exc:
+            self._warm_tts.release(job_id, healthy=False)
             self.service.jobs.append_worker_event(
                 event_id=str(uuid4()),
                 job_id=job_id,
@@ -841,7 +958,16 @@ class JobManagerServer(QObject):
         credential_references: object = None,
         provider_options: object = None,
     ) -> dict[str, Any]:
+        self._ensure_update_admission_open()
         job = self.service.jobs.get(job_id)
+        if (
+            job.spec.kind is JobKind.TTS
+            and job.spec.provider_id == "vieneu-3.3"
+        ):
+            raise ValueError(
+                "Tác vụ VieNeu 3.3 cũ không thể tiếp tục bằng engine 3.8.1. "
+                "Hãy tạo tác vụ voice mới; trạng thái và cache cũ vẫn được giữ nguyên."
+            )
         self._ensure_no_other_active_stage(job)
         if job.state is JobState.CANCELLED and job.spec.kind.value != "translate":
             raise ValueError("Chỉ tác vụ dịch có checkpoint mới được tiếp tục sau khi hủy")
@@ -888,6 +1014,7 @@ class JobManagerServer(QObject):
         return self.service.get_job(job_id)
 
     def _resume_job(self, job_id: str) -> dict[str, Any]:
+        self._ensure_update_admission_open()
         job = self.service.jobs.get(job_id)
         self._ensure_no_other_active_stage(job)
         intent = control_intent("resume", job.state)
@@ -1001,12 +1128,16 @@ class JobManagerServer(QObject):
     def _worker_event(self, job_id: str, message: WorkerMessage) -> None:
         try:
             self._persist_worker_event(job_id, message)
-            self.multi.on_worker_event(job_id, message.kind, dict(message.payload))
+            managed_by_multi = self.multi.on_worker_event(
+                job_id, message.kind, dict(message.payload)
+            )
+            if managed_by_multi and message.kind == "progress":
+                return
             # Manual OCR/translation/TTS/export jobs also drive catalog card
             # status, but only when this project is actually in Multi. Avoid
             # emitting unsolicited IPC events for unrelated standalone jobs.
             try:
-                project_id = self.service.jobs.get(job_id).spec.project_id
+                project_id = self.service.jobs.project_id_for(job_id)
                 is_member = any(
                     str(item.get("project_id", "")) == project_id
                     for item in self.service.multi_videos.list_items()
@@ -1380,6 +1511,7 @@ class JobManagerServer(QObject):
     @Slot(str, int)
     def _worker_finished(self, job_id: str, exit_code: int) -> None:
         state = self.service.jobs.get(job_id).state
+        self._warm_tts.release(job_id, healthy=(state is JobState.SUCCEEDED and exit_code == 0))
         active_states = {
             JobState.RUNNING,
             JobState.START_REQUESTED,

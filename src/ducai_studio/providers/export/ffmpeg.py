@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,7 +13,9 @@ from ducai_studio.domain.effects import (
     RenderClip,
     RenderConformSegment,
     RenderOverlay,
+    RenderSceneText,
     RenderSubtitle,
+    RenderSubtitleBlur,
     SubtitleStyle,
     VideoFilterSettings,
 )
@@ -173,6 +176,18 @@ def materialize_export_chunk(
     ]
     logos = [overlay for overlay in active_overlays if overlay.kind == "logo"]
     blurs = [overlay for overlay in active_overlays if overlay.kind == "blur"]
+    active_subtitle_blurs = [
+        blur
+        for blur in snapshot.subtitle_blurs
+        if blur.end_us > start_us and blur.start_us < end_us
+    ]
+    active_scene_texts = [
+        cue
+        for cue in snapshot.scene_texts
+        if cue.review_state == "accepted"
+        and cue.end_us > start_us
+        and cue.start_us < end_us
+    ]
     logo_inputs: list[tuple[int, RenderOverlay]] = []
     next_input = 1
     for logo in logos:
@@ -362,10 +377,119 @@ def materialize_export_chunk(
         f"[{video_input_label}]" + ",".join(video_filters or ["null"]) + "[vprep]"
     )
     current_label = "vprep"
+    blur_groups: dict[tuple[int, bool], list[RenderSubtitleBlur]] = {}
+    for blur in active_subtitle_blurs:
+        key = (blur.blur_radius, blur.concealment_mode == "cover")
+        blur_groups.setdefault(key, []).append(blur)
+    for group_number, ((requested_radius, strong_blur), group) in enumerate(
+        sorted(blur_groups.items())
+    ):
+        base_label = f"vsubblur{group_number}base"
+        source_label = f"vsubblur{group_number}src"
+        graph.append(
+            f"[{current_label}]split=2[{base_label}][{source_label}]"
+        )
+        radius = max(1, min(requested_radius, output_width // 2, output_height // 2))
+        chroma_radius = max(1, min(6, radius // 2))
+        blurred_label = f"vsubblur{group_number}full"
+        power = 2 if strong_blur else 1
+        graph.append(
+            f"[{source_label}]boxblur=luma_radius={radius}:luma_power={power}:"
+            f"chroma_radius={chroma_radius}:chroma_power={power}[{blurred_label}]"
+        )
+        mask_filters = [
+            f"color=c=black:s={output_width}x{output_height}:r={snapshot.settings.fps}:"
+            f"d={duration_s}"
+        ]
+        for blur in group:
+            x, y, width, height = _overlay_pixels(blur, output_width, output_height)
+            enable = _range_enable(blur.start_us, blur.end_us, start_us, end_us)
+            mask_filters.append(
+                f"drawbox=x={x}:y={y}:w={width}:h={height}:"
+                f"color=white@{blur.opacity:.6f}:t=fill:enable='{enable}'"
+            )
+        mask_label = f"vsubblur{group_number}mask"
+        graph.append(",".join(mask_filters) + f",format=gray[{mask_label}]")
+        next_label = f"vsubblur{group_number}out"
+        graph.append(
+            f"[{base_label}][{blurred_label}][{mask_label}]maskedmerge[{next_label}]"
+        )
+        current_label = next_label
+        covered = [blur for blur in group if blur.concealment_mode == "cover"]
+        if covered:
+            cover_filters = []
+            for blur in covered:
+                x, y, width, height = _overlay_pixels(
+                    blur, output_width, output_height
+                )
+                enable = _range_enable(blur.start_us, blur.end_us, start_us, end_us)
+                cover_filters.append(
+                    f"drawbox=x={x}:y={y}:w={width}:h={height}:"
+                    f"color=black@0.900000:t=fill:enable='{enable}'"
+                )
+            cover_label = f"vsubblur{group_number}covered"
+            graph.append(
+                f"[{current_label}]" + ",".join(cover_filters) + f"[{cover_label}]"
+            )
+            current_label = cover_label
+    scene_blur_groups: dict[int, list[RenderSceneText]] = {}
+    for cue in active_scene_texts:
+        scene_blur_groups.setdefault(cue.blur_radius, []).append(cue)
+    for group_number, (requested_radius, group) in enumerate(
+        sorted(scene_blur_groups.items())
+    ):
+        base_label = f"vscene{group_number}base"
+        source_label = f"vscene{group_number}src"
+        graph.append(f"[{current_label}]split=2[{base_label}][{source_label}]")
+        radius = max(1, min(requested_radius, output_width // 2, output_height // 2))
+        chroma_radius = max(1, min(6, radius // 2))
+        blurred_label = f"vscene{group_number}full"
+        graph.append(
+            f"[{source_label}]boxblur=luma_radius={radius}:luma_power=2:"
+            f"chroma_radius={chroma_radius}:chroma_power=2[{blurred_label}]"
+        )
+        mask_filters = [
+            f"color=c=black:s={output_width}x{output_height}:r={snapshot.settings.fps}:"
+            f"d={duration_s}"
+        ]
+        for cue in group:
+            x, y, width, height = _scene_glyph_pixels(cue, output_width, output_height)
+            enable = _range_enable(cue.start_us, cue.end_us, start_us, end_us)
+            mask_filters.append(
+                f"drawbox=x={x}:y={y}:w={width}:h={height}:"
+                f"color=white@1.000000:t=fill:enable='{enable}'"
+            )
+        mask_label = f"vscene{group_number}mask"
+        graph.append(",".join(mask_filters) + f",format=gray[{mask_label}]")
+        next_label = f"vscene{group_number}merged"
+        graph.append(
+            f"[{base_label}][{blurred_label}][{mask_label}]maskedmerge[{next_label}]"
+        )
+        current_label = next_label
+        fills = []
+        for cue in group:
+            if not cue.background_color or cue.background_style != "solid":
+                continue
+            x, y, width, height = _scene_label_background_pixels(
+                cue,
+                output_width,
+                output_height,
+            )
+            enable = _range_enable(cue.start_us, cue.end_us, start_us, end_us)
+            fills.append(
+                f"drawbox=x={x}:y={y}:w={width}:h={height}:"
+                f"color=0x{cue.background_color[1:]}@"
+                f"{cue.background_opacity_percent / 100:.6f}:t=fill:enable='{enable}'"
+            )
+        if fills:
+            filled_label = f"vscene{group_number}filled"
+            graph.append(f"[{current_label}]" + ",".join(fills) + f"[{filled_label}]")
+            current_label = filled_label
     if blurs:
         split_labels = ["vmain", *(f"vblur{number}src" for number in range(len(blurs)))]
         graph.append(
-            f"[vprep]split={len(split_labels)}" + "".join(f"[{label}]" for label in split_labels)
+            f"[{current_label}]split={len(split_labels)}"
+            + "".join(f"[{label}]" for label in split_labels)
         )
         current_label = "vmain"
         for number, blur in enumerate(blurs):
@@ -405,7 +529,7 @@ def materialize_export_chunk(
         for cue in snapshot.subtitles
         if cue.end_us > start_us and cue.start_us < end_us
     ]
-    if snapshot.settings.subtitle_style.enabled and active_subtitles:
+    if snapshot.settings.subtitle_style.enabled and (active_subtitles or active_scene_texts):
         ass_path = work_dir / f"subtitles-{index:05d}.ass"
         _write_ass(
             ass_path,
@@ -415,9 +539,18 @@ def materialize_export_chunk(
             width=output_width,
             height=output_height,
             style=snapshot.settings.subtitle_style,
+            scene_texts=active_scene_texts,
         )
         next_label = "vsub"
-        graph.append(f"[{current_label}]ass=filename='{ass_path.name}'[{next_label}]")
+        font_directory = _bundled_font_directory()
+        font_option = (
+            f":fontsdir='{_ffmpeg_filter_path(font_directory)}'"
+            if font_directory is not None
+            else ""
+        )
+        graph.append(
+            f"[{current_label}]ass=filename='{ass_path.name}'{font_option}[{next_label}]"
+        )
         current_label = next_label
     graph.append(f"[{current_label}]null[vout]")
 
@@ -684,6 +817,14 @@ def decode_export_snapshot(raw: object) -> ExportSnapshot:
             RenderConformSegment(**_dict(item, "conform segment"))
             for item in _list(raw.get("conform_segments", []), "conform_segments")
         ),
+        tuple(
+            RenderSubtitleBlur(**_dict(item, "subtitle blur"))
+            for item in _list(raw.get("subtitle_blurs", []), "subtitle_blurs")
+        ),
+        tuple(
+            RenderSceneText(**_dict(item, "scene text"))
+            for item in _list(raw.get("scene_texts", []), "scene_texts")
+        ),
     )
 
 
@@ -765,7 +906,9 @@ def _atempo_filters(speed: float) -> list[str]:
 
 
 def _overlay_pixels(
-    overlay: RenderOverlay, output_width: int, output_height: int
+    overlay: RenderOverlay | RenderSubtitleBlur,
+    output_width: int,
+    output_height: int,
 ) -> tuple[int, int, int, int]:
     x = max(0, min(output_width - 2, int(round(overlay.x * output_width))))
     y = max(0, min(output_height - 2, int(round(overlay.y * output_height))))
@@ -776,10 +919,276 @@ def _overlay_pixels(
     return x, y, max(2, width), max(2, height)
 
 
+def _scene_glyph_pixels(
+    cue: RenderSceneText,
+    output_width: int,
+    output_height: int,
+) -> tuple[int, int, int, int]:
+    proxy = RenderSubtitleBlur(
+        cue.cue_id,
+        cue.index,
+        cue.start_us,
+        cue.end_us,
+        cue.glyph_x,
+        cue.glyph_y,
+        cue.glyph_width,
+        cue.glyph_height,
+    )
+    return _overlay_pixels(proxy, output_width, output_height)
+
+
+def _scene_label_background_pixels(
+    cue: RenderSceneText,
+    output_width: int,
+    output_height: int,
+) -> tuple[int, int, int, int]:
+    """Approximate Qt-painted bounds for a tight export-side label panel."""
+
+    lines = [line for line in cue.text.splitlines() if line] or [cue.text]
+    longest = max(1, max(len(line) for line in lines))
+    script_font = cue.style_hint.startswith("calligraphy")
+    width_ratio = 0.72 if script_font else 0.62
+    line_height_ratio = 1.18 if script_font else 1.10
+    spacing = cue.font_size * cue.letter_spacing_percent / 100
+    text_width = max(
+        cue.font_size,
+        round(longest * cue.font_size * width_ratio + max(0, longest - 1) * spacing),
+    )
+    text_height = max(
+        cue.font_size,
+        round(len(lines) * cue.font_size * line_height_ratio),
+    )
+    pad_x = round(cue.font_size * cue.background_padding_x / 100)
+    pad_y = round(cue.font_size * cue.background_padding_y / 100)
+    width = min(output_width, max(2, text_width + pad_x * 2))
+    height = min(output_height, max(2, text_height + pad_y * 2))
+    center_x = (cue.panel_x + cue.panel_width / 2) * output_width
+    center_y = (cue.panel_y + cue.panel_height / 2) * output_height
+    x = max(0, min(output_width - width, round(center_x - width / 2)))
+    y = max(0, min(output_height - height, round(center_y - height / 2)))
+    return x, y, width, height
+
+
+def _scene_ink_background_pixels(
+    cue: RenderSceneText,
+    output_width: int,
+    output_height: int,
+) -> tuple[int, int, int, int]:
+    """Expand the tight text panel enough for organic brush fringes and splats."""
+
+    x, y, width, height = _scene_label_background_pixels(
+        cue, output_width, output_height
+    )
+    extra_x = max(3, round(cue.font_size * (0.34 if cue.orientation == "vertical" else 0.22)))
+    extra_y = max(3, round(cue.font_size * (0.22 if cue.orientation == "vertical" else 0.34)))
+    left = max(0, x - extra_x)
+    top = max(0, y - extra_y)
+    right = min(output_width, x + width + extra_x)
+    bottom = min(output_height, y + height + extra_y)
+    return left, top, max(2, right - left), max(2, bottom - top)
+
+
+_INK_SHAPES = {
+    "ink_splash": (
+        0.72,
+        (
+            (0.46, 0.01), (0.63, 0.04), (0.58, 0.09), (0.79, 0.12),
+            (0.68, 0.17), (0.88, 0.22), (0.75, 0.27), (0.92, 0.34),
+            (0.77, 0.39), (0.89, 0.45), (0.73, 0.50), (0.86, 0.57),
+            (0.74, 0.62), (0.91, 0.69), (0.75, 0.74), (0.83, 0.81),
+            (0.63, 0.84), (0.70, 0.92), (0.55, 0.89), (0.61, 0.99),
+            (0.43, 0.95), (0.33, 1.00), (0.30, 0.90), (0.12, 0.85),
+            (0.25, 0.79), (0.07, 0.73), (0.23, 0.67), (0.10, 0.60),
+            (0.25, 0.54), (0.08, 0.48), (0.27, 0.42), (0.12, 0.35),
+            (0.29, 0.30), (0.09, 0.23), (0.31, 0.18), (0.22, 0.10),
+            (0.41, 0.08),
+        ),
+        (
+            (0.08, 0.16, 0.025, 0.016),
+            (0.94, 0.29, 0.018, 0.012),
+            (0.04, 0.64, 0.020, 0.013),
+            (0.91, 0.82, 0.028, 0.018),
+        ),
+    ),
+    "ink_wash": (
+        0.82,
+        (
+            (0.43, 0.00), (0.62, 0.02), (0.58, 0.06), (0.78, 0.08),
+            (0.70, 0.12), (0.96, 0.16), (0.76, 0.20), (0.88, 0.25),
+            (0.74, 0.30), (0.93, 0.35), (0.80, 0.40), (0.89, 0.46),
+            (0.73, 0.51), (0.95, 0.57), (0.78, 0.62), (0.88, 0.68),
+            (0.76, 0.74), (0.91, 0.80), (0.72, 0.85), (0.78, 0.91),
+            (0.61, 0.94), (0.56, 1.00), (0.39, 0.97), (0.28, 0.93),
+            (0.32, 0.88), (0.11, 0.84), (0.23, 0.78), (0.06, 0.73),
+            (0.24, 0.67), (0.10, 0.61), (0.26, 0.56), (0.05, 0.50),
+            (0.25, 0.45), (0.12, 0.39), (0.28, 0.34), (0.07, 0.28),
+            (0.27, 0.23), (0.04, 0.18), (0.29, 0.13), (0.17, 0.08),
+            (0.38, 0.06),
+        ),
+        (
+            (0.07, 0.11, 0.032, 0.020),
+            (0.95, 0.22, 0.026, 0.018),
+            (0.03, 0.64, 0.020, 0.014),
+            (0.92, 0.72, 0.036, 0.024),
+            (0.16, 0.91, 0.025, 0.018),
+            (0.84, 0.06, 0.018, 0.013),
+        ),
+    ),
+    "ink_cloud": (
+        0.96,
+        (
+            (0.38, 0.02), (0.56, 0.00), (0.70, 0.05), (0.78, 0.11),
+            (0.91, 0.17), (0.84, 0.24), (0.94, 0.31), (0.85, 0.38),
+            (0.92, 0.46), (0.84, 0.54), (0.94, 0.62), (0.83, 0.69),
+            (0.89, 0.77), (0.77, 0.84), (0.73, 0.92), (0.58, 0.98),
+            (0.43, 1.00), (0.30, 0.95), (0.22, 0.89), (0.24, 0.82),
+            (0.10, 0.76), (0.17, 0.68), (0.07, 0.61), (0.16, 0.53),
+            (0.06, 0.45), (0.17, 0.37), (0.09, 0.29), (0.20, 0.22),
+            (0.17, 0.14), (0.30, 0.09),
+        ),
+        (
+            (0.11, 0.27, 0.022, 0.016),
+            (0.91, 0.43, 0.018, 0.013),
+            (0.13, 0.72, 0.017, 0.012),
+        ),
+    ),
+    "brush_stroke": (
+        0.62,
+        (
+            (0.36, 0.01), (0.52, 0.04), (0.66, 0.00), (0.75, 0.06),
+            (0.70, 0.12), (0.83, 0.19), (0.78, 0.29), (0.86, 0.40),
+            (0.80, 0.50), (0.85, 0.61), (0.77, 0.72), (0.82, 0.82),
+            (0.69, 0.91), (0.62, 1.00), (0.54, 0.94), (0.45, 1.00),
+            (0.40, 0.93), (0.27, 0.88), (0.22, 0.78), (0.18, 0.67),
+            (0.23, 0.56), (0.16, 0.45), (0.22, 0.34), (0.17, 0.24),
+            (0.28, 0.15), (0.24, 0.08),
+        ),
+        (
+            (0.12, 0.18, 0.016, 0.010),
+            (0.88, 0.83, 0.018, 0.011),
+        ),
+    ),
+}
+
+
+def _ink_splash_ass_drawing(
+    cue: RenderSceneText,
+    output_width: int,
+    output_height: int,
+) -> str:
+    """Create a deterministic, aspect-safe ASS vector ink silhouette."""
+
+    x, y, width, height = _scene_ink_background_pixels(
+        cue, output_width, output_height
+    )
+
+    cap_scale, body_points, splat_points = _INK_SHAPES.get(
+        cue.background_style, _INK_SHAPES["ink_splash"]
+    )
+    vertical = cue.orientation == "vertical"
+    thickness = width if vertical else height
+    length = height if vertical else width
+
+    def long_coordinate(value: float) -> float:
+        edge = 0.24
+        cap = min(length * 0.34, thickness * cap_scale)
+        if value <= edge:
+            return value / edge * cap
+        if value >= 1.0 - edge:
+            return length - (1.0 - value) / edge * cap
+        return cap + (value - edge) / (1.0 - edge * 2.0) * max(
+            0.0, length - cap * 2.0
+        )
+
+    def orient(u: float, v: float) -> tuple[float, float]:
+        cross = u * thickness
+        along = long_coordinate(v)
+        local_x, local_y = (
+            (cross, along) if vertical else (along, thickness - cross)
+        )
+        if cue.index % 2 == 0:
+            local_x = width - local_x
+        return x + local_x, y + local_y
+
+    points = [orient(u, v) for u, v in body_points]
+    start = (
+        (points[-1][0] + points[0][0]) / 2.0,
+        (points[-1][1] + points[0][1]) / 2.0,
+    )
+    body_parts = [f"m {round(start[0])} {round(start[1])}"]
+    cursor_x, cursor_y = start
+    for index, (control_x, control_y) in enumerate(points):
+        next_x, next_y = points[(index + 1) % len(points)]
+        end_x = (control_x + next_x) / 2.0
+        end_y = (control_y + next_y) / 2.0
+        first_x = cursor_x + (control_x - cursor_x) * 2.0 / 3.0
+        first_y = cursor_y + (control_y - cursor_y) * 2.0 / 3.0
+        second_x = end_x + (control_x - end_x) * 2.0 / 3.0
+        second_y = end_y + (control_y - end_y) * 2.0 / 3.0
+        body_parts.append(
+            "b "
+            f"{round(first_x)} {round(first_y)} "
+            f"{round(second_x)} {round(second_y)} "
+            f"{round(end_x)} {round(end_y)}"
+        )
+        cursor_x, cursor_y = end_x, end_y
+    body = " ".join(body_parts)
+    splats = []
+    for u, v, cross_scale, long_scale in splat_points:
+        center_x, center_y = orient(u, v)
+        cross_radius = max(1.0, thickness * cross_scale)
+        long_radius = max(1.0, thickness * long_scale)
+        radius_x, radius_y = (
+            (cross_radius, long_radius)
+            if vertical
+            else (long_radius, cross_radius)
+        )
+        splats.append(
+            "m "
+            f"{round(center_x - radius_x)} {round(center_y)} "
+            f"b {round(center_x - radius_x)} {round(center_y - radius_y)} "
+            f"{round(center_x + radius_x)} {round(center_y - radius_y)} "
+            f"{round(center_x + radius_x)} {round(center_y)} "
+            f"b {round(center_x + radius_x)} {round(center_y + radius_y)} "
+            f"{round(center_x - radius_x)} {round(center_y + radius_y)} "
+            f"{round(center_x - radius_x)} {round(center_y)}"
+        )
+    return " ".join((body, *splats))
+
+
+def _bundled_font_directory() -> Path | None:
+    source = Path(__file__).resolve().parents[2] / "ui" / "assets" / "fonts"
+    if source.is_dir():
+        return source
+    frozen = Path(sys.executable).resolve().parent / "ui" / "assets" / "fonts"
+    return frozen if frozen.is_dir() else None
+
+
+def _ffmpeg_filter_path(path: Path) -> str:
+    value = path.resolve().as_posix()
+    if len(value) >= 2 and value[1] == ":":
+        value = value[0] + r"\:" + value[2:]
+    return value.replace("'", r"\'")
+
+
 def _enable_expression(overlay: RenderOverlay, chunk_start: int, chunk_end: int) -> str:
-    start = max(chunk_start, overlay.start_us) - chunk_start
-    end = min(chunk_end, overlay.end_us) - chunk_start
-    return f"between(t,{start / 1_000_000:.6f},{end / 1_000_000:.6f})"
+    return _range_enable(overlay.start_us, overlay.end_us, chunk_start, chunk_end)
+
+
+def _range_enable(
+    item_start_us: int,
+    item_end_us: int,
+    chunk_start: int,
+    chunk_end: int,
+) -> str:
+    start = max(chunk_start, item_start_us) - chunk_start
+    end = min(chunk_end, item_end_us) - chunk_start
+    # Project ranges are half-open.  ``between`` includes both endpoints and
+    # therefore concealed one extra frame at a cue boundary.
+    return (
+        f"gte(t,{start / 1_000_000:.6f})"
+        f"*lt(t,{end / 1_000_000:.6f})"
+    )
 
 
 def _write_ass(
@@ -791,6 +1200,7 @@ def _write_ass(
     width: int,
     height: int,
     style: SubtitleStyle,
+    scene_texts: list[RenderSceneText] | None = None,
 ) -> None:
     style_format = (
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
@@ -804,6 +1214,28 @@ def _write_ass(
         f"{_ass_color(style.outline_color)},&H64000000,0,0,0,0,100,100,0,0,1,"
         f"{style.outline_width},0,{style.alignment},40,40,{style.margin_bottom},1"
     )
+    background_style_names = {
+        (color, opacity): f"CueBackground{index}"
+        for index, (color, opacity) in enumerate(
+            sorted(
+                {
+                    (cue.background_color, cue.background_opacity_percent)
+                    for cue in cues
+                    if cue.background_color
+                }
+            ),
+            start=1,
+        )
+    }
+    style_rows = [style_value]
+    for (color, opacity), name in background_style_names.items():
+        background = _ass_color(color, opacity)
+        style_rows.append(
+            f"Style: {name},{style.font_family},{style.font_size},"
+            f"{_ass_color(style.primary_color, style.opacity_percent)},&H000000FF,"
+            f"{background},{background},0,0,0,0,100,100,0,0,3,"
+            f"6,0,{style.alignment},40,40,{style.margin_bottom},1"
+        )
     header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
@@ -813,20 +1245,98 @@ def _write_ass(
         "ScaledBorderAndShadow: yes\n\n"
         "[V4+ Styles]\n"
         f"{style_format}\n"
-        f"{style_value}\n\n"
-        "[Events]\n"
-        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, "
-        "Effect, Text\n"
+        + "\n".join(style_rows)
+        + "\n\n"
+        + "[Events]\n"
+        + "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, "
+        + "Effect, Text\n"
     )
     lines = [header]
+    for cue in scene_texts or []:
+        start = max(chunk_start_us, cue.start_us) - chunk_start_us
+        end = min(chunk_end_us, cue.end_us) - chunk_start_us
+        if end <= start:
+            continue
+        fade_ms = min(
+            cue.fade_duration_ms,
+            max(0, (cue.end_us - cue.start_us) // 2_000),
+        ) if cue.fade_enabled else 0
+        fade_in_ms = fade_ms if cue.start_us >= chunk_start_us else 0
+        fade_out_ms = fade_ms if cue.end_us <= chunk_end_us else 0
+        fade_override = (
+            f"\\fad({fade_in_ms},{fade_out_ms})"
+            if fade_in_ms or fade_out_ms
+            else ""
+        )
+        if cue.background_style in _INK_SHAPES:
+            drawing = _ink_splash_ass_drawing(cue, width, height)
+            ink_color = cue.background_color or "#080808"
+            ink_override = (
+                r"{\an7\pos(0,0)\p1\bord0\shad0"
+                + _ass_primary_override(ink_color)
+                + _ass_alpha_override(cue.background_opacity_percent)
+                + fade_override
+                + "}"
+            )
+            lines.append(
+                f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Default,,0,0,0,,"
+                f"{ink_override}{drawing}{{\\p0}}\n"
+            )
+        position_x = round((cue.panel_x + cue.panel_width / 2) * width)
+        position_y = round((cue.panel_y + cue.panel_height / 2) * height)
+        text = _ass_text(cue.text)
+        override = (
+            r"{\an5\q2"
+            + f"\\pos({position_x},{position_y})"
+            + f"\\fn{_ass_override_text(cue.font_family)}"
+            + f"\\fs{cue.font_size}"
+            + (_ass_primary_override(cue.text_color) if cue.text_color else "")
+            + (f"\\fsp{round(cue.font_size * cue.letter_spacing_percent / 100)}")
+            + (r"\b1" if cue.font_bold else r"\b0")
+            + (r"\i1" if cue.font_italic else r"\i0")
+            + _ass_global_alpha_override(cue.text_opacity_percent)
+            + fade_override
+            + r"\bord2\shad1}"
+        )
+        lines.append(
+            f"Dialogue: 1,{_ass_time(start)},{_ass_time(end)},Default,,0,0,0,,"
+            f"{override}{text}\n"
+        )
     for cue in cues:
         start = max(chunk_start_us, cue.start_us) - chunk_start_us
         end = min(chunk_end_us, cue.end_us) - chunk_start_us
         if end <= start:
             continue
         text = _ass_text(cue.text)
+        cue_style = background_style_names.get(
+            (cue.background_color, cue.background_opacity_percent), "Default"
+        )
+        override_values = []
+        if cue.font_size > 0:
+            override_values.append(f"\\fs{cue.font_size}")
+        if cue.text_color:
+            override_values.append(_ass_primary_override(cue.text_color))
+        if cue.font_family:
+            override_values.append(f"\\fn{_ass_override_text(cue.font_family)}")
+        override_values.append(
+            f"\\fsp{round(cue.font_size * cue.letter_spacing_percent / 100)}"
+        )
+        override_values.append(r"\b1" if cue.font_bold else r"\b0")
+        override_values.append(r"\i1" if cue.font_italic else r"\i0")
+        override_values.append(_ass_alpha_override(cue.text_opacity_percent))
+        if cue.panel_x >= 0:
+            position_x = round((cue.panel_x + cue.panel_width / 2) * width)
+            position_y = round((cue.panel_y + cue.panel_height / 2) * height)
+            override_values.extend(
+                (
+                    r"\an5\q2",
+                    f"\\pos({position_x},{position_y})",
+                )
+            )
+        override = "{" + "".join(override_values) + "}" if override_values else ""
         lines.append(
-            f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Default,,0,0,0,,{text}\n"
+            f"Dialogue: 2,{_ass_time(start)},{_ass_time(end)},{cue_style},,0,0,0,,"
+            f"{override}{text}\n"
         )
     path.write_text("".join(lines), encoding="utf-8-sig", newline="\n")
 
@@ -837,6 +1347,27 @@ def _ass_color(value: str, opacity_percent: int = 100) -> str:
     blue = value[5:7]
     alpha = round((100 - opacity_percent) * 255 / 100)
     return f"&H{alpha:02X}{blue}{green}{red}"
+
+
+def _ass_primary_override(value: str) -> str:
+    red = value[1:3]
+    green = value[3:5]
+    blue = value[5:7]
+    return f"\\c&H{blue}{green}{red}&"
+
+
+def _ass_alpha_override(opacity_percent: int) -> str:
+    alpha = round((100 - opacity_percent) * 255 / 100)
+    return f"\\1a&H{alpha:02X}&"
+
+
+def _ass_global_alpha_override(opacity_percent: int) -> str:
+    alpha = round((100 - opacity_percent) * 255 / 100)
+    return f"\\alpha&H{alpha:02X}&"
+
+
+def _ass_override_text(value: str) -> str:
+    return value.replace("\\", "").replace("{", "").replace("}", "")
 
 
 def _video_filter_chain(settings: VideoFilterSettings) -> list[str]:
