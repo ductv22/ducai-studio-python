@@ -2,7 +2,34 @@ from pathlib import Path
 
 import pytest
 
-from ducai_studio.ui.app import _application_data_root, _ui_resource_root
+from ducai_studio.ui.app import (
+    _application_data_root,
+    _seed_signed_update_smoke_candidate,
+    _ui_resource_root,
+)
+
+
+def test_signed_update_smoke_is_inert_on_normal_launch(monkeypatch):
+    monkeypatch.delenv("DUCAI_SMOKE_UPDATE_CANDIDATE", raising=False)
+    _seed_signed_update_smoke_candidate(None)
+
+
+def test_signed_update_smoke_requires_explicit_isolated_bounded_launch(monkeypatch):
+    monkeypatch.setenv("DUCAI_SMOKE_UPDATE_CANDIDATE", "missing-candidate")
+    monkeypatch.delenv("DUCAI_APP_DATA_ROOT", raising=False)
+    monkeypatch.delenv("DUCAI_SMOKE_EXIT_MS", raising=False)
+    with pytest.raises(ValueError, match="isolated app data"):
+        _seed_signed_update_smoke_candidate(None)
+
+
+def test_signed_update_smoke_rejects_unsigned_candidate(monkeypatch, tmp_path):
+    monkeypatch.setenv("DUCAI_SMOKE_UPDATE_CANDIDATE", str(tmp_path))
+    monkeypatch.setenv("DUCAI_APP_DATA_ROOT", str(tmp_path / "app-data"))
+    monkeypatch.setenv("DUCAI_SMOKE_EXIT_MS", "15000")
+    (tmp_path / "update-manifest.json").write_bytes(b"{}")
+    (tmp_path / "update-manifest.sig").write_bytes(b"x" * 64)
+    with pytest.raises(ValueError):
+        _seed_signed_update_smoke_candidate(None)
 
 
 def test_settings_update_panel_requires_explicit_restart_confirmation() -> None:
@@ -16,6 +43,32 @@ def test_settings_update_panel_requires_explicit_restart_confirmation() -> None:
     assert "textFormat: Text.PlainText" in settings
     assert "onInstallConfirmationRequested" in main
     assert "window.appModel.updater.installConfirmed()" in main
+
+
+def test_locked_settings_keep_diagnostics_but_gate_database_optimization() -> None:
+    settings = (
+        Path(__file__).parents[2]
+        / "src"
+        / "ducai_studio"
+        / "ui"
+        / "qml"
+        / "screens"
+        / "SettingsScreen.qml"
+    ).read_text(encoding="utf-8")
+    compact = " ".join(line.strip() for line in settings.splitlines())
+
+    diagnostics = compact[compact.index('text: "Chạy chẩn đoán"') :]
+    diagnostics = diagnostics[: diagnostics.index("onClicked:")]
+    assert "enabled: root.appModel.backendReady" in diagnostics
+    assert "activation.active" not in diagnostics
+
+    optimizer = compact[compact.index('text: root.appModel.databaseMaintenanceBusy') :]
+    optimizer = optimizer[: optimizer.index("onClicked:")]
+    assert (
+        "enabled: root.appModel.backendReady && (root.appModel.activation.active || "
+        "root.appModel.databaseMaintenanceBusy) && "
+        'root.appModel.databaseMaintenance.state !== "cancelling"'
+    ) in optimizer
 
 
 def test_application_data_root_is_canonical_before_single_instance_lock(tmp_path: Path) -> None:
@@ -40,35 +93,33 @@ def test_file_dialogs_pass_url_strings_to_python_for_unicode_safe_normalization(
 
 def test_scene_text_preview_is_glyph_aware_monotonic_and_manually_adjustable() -> None:
     qml_root = Path(__file__).parents[2] / "src" / "ducai_studio" / "ui" / "qml"
-    preview = (qml_root / "controls" / "TimelinePreview.qml").read_text(
-        encoding="utf-8"
-    )
-    editor = (qml_root / "screens" / "SubtitleEditorScreen.qml").read_text(
-        encoding="utf-8"
-    )
-    toolbar = (qml_root / "controls" / "SubtitleTextToolbar.qml").read_text(
-        encoding="utf-8"
-    )
+    preview = (qml_root / "controls" / "TimelinePreview.qml").read_text(encoding="utf-8")
+    editor = (qml_root / "screens" / "SubtitleEditorScreen.qml").read_text(encoding="utf-8")
+    toolbar = (qml_root / "controls" / "SubtitleTextToolbar.qml").read_text(encoding="utf-8")
 
-    assert "const glyph = sceneGlyphRect(cue)" in preview
-    assert "automaticSize * fontScale" in preview
-    assert "const widthRatio = calligraphy ? 1.96 : 1.28" in preview
+    assert "root.artworkForCue(sceneTextFrame.modelData)" in preview
+    assert "root.artworkForCue(root.activeSubtitle)" in preview
     assert "Math.min(240" not in preview
     assert "fontSizeMode: Text.Fit" not in preview
-    assert "background_padding_x" in preview
-    assert "background_padding_y" in preview
+    artwork = (qml_root.parents[1] / "providers" / "subtitle_artwork.py").read_text(
+        encoding="utf-8"
+    )
+    assert "background_padding_x" in artwork
+    assert "background_padding_y" in artwork
     assert "clip: true" in preview
-    assert "SubtitleTextToolbar {" in editor
+    timeline = (qml_root / "screens" / "TimelineScreen.qml").read_text(encoding="utf-8")
+    assert "SubtitleTextToolbar {" not in editor
+    assert "SubtitleTextToolbar {" in timeline
     assert 'text: "Kích thước chữ S2"' not in editor
     assert "from: 1" in toolbar
-    assert "to: 100" in toolbar
+    assert "to: 2147483647" in toolbar
     assert "setSelectedSubtitleTextFormat" in toolbar
     assert preview.count("enabled: !root.editableOverlays") >= 2
     assert preview.count("visible: !root.editableOverlays") >= 2
     assert 'text: "Ngang"' in toolbar
     assert 'text: "Dọc"' in toolbar
-    assert 'Accessible.name: "Độ rộng nền theo chiều ngang"' in toolbar
-    assert 'Accessible.name: "Độ rộng nền theo chiều dọc"' in toolbar
+    assert 'accessibleName: "Nền ngang (%)"' in toolbar
+    assert 'accessibleName: "Nền dọc (%)"' in toolbar
     assert 'value: "calligraphy_soft"' in toolbar
     assert 'value: "calligraphy_bold"' in toolbar
     assert 'value: "calligraphy_ink"' in toolbar
@@ -81,25 +132,19 @@ def test_scene_text_preview_is_glyph_aware_monotonic_and_manually_adjustable() -
     assert 'value: "ink_cloud"' in toolbar
     assert 'value: "brush_stroke"' in toolbar
     assert 'text: "Mực tàu"' in toolbar
-    assert 'Accessible.name: "Áp preset chữ và nền mực tàu"' in toolbar
-    assert "InkSplashBackground" in preview
-    assert "background_style" in preview
+    assert "root.applyInkPreset()" in toolbar
+    assert "root.appModel.subtitleArtwork(" in preview
+    assert "background_style" in artwork
 
 
 def test_subtitle_cues_can_be_opened_deleted_formatted_and_drawn_from_ui() -> None:
     qml_root = Path(__file__).parents[2] / "src" / "ducai_studio" / "ui" / "qml"
-    preview = (qml_root / "controls" / "TimelinePreview.qml").read_text(
+    preview = (qml_root / "controls" / "TimelinePreview.qml").read_text(encoding="utf-8")
+    timeline = (qml_root / "screens" / "TimelineScreen.qml").read_text(encoding="utf-8")
+    editor = (qml_root / "screens" / "SubtitleEditorScreen.qml").read_text(encoding="utf-8")
+    manual_dialog = (qml_root / "controls" / "ManualSubtitleCueDialog.qml").read_text(
         encoding="utf-8"
     )
-    timeline = (qml_root / "screens" / "TimelineScreen.qml").read_text(
-        encoding="utf-8"
-    )
-    editor = (qml_root / "screens" / "SubtitleEditorScreen.qml").read_text(
-        encoding="utf-8"
-    )
-    manual_dialog = (
-        qml_root / "controls" / "ManualSubtitleCueDialog.qml"
-    ).read_text(encoding="utf-8")
 
     assert "readonly property bool isSubtitleClip" in timeline
     assert "root.appModel.openSubtitleCueInEditor(" in timeline
@@ -117,6 +162,27 @@ def test_subtitle_cues_can_be_opened_deleted_formatted_and_drawn_from_ui() -> No
     assert 'value: "scene_text"' in manual_dialog
     assert 'text: "Mờ dần vào/ra"' in manual_dialog
     assert "root.appModel.setOcrRegions(" in editor
+
+
+def test_timeline_exposes_persistent_marks_and_heavy_overlap_warning() -> None:
+    timeline = (
+        Path(__file__).parents[2]
+        / "src"
+        / "ducai_studio"
+        / "ui"
+        / "qml"
+        / "screens"
+        / "TimelineScreen.qml"
+    ).read_text(encoding="utf-8")
+
+    assert 'text: "＋ Mark"' in timeline
+    assert 'text: "Xoá mark"' in timeline
+    assert "addTimelineMarker()" in timeline
+    assert "removeTimelineMarkerAtPlayhead()" in timeline
+    assert "timelineMarkers" in timeline
+    assert "removeTimelineMarker(markerUs)" in timeline
+    assert "model.overlapWarning" in timeline
+    assert "Cue chồng nhau trên 2/3 thời lượng" in timeline
 
 
 def test_projects_screen_uses_a_dedicated_new_project_dialog_contract() -> None:
@@ -142,7 +208,7 @@ def test_duplicate_media_dialog_has_safe_choices_and_a_no_op_close_button() -> N
 
 def test_every_integer_spinbox_is_editable_and_uses_the_shared_control() -> None:
     root = Path(__file__).parents[2] / "src" / "ducai_studio" / "ui" / "qml"
-    export = (root / "screens" / "ExportScreen.qml").read_text(encoding="utf-8")
+    export = (root / "controls" / "ExportSettingsPanel.qml").read_text(encoding="utf-8")
     control = (root / "controls" / "DsSpinBox.qml").read_text(encoding="utf-8")
 
     assert not any(line.lstrip().startswith("SpinBox {") for line in export.splitlines())
@@ -158,27 +224,21 @@ def test_subtitle_numeric_controls_and_timeline_inspector_are_width_safe() -> No
     root = Path(__file__).parents[2] / "src" / "ducai_studio" / "ui" / "qml"
     spinbox = (root / "controls" / "DsSpinBox.qml").read_text(encoding="utf-8")
     button = (root / "controls" / "DsButton.qml").read_text(encoding="utf-8")
-    toolbar = (root / "controls" / "SubtitleTextToolbar.qml").read_text(
-        encoding="utf-8"
-    )
-    dialog = (root / "controls" / "ManualSubtitleCueDialog.qml").read_text(
-        encoding="utf-8"
-    )
-    timeline = (root / "screens" / "TimelineScreen.qml").read_text(
-        encoding="utf-8"
-    )
+    toolbar = (root / "controls" / "SubtitleTextToolbar.qml").read_text(encoding="utf-8")
+    dialog = (root / "controls" / "ManualSubtitleCueDialog.qml").read_text(encoding="utf-8")
+    timeline = (root / "screens" / "TimelineScreen.qml").read_text(encoding="utf-8")
 
     assert "Layout.minimumWidth: 104" in spinbox
     assert "readonly property int indicatorWidth: 28" in spinbox
     assert "ToolTip.text: control.accessibleName" in spinbox
     assert 'property string tooltipText: ""' in button
     assert "ToolTip.text: control.tooltipText" in button
-    assert toolbar.count("Layout.preferredWidth: 104") >= 5
-    assert 'text: "MÀU & HIỆU ỨNG"' in toolbar
-    assert 'tooltipText: "Cho chữ trong cảnh xuất hiện' in toolbar
+    assert toolbar.count("Layout.fillWidth: true") >= 10
+    assert 'SectionTitle { text: "Hiệu ứng" }' in toolbar
+    assert 'tooltipText: "Bật/tắt mờ dần' in toolbar
     assert "standardButtons: Dialog.NoButton" in dialog
     assert 'text: "Hủy"' in dialog
-    assert 'text: root.cueRole === "dialogue"' in dialog
+    assert 'text: root.titleMode ? "Thêm Text" : root.cueRole === "dialogue"' in dialog
     assert timeline.count("Layout.minimumWidth: 0") >= 6
     assert 'tooltipText: "Thuộc tính clip đang chọn."' in timeline
     assert 'tooltipText: "Áp dụng phần trăm tốc độ' in timeline
@@ -201,7 +261,9 @@ def test_timeline_context_menus_render_inside_the_main_window() -> None:
     assert timeline.count("parent: Overlay.overlay") == 2
     assert timeline.count("closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside") == 2
     assert "trackMenu.openAt(trackRow,mouse.x,mouse.y)" in compact
-    assert "clipMenu.openAt(clipItem,mouse.x,mouse.y)" in compact
+    assert "clipMenuLoader.openAt(clipItem,mouse.x,mouse.y)" in compact
+    assert "sourceComponent: Popup" in timeline
+    assert "openContextMenus > 0" in timeline
     assert 'root.selectInspectorTab("clip")' in timeline
     assert timeline.count("sourceItem.mapToItem(") == 2
     assert "DsContextButton {" in timeline
@@ -243,9 +305,7 @@ def test_review_required_jobs_are_not_presented_as_engine_failures() -> None:
 def test_translation_history_can_cancel_delete_active_rows_and_select_a_cache() -> None:
     root = Path(__file__).parents[2] / "src" / "ducai_studio" / "ui" / "qml"
     panel = (root / "controls" / "JobActivityPanel.qml").read_text(encoding="utf-8")
-    subtitle = (root / "screens" / "SubtitleEditorScreen.qml").read_text(
-        encoding="utf-8"
-    )
+    subtitle = (root / "screens" / "SubtitleEditorScreen.qml").read_text(encoding="utf-8")
 
     assert 'text: "Xoá toàn bộ lịch sử"' in panel
     assert "root.appModel.deleteJobHistory(jobRow.model.jobId)" in panel
@@ -272,7 +332,8 @@ def test_voice_studio_exposes_finished_voice_player_and_detailed_tts_phases() ->
     assert 'model.phase === "final_master_measure"' in panel
     assert 'model.phase === "final_master_apply"' in panel
     assert '"Đã kiểm tra cache " + model.phaseCurrent + "/" + model.phaseTotal' in panel
-    assert '"Đã tổng hợp " + model.phaseCurrent + "/" + model.phaseTotal' in panel
+    assert 'model.phase === "warmup" ? "Đang làm nóng · " : "Đã tổng hợp "' in panel
+    assert '+ model.phaseCurrent + "/" + model.phaseTotal' in panel
     assert '"Đã ghép " + model.phaseCurrent + "/" + model.phaseTotal' in panel
 
 
@@ -313,7 +374,7 @@ def test_job_activity_panel_localizes_whisper_phases() -> None:
     assert "function percentLabel(current, total)" in panel
     assert ".toFixed(1)" in panel
     assert '"Đang nạp VieNeu và chuẩn bị dò cache"' in panel
-    assert 'model.progressAgeMs' in panel
+    assert "model.progressAgeMs" in panel
     assert '" · batch hiện tại "' in panel
     assert "Behavior on value" in panel
     assert "indeterminate:" in panel
@@ -382,15 +443,14 @@ def test_export_settings_keep_critical_controls_visible_in_a_narrow_pane() -> No
         / "ducai_studio"
         / "ui"
         / "qml"
-        / "screens"
-        / "ExportScreen.qml"
+        / "controls"
+        / "ExportSettingsPanel.qml"
     ).read_text(encoding="utf-8")
 
-    assert "width: settingsScroll.availableWidth" in qml
+    assert "width: root.availableWidth" in qml
     assert 'objectName: "exportOutputPicker"' in qml
-    assert 'objectName: "exportCancelButton"' in qml
     assert 'objectName: "exportCheckpointSpinBox"' in qml
-    assert "id: exportJobActions" in qml
+    assert "exportJobActions" not in qml
     assert "columns: 2" in qml
 
 
@@ -422,7 +482,7 @@ def test_gemini_web_floating_window_defaults_to_off() -> None:
     assert '"finalize_probe": "Đang kiểm tra video/audio"' in activity
     assert '"finalize_checksum": "Đang xác minh SHA-256"' in activity
     assert '"finalize_publish": "Đang công bố file thành phẩm"' in activity
-    assert 'function sizeLabel(bytes)' in activity
+    assert "function sizeLabel(bytes)" in activity
 
 
 def test_export_preview_owns_feedback_before_playback_state_changes() -> None:
@@ -444,11 +504,12 @@ def test_export_preview_owns_feedback_before_playback_state_changes() -> None:
 
 def test_effects_screen_has_live_logo_and_blur_preview() -> None:
     root = Path(__file__).parents[2] / "src" / "ducai_studio" / "ui" / "qml"
-    export = (root / "screens" / "ExportScreen.qml").read_text(encoding="utf-8")
+    export = (root / "controls" / "ExportSettingsPanel.qml").read_text(encoding="utf-8")
     preview = (root / "controls" / "TimelinePreview.qml").read_text(encoding="utf-8")
 
-    assert 'objectName: "effectsLivePreview"' in export
-    assert "showProjectOverlays: true" in export
+    timeline = (root / "screens" / "TimelineScreen.qml").read_text(encoding="utf-8")
+    assert "showProjectOverlays: true" in timeline
+    assert "editableProjectOverlays:" in timeline
     assert "mediaName(root.logoOverlay.asset_id)" in export
     assert "import QtQuick.Effects" in preview
     assert "property bool showProjectOverlays: false" in preview
@@ -457,7 +518,7 @@ def test_effects_screen_has_live_logo_and_blur_preview() -> None:
     assert "* root.subtitleScale()" in preview
     assert "? Math.SQRT2 : 1.0" in preview
     assert 'root.blurOverlay.concealment_mode === "cover"' in preview
-    assert 'opacity: 0.90' in preview
+    assert "opacity: 0.90" in preview
     assert 'overlayFrame.overlay.concealment_mode === "cover"' in preview
     assert 'overlayFrame.overlay.tracking_mode === "ocr_watermark"' in preview
     assert '"CHE WATERMARK OCR"' in preview
@@ -491,7 +552,8 @@ def test_effects_screen_has_live_logo_and_blur_preview() -> None:
     assert "overlayFrame.manualWidth = right - overlayFrame.manualX" in preview
     assert "overlayFrame.manualHeight = bottom - overlayFrame.manualY" in preview
     assert "anchors.bottom: parent.bottom" in preview
-    assert "visible: !root.editableOverlays && opacity > 0.01" in preview
+    assert "visible: !root.editableOverlays" in preview
+    assert "height: root.editableOverlays ? 0 : 46" in preview
     assert "root.selectedOverlayId === overlayFrame.overlay.id" in preview
     assert "? 100 : 40" in preview
     assert 'objectName: "overlayTopRightResizeHandle"' in preview
@@ -516,6 +578,10 @@ def test_translation_style_rules_use_multiline_editor_and_serialized_save() -> N
     assert "if (text.length <= 4000) return" in editor
     assert "!root.appModel.translationPreferencesBusy" in editor
     assert 'runningText: "Đang lưu…"' in editor
+    assert "id: translationStyleName" in editor
+    assert "id: savedTranslationStyleBox" in editor
+    assert "saveTranslationStyle" in editor
+    assert "loadSavedTranslationStyle" in editor
 
 
 def test_shared_buttons_expose_text_states_and_top_center_feedback() -> None:
@@ -547,7 +613,7 @@ def test_shared_buttons_expose_text_states_and_top_center_feedback() -> None:
 def test_subtitle_style_and_video_filters_are_real_preview_controls() -> None:
     root = Path(__file__).parents[2] / "src" / "ducai_studio" / "ui" / "qml"
     subtitle = (root / "screens" / "SubtitleEditorScreen.qml").read_text(encoding="utf-8")
-    export = (root / "screens" / "ExportScreen.qml").read_text(encoding="utf-8")
+    export = (root / "controls" / "ExportSettingsPanel.qml").read_text(encoding="utf-8")
     preview = (root / "controls" / "TimelinePreview.qml").read_text(encoding="utf-8")
 
     assert 'title: "Chọn màu chữ phụ đề"' in subtitle
@@ -556,7 +622,7 @@ def test_subtitle_style_and_video_filters_are_real_preview_controls() -> None:
     assert 'objectName: "liveSubtitlePreview"' in preview
     assert "currentProject.subtitleAt(playhead)" in preview
     assert "exportSubtitlePrimaryColor" in preview
-    assert "exportSubtitleOpacityPercent / 100" in preview
+    assert "exportSubtitleOpacityPercent" in preview
     assert 'SectionTitle { id: filterTitle; text: "Filter màu" }' in export
     assert "setExportVideoFilterPreset" in export
     assert "id: filteredVideo" in preview
@@ -565,20 +631,16 @@ def test_subtitle_style_and_video_filters_are_real_preview_controls() -> None:
     assert "VideoOutput.Stretch" in preview
     assert "fillMode: Image.Stretch" in preview
     assert 'objectName: "liveSubtitlePreview"' in preview
-    assert "exportSubtitleOutlineWidth * scaleFactor" in preview
-    assert "exportSubtitleOpacityPercent / 100" in preview
+    artwork = (root.parents[1] / "providers" / "subtitle_artwork.py").read_text(encoding="utf-8")
+    assert "root.artworkForCue(root.activeSubtitle)" in preview
+    assert "style.outline_width" in artwork
+    assert "style.opacity_percent / 100" in artwork
 
 
 def test_scene_text_preview_conceals_glyphs_and_preserves_review_cues() -> None:
     project_root = Path(__file__).parents[2]
     preview = (
-        project_root
-        / "src"
-        / "ducai_studio"
-        / "ui"
-        / "qml"
-        / "controls"
-        / "TimelinePreview.qml"
+        project_root / "src" / "ducai_studio" / "ui" / "qml" / "controls" / "TimelinePreview.qml"
     ).read_text(encoding="utf-8")
     fonts = project_root / "src" / "ducai_studio" / "ui" / "assets" / "fonts"
 
@@ -599,14 +661,20 @@ def test_scene_text_preview_conceals_glyphs_and_preserves_review_cues() -> None:
     assert "Chấp nhận chữ trong cảnh" in editor
     assert "acceptSceneTextCue" in editor
     assert ') + " · CẦN DUYỆT"' in preview
-    assert 'if (style === "calligraphy") return "Playwrite VN"' in preview
-    assert 'if (style === "calligraphy_soft") return "Dancing Script"' in preview
-    assert 'if (style === "calligraphy_bold") return "Lobster"' in preview
-    assert 'if (style === "calligraphy_ink") return "Agbalumo"' in preview
-    assert 'if (style === "calligraphy_brush") return "Comforter Brush"' in preview
-    assert 'if (style === "calligraphy_water") return "Water Brush"' in preview
-    assert 'if (style === "calligraphy_splash") return "Splash"' in preview
-    assert 'if (style === "calligraphy_hurricane") return "Hurricane"' in preview
+    pipeline = (project_root / "src/ducai_studio/application/export_pipeline.py").read_text(
+        encoding="utf-8"
+    )
+    assert '"calligraphy": "Playwrite VN"' in pipeline
+    for key, family in {
+        "calligraphy_soft": "Dancing Script",
+        "calligraphy_bold": "Lobster",
+        "calligraphy_ink": "Agbalumo",
+        "calligraphy_brush": "Comforter Brush",
+        "calligraphy_water": "Water Brush",
+        "calligraphy_splash": "Splash",
+        "calligraphy_hurricane": "Hurricane",
+    }.items():
+        assert f'"{key}": "{family}"' in pipeline
     assert (fonts / "PlaywriteVN-Variable.ttf").is_file()
     assert (fonts / "PLAYWRITE-VN-OFL.txt").is_file()
 
@@ -656,16 +724,16 @@ def test_timeline_has_resizable_preview_zoom_slider_and_preview_transport_shortc
     assert '"timelinePreviewRatio"' in timeline
     assert "orientation: Qt.Vertical" in timeline
     assert "id: zoomSlider" in timeline
-    assert "onActivated: root.seekRelative(-5_000)" in preview
-    assert "onActivated: root.seekRelative(5_000)" in preview
+    assert "onActivated: root.seekRelative(-root.appModel.timelineSeekStepMs)" in preview
+    assert "onActivated: root.seekRelative(root.appModel.timelineSeekStepMs)" in preview
     assert 'iconName: "chevron-left"' in preview
     assert 'iconName: "chevron-right"' in preview
-    assert 'tooltipText: "Lùi 5 giây"' in preview
-    assert 'tooltipText: "Tiến 5 giây"' in preview
-    assert "property bool controlsVisible: false" in preview
-    assert "readonly property bool controlsHovered: viewportHovered || transportHovered" in preview
-    assert "interval: 0" in preview
-    assert "color: Qt.rgba(0.03, 0.06, 0.09, 0.78)" in preview
+    assert 'tooltipText: "Lùi " + root.appModel.timelineSeekStepMs + " ms"' in preview
+    assert 'tooltipText: "Tiến " + root.appModel.timelineSeekStepMs + " ms"' in preview
+    assert "anchors.bottom: transport.top" in preview
+    assert 'objectName: "previewTransport"' in preview
+    assert "color: Theme.surfacePanel" in preview
+    assert "id: sceneGlyphCover" not in preview
     assert preview.index("z: 110") < preview.index(
         "model: root.appModel.currentProject.overlayModel"
     )
@@ -674,6 +742,30 @@ def test_timeline_has_resizable_preview_zoom_slider_and_preview_transport_shortc
     assert "model: root.appModel.currentProject.subtitleCueModel" in timeline
     assert "root.appModel.selectCue(" in timeline
     assert "function onOverlayGeometrySettled" in preview
+
+
+def test_timeline_scissors_replace_all_retention_controls_and_open_text_inspector() -> None:
+    root = Path(__file__).parents[2] / "src" / "ducai_studio" / "ui" / "qml"
+    timeline = (root / "screens" / "TimelineScreen.qml").read_text(encoding="utf-8")
+    toolbar = (root / "controls" / "SubtitleTextToolbar.qml").read_text(encoding="utf-8")
+    for removed in ("cutPanel", "cutMarker", "cutPreviewOperation", "CutMarkerHandle",
+                    "Giữ từ đây", "Giữ đến đây", "Giữ đoạn A", "onHoveredChanged",
+                    "applyTimelineCutAction"):
+        assert removed not in timeline
+    assert 'objectName: "timelineScissorsButton"' in timeline
+    assert 'iconName: "scissors"' in timeline
+    for key in ("X", "Delete", "Z", "Y"):
+        assert f"event.key === Qt.Key_{key}" in timeline
+    assert "Keys.priority: Keys.AfterItem" in timeline
+    assert "root.appModel.splitVideoAtPlayhead()" in timeline
+    assert "root.appModel.deleteTimelineSelection()" in timeline
+    assert 'objectName: "timelineTextInspectorTab"' in timeline
+    assert 'inspectorMode: true' in timeline
+    assert 'root.selectInspectorTab("text")' in timeline
+    assert timeline.index("id: inspector") < timeline.index("SubtitleTextToolbar {")
+    assert "advancedPopup" not in toolbar and "Nâng cao" not in toolbar
+    assert "ScrollView {" in toolbar and "inputCueId" in toolbar
+    assert 'columns: root.inspectorMode ? 2 : 6' in toolbar
 
 
 def test_timeline_clip_decimal_fields_are_locale_independent() -> None:
@@ -748,7 +840,9 @@ def test_translation_review_state_exposes_cache_qa_retry() -> None:
     assert 'translationJobState === "cancelled"' in qml
     assert 'cancelledText: "Tiếp tục dịch từ cache"' in qml
     assert 'failedText: "Tiếp tục dịch từ cache"' in qml
-    assert "root.appModel.toggleTranslation(" in qml
+    assert "root.appModel.toggleTranslationWithStyle(" in qml
+    assert "root.translationStyleIds[translationStyleBox.currentIndex]" in qml
+    assert "&& !root.appModel.translationPreferencesBusy" in qml
     assert '"cancelled": "Đã hủy — có thể tiếp tục từ cache"' in qml
     assert '"Đang tiếp tục dịch…"' in qml
 
@@ -773,24 +867,14 @@ def test_subtitle_workspace_hides_engine_notes_and_web_session_switches() -> Non
     assert "workspaceDescription" not in qml
     assert "visible: providerBox.currentIndex !== 0" in qml
 
-    main_qml = (
-        project_root / "src" / "ducai_studio" / "ui" / "qml" / "Main.qml"
-    ).read_text(encoding="utf-8")
+    main_qml = (project_root / "src" / "ducai_studio" / "ui" / "qml" / "Main.qml").read_text(
+        encoding="utf-8"
+    )
     view_model = (
-        project_root
-        / "src"
-        / "ducai_studio"
-        / "ui"
-        / "viewmodels"
-        / "application_view_model.py"
+        project_root / "src" / "ducai_studio" / "ui" / "viewmodels" / "application_view_model.py"
     ).read_text(encoding="utf-8")
     gemini_web = (
-        project_root
-        / "src"
-        / "ducai_studio"
-        / "providers"
-        / "translation"
-        / "gemini_web.py"
+        project_root / "src" / "ducai_studio" / "providers" / "translation" / "gemini_web.py"
     ).read_text(encoding="utf-8")
 
     assert "window.publicStatusMessage(window.appModel.statusMessage)" in main_qml
@@ -802,14 +886,15 @@ def test_subtitle_workspace_hides_engine_notes_and_web_session_switches() -> Non
 def test_projects_screen_delete_is_confirmed_and_effects_support_added_blur() -> None:
     root = Path(__file__).parents[2] / "src" / "ducai_studio" / "ui" / "qml"
     projects = (root / "screens" / "ProjectsScreen.qml").read_text(encoding="utf-8")
-    export = (root / "screens" / "ExportScreen.qml").read_text(encoding="utf-8")
+    export = (root / "controls" / "ExportSettingsPanel.qml").read_text(encoding="utf-8")
 
     assert 'text: "Xóa dự án"' in projects
     assert "deleteProjectDialog.close()" in projects
     assert "root.appModel.deleteProject" in projects
     assert "root.appModel.addBlurRegion()" in export
     assert "root.appModel.deleteOverlay" in export
-    assert "editableOverlays: true" in export
+    timeline = (root / "screens" / "TimelineScreen.qml").read_text(encoding="utf-8")
+    assert "editableProjectOverlays:" in timeline
 
 
 def test_voice_studio_uses_automatic_timing_repair_and_exposes_speed_controls() -> None:
@@ -920,45 +1005,48 @@ def test_timeline_voice_resize_handles_leave_a_double_click_target() -> None:
     # The hit area is deliberately wider for easier grabbing, while the one-third
     # cap keeps a centre target available on short cues for click/double-click.
     assert qml.count("width: Math.min(14, parent.width / 3)") == 2
-    assert "width: 10" not in qml
+    assert "width: 10\n" not in qml
     assert 'objectName: "timelineClipBody-" + clipItem.model.clipId' in qml
 
 
 def test_timeline_exposes_multicue_scene_layers_text_tool_and_marquee() -> None:
     qml_root = Path(__file__).parents[2] / "src" / "ducai_studio" / "ui" / "qml"
-    timeline = (qml_root / "screens" / "TimelineScreen.qml").read_text(
-        encoding="utf-8"
-    )
-    preview = (qml_root / "controls" / "TimelinePreview.qml").read_text(
-        encoding="utf-8"
-    )
-    editor = (qml_root / "screens" / "SubtitleEditorScreen.qml").read_text(
-        encoding="utf-8"
-    )
+    timeline = (qml_root / "screens" / "TimelineScreen.qml").read_text(encoding="utf-8")
+    preview = (qml_root / "controls" / "TimelinePreview.qml").read_text(encoding="utf-8")
+    toolbar = (qml_root / "controls" / "SubtitleTextToolbar.qml").read_text(encoding="utf-8")
+    editor = (qml_root / "screens" / "SubtitleEditorScreen.qml").read_text(encoding="utf-8")
     manual_dialog = (qml_root / "controls" / "ManualSubtitleCueDialog.qml").read_text(
         encoding="utf-8"
     )
 
     assert 'text: "T"' in timeline
-    assert 'id: manualCueDialog' in timeline
-    assert 'id: subtitleMarqueeArea' in timeline
+    assert "id: manualCueDialog" in timeline
+    assert "id: subtitleMarqueeArea" in timeline
     assert "subtitleCueIdsInRange(" in timeline
     assert "selectSubtitleCueIds(ids, additive)" in timeline
     assert "moveSelectedSceneTexts(" in timeline
     assert "previewSelectedSceneTextMove" in timeline
     assert "!root.cueSelected(clipItem.model.cueId)" in timeline
     assert "property bool selectionHandledOnPress" in timeline
-    assert "&& !selectionHandledOnPress" in timeline
-    assert '&& root.sceneTimingLaneDelta !== 0)' in timeline
+    assert "if (selectionHandledOnPress" in timeline
+    assert "root.appModel.selectTimelineClip(" in timeline
+    assert "&& root.sceneTimingLaneDelta !== 0)" in timeline
     assert "manualCueDialog.openForPlayhead(root.appModel.playheadUs)" in timeline
     assert "manualCueDialog.submitAtRegion(x, y, width, height)" in timeline
     assert "startUs + durationSeconds * 1000000" in manual_dialog
     assert "projectEndUs - 100000" not in timeline
     assert "isSceneTextCue(" not in timeline
-    assert "Math.max(1 - currentLane, rawLaneDelta)" in timeline
+    assert "root.sceneTimingMinimumLaneDelta, rawLaneDelta" in timeline
     assert "root.seekTimelineAt(mouse.x)" in timeline
-    assert "root.seekTimelineAt(point.x)" in timeline
-    assert 'id: subtitleTextToolbar' in timeline
+    assert "root.seekTimelineAt(point.x)" not in timeline
+    assert "root.appModel.clearTimelineCueSelection()" in timeline
+    assert "root.appModel.selectTimelineCue(" in timeline
+    assert "root.appModel.previewSelectedSceneTextResize(" in timeline
+    assert "root.appModel.resizeSelectedSceneTexts(" in timeline
+    assert "setTrackViewport(" in timeline
+    assert "id: subtitleTextToolbar" in timeline
+    assert "enabled: !root.appModel.timelineBusy" in toolbar
+    assert "root.appModel.subtitleBusy || root.appModel.timelineBusy" in toolbar
     assert "visible: root.appModel.selectedCueCount > 0" not in timeline
     assert "transformSelectedSubtitleGeometry" in preview
     assert "subtitleGeometryPending" in preview
@@ -966,8 +1054,12 @@ def test_timeline_exposes_multicue_scene_layers_text_tool_and_marquee() -> None:
     assert "property string editTargetCueId" in editor
     assert editor.count("restoreMode: Binding.RestoreNone") == 2
     assert "selectCueWithAdditive(" in editor
-    assert "selectCueWithAdditive(" in timeline
-    assert "selectCueWithAdditive(" in preview
+    assert "selectCueWithAdditive(" not in timeline
+    assert "selectCueWithAdditive(" not in preview
+    assert "root.appModel.selectTimelineCue(" in preview
+    assert "onSubtitleGeometrySettled" in preview
+    assert "onActiveSceneTextsChanged: root.cancelHiddenSubtitleGeometry()" in preview
+    assert "onCanceled: root.finishSubtitleGeometry()" not in preview
     assert "ScrollBar.vertical: ScrollBar" in timeline
     assert "ensureSelectedCueTrackVisible" not in timeline
     assert "selectSubtitleCueIds([], false)" not in timeline
@@ -990,10 +1082,9 @@ def test_translation_editor_plain_click_collapses_selection_and_exposes_manual_t
         / "SubtitleEditorScreen.qml"
     ).read_text(encoding="utf-8")
 
-    assert (
-        'visible: root.workspaceMode === "translate" '
-        '|| root.workspaceMode === "subtitles"'
-    ) in editor
+    assert "SubtitleTextToolbar {" not in editor
+    assert 'text: "Thêm cue"' in editor
+    assert "root.appModel.updateSubtitleText(" in editor
     assert "acceptedModifiers: Qt.NoModifier" in editor
     assert "acceptedModifiers: Qt.ControlModifier" in editor
     assert editor.count("root.appModel.selectCueWithModifiers(") >= 2
@@ -1016,7 +1107,8 @@ def test_timeline_voice_resize_is_local_until_release_and_has_visual_snap_guides
     assert "function finishClipResize()" in qml
     assert qml.count("root.appModel.resizeSelectedClip(") == 1
     assert qml.count("root.updateClipResize(point.x)") == 2
-    assert qml.count("mapToItem(clipLayer, mouse.x, mouse.y)") == 6
+    # Cue body/handles also sample the final release position.
+    assert qml.count("mapToItem(clipLayer, mouse.x, mouse.y)") == 9
     assert "id: resizeVerticalGuide" in qml
     assert "id: resizeDistanceGuide" in qml
     assert "id: resizeGuideLabel" in qml
@@ -1061,32 +1153,31 @@ def test_timeline_preserves_vertical_track_scroll_across_model_refresh() -> None
     assert "trackList.contentHeight - trackList.height" in qml
     assert "trackList.modelResetInProgress = false" in qml
     assert "positionViewAtIndex" not in qml
+    assert "id: timelineViewportTimer" in qml
+    assert "onTriggered: root.syncTimelineViewportModels()" in qml
+    assert "if (!timelineViewportTimer.running) timelineViewportTimer.start()" in qml
 
 
 def test_preview_playback_toggle_color_picker_and_scene_snap_are_direct() -> None:
     qml_root = Path(__file__).parents[2] / "src" / "ducai_studio" / "ui" / "qml"
-    preview = (qml_root / "controls" / "TimelinePreview.qml").read_text(
-        encoding="utf-8"
-    )
-    timeline = (qml_root / "screens" / "TimelineScreen.qml").read_text(
-        encoding="utf-8"
-    )
-    toolbar = (qml_root / "controls" / "SubtitleTextToolbar.qml").read_text(
-        encoding="utf-8"
-    )
+    preview = (qml_root / "controls" / "TimelinePreview.qml").read_text(encoding="utf-8")
+    timeline = (qml_root / "screens" / "TimelineScreen.qml").read_text(encoding="utf-8")
+    toolbar = (qml_root / "controls" / "SubtitleTextToolbar.qml").read_text(encoding="utf-8")
 
     assert "function togglePlayback()" in preview
-    assert 'id: videoPlaybackToggleArea' in preview
-    assert 'id: previewColorPicker' in preview
+    assert "id: videoPlaybackToggleArea" in preview
+    assert "id: previewColorPicker" in preview
     assert "filteredVideo.grabToImage" in preview
     assert "samplePreviewColor(" in preview
-    assert 'signal colorPickRequested(string target)' in toolbar
+    assert "signal colorPickRequested(string target)" in toolbar
     assert "applyPickedColor" in toolbar
     assert 'sequence: "Space"' in preview
     assert "!root.textEditorHasFocus()" in preview
     assert "sceneTimingSnapActive" in timeline
-    assert "Math.min(\n            500_000, Math.max(80_000, eightPixelsUs)" in timeline
-    assert 'id: sceneTimingSnapGuide' in timeline
+    assert "Math.min(500_000, 8 * root.viewportDurationUs" in timeline
+    assert "sceneTimingSnapStartEligible" in timeline
+    assert "onSceneTimingSettled(generation, succeeded)" in timeline
+    assert "id: sceneTimingSnapGuide" in timeline
 
 
 def test_global_status_notifications_are_readable_and_dismissible() -> None:
@@ -1162,6 +1253,6 @@ def test_multi_video_has_dedicated_video_import_and_restore_controls() -> None:
     assert 'text: "Nhập video"' in multi
     assert "showMultiImportDialog()" in multi
     assert "Khôi phục đã ẩn" in multi
-    assert "Accessible.name: \"Chọn video \"" in multi
+    assert 'Accessible.name: "Chọn video "' in multi
     assert "def importMultiPaths" in view_model
     assert "def restoreHiddenMultiVideos" in view_model

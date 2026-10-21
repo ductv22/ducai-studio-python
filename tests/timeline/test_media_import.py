@@ -8,15 +8,69 @@ import pytest
 
 from ducai_studio.application.media_commands import MediaImportService
 from ducai_studio.domain.project import (
+    MediaAsset,
+    MediaKind,
     OverlayKind,
     ProjectSnapshot,
     SubtitleCue,
+    TimelineClip,
+    TimelineTrack,
     TrackKind,
 )
 from ducai_studio.domain.timebase import TimeRange
 from ducai_studio.providers.media_probe import FfprobeProvider, MediaProbeResult
 
 SECOND = 1_000_000
+
+
+def test_repeat_ocr_translation_voice_with_scene_tracks_replaces_without_dangling_media(tmp_path):
+    from dataclasses import replace
+
+    ids = _ids()
+    service = MediaImportService(
+        FakeProbe(MediaProbeResult(SECOND, False, True, format_name="wav")),
+        id_factory=lambda: next(ids),
+    )
+    source = tmp_path / "source.srt"
+    source.write_text("1\n00:00:00,000 --> 00:00:01,000\n新字幕\n", encoding="utf-8")
+    translated = tmp_path / "translated.srt"
+    translated.write_text("1\n00:00:00,000 --> 00:00:01,000\nLời mới\n", encoding="utf-8")
+    voice = tmp_path / "voice.wav"
+    voice.write_bytes(b"preserved voice cache")
+    snapshot = service.import_srt(ProjectSnapshot("p", "Repeat", 1), source)
+    for _ in range(3):
+        asset = next(m for m in snapshot.media if m.kind is MediaKind.SUBTITLE)
+        # Existing OCR scene lanes share the previous subtitle asset.
+        snapshot = replace(snapshot, tracks=(*snapshot.tracks, *(
+            TimelineTrack(f"S{lane}", TrackKind.SUBTITLE, f"S{lane}", (
+                TimelineClip(f"scene{lane}", f"S{lane}", TimeRange(0, SECOND),
+                             TimeRange(0, SECOND), asset.id),))
+            for lane in (2, 3)
+        )))
+        snapshot = service.import_srt(snapshot, source)
+        assert [t.id for t in snapshot.tracks] == ["S1"]
+        snapshot = service.import_srt(snapshot, translated, language="vi")
+        snapshot = service.import_voice_media(snapshot, voice)
+        snapshot = service.import_voice_media(snapshot, voice)
+        assert len([t for t in snapshot.tracks if t.id == "D1"]) == 1
+        # Re-translation replaces D1, then re-OCR can also run on that same project.
+        snapshot = service.import_srt(snapshot, translated, language="vi")
+        assert all(t.id != "D1" for t in snapshot.tracks)
+    assert voice.read_bytes() == b"preserved voice cache"
+
+
+def test_voice_replacement_preserves_media_referenced_outside_d1(tmp_path):
+    project = ProjectSnapshot("p", "Shared", 1,
+        media=(MediaAsset("shared", str(tmp_path / "old.wav"), MediaKind.AUDIO, SECOND),),
+        tracks=tuple(TimelineTrack(t, kind, t, (
+            TimelineClip(t.lower(), t, TimeRange(0, SECOND), TimeRange(0, SECOND), "shared"),
+        )) for t, kind in (("D1", TrackKind.VOICE), ("M1", TrackKind.BACKGROUND_MUSIC))))
+    voice = tmp_path / "new.wav"
+    voice.write_bytes(b"voice")
+    service = MediaImportService(FakeProbe(MediaProbeResult(SECOND, False, True)))
+    for result in (service.remove_voice_media(project), service.import_voice_media(project, voice)):
+        assert any(m.id == "shared" for m in result.media)
+        assert next(t for t in result.tracks if t.id == "M1").clips[0].media_id == "shared"
 
 
 class FakeProbe:

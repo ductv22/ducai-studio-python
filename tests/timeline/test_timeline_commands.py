@@ -73,6 +73,62 @@ def _ids():
         yield str(value)
 
 
+def test_video_clipboard_is_immutable_pastes_new_layer_and_preserves_properties():
+    original = _linked_snapshot()
+    editor = TimelineEditor(original)
+    bundle = editor.copy_video("video-1")
+    editor.set_clip_muted("video-1", True)
+    pasted = editor.paste_video(bundle, 5 * SECOND)
+    layer = next(track for track in pasted.tracks if track.id == "V2")
+    clip = layer.clips[0]
+    assert clip.timeline_range == TimeRange(5 * SECOND, 65 * SECOND)
+    assert clip.source_range == original.tracks[0].clips[0].source_range
+    assert clip.speed == original.tracks[0].clips[0].speed
+    assert clip.volume == 0 and clip.muted is False
+    assert clip.id != "video-1" and clip.link_group_id != "av-1"
+    audio = next(
+        c
+        for t in pasted.tracks
+        if t.kind is TrackKind.ORIGINAL_AUDIO
+        for c in t.clips
+        if c.link_group_id == clip.link_group_id
+    )
+    assert audio.timeline_range == clip.timeline_range
+    assert audio.volume == 1 and not audio.muted
+    restored = editor.undo()
+    assert len(restored.tracks) == 2
+    assert all(c.muted for t in restored.tracks for c in t.clips)
+
+
+def test_clip_mute_preserves_linked_volume_and_unmute_restores_exactly():
+    editor = TimelineEditor(_linked_snapshot())
+    editor.set_volume("audio-1", 0.37)
+    muted = editor.set_clip_muted("video-1", True)
+    assert all(c.muted for t in muted.tracks for c in t.clips)
+    assert muted.tracks[1].clips[0].volume == 0.37
+    unmuted = editor.set_clip_muted("video-1", False)
+    assert not any(c.muted for t in unmuted.tracks for c in t.clips)
+    assert unmuted.tracks[1].clips[0].volume == 0.37
+
+
+def test_duplicate_video_inserts_after_segment_ripples_and_undoes_once():
+    editor = TimelineEditor(_linked_snapshot())
+    editor.split("video-1", 20 * SECOND)
+    before = editor.snapshot
+    selected = before.tracks[0].clips[0]
+    duplicated = editor.duplicate_video(selected.id)
+    video = duplicated.tracks[0].clips
+    assert [c.timeline_range for c in video] == [
+        TimeRange(0, 20 * SECOND),
+        TimeRange(20 * SECOND, 40 * SECOND),
+        TimeRange(40 * SECOND, 80 * SECOND),
+    ]
+    assert video[0].source_range == video[1].source_range
+    assert len({c.id for t in duplicated.tracks for c in t.clips}) == 6
+    assert editor.undo().tracks == before.tracks
+    assert editor.redo().tracks == duplicated.tracks
+
+
 def test_source_timeline_mapping_keeps_trim_origin_and_exact_speed() -> None:
     speed = SpeedRatio.from_percent(85)
     clip = TimelineClip(
@@ -241,9 +297,7 @@ def test_viewport_index_does_not_allocate_all_4333_cues() -> None:
 
 def test_project_rejects_clip_that_exceeds_media() -> None:
     media = MediaAsset("m", "C:/m.mp4", MediaKind.VIDEO, SECOND)
-    clip = TimelineClip(
-        "c", "V1", TimeRange(0, 2 * SECOND), TimeRange(0, 2 * SECOND), "m"
-    )
+    clip = TimelineClip("c", "V1", TimeRange(0, 2 * SECOND), TimeRange(0, 2 * SECOND), "m")
     with pytest.raises(ValueError, match="exceeds media duration"):
         ProjectSnapshot(
             "p",

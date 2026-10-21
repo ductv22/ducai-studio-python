@@ -374,7 +374,159 @@ def test_worker_generates_every_eligible_cue_and_final_wav(tmp_path, monkeypatch
     assert events[-1][1]["coverage_ratio"] == 1.0
 
 
-def test_worker_announces_synthesis_before_provider_starts(tmp_path, monkeypatch) -> None:
+def test_real_cpu_pool_publishes_shared_variants_in_order_and_resumes_cache(tmp_path, monkeypatch):
+    from ducai_studio.providers.audio_processing import FfmpegAudioProcessor
+
+    provider = DeterministicTtsProvider()
+    worker, events = _worker(tmp_path, monkeypatch, provider,
+                             audio_processor_factory=FfmpegAudioProcessor)
+    worker._execute()
+    assert worker._wav_pool is None
+    assert list(worker.ledger["entries"]) == ["cue-1", "cue-2"]
+    values = list(worker.ledger["entries"].values())
+    assert values[0]["variant_fingerprint"] == values[1]["variant_fingerprint"]
+    assert [v["cue_id"] for v in values] == ["cue-1", "cue-2"]
+    shared = json.loads(Path(values[1]["cache_path"]).with_suffix(".json").read_text())
+    assert shared["cue_id"] == "cue-2"
+    assert not list(worker.processed_root.rglob("*.wav"))
+    assert not any(p.get("code") == "tts_wav_parallel_fallback" for _, p in events)
+    restored, restored_events = _worker(tmp_path, monkeypatch, DeterministicTtsProvider(),
+                                        audio_processor_factory=FfmpegAudioProcessor)
+    restored._execute()
+    assert len(restored.ledger["entries"]) == 2
+    assert restored.provider is None
+    assert restored._wav_pool is None
+    assert restored_events[-1][0] == "succeeded"
+
+
+def test_cpu_pool_start_failure_falls_back_without_losing_audio(tmp_path, monkeypatch):
+    from ducai_studio.providers.audio_processing import FfmpegAudioProcessor
+
+    worker, events = _worker(tmp_path, monkeypatch, DeterministicTtsProvider(),
+                             audio_processor_factory=FfmpegAudioProcessor)
+
+    def failed_start(*_args, **_kwargs):
+        raise OSError("owned CPU process cannot start")
+
+    monkeypatch.setattr("ducai_studio.workers.tts_worker.WavPreparationPool", failed_start)
+    worker._execute()
+    assert len(worker.ledger["entries"]) == 2
+    assert sum(p.get("code") == "tts_wav_parallel_fallback" for _, p in events) == 1
+    assert events[-1][0] == "succeeded"
+
+
+def test_prepared_competing_owner_reuses_verified_base_winner(tmp_path, monkeypatch):
+    from array import array
+
+    from ducai_studio.providers.tts.wav_preparation import prepare_artifact
+
+    first, _ = _worker(tmp_path, monkeypatch, DeterministicTtsProvider())
+    second, _ = _worker(tmp_path, monkeypatch, DeterministicTtsProvider())
+    cue = first.cues[0]
+    prepared = []
+    for index, worker in enumerate((first, second), 1):
+        raw = tmp_path / f"competing-{index}.wav"
+        write_pcm16_mono(raw, array("f", (
+            0.1 * ((sample % (80 * index)) / (40 * index) - 1)
+            for sample in range(12_000)
+        )), 48_000)
+        prepared.append(prepare_artifact(
+            cue, raw, directory=worker._preparation_directory(),
+            cache_root=Path(first.config["cache_root"]), settings=worker.settings,
+            next_start_us=worker._next_start_us.get(cue.index), allow_timing_failure=False,
+            processor_factory=CopyAudioProcessor,
+        ))
+    assert prepared[0].base_sha256 != prepared[1].base_sha256
+    assert first._adopt_and_clean(cue, prepared[0]).approved
+    assert second._adopt_and_clean(cue, prepared[1]).approved
+    entry = first.ledger["entries"][cue.cue_id]
+    adopted = second.ledger["entries"][cue.cue_id]
+    assert file_sha256(Path(entry["base_cache_path"])) == entry["base_cache_sha256"]
+    assert adopted["base_cache_sha256"] == entry["base_cache_sha256"]
+    assert adopted["variant_fingerprint"] == entry["variant_fingerprint"]
+    assert adopted["qa"] == entry["qa"]
+    assert not list(Path(first.config["cache_root"]).glob("*.lock"))
+    first._close_wav_pool()
+    second._close_wav_pool()
+
+
+@pytest.mark.parametrize("action", ["pause", "cancel", "cancel-paused"])
+def test_cpu_wait_controls_checkpoint_only_adopted_work_and_close_hosts(
+    tmp_path, monkeypatch, action,
+):
+    from ducai_studio.providers.audio_processing import FfmpegAudioProcessor
+    from ducai_studio.providers.tts.postprocess_client import WavPreparationPool
+    from ducai_studio.workers.protocol import PROTOCOL_VERSION, WorkerMessage
+    from ducai_studio.workers.tts_worker import WorkerStopped
+
+    worker, events = _worker(tmp_path, monkeypatch, DeterministicTtsProvider(),
+                             audio_processor_factory=FfmpegAudioProcessor)
+    pools = []
+    original_submit = WavPreparationPool.submit
+
+    def submit(pool, payload):
+        future = original_submit(pool, payload)
+        if not pools:
+            pools.append(pool)
+            worker.commands.put(WorkerMessage(PROTOCOL_VERSION, worker.job_id, "control-event",
+                "control", {"action": "pause" if action == "cancel-paused" else action,
+                            "command_id": "control-id"}))
+        return future
+
+    def send(kind, payload):
+        events.append((kind, payload))
+        if kind == "paused":
+            assert not worker.ledger["entries"]
+            worker.commands.put(WorkerMessage(PROTOCOL_VERSION, worker.job_id, "resume-event",
+                "control", {"action": "cancel" if action == "cancel-paused" else "resume",
+                            "command_id": "resume-id"}))
+
+    monkeypatch.setattr(WavPreparationPool, "submit", submit)
+    worker.send = send
+    if action in {"cancel", "cancel-paused"}:
+        with pytest.raises(WorkerStopped):
+            worker._execute()
+        assert not worker.ledger["entries"]
+        assert events[-1][0] == "stopped"
+    else:
+        worker._execute()
+        assert len(worker.ledger["entries"]) == 2
+        assert any(kind == "paused" for kind, _ in events)
+        assert any(kind == "resumed" for kind, _ in events)
+    assert worker._wav_pool is None
+    assert all(h.process.poll() is not None for h in pools[0].hosts)
+
+
+def test_cpu_preparation_preserves_existing_targeted_retry_and_checkpoint_order(
+    tmp_path, monkeypatch,
+):
+    from ducai_studio.providers.audio_processing import FfmpegAudioProcessor
+
+    provider = DeterministicTtsProvider()
+    synthesize = provider.synthesize_batch
+
+    def first_missing(**kwargs):
+        result = synthesize(**kwargs)
+        if len(provider.calls) == 1:
+            return TtsBatchResult(result.request_id, tuple(
+                item for item in result.artifacts if item.cue_id != "cue-1"
+            ))
+        return result
+
+    provider.synthesize_batch = first_missing
+    worker, events = _worker(tmp_path, monkeypatch, provider,
+                             audio_processor_factory=FfmpegAudioProcessor)
+    worker._execute()
+    assert provider.calls == [("cue-1", "cue-2"), ("cue-1",)]
+    # Preserve first-pass acceptance followed by targeted retries. Sparse
+    # signed checkpoints are intentional, not a missing cue.
+    assert list(worker.ledger["entries"]) == ["cue-2", "cue-1"]
+    assert not worker.ledger["blockers"]
+    assert events[-1][0] == "succeeded"
+    assert json.loads(worker.ledger_path.read_text())["signature"] == worker.ledger["signature"]
+
+
+def test_worker_announces_warmup_before_first_provider_batch(tmp_path, monkeypatch) -> None:
     provider = DeterministicTtsProvider()
     worker, events = _worker(tmp_path, monkeypatch, provider)
     original_synthesize = provider.synthesize_batch
@@ -391,7 +543,7 @@ def test_worker_announces_synthesis_before_provider_starts(tmp_path, monkeypatch
     assert observed_latest_events
     kind, payload = observed_latest_events[0]
     assert kind == "progress"
-    assert payload["phase"] == "synthesis"
+    assert payload["phase"] == "warmup"
     assert payload["phase_current"] == 0
     assert payload["eta_ms"] is None
 
@@ -561,6 +713,25 @@ def test_worker_restores_legacy_cache_metadata_with_previous_path_name(
         legacy_path
     )
     assert events[-1][0] == "succeeded"
+
+
+def test_legacy_cache_sidecar_bootstrap_scans_json_only_once(tmp_path, monkeypatch) -> None:
+    worker, _events = _worker(tmp_path, monkeypatch, DeterministicTtsProvider())
+    cache_root = Path(worker.config["cache_root"]).resolve()
+    original_glob = Path.glob
+    scans: list[str] = []
+
+    def counted_glob(path: Path, pattern: str):
+        if path.resolve() == cache_root and pattern == "*.json":
+            scans.append(pattern)
+        return original_glob(path, pattern)
+
+    monkeypatch.setattr(Path, "glob", counted_glob)
+
+    worker._ensure_cache_index_bootstrapped()
+    worker._ensure_cache_index_bootstrapped()
+
+    assert scans == ["*.json"]
 
 
 def test_worker_restores_a36_global_cache_without_prior_job_ledger(

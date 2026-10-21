@@ -143,3 +143,17 @@ def test_multi_thumbnail_provider_decodes_descriptor_and_reuses_cached_png(
     assert first.size() == QSize(320, 180)
     assert second == first
     assert len(list((tmp_path / "thumbnail-cache").rglob("*.png"))) == 1
+
+
+@pytest.mark.parametrize("error", [subprocess.TimeoutExpired("ffmpeg", 30), OSError("disk")])
+def test_multi_thumbnail_failure_returns_placeholder(tmp_path, monkeypatch, error):
+    media = tmp_path / "media.mp4"
+    media.touch()
+    image_id = multi_thumbnail_url(media, 500_000).toString().split("multi-thumbnail/", 1)[1]
+    provider = MultiThumbnailProvider(tmp_path / "cache")
+
+    def fail(*_args):
+        raise error
+
+    monkeypatch.setattr(FfmpegPreviewTileProvider, "render", fail)
+    assert provider.requestImage(image_id, QSize(), QSize(160, 90)).isNull()

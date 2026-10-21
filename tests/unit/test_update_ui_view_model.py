@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from PySide6.QtCore import QCoreApplication, QObject
 
+from ducai_studio.infrastructure import runtime_program
 from ducai_studio.ui.viewmodels import update_view_model as module
 
 
@@ -154,3 +155,53 @@ def test_install_reserves_globally_and_never_auto_installs_after_jobs(
     assert vm.state == "ready"
     assert runtime.requests[-1][0] == "release_update_install"
     assert runtime.requests[-1][1] == {"token": "lease"}
+
+
+def test_install_task_uses_actual_frozen_root_without_explicit_override(tmp_path, monkeypatch):
+    QCoreApplication.instance() or QCoreApplication([])
+    install = tmp_path / "Portable App"
+    install.mkdir()
+    executable = install / "DucaiStudio2.exe"
+    executable.touch()
+    monkeypatch.setattr(runtime_program.sys, "executable", str(install / "python.exe"))
+    monkeypatch.setattr(runtime_program.sys, "argv", [str(executable)])
+    prepared = []
+    launched = []
+    errors = []
+    handoff = object()
+
+    def prepare(**kwargs):
+        prepared.append(kwargs)
+        return handoff
+
+    monkeypatch.setattr(module, "prepare_update_handoff", prepare)
+    monkeypatch.setattr(
+        module, "launch_update_helper", lambda value, **kwargs: launched.append(value)
+    )
+    signals = module._UpdateSignals()
+    signals.launched.connect(errors.append)
+    task = module._InstallTask(
+        signals, tmp_path / "payload", tmp_path / "manifest", tmp_path / "signature",
+        tmp_path / "updates", "2.0.0a151", "a" * 64,
+    )
+
+    task.run()
+
+    assert prepared[0]["install_root"] == install.resolve()
+    assert launched == [handoff]
+    assert errors == [""]
+
+
+def test_portable_staging_resolves_synthetic_frozen_path(tmp_path, monkeypatch):
+    install = tmp_path / "Portable App"
+    install.mkdir()
+    executable = install / "DucaiStudio2.exe"
+    executable.touch()
+    monkeypatch.setattr(runtime_program.sys, "executable", str(install / "python.exe"))
+    monkeypatch.setattr(runtime_program.sys, "argv", [str(executable)])
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "Local App Data"))
+    runtime = _Runtime(install / "DUCAI_STUDIO_DATA")
+
+    assert module._update_work_root(runtime) == (
+        tmp_path / "Local App Data" / "DUCAI STUDIO" / "updates"
+    ).resolve()

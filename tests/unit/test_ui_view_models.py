@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,6 +24,7 @@ from ducai_studio.ui.viewmodels.project_job_models import (
     ProjectStateModel,
     SubtitleCueListModel,
     TimelineClipListModel,
+    TimelineTrackListModel,
     VoiceConformCueListModel,
 )
 from ducai_studio.ui.viewmodels.voice_models import VoiceCatalogModel
@@ -57,6 +59,576 @@ class MemorySettings:
 
     def setValue(self, key: str, value: object) -> None:
         self.values[key] = value
+
+
+@pytest.mark.parametrize("override", ["exists", "missing", "unset"])
+def test_ocr_runtime_override_matches_diagnostics_without_overwriting_saved_choice(
+    tmp_path, monkeypatch, override,
+):
+    QCoreApplication.instance() or QCoreApplication([])
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    saved = str(tmp_path / "older-installation" / "python.exe")
+    MemorySettings.values = {"engines/paddlePython": saved}
+    candidate = tmp_path / "new-runtime" / "python.exe"
+    if override == "exists":
+        candidate.parent.mkdir()
+        candidate.touch()
+    if override == "unset":
+        monkeypatch.delenv("DUCAI_PADDLE_PYTHON", raising=False)
+    else:
+        monkeypatch.setenv("DUCAI_PADDLE_PYTHON", str(candidate))
+    model = ApplicationViewModel()
+    assert model.ocrEnginePython == (str(candidate.resolve()) if override == "exists" else saved)
+    assert MemorySettings.values["engines/paddlePython"] == saved
+
+
+def test_timeline_clip_selection_delete_and_scissors_are_unambiguous(monkeypatch):
+    QCoreApplication.instance() or QCoreApplication([])
+    monkeypatch.setattr(application_module, 'QSettings', MemorySettings)
+    MemorySettings.values = {}
+    model = ApplicationViewModel()
+    interval = {'start_us': 0, 'end_us': 10_000_000}
+    model.project_state.replace({'id': 'p', 'name': 'Selection', 'revision': 1,
+        'source_cues': [{'id': 'c', 'index': 1, 'text': '字幕', 'range': interval}],
+        'tracks': [{'id': 'V1', 'kind': 'video', 'name': 'Video', 'clips': [
+            {'id': 'v', 'track_id': 'V1', 'timeline_range': interval}]},
+            {'id': 'S1', 'kind': 'subtitle', 'name': 'Sub', 'clips': [
+                {'id': 's', 'track_id': 'S1', 'cue_id': 'c', 'timeline_range': interval}]}]})
+    requests = []
+    model.runtime.request = lambda a, p=None, context=None: requests.append((a, p, context))
+    model.setPlayheadMs(3000)
+    model.selectTimelineClip('s', False)
+    assert model.selectedCueId == 'c' and model.playheadUs == 3_000_000
+    model.deleteTimelineSelection()
+    assert requests[-1][1]['command'] == 'delete_cues'
+    assert requests[-1][1]['values']['cue_ids'] == ['c']
+    model._set_subtitle_busy(False)
+    model.selectTimelineClip('v', False)
+    assert not model.selectedCueId
+    model.selectCue('c', 0)
+    assert not model.selectedClipId  # An editor selection must not delete stale V1.
+    model.setPlayheadMs(3000)
+    model.splitVideoAtPlayhead()
+    assert requests[-1][1]['command'] == 'split_video'
+    assert 'clip_id' not in requests[-1][1]
+    assert requests[-1][1]['timeline_us'] == 3_000_000
+    model._finish_timeline_cut(True, requests[-1][2])
+    assert model.playheadUs == 3_000_000 and not model.timelineBusy
+
+
+def test_title_clip_selection_and_deletion_keep_title_identity(monkeypatch):
+    QCoreApplication.instance() or QCoreApplication([])
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    MemorySettings.values = {}
+    model = ApplicationViewModel()
+    interval = {"start_us": 0, "end_us": 10_000_000}
+    model.project_state.replace({"id": "p", "name": "Text", "revision": 1,
+        "title_cues": [{"id": "title", "index": 1, "role": "title_text",
+                        "text": "Channel", "range": interval}],
+        "tracks": [{"id": "T1", "kind": "text", "name": "Text", "clips": [
+            {"id": "title-clip", "track_id": "T1", "cue_id": "title",
+             "timeline_range": interval}]}]})
+    requests = []
+    model.runtime.request = lambda a, p=None, context=None: requests.append((a, p, context))
+    model.setPlayheadMs(3000)
+    model.selectTimelineCue("title")
+    model.selectTimelineClip("title-clip", False)
+    assert model.selectedCueId == "title" and model.selectedClipId == "title-clip"
+    assert model.playheadUs == 3_000_000
+    model.selectClip("title-clip")
+    assert model.selectedCueId == "title"
+    model.deleteSelected(True)
+    assert requests[-1][1]["command"] == "delete_cues"
+    assert requests[-1][1]["values"]["cue_ids"] == ["title"]
+    assert requests[-1][1]["values"]["title_mode"] is True
+
+
+def test_partial_translation_uses_shared_identity_not_stale_cut_index():
+    QCoreApplication.instance() or QCoreApplication([])
+    model = ProjectStateModel()
+    cues = [{'id': f'c{i}', 'index': i, 'text': f'字幕{i}',
+             'range': {'start_us': i*100, 'end_us': i*100+90}} for i in range(1, 4)]
+    model.replace({'id': 'p', 'name': 'Sparse', 'revision': 1, 'source_cues': cues,
+                   'translated_cues': [{**cues[-1], 'index': 1, 'text': 'Câu thứ ba'}],
+                   'tracks': [{'id': 'S1', 'kind': 'subtitle', 'name': 'Sub', 'clips': [
+                       {'id': c['id'], 'cue_id': c['id'], 'timeline_range': c['range']}
+                       for c in cues]}]})
+    assert not model.subtitle_cues.find('c1')['translated_text']
+    assert model.subtitle_cues.find('c3')['translated_text'] == 'Câu thứ ba'
+    assert model.clip_info('c1')['cue_text'] == '字幕1'
+    assert model.clip_info('c3')['cue_text'] == 'Câu thứ ba'
+
+
+def test_subtitle_role_projection_is_cached_and_invalidated_after_edit() -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    model = SubtitleCueListModel()
+    source = [{"id": "c1", "index": 1, "text": "原文",
+               "range": {"start_us": 0, "end_us": 1_000_000}}]
+    model.replace(source, [{"id": "t1", "index": 1, "text": "Bản dịch"}])
+
+    index = model.index(0, 0)
+    assert model.data(index, model.SourceTextRole) == "原文"
+    assert model.data(index, model.TranslatedTextRole) == "Bản dịch"
+    assert len(model._role_data_cache) == 1
+
+    model.optimistic_update_text("c1", "原文 mới", language="source")
+    assert model.data(index, model.SourceTextRole) == "原文 mới"
+    assert model.data(index, model.TranslatedTextRole) == "Bản dịch"
+
+
+@pytest.mark.parametrize("succeeded", [True, False])
+def test_background_subtitle_response_does_not_release_active_timing_edit(
+    monkeypatch, succeeded: bool,
+) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model.project_state.replace({"id": "save-race", "name": "Race", "revision": 1})
+    model._set_subtitle_busy(True)
+    model._set_timeline_busy(True)
+    context = {"project_id": "save-race", "background_subtitle_save": True,
+               "subtitle_command": "update_text"}
+    if succeeded:
+        model._action_succeeded("subtitle_command", {
+            "id": "save-race", "revision": 2, "_subtitle_patch": True,
+        }, context)
+    else:
+        model._action_failed("subtitle_command", {"message": "disk full"}, context)
+    assert model.subtitleBusy is True
+    assert model.timelineBusy is True
+
+
+def test_timing_settlement_ignores_responses_from_an_older_gesture(monkeypatch) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    cue = {"id": "cue", "index": 1, "role": "scene_text",
+           "range": {"start_us": 1_000_000, "end_us": 2_000_000}, "text": "人物"}
+    model.project_state.replace({"id": "timing", "name": "Timing", "revision": 1,
+                                 "source_cues": [cue]})
+    model.selectSubtitleCueIds(["cue"])
+    requests = []
+    monkeypatch.setattr(model.runtime, "request",
+                        lambda action, payload=None, context=None:
+                        requests.append((action, payload, context)))
+    settled = []
+    model.sceneTimingSettled.connect(lambda generation, ok: settled.append((generation, ok)))
+    first = model.moveSelectedSceneTexts(100_000, 0)
+    first_context = requests[-1][2]
+    model._action_failed("subtitle_command", {"message": "disk full"}, first_context)
+    second = model.moveSelectedSceneTexts(200_000, 0)
+    second_context = requests[-1][2]
+    assert second > first > 0
+    for succeeded in (False, True):
+        if succeeded:
+            model._action_succeeded("subtitle_command", {
+                "id": "timing", "revision": 99, "_subtitle_patch": True,
+            }, first_context)
+        else:
+            model._action_failed("subtitle_command", {"message": "old failure"}, first_context)
+        assert model.subtitleBusy and settled == [(first, False)]
+        assert model.project_state.revision == 1
+        assert model.project_state.subtitle_cues.find("cue")["start_us"] == 1_200_000
+    model._action_succeeded("subtitle_command", {
+        "id": "timing", "revision": 2, "_subtitle_patch": True,
+        "source_cue_upserts": [{**cue, "range": {
+            "start_us": 1_200_000, "end_us": 2_200_000}}],
+    }, second_context)
+    assert settled == [(first, False), (second, True)] and not model.subtitleBusy
+
+
+def test_stale_background_ack_is_saved_without_rolling_back_new_head(monkeypatch) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model.project_state.replace({"id": "late", "name": "Late", "revision": 3})
+    model._subtitle_save_in_flight = True
+    model._action_succeeded("subtitle_command", {
+        "id": "late", "revision": 2, "_subtitle_patch": True,
+    }, {"project_id": "late", "background_subtitle_save": True})
+    assert model.project_state.revision == 3 and model.saveState == "Đã lưu"
+    assert not model._subtitle_save_in_flight
+
+
+def test_timing_submit_failure_returns_rejection_and_restores_confirmed_timing(monkeypatch) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model.project_state.replace({"id": "reject", "name": "Reject", "revision": 1,
+                                 "source_cues": [{"id": "cue", "index": 1, "text": "名字",
+                                     "range": {"start_us": 1_000_000, "end_us": 2_000_000}}]})
+    model.selectSubtitleCueIds(["cue"])
+
+    def failed_request(*args, **kwargs):
+        raise RuntimeError("socket closed")
+
+    monkeypatch.setattr(model.runtime, "request", failed_request)
+    assert model.moveSelectedSceneTexts(200_000, 0) == 0
+    assert not model.subtitleBusy and not model._scene_timing_context
+    assert model.project_state.subtitle_cues.find("cue")["start_us"] == 1_000_000
+
+
+@pytest.mark.parametrize("change_text", [False, True])
+def test_geometry_measurement_uses_inputs_not_unrelated_revision(monkeypatch, change_text):
+    QCoreApplication.instance() or QCoreApplication([])
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    MemorySettings.values = {}
+    model = ApplicationViewModel()
+    cue = {"id": "cue", "index": 1, "text": "Cha",
+           "range": {"start_us": 0, "end_us": 1_000_000}}
+    project = {"id": "geometry-race", "name": "Geometry", "revision": 1,
+               "source_cues": [cue]}
+    model.project_state.replace(project)
+    context = {"generation": 1, "project_id": "geometry-race", "revision": 1,
+               "cue_ids": ["cue"], "delta_x": 0, "delta_y": -.1,
+               "scale_x": 1, "scale_y": 1,
+               "measured_cues": [model.project_state.subtitle_cues.find("cue")],
+               "measured_style": model._subtitle_artwork_style()}
+    model._subtitle_geometry_context = context
+    model._set_subtitle_busy(True)
+    requests = []
+    monkeypatch.setattr(model.runtime, "request",
+                        lambda a, p=None, context=None: requests.append((a, p, context)))
+    # A previously queued save can acknowledge during measurement. Only actual
+    # layout-input changes invalidate the worker's measured placement.
+    model.project_state.replace({**project, "revision": 2, "source_cues": [
+        {**cue, "revision": 2, "text": "Câu đã sửa" if change_text else cue["text"]}]})
+    model._subtitle_geometry_measured(True, {"cue": [.1, .8, .5, .1]}, context)
+    assert len(requests) == (0 if change_text else 1)
+    assert model.subtitleBusy is not change_text
+    if not change_text:
+        assert "measured_cues" not in requests[0][1]["values"]
+        assert "measured_style" not in requests[0][1]["values"]
+
+
+def test_geometry_pending_survives_unrelated_ack_and_releases_on_disconnect(monkeypatch):
+    QCoreApplication.instance() or QCoreApplication([])
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    MemorySettings.values = {}
+    model = ApplicationViewModel()
+    settled = []
+    model.subtitleGeometrySettled.connect(lambda generation, ok: settled.append((generation, ok)))
+    model.project_state.replace({"id": "geometry", "name": "Geometry", "revision": 1})
+    model._subtitle_geometry_context = {"generation": 1, "project_id": "geometry"}
+    model._set_subtitle_busy(True)
+    monkeypatch.setattr(model.runtime, "request", lambda *a, **k: None)
+    model._action_succeeded("get_project", {
+        "id": "geometry", "name": "Geometry", "revision": 1,
+    }, {"project_id": "geometry"})
+    assert model.subtitleBusy and model.saveState != "Đã lưu"
+    model._finish_background_subtitle_save()
+    assert model.subtitleBusy and model.saveState != "Đã lưu"
+    assert settled == []
+    model._backend_ready = True
+    monkeypatch.setattr(model, "_begin_timeline_reconcile", lambda project_id: None)
+    model._set_backend_ready(False)
+    assert not model.subtitleBusy and not model._subtitle_geometry_context
+    assert settled == [(1, False)]
+    # Completion from the disconnected measurement cannot send a new edit.
+    model._subtitle_geometry_measured(True, {}, {"generation": 1, "project_id": "geometry"})
+    assert not model.subtitleBusy
+    assert settled == [(1, False)]
+
+
+def test_geometry_submit_exception_releases_pending_preview(monkeypatch):
+    QCoreApplication.instance() or QCoreApplication([])
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    MemorySettings.values = {}
+    model = ApplicationViewModel()
+    model.project_state.replace({"id": "geometry", "name": "Geometry", "revision": 1,
+        "source_cues": [{"id": "cue", "index": 1, "text": "Cha",
+                         "panel_box": [.1, .8, .5, .1],
+                         "range": {"start_us": 0, "end_us": 1_000_000}}]})
+    model.selectSubtitleCueIds(["cue"])
+
+    def failed_request(*args, **kwargs):
+        raise RuntimeError("socket closed")
+
+    monkeypatch.setattr(model.runtime, "request", failed_request)
+    assert not model.transformSelectedSubtitleGeometry(0, -.1, 1, 1)
+    assert not model.subtitleBusy and not model._subtitle_geometry_context
+    assert model.project_state.subtitle_cues.find("cue")["panel_box"] == [.1, .8, .5, .1]
+
+
+def test_background_flush_waits_for_timing_ack_before_deferred_action(monkeypatch) -> None:
+    app = QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model.project_state.replace({"id": "flush", "name": "Flush", "revision": 1})
+    model._scene_timing_context = {"scene_timing_generation": 1}
+    called = []
+    assert model._defer_until_subtitle_saves_flushed(
+        "export", lambda: called.append(True), "Waiting")
+    model._finish_background_subtitle_save()
+    app.processEvents()
+    assert not called and model.saveState != "Đã lưu"
+    model._finish_scene_timing_command(True)
+    app.processEvents()
+    assert called == [True]
+
+
+def test_background_subtitle_save_coalesces_rapid_edits_and_flushes_once(
+    monkeypatch,
+) -> None:
+    application = QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    view_model = ApplicationViewModel()
+    view_model._set_backend_ready(True)
+    view_model.project_state.replace(
+        {
+            "id": "project-save-queue",
+            "name": "Save queue",
+            "revision": 1,
+            "source_cues": [
+                {
+                    "id": "cue-1",
+                    "index": 1,
+                    "range": {"start_us": 0, "end_us": 1_000_000},
+                    "text": "第一句",
+                }
+            ],
+            "translated_cues": [
+                {
+                    "id": "cue-1",
+                    "index": 1,
+                    "range": {"start_us": 0, "end_us": 1_000_000},
+                    "text": "Câu cũ",
+                }
+            ],
+        }
+    )
+    requests: list[tuple[str, dict, object]] = []
+    monkeypatch.setattr(
+        view_model.runtime,
+        "request",
+        lambda action, payload=None, context=None: requests.append(
+            (action, payload or {}, context)
+        ),
+    )
+
+    for index in range(20):
+        view_model.updateSubtitleText("cue-1", f"Câu mới {index}", "translated")
+
+    assert requests == []
+    assert len(view_model._subtitle_save_queue) == 1
+    assert view_model.project_state.subtitle_cues.get(0)["translated_text"] == "Câu mới 19"
+
+    flushed: list[str] = []
+    assert view_model._defer_until_subtitle_saves_flushed(
+        "test", lambda: flushed.append("done"), "Đang flush"
+    )
+    assert len(requests) == 1
+    assert requests[0][1]["values"]["text"] == "Câu mới 19"
+    view_model._finish_background_subtitle_save()
+    application.processEvents()
+
+    assert flushed == ["done"]
+    assert view_model.saveState == "Đã lưu"
+
+
+@pytest.mark.parametrize("failure", ["disconnect", "send", "watchdog"])
+def test_pending_delete_is_cancelled_on_uncertain_background_save(monkeypatch, failure):
+    app = QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model._set_backend_ready(True)
+    model.project_state.replace({"id": "save-loss", "name": "Save loss", "revision": 1,
+        "source_cues": [{"id": "c", "index": 1, "text": "旧文字",
+                         "range": {"start_us": 0, "end_us": 1_000_000}}]})
+    requests = []
+
+    def request(action, params=None, context=None):
+        if failure == "send" and action == "subtitle_command":
+            raise OSError("closed socket")
+        requests.append((action, params, context))
+
+    monkeypatch.setattr(model.runtime, "request", request)
+    deleted = []
+    model.updateSubtitleText("c", "新文字", "source")
+    model._defer_until_subtitle_saves_flushed("delete", lambda: deleted.append(True), "Chờ lưu")
+    old_context = dict(model._subtitle_save_context)
+    if failure == "disconnect":
+        model._set_backend_ready(False)
+    elif failure == "watchdog":
+        model._background_subtitle_save_timed_out()
+    app.processEvents()
+    assert not deleted
+    assert not model._subtitle_save_in_flight and not model._subtitle_save_queue
+    assert not model._subtitle_flush_callbacks
+    assert model.project_state.subtitle_cues.find("c")["source_text"] == "旧文字"
+    assert model._timeline_reconcile_pending
+    if old_context:
+        # Late ACK from the uncertain write may not overwrite the new durable
+        # head or unlock a newer save operation.
+        model._subtitle_save_context = {**old_context,
+            "background_save_generation": old_context["background_save_generation"] + 1}
+        model._subtitle_save_in_flight = True
+        model._action_succeeded("subtitle_command", {"_subtitle_patch": True,
+            "id": "save-loss", "revision": 2}, old_context)
+        assert model._subtitle_save_in_flight
+        assert model.project_state.revision == 1
+
+
+def test_video_copy_and_paste_capture_selection_and_playhead_before_flush(monkeypatch):
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model.project_state.replace({"id": "copy", "revision": 1, "name": "Copy", "tracks": [
+        {"id": "V1", "kind": "video", "name": "V1", "clips": [
+            {"id": value, "track_id": "V1", "timeline_range": {"start_us": start,
+             "end_us": start + 10_000_000}, "source_range": {"start_us": 0,
+             "end_us": 10_000_000}} for value, start in (("a", 0), ("b", 10_000_000))]}]})
+    deferred = []
+    requests = []
+    monkeypatch.setattr(model, "_defer_until_subtitle_saves_flushed",
+                        lambda key, callback, status: deferred.append(callback) or True)
+    monkeypatch.setattr(model.runtime, "request",
+                        lambda a, p=None, context=None: requests.append((a, p, context)))
+    model.selectClip("a")
+    model.copySelectedVideo()
+    model.selectClip("b")
+    monkeypatch.setattr(model, "_defer_until_subtitle_saves_flushed", lambda *a: False)
+    deferred.pop()()
+    assert requests[-1][1]["clip_id"] == "a"
+    model._video_clipboard_project_id = "copy"
+    model.setPlayheadMs(1234)
+    monkeypatch.setattr(model, "_defer_until_subtitle_saves_flushed",
+                        lambda key, callback, status: deferred.append(callback) or True)
+    model.pasteVideoAtPlayhead()
+    model.setPlayheadMs(8000)
+    monkeypatch.setattr(model, "_defer_until_subtitle_saves_flushed", lambda *a: False)
+    deferred.pop()()
+    assert requests[-1][1]["timeline_us"] == 1_234_000
+
+
+def test_flush_dispatches_distinct_queued_subtitle_edits_without_debounce_delay(
+    monkeypatch,
+) -> None:
+    application = QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    view_model = ApplicationViewModel()
+    view_model._set_backend_ready(True)
+    view_model.project_state.replace(
+        {
+            "id": "project-fast-flush",
+            "name": "Fast flush",
+            "revision": 1,
+            "source_cues": [
+                {
+                    "id": f"cue-{index}",
+                    "index": index,
+                    "range": {
+                        "start_us": (index - 1) * 1_000_000,
+                        "end_us": index * 1_000_000,
+                    },
+                    "text": f"原文 {index}",
+                }
+                for index in (1, 2)
+            ],
+            "translated_cues": [
+                {
+                    "id": f"cue-{index}",
+                    "index": index,
+                    "range": {
+                        "start_us": (index - 1) * 1_000_000,
+                        "end_us": index * 1_000_000,
+                    },
+                    "text": f"Câu cũ {index}",
+                }
+                for index in (1, 2)
+            ],
+        }
+    )
+    requests: list[tuple[str, dict, object]] = []
+    monkeypatch.setattr(
+        view_model.runtime,
+        "request",
+        lambda action, payload=None, context=None: requests.append(
+            (action, payload or {}, context)
+        ),
+    )
+
+    view_model.updateSubtitleText("cue-1", "Câu mới 1", "translated")
+    view_model.updateSubtitleText("cue-2", "Câu mới 2", "translated")
+    flushed: list[bool] = []
+    assert view_model._defer_until_subtitle_saves_flushed(
+        "export", lambda: flushed.append(True), "Đang lưu trước khi xuất"
+    )
+    assert len(requests) == 1
+
+    view_model._finish_background_subtitle_save()
+    application.processEvents()
+    assert len(requests) == 2
+    assert view_model._subtitle_save_timer.isActive() is False
+
+    view_model._finish_background_subtitle_save()
+    application.processEvents()
+    assert flushed == [True]
+
+
+def test_failed_background_subtitle_save_drops_deferred_action_and_rolls_back(
+    monkeypatch,
+) -> None:
+    application = QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    view_model = ApplicationViewModel()
+    view_model._set_backend_ready(True)
+    view_model.project_state.replace(
+        {
+            "id": "project-save-failure",
+            "name": "Save failure",
+            "revision": 1,
+            "source_cues": [
+                {
+                    "id": "cue-1",
+                    "index": 1,
+                    "range": {"start_us": 0, "end_us": 1_000_000},
+                    "text": "第一句",
+                }
+            ],
+            "translated_cues": [
+                {
+                    "id": "cue-1",
+                    "index": 1,
+                    "range": {"start_us": 0, "end_us": 1_000_000},
+                    "text": "Câu cũ",
+                }
+            ],
+        }
+    )
+    requests: list[tuple[str, dict, object]] = []
+    monkeypatch.setattr(
+        view_model.runtime,
+        "request",
+        lambda action, payload=None, context=None: requests.append(
+            (action, payload or {}, context)
+        ),
+    )
+    callback_runs: list[bool] = []
+
+    view_model.updateSubtitleText("cue-1", "Câu chưa lưu", "translated")
+    assert view_model._defer_until_subtitle_saves_flushed(
+        "export", lambda: callback_runs.append(True), "Đang flush"
+    )
+    view_model._action_failed(
+        "subtitle_command",
+        {"message": "disk full"},
+        requests[0][2],
+    )
+    application.processEvents()
+
+    assert callback_runs == []
+    assert view_model.project_state.subtitle_cues.get(0)["translated_text"] == "Câu cũ"
 
 
 def test_translation_preferences_save_is_serialized_and_releases_on_failure(
@@ -125,9 +697,80 @@ def test_translation_preferences_save_is_serialized_and_releases_on_failure(
     assert view_model.project_state.translationStylePreset == "xianxia"
 
 
+def test_named_translation_style_save_updates_project_and_is_exposed_to_qml(
+    monkeypatch,
+) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    view_model = ApplicationViewModel()
+    project = {
+        "id": "project-named-style",
+        "name": "Named style",
+        "revision": 1,
+        "media": [],
+        "tracks": [],
+        "source_cues": [],
+        "translated_cues": [],
+        "overlays": [],
+        "translation_preferences": {"preset": "auto", "custom_rules": ""},
+    }
+    view_model._apply_project(project)
+    view_model._backend_ready = True
+    requests: list[tuple[str, dict, object]] = []
+    monkeypatch.setattr(
+        view_model.runtime,
+        "request",
+        lambda action, payload=None, *, context=None: requests.append(
+            (action, payload or {}, context)
+        ),
+    )
+
+    view_model.saveTranslationStyle("  Bản riêng  ", "modern", "Dùng anh/em.")
+
+    assert requests[0][0] == "save_translation_style"
+    assert requests[0][1]["name"] == "Bản riêng"
+    saved = {
+        **project,
+        "revision": 2,
+        "translation_preferences": {
+            "preset": "modern",
+            "custom_rules": "Dùng anh/em.",
+            "active_style_name": "Bản riêng",
+            "saved_styles": [
+                {"name": "Bản riêng", "preset": "modern", "custom_rules": "Dùng anh/em."}
+            ],
+        },
+    }
+    view_model._action_succeeded("save_translation_style", saved, requests[0][2])
+
+    assert view_model.translationPreferencesBusy is False
+    assert view_model.project_state.translationStylePreset == "modern"
+    assert view_model.project_state.translationActiveStyleName == "Bản riêng"
+    assert view_model.project_state.translationStylePresets == [
+        {"name": "Bản riêng", "preset": "modern", "custom_rules": "Dùng anh/em."}
+    ]
+
+    view_model.setTranslationPreferences("modern", "Dùng anh/em.", "Bản riêng")
+    assert requests[-1][1]["active_style_name"] == "Bản riêng"
+    view_model._action_failed(
+        "set_translation_preferences", {"message": "write failed"}, requests[-1][2]
+    )
+    assert not view_model.translationPreferencesBusy
+    assert view_model.project_state.translationActiveStyleName == "Bản riêng"
+
+    view_model.saveTranslationStyle("Bản riêng 2", "neutral", "Quy tắc mới")
+    view_model._action_failed(
+        "save_translation_style", {"message": "disk full"}, requests[-1][2]
+    )
+    assert not view_model.translationPreferencesBusy
+    assert len(view_model.project_state.translationStylePresets) == 1
+
+
 @pytest.mark.parametrize("response", [{}, [], "invalid", None])
 def test_malformed_translation_preferences_response_keeps_current_project(
-    monkeypatch, response,
+    monkeypatch,
+    response,
 ) -> None:
     QCoreApplication.instance() or QCoreApplication([])
     MemorySettings.values = {}
@@ -162,6 +805,172 @@ def test_malformed_translation_preferences_response_keeps_current_project(
     assert view_model.translationPreferencesBusy is False
     assert view_model.project_state.projectId == "project-style-response"
     assert view_model.project_state.translationStylePreset == "auto"
+
+
+@pytest.mark.parametrize("action", ["set_translation_preferences", "save_translation_style"])
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_style_save_ack_preserves_newer_and_optimistic_cue_edits(
+    monkeypatch, action: str, confirmed: bool,
+) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    interval = {"start_us": 0, "end_us": 1_000_000}
+    project = {"id": "style-race", "name": "Styles", "revision": 1,
+               "source_cues": [{"id": "c1", "index": 1, "range": interval,
+                                "text": "原文"}],
+               "translated_cues": [{"id": "c1", "index": 1, "range": interval,
+                                    "text": "Câu cũ"}],
+               "translation_preferences": {"preset": "auto", "custom_rules": ""}}
+    model._apply_project(project)
+    model._backend_ready = True
+    requests = []
+    model.runtime.request = lambda a, p=None, context=None: requests.append((a, p, context))
+    if action == "save_translation_style":
+        model.saveTranslationStyle("Bản riêng", "modern", "Dùng anh/em.")
+    else:
+        model.setTranslationPreferences("modern", "Dùng anh/em.")
+    context = requests[0][2]
+    preferences = {"preset": "modern", "custom_rules": "Dùng anh/em."}
+    if action == "save_translation_style":
+        preferences.update(active_style_name="Bản riêng", saved_styles=[
+            {"name": "Bản riêng", "preset": "modern", "custom_rules": "Dùng anh/em."}])
+    model.selectCue("c1", 0)
+    if confirmed:
+        model.project_state.apply_subtitle_patch({
+            "id": "style-race", "revision": 3, "_subtitle_patch": True,
+            "translated_cue_upserts": [{"id": "c1", "index": 1, "range": interval,
+                                        "text": "Câu mới"}],
+        })
+        model._observe_project_persistence({"id": "style-race", "_project_dirty": True,
+                                           "_saved_revision": 2})
+    else:
+        model.updateSubtitleText("c1", "Câu mới", "translated")
+    # A separate operation can still be saving when the disjoint style ACK arrives.
+    model._set_subtitle_busy(True)
+    model._set_timeline_busy(True)
+    cue_resets = []
+    model.project_state.subtitle_cues.modelReset.connect(lambda: cue_resets.append(True))
+    model._action_succeeded(action, {**project, "revision": 2,
+                                    "translation_preferences": preferences}, context)
+
+    assert model.project_state.subtitle_cues.find("c1")["translated_text"] == "Câu mới"
+    assert model.project_state.revision == (3 if confirmed else 2)
+    assert model.project_state.translationStylePreset == "modern"
+    assert model.selectedCueId == "c1"
+    assert not cue_resets
+    assert model.subtitleBusy and model.timelineBusy
+    assert not model.translationPreferencesBusy
+    if confirmed:
+        assert model.projectDirty and model._last_saved_revision == 2
+        assert model.project_state._canonical_snapshot["translated_cues"][0]["text"] == (
+            "Câu mới")
+    else:
+        assert model._subtitle_save_queue or model._subtitle_save_in_flight
+        assert model.saveState != "Đã lưu"
+
+
+@pytest.mark.parametrize("kind", ["subtitle", "timeline"])
+@pytest.mark.parametrize("style_revision", [2, 4])
+def test_prepared_cue_patch_keeps_styles_saved_after_projection_started(
+    kind: str, style_revision: int,
+) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    state = ProjectStateModel()
+    project = {"id": "style-projection", "name": "Styles", "revision": 1,
+               "tracks": [], "source_cues": [], "translated_cues": [],
+               "translation_preferences": {"preset": "auto", "custom_rules": ""}}
+    state.replace(project)
+    patch = {"id": "style-projection", "revision": 3, f"_{kind}_patch": True,
+             "source_cue_upserts": [{"id": "new-cue", "index": 1, "text": "原文",
+                                    "range": {"start_us": 0, "end_us": 1_000_000}}]}
+    prepare = (state.prepare_subtitle_patch if kind == "subtitle"
+               else state.prepare_timeline_patch)
+    canonical, projected = prepare(state._canonical_snapshot, patch)
+    preferences = {"preset": "modern", "custom_rules": "Dùng anh/em.",
+                   "active_style_name": "Bản riêng", "saved_styles": [
+                       {"name": "Bản riêng", "preset": "modern",
+                        "custom_rules": "Dùng anh/em."}]}
+    state.apply_translation_preferences({"id": "style-projection", "revision": style_revision,
+                                         "translation_preferences": preferences})
+    apply = (state.apply_prepared_subtitle_patch if kind == "subtitle"
+             else state.apply_prepared_timeline_patch)
+    apply(canonical, projected)
+
+    assert state.revision == max(3, style_revision)
+    assert state.translationActiveStyleName == "Bản riêng"
+    assert state._canonical_snapshot["translation_preferences"] == preferences
+    assert state._canonical_snapshot["source_cues"][0]["id"] == "new-cue"
+    assert state.subtitle_cues.find("new-cue")
+
+
+@pytest.mark.parametrize("kind", ["subtitle", "timeline", "effect"])
+def test_content_patch_after_style_ack_keeps_head_and_rejects_older_content(kind: str) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    state = ProjectStateModel()
+    state.replace({"id": "styles", "name": "Styles", "revision": 1,
+                   "tracks": [], "source_cues": [], "translated_cues": [], "overlays": []})
+    state.apply_translation_preferences({"id": "styles", "revision": 3,
+                                         "translation_preferences": {
+                                             "preset": "modern", "custom_rules": "Mới"}})
+    patch = {"id": "styles", "revision": 2, f"_{kind}_patch": True}
+    apply = getattr(state, f"apply_{kind}_patch")
+    apply(patch)
+    assert state.revision == 3 and state._canonical_snapshot["revision"] == 3
+    assert state.translationCustomRules == "Mới"
+    with pytest.raises(ValueError, match="revision"):
+        apply({**patch, "revision": 1})
+
+
+def test_stale_style_ack_does_not_replace_newer_preferences() -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    state = ProjectStateModel()
+    state.replace({"id": "styles", "name": "Styles", "revision": 4,
+                   "translation_preferences": {"preset": "modern", "custom_rules": "Mới"}})
+    state.apply_translation_preferences({"id": "styles", "revision": 2,
+                                         "translation_preferences": {
+                                             "preset": "neutral", "custom_rules": "Cũ"}})
+    assert state.revision == 4
+    assert state.translationCustomRules == "Mới"
+
+
+def test_style_ack_before_pending_cue_patch_retains_durable_saved_revision(monkeypatch) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    cue = {"id": "c", "index": 1, "text": "Cũ",
+           "range": {"start_us": 0, "end_us": 1_000_000}}
+    model._apply_project({"id": "styles", "name": "Styles", "revision": 1,
+                          "source_cues": [cue], "tracks": []})
+    model._backend_ready = True
+    requests = []
+    model.runtime.request = lambda a, p=None, context=None: requests.append((a, p, context))
+    model.updateSubtitleText("c", "Mới", "source")
+    model._subtitle_save_timer.stop()
+    model._dispatch_background_subtitle_save()
+    model.saveTranslationStyle("Bản riêng", "modern", "Quy tắc")
+    assert [request[0] for request in requests] == ["subtitle_command", "save_translation_style"]
+    model._action_succeeded("save_translation_style", {
+        "id": "styles", "revision": 3, "_project_dirty": False, "_saved_revision": 3,
+        "translation_preferences": {"preset": "modern", "custom_rules": "Quy tắc",
+                                    "active_style_name": "Bản riêng", "saved_styles": [
+                                        {"name": "Bản riêng", "preset": "modern",
+                                         "custom_rules": "Quy tắc"}]},
+    }, requests[1][2])
+    assert model._last_saved_revision == 3
+    assert model.saveState != "Đã lưu"
+    model._action_succeeded("subtitle_command", {
+        "id": "styles", "revision": 2, "_subtitle_patch": True,
+        "source_cue_upserts": [{**cue, "text": "Mới"}],
+        "_project_dirty": True, "_saved_revision": 1,
+    }, requests[0][2])
+    assert model.project_state.revision == 3
+    assert model.project_state._canonical_snapshot["source_cues"][0]["text"] == "Mới"
+    assert model.project_state.translationActiveStyleName == "Bản riêng"
+    assert not model.projectDirty and model._last_saved_revision == 3
+    assert model.saveState == "Đã lưu"
 
 
 def test_voice_catalog_refresh_does_not_run_blocking_vieneu_health_probe(
@@ -238,6 +1047,42 @@ def test_job_runtime_releases_ready_state_when_socket_disconnects() -> None:
     assert states == [False]
 
 
+def test_job_runtime_suppresses_transient_socket_errors_during_slow_startup(
+    monkeypatch,
+) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    runtime = JobRuntime()
+    runtime._state = "starting"
+    runtime._attempts = 200
+    runtime._startup_deadline = 100.0
+    statuses: list[str] = []
+    runtime.statusChanged.connect(statuses.append)
+    monkeypatch.setattr(application_module, "monotonic", lambda: 50.0)
+
+    runtime._client_error("QLocalSocket::connectToServer: Invalid name")
+
+    assert runtime._state == "starting"
+    assert statuses == []
+
+
+def test_job_runtime_reports_a_friendly_error_after_startup_deadline(monkeypatch) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    runtime = JobRuntime()
+    runtime._state = "starting"
+    runtime._startup_deadline = 100.0
+    statuses: list[str] = []
+    runtime.statusChanged.connect(statuses.append)
+    monkeypatch.setattr(application_module, "monotonic", lambda: 101.0)
+
+    runtime._client_error("QLocalSocket::connectToServer: Invalid name")
+
+    assert runtime._state == "error"
+    assert statuses == [
+        "Không thể khởi động Job Manager. Dữ liệu dự án vẫn được giữ nguyên; "
+        "hãy đóng ứng dụng rồi mở lại."
+    ]
+
+
 def test_legacy_settings_map_to_current_qsettings_without_losing_safe_values() -> None:
     values = application_module._legacy_qsettings_values(
         {
@@ -305,9 +1150,7 @@ def test_whisper_extraction_method_persists_and_dispatches_external_runtime(
     monkeypatch.setattr(application_module, "whisper_runtime_is_ready", lambda *_args: True)
     view_model = ApplicationViewModel()
     view_model._set_backend_ready(True)
-    view_model.project_state.replace(
-        {"id": "project-whisper", "name": "Phim", "revision": 1}
-    )
+    view_model.project_state.replace({"id": "project-whisper", "name": "Phim", "revision": 1})
     requests: list[tuple[str, dict, object]] = []
     monkeypatch.setattr(
         view_model.runtime,
@@ -462,14 +1305,11 @@ def test_select_all_multi_videos_updates_every_card_before_backend_response(
     view_model.selectAllMultiVideos(True)
 
     selected_role = next(
-        role
-        for role, name in view_model.multi_videos.roleNames().items()
-        if name == b"selected"
+        role for role, name in view_model.multi_videos.roleNames().items() if name == b"selected"
     )
     assert view_model.multiSelectedCount == 2
     assert all(
-        view_model.multi_videos.data(view_model.multi_videos.index(row, 0), selected_role)
-        is True
+        view_model.multi_videos.data(view_model.multi_videos.index(row, 0), selected_role) is True
         for row in range(2)
     )
     assert requests[0][0:2] == ("multi_select_all", {"selected": True})
@@ -497,9 +1337,7 @@ def test_select_one_multi_video_updates_card_before_backend_response(monkeypatch
     view_model.selectMultiVideo("first", True)
 
     selected_role = next(
-        role
-        for role, name in view_model.multi_videos.roleNames().items()
-        if name == b"selected"
+        role for role, name in view_model.multi_videos.roleNames().items() if name == b"selected"
     )
     assert view_model.multiSelectedCount == 1
     assert view_model.multi_videos.data(view_model.multi_videos.index(0, 0), selected_role)
@@ -747,9 +1585,7 @@ def test_multi_card_uses_manual_status_then_falls_back_to_artifacts() -> None:
     )
 
     assert model.data(model.index(0, 0), roles[b"state"]) == "running"
-    assert model.data(model.index(0, 0), roles[b"statusText"]) == (
-        "Thủ công · Đang dịch 25%"
-    )
+    assert model.data(model.index(0, 0), roles[b"statusText"]) == ("Thủ công · Đang dịch 25%")
     assert model.data(model.index(0, 0), roles[b"progress"]) == 0.25
     assert model.data(model.index(1, 0), roles[b"state"]) == "completed"
     assert model.data(model.index(1, 0), roles[b"statusText"]) == "D1 sẵn sàng"
@@ -844,8 +1680,8 @@ def test_multi_video_card_model_keeps_all_50_cards_and_exposes_edge_roles() -> N
     assert model.data(last, roles[b"projectId"]) == "project-49"
     assert model.data(last, roles[b"progress"]) == 0.5
     assert model.data(last, roles[b"statusText"]) == "Đang dịch 50%"
-    assert model.data(first, roles[b"thumbnailUrl"]).toString().startswith(
-        "image://multi-thumbnail/"
+    assert (
+        model.data(first, roles[b"thumbnailUrl"]).toString().startswith("image://multi-thumbnail/")
     )
 
 
@@ -875,9 +1711,7 @@ def test_multi_card_updates_live_cjk_count_and_manual_ready_state() -> None:
 
     needs_edit = model.index(0, 0)
     ready = model.index(1, 0)
-    assert model.data(needs_edit, roles[b"statusText"]) == (
-        "Còn chữ Trung · 10 cue · đã bỏ qua"
-    )
+    assert model.data(needs_edit, roles[b"statusText"]) == ("Còn chữ Trung · 10 cue · đã bỏ qua")
     assert model.data(ready, roles[b"state"]) == "completed"
     assert model.data(ready, roles[b"statusText"]) == (
         "Đã sửa xong chữ Trung · sẵn sàng lồng tiếng"
@@ -929,9 +1763,7 @@ def test_partial_multi_status_merges_without_resetting_catalog_cards(monkeypatch
     roles = {name: role for role, name in view_model.multi_videos.roleNames().items()}
     card = view_model.multi_videos.index(0, 0)
     assert resets == []
-    assert view_model.multi_videos.data(card, roles[b"videoUrl"]).toString().endswith(
-        "/source.mp4"
-    )
+    assert view_model.multi_videos.data(card, roles[b"videoUrl"]).toString().endswith("/source.mp4")
     assert view_model.multi_videos.data(card, roles[b"progress"]) == 0.5
     assert view_model.multi_videos.data(card, roles[b"stageProgress"]) == pytest.approx(0.5)
     assert view_model.multi_videos.data(card, roles[b"statusText"]) == "Đang dịch 50%"
@@ -970,9 +1802,7 @@ def test_multi_pause_button_updates_state_before_ipc_response(monkeypatch) -> No
     assert view_model.multiBatchState == "pause_requested"
     roles = {name: role for role, name in view_model.multi_videos.roleNames().items()}
     card = view_model.multi_videos.index(0, 0)
-    assert "Đang tạm dừng" in view_model.multi_videos.data(
-        card, roles[b"statusText"]
-    )
+    assert "Đang tạm dừng" in view_model.multi_videos.data(card, roles[b"statusText"])
 
 
 def test_multi_resume_optimistic_state_preserves_current_stage(monkeypatch) -> None:
@@ -1092,9 +1922,7 @@ def test_selection_response_does_not_overwrite_optimistic_card_state() -> None:
     received: list[dict] = []
     succeeded: list[str] = []
     runtime.multiVideosReceived.connect(lambda payload: received.append(dict(payload)))
-    runtime.actionSucceeded.connect(
-        lambda action, _result, _context: succeeded.append(action)
-    )
+    runtime.actionSucceeded.connect(lambda action, _result, _context: succeeded.append(action))
 
     runtime._response(
         SimpleNamespace(
@@ -1145,9 +1973,7 @@ def test_multi_card_reports_paused_interrupted_and_final_failure_truthfully() ->
     )
 
     assert model.data(model.index(0, 0), roles[b"state"]) == "paused"
-    assert model.data(model.index(0, 0), roles[b"statusText"]) == (
-        "Đã tạm dừng · dịch 50%"
-    )
+    assert model.data(model.index(0, 0), roles[b"statusText"]) == ("Đã tạm dừng · dịch 50%")
     assert model.data(model.index(1, 0), roles[b"state"]) == "interrupted"
     assert model.data(model.index(1, 0), roles[b"statusText"]) == (
         "Đã gián đoạn · lồng tiếng 25% · cache vẫn được giữ"
@@ -1195,7 +2021,7 @@ def test_multi_card_distinguishes_worker_start_cache_restore_and_unconfirmed_pau
         "Đang khởi động bộ máy từ cache · lồng tiếng 40%"
     )
     assert model.data(model.index(1, 0), roles[b"statusText"]) == (
-        "Đang khôi phục cache · lồng tiếng 40%"
+        "Đang kiểm tra cache · lồng tiếng 40%"
     )
     assert model.data(model.index(2, 0), roles[b"state"]) == "pause_requested"
     assert model.data(model.index(2, 0), roles[b"statusText"]) == (
@@ -1791,6 +2617,7 @@ def test_scene_text_timing_preview_is_live_and_failed_save_rolls_back(
     assert requests[-1][1]["values"] == {
         "start_us": 3_000_000,
         "end_us": 5_000_000,
+            "display_time": True,
     }
     view_model._action_failed(
         "subtitle_command",
@@ -2018,10 +2845,7 @@ def test_vietnamese_find_replace_is_optimistic_compact_and_rolls_back_on_failure
     view_model.findReplaceSubtitles("hạm", " hạm", 1)
 
     assert view_model.project_state.subtitle_cues.get(0)["source_text"] == "第一句话"
-    assert (
-        view_model.project_state.subtitle_cues.get(0)["translated_text"]
-        == "Đây là chiến hạm"
-    )
+    assert view_model.project_state.subtitle_cues.get(0)["translated_text"] == "Đây là chiến hạm"
     assert requests[-1][0] == "subtitle_command"
     assert requests[-1][1]["language"] == "translated"
     assert requests[-1][1]["compact"] is True
@@ -2033,10 +2857,7 @@ def test_vietnamese_find_replace_is_optimistic_compact_and_rolls_back_on_failure
         requests[-1][2],
     )
 
-    assert (
-        view_model.project_state.subtitle_cues.get(0)["translated_text"]
-        == "Đây là chiếnhạm"
-    )
+    assert view_model.project_state.subtitle_cues.get(0)["translated_text"] == "Đây là chiếnhạm"
     assert "đã được hoàn nguyên" in view_model.statusMessage
 
 
@@ -2105,6 +2926,7 @@ def test_manual_cjk_edit_updates_multi_card_before_ipc_response(monkeypatch) -> 
     )
 
     view_model.updateSubtitleText("translated-1", "Đã sửa", "translated")
+    view_model._dispatch_background_subtitle_save()
 
     roles = {name: role for role, name in view_model.multi_videos.roleNames().items()}
     card = view_model.multi_videos.index(0, 0)
@@ -2238,6 +3060,43 @@ def test_subtitle_multi_selection_uses_stable_cue_ids(monkeypatch) -> None:
 
     assert view_model.selectedCueIds == ["scene-2"]
     assert view_model.selectedCueId == "scene-2"
+
+
+def test_timeline_cue_selection_does_not_seek_and_blank_click_can_clear(
+    monkeypatch,
+) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    view_model = ApplicationViewModel()
+    view_model.project_state.replace(
+        {
+            "id": "project-timeline-selection",
+            "name": "Chọn cue Timeline",
+            "revision": 1,
+            "tracks": [],
+            "source_cues": [
+                {
+                    "id": "scene-1",
+                    "index": 1,
+                    "range": {"start_us": 2_000_000, "end_us": 3_000_000},
+                    "text": "人物",
+                    "role": "scene_text",
+                    "subtitle_track_id": "S2",
+                }
+            ],
+            "translated_cues": [],
+        }
+    )
+    view_model.setPlayheadMs(750)
+
+    view_model.selectTimelineCue("scene-1", False)
+
+    assert view_model.selectedCueIds == ["scene-1"]
+    assert view_model.playheadUs == 750_000
+    view_model.clearTimelineCueSelection()
+    assert view_model.selectedCueIds == []
+    assert view_model.playheadUs == 750_000
 
 
 def test_manual_scene_text_waits_for_current_subtitle_save_then_dispatches(
@@ -2392,6 +3251,8 @@ def test_manual_scene_text_defaults_use_brush_white_on_opaque_black_ink(
     assert defaults["text_color"] == "#FFFFFF"
     assert defaults["background_color"] == "#000000"
     assert defaults["background_opacity_percent"] == 100
+    assert defaults["fade_enabled"] is True
+    assert defaults["fade_duration_ms"] == 300
 
 
 def test_selected_scene_move_preview_is_not_compounded_and_rolls_back(
@@ -2451,12 +3312,14 @@ def test_selected_scene_move_preview_is_not_compounded_and_rolls_back(
         "cue_ids": ["scene-1", "scene-2"],
         "delta_us": 600_000,
         "lane_delta": 1,
+        "display_time": True,
     }
     context = requests[-1][2]
     assert isinstance(context, dict)
-    assert [
-        item["previous_start_us"] for item in context["optimistic_changes"]
-    ] == [1_000_000, 3_000_000]
+    assert [item["previous_start_us"] for item in context["optimistic_changes"]] == [
+        1_000_000,
+        3_000_000,
+    ]
 
     view_model._action_failed(
         "subtitle_command",
@@ -2466,6 +3329,67 @@ def test_selected_scene_move_preview_is_not_compounded_and_rolls_back(
 
     assert view_model.project_state.subtitle_cues.find("scene-1")["start_us"] == 1_000_000
     assert view_model.project_state.subtitle_cues.find("scene-2")["start_us"] == 3_000_000
+
+
+def test_selected_scene_resize_previews_group_and_dispatches_one_command(
+    monkeypatch,
+) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    view_model = ApplicationViewModel()
+    view_model.project_state.replace(
+        {
+            "id": "project-scene-resize",
+            "name": "Resize nhóm cue",
+            "revision": 1,
+            "tracks": [],
+            "source_cues": [
+                {
+                    "id": "scene-1",
+                    "index": 1,
+                    "range": {"start_us": 1_000_000, "end_us": 2_000_000},
+                    "text": "人物",
+                    "role": "scene_text",
+                    "subtitle_track_id": "S2",
+                },
+                {
+                    "id": "scene-2",
+                    "index": 2,
+                    "range": {"start_us": 3_000_000, "end_us": 4_000_000},
+                    "text": "法宝",
+                    "role": "scene_text",
+                    "subtitle_track_id": "S3",
+                },
+            ],
+            "translated_cues": [],
+        }
+    )
+    view_model.selectSubtitleCueIds(["scene-1", "scene-2"])
+
+    view_model.previewSelectedSceneTextResize("right", 350_000)
+
+    assert view_model.project_state.subtitle_cues.find("scene-1")["end_us"] == 2_350_000
+    assert view_model.project_state.subtitle_cues.find("scene-2")["end_us"] == 4_350_000
+    requests: list[tuple[str, dict, object]] = []
+    monkeypatch.setattr(
+        view_model.runtime,
+        "request",
+        lambda action, payload=None, *, context=None: requests.append(
+            (action, payload or {}, context)
+        ),
+    )
+
+    view_model.resizeSelectedSceneTexts("right", 350_000)
+
+    assert len(requests) == 1
+    assert requests[0][1]["command"] == "resize_scene_texts"
+    assert requests[0][1]["values"] == {
+        "cue_ids": ["scene-1", "scene-2"],
+        "edge": "right",
+        "delta_us": 350_000,
+        "display_time": True,
+    }
 
 
 def test_compact_subtitle_patch_moves_clip_without_leaving_it_in_old_lane() -> None:
@@ -2545,9 +3469,7 @@ def test_compact_subtitle_patch_moves_clip_without_leaving_it_in_old_lane() -> N
                 }
             ],
             "removed_subtitle_clip_ids": [],
-            "subtitle_track_upserts": [
-                {"id": "S3", "kind": "subtitle", "name": "Chữ trong cảnh"}
-            ],
+            "subtitle_track_upserts": [{"id": "S3", "kind": "subtitle", "name": "Chữ trong cảnh"}],
             "removed_subtitle_track_ids": [],
         }
     )
@@ -2598,8 +3520,9 @@ def test_marquee_range_selects_only_intersecting_subtitle_lanes() -> None:
         }
     )
 
-    assert model.subtitleCueIdsInRange(900_000, 2_100_000, 1, 1) == ["scene-1"]
-    assert model.subtitleCueIdsInRange(0, 5_000_000, 1, 2) == [
+    scene_track = model.subtitleTrackIndexForCueId("scene-1")
+    assert model.subtitleCueIdsInRange(900_000, 2_100_000, scene_track, scene_track) == ["scene-1"]
+    assert model.subtitleCueIdsInRange(0, 5_000_000, scene_track, scene_track + 1) == [
         "scene-1",
         "scene-2",
     ]
@@ -2785,6 +3708,7 @@ def test_manual_vietnamese_edit_clears_stale_cjk_qa_immediately_and_restores_on_
     )
 
     view_model.updateSubtitleText("translated-1", "Đây là bạn của tôi", "translated")
+    view_model._dispatch_background_subtitle_save()
 
     assert view_model.translationQa["status"] == "PASS"
     assert view_model.translationQa["issues"] == []
@@ -2817,10 +3741,7 @@ def test_manual_vietnamese_edit_clears_stale_cjk_qa_immediately_and_restores_on_
 
     assert view_model.translationQa["status"] == "REVIEW"
     assert view_model.translationQa["issues"][0]["code"] == "cjk_remaining"
-    assert (
-        view_model.project_state.subtitle_cues.get(0)["translated_text"]
-        == "Đây là 朋友 của tôi"
-    )
+    assert view_model.project_state.subtitle_cues.get(0)["translated_text"] == "Đây là 朋友 của tôi"
 
 
 def test_navigation_feedback_stays_inside_budget_and_preserves_job_models(monkeypatch) -> None:
@@ -2876,8 +3797,6 @@ def test_every_navigation_workspace_routes_to_an_intentional_screen(monkeypatch)
         "voice": 3,
         "multi": 4,
         "timeline": 5,
-        "effects": 6,
-        "mixer": 6,
         "export": 6,
         "queue": 6,
         "settings": 7,
@@ -2888,6 +3807,11 @@ def test_every_navigation_workspace_routes_to_an_intentional_screen(monkeypatch)
         assert view_model.currentWorkspace == workspace
         assert view_model.currentIndex == expected_index
         assert "sẽ được nối" not in view_model.statusMessage
+
+    for workspace in ("effects", "mixer"):
+        view_model.navigate(workspace)
+        assert view_model.currentWorkspace == "timeline"
+        assert view_model.currentIndex == 5
 
 
 def test_opening_multi_refreshes_catalog_on_the_first_click(monkeypatch) -> None:
@@ -2939,6 +3863,66 @@ def test_import_path_accepts_percent_encoded_unicode_file_url(monkeypatch, tmp_p
     assert action == "create_project"
     assert payload["name"] == media.stem
     assert context["media_path"] == str(media.resolve())
+
+
+def test_successful_media_import_opens_updated_timeline_without_reload(monkeypatch):
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model.navigate("projects")
+    model._set_import_busy(True)
+    requests = []
+    model.runtime.request = lambda action, params=None, context=None: requests.append(action)
+    interval = {"start_us": 0, "end_us": 10_000_000}
+    snapshot = {"id": "imported", "name": "Imported", "revision": 2,
+                "media": [{"id": "media", "path": "E:/fixture.mp4", "kind": "video"}],
+                "tracks": [{"id": "V1", "name": "Video", "kind": "video", "clips": [
+                    {"id": "video", "track_id": "V1", "media_id": "media",
+                     "timeline_range": interval, "source_range": interval}]}]}
+    model._action_succeeded("import_media", snapshot, {"media_path": "E:/fixture.mp4"})
+    assert model.currentWorkspace == "timeline"
+    assert model.project_state.projectId == "imported"
+    assert model.project_state.clip_info("video") is not None
+    assert not model.importBusy
+    assert "get_project" not in requests
+
+
+def test_failed_media_import_keeps_current_workspace_and_project(monkeypatch):
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model.project_state.replace({"id": "existing", "name": "Existing", "revision": 1})
+    model.navigate("projects")
+    model._set_import_busy(True)
+    model._action_failed("import_media", {"message": "Cannot read media"}, {})
+    assert model.currentWorkspace == "projects"
+    assert model.project_state.projectId == "existing"
+    assert not model.importBusy
+
+
+def test_received_snapshot_ownership_avoids_recopy_but_regular_replace_is_isolated(monkeypatch):
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    interval = {"start_us": 0, "end_us": 1_000_000}
+    snapshot = {"id": "owned", "name": "Owned", "revision": 1,
+                "source_cues": [{"id": "cue", "index": 1, "text": "字幕",
+                                 "range": interval}]}
+    preserved = deepcopy(snapshot)
+    regular = ProjectStateModel()
+    regular.replace(snapshot)
+    assert regular._canonical_snapshot is not snapshot
+    model = ApplicationViewModel()
+    model._apply_project(snapshot)
+    assert model.project_state._canonical_snapshot is snapshot
+    assert snapshot == preserved
+    # Preview edits are not allowed to mutate either the received canonical
+    # head or another model which took its own defensive copy.
+    model.project_state.subtitle_cues.preview_scene_text_timing("cue", 100_000, 900_000)
+    assert snapshot == preserved
+    assert regular._canonical_snapshot == preserved
 
 
 def test_create_project_from_media_never_appends_to_the_open_project(
@@ -3131,9 +4115,7 @@ def test_export_subtitle_srt_dispatches_current_project_and_releases_busy_state(
     monkeypatch.setattr(application_module, "QSettings", MemorySettings)
     view_model = ApplicationViewModel()
     view_model._set_backend_ready(True)
-    view_model.project_state.replace(
-        {"id": "project-export", "name": "Phim", "revision": 8}
-    )
+    view_model.project_state.replace({"id": "project-export", "name": "Phim", "revision": 8})
     requests: list[tuple[str, dict, object]] = []
     monkeypatch.setattr(
         view_model.runtime,
@@ -3144,9 +4126,7 @@ def test_export_subtitle_srt_dispatches_current_project_and_releases_busy_state(
     )
     output = tmp_path / "edited.srt"
 
-    view_model.exportSubtitleSrt(
-        "translated", QUrl.fromLocalFile(str(output)).toString()
-    )
+    view_model.exportSubtitleSrt("translated", QUrl.fromLocalFile(str(output)).toString())
 
     assert requests == [
         (
@@ -3415,7 +4395,10 @@ def test_startup_keeps_provider_pools_scoped_and_does_not_claim_orphaned_vault_n
     assert view_model.openaiCompatibleCredentialReferences == ["seekai-main"]
 
 
-def test_failed_translation_with_different_provider_starts_a_new_job(monkeypatch) -> None:
+@pytest.mark.parametrize("stopped_state", ["failed", "cancelled", "paused", "queued"])
+def test_failed_translation_with_different_provider_starts_a_new_job(
+    monkeypatch, stopped_state,
+) -> None:
     QCoreApplication.instance() or QCoreApplication([])
     MemorySettings.values = {
         "translation/geminiApiCredentialReferences": ["gemini-1"],
@@ -3442,7 +4425,7 @@ def test_failed_translation_with_different_provider_starts_a_new_job(monkeypatch
         }
     )
     view_model._translation_job_id = "failed-web"
-    view_model._translation_job_state = "failed"
+    view_model._translation_job_state = stopped_state
     view_model._translation_provider_id = "gemini-web"
     view_model._translation_model_id = "selected-on-web"
     requests: list[tuple[str, dict, object]] = []
@@ -3456,9 +4439,91 @@ def test_failed_translation_with_different_provider_starts_a_new_job(monkeypatch
 
     view_model.toggleTranslation("gemini-api", "gemini-3.5-flash-lite")
 
+    if stopped_state in {"paused", "queued"}:
+        assert requests[0][0] == "cancel_job"
+        assert not any(action == "resume_job" for action, _, _ in requests)
+        view_model._replace_jobs([{
+            "id": "failed-web", "state": "cancelled", "spec": {
+                "kind": "translate", "project_id": "project-1", "provider_id": "gemini-web",
+                "model_id": "selected-on-web",
+            },
+        }])
+        requests[:] = [r for r in requests if r[0] == "create_translation_job"]
     assert requests[0][0] == "create_translation_job"
     assert requests[0][1]["provider_id"] == "gemini-api"
     assert requests[0][1]["model_id"] == "gemini-3.5-flash-lite"
+
+
+@pytest.mark.parametrize("state", ["paused", "queued", "cancelled", "failed"])
+@pytest.mark.parametrize("change", ["preset", "rules"])
+def test_changed_translation_style_replaces_stale_job(monkeypatch, state, change) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {"translation/geminiApiCredentialReferences": ["gemini-1"]}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model._set_backend_ready(True)
+    model.project_state.replace({
+        "id": "project-1", "name": "Phim", "revision": 2,
+        "source_cues": [{"id": "cue-1", "index": 1, "text": "你好",
+                         "start_us": 0, "end_us": 1_000_000}],
+        "translation_preferences": {
+            "preset": "xianxia" if change == "preset" else "auto",
+            "custom_rules": "Giữ nguyên nghĩa." if change == "rules" else "",
+        },
+    })
+    old_job = {
+        "id": "old-style", "state": state, "spec": {
+            "kind": "translate", "project_id": "project-1", "provider_id": "gemini-api",
+            "model_id": "same-model", "provider_config": {
+                "translation_style_preset": "auto", "translation_custom_rules": "",
+                "credential_references": ["gemini-1"],
+            },
+        },
+    }
+    requests = []
+    monkeypatch.setattr(model.runtime, "request", lambda action, payload=None, context=None:
+                        requests.append((action, payload or {}, context)))
+    model._replace_jobs([old_job])
+    requests.clear()
+    assert not model.translationSelectionMatches("gemini-api", "same-model", "")
+    model.toggleTranslation("gemini-api", "same-model")
+    if state in {"paused", "queued"}:
+        assert [r[0] for r in requests] == ["cancel_job"]
+        model._replace_jobs([{**old_job, "state": "cancelled"}])
+        model._replace_jobs([{**old_job, "state": "cancelled"}])
+    assert len([r for r in requests if r[0] == "create_translation_job"]) == 1
+    assert not any(r[0] in {"resume_job", "retry_job"} for r in requests)
+
+
+def test_translation_draft_is_saved_before_continue_and_failed_save_does_not_start(
+    monkeypatch,
+) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model._set_backend_ready(True)
+    model.project_state.replace({"id": "project-1", "name": "Phim", "revision": 1})
+    requests = []
+    monkeypatch.setattr(model.runtime, "request", lambda action, payload=None, context=None:
+                        requests.append((action, payload or {}, context)))
+    controls = []
+    monkeypatch.setattr(model, "toggleTranslation", lambda *args: controls.append(args))
+    arguments = ("gemini-api", "new-model", False, False, "", "", "xianxia", "Quy tắc mới")
+    model.toggleTranslationWithStyle(*arguments)
+    assert model.translationPreferencesBusy
+    assert [r[0] for r in requests] == ["set_translation_preferences"]
+    assert controls == []
+    model._translation_preferences_saved("set_translation_preferences", {
+        "id": "project-1", "revision": 2,
+        "translation_preferences": {"preset": "xianxia", "custom_rules": "Quy tắc mới"},
+    }, {"project_id": "project-1"})
+    assert controls == [arguments[:6]]
+    assert model.project_state.translationCustomRules == "Quy tắc mới"
+    model.toggleTranslationWithStyle(*arguments[:6], "neutral", "Khác")
+    model._action_failed("set_translation_preferences", {"message": "save failed"}, {})
+    assert controls == [arguments[:6]]
+    assert not model.translationPreferencesBusy
 
 
 def test_failed_api_translation_stores_new_key_then_retries_same_cache(monkeypatch) -> None:
@@ -3931,10 +4996,10 @@ def test_translation_cache_listing_binds_default_terminal_cache_before_preview(m
         {
             "job_id": "cache-default-failed",
             "state": "failed",
-                "display_state": "failed",
-                "provider_id": "gemini-web",
-                "model_id": "selected-on-web",
-                "completed_cues": 3,
+            "display_state": "failed",
+            "provider_id": "gemini-web",
+            "model_id": "selected-on-web",
+            "completed_cues": 3,
             "cue_total": 4,
         }
     ]
@@ -3954,6 +5019,132 @@ def test_translation_cache_listing_binds_default_terminal_cache_before_preview(m
     view_model.toggleTranslation("gemini-web", "selected-on-web", guest=True)
     assert requests[0][0] == "retry_job"
     assert requests[0][1]["job_id"] == "cache-default-failed"
+
+
+@pytest.mark.parametrize("state", ["start_requested", "running", "paused"])
+def test_delayed_cache_listing_cannot_select_an_older_translation(monkeypatch, state) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model.project_state.replace({"id": "project-1", "name": "Phim", "revision": 1})
+    requests = []
+    monkeypatch.setattr(model.runtime, "request", lambda action, payload=None, context=None:
+                        requests.append((action, payload or {}, context)))
+    model._translation_job_id = "current-job" if state != "start_requested" else ""
+    model._set_translation_job_state(state)
+    model._set_translation_busy(True)
+    model._action_succeeded("list_translation_caches", [{
+        "job_id": "older-job", "state": "interrupted", "provider_id": "gemini-web",
+        "model_id": "old-model", "completed_cues": 626,
+    }], {"project_id": "project-1"})
+    assert model.translationJobId == ("current-job" if state != "start_requested" else "")
+    assert model.translationJobState == state
+    assert model.selectedTranslationCacheId == model.translationJobId
+    assert model.translationBusy
+    assert not any(request[0] == "get_translation_preview" for request in requests)
+
+
+@pytest.mark.parametrize("event", ["preview", "delta", "qa"])
+@pytest.mark.parametrize("starting", [False, True])
+def test_older_translation_results_cannot_overwrite_current_preview(monkeypatch, event, starting):
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model.project_state.replace({
+        "id": "project-1", "name": "Phim", "revision": 1,
+        "source_cues": [{"id": "cue-1", "index": 1, "text": "你好",
+                         "range": {"start_us": 0, "end_us": 1_000_000}}],
+    })
+    model._translation_job_id = "" if starting else "current-job"
+    model._set_translation_job_state("start_requested" if starting else "running")
+    model._set_translation_busy(True)
+    model.project_state.subtitle_cues.apply_translation_delta(
+        [{"id": "cue-1", "index": 1, "text": "Bản hiện tại"}])
+    model._set_translation_qa({"status": "RUNNING", "checked_cues": 10})
+    current_qa = model.translationQa
+    # The old response was requested before a new translation began. It can
+    # arrive after the selector was cleared or after the new job was bound.
+    values = [{"id": "cue-1", "index": 1, "text": "Bản lỗi thời"}]
+    qa = {"status": "PASS", "checked_cues": 626}
+    if event == "preview":
+        model._action_succeeded("get_translation_preview", {
+            "project_id": "project-1", "job_id": "older-job", "values": values, "qa": qa,
+        }, {"project_id": "project-1", "cache_job_id": "older-job"})
+    else:
+        kind = "translation_delta" if event == "delta" else "translation_qa_status"
+        model._action_succeeded("list_events", [{
+            "sequence": 100, "kind": kind,
+            "payload": {"values": values} if event == "delta" else qa,
+        }], {"project_id": "project-1", "job_id": "older-job",
+             "translation_deltas" if event == "delta" else "translation_qa_status": True})
+    assert model.project_state.subtitle_cues.get(0)["translated_text"] == "Bản hiện tại"
+    assert model.translationQa == current_qa
+    assert model._translation_event_sequences.get("older-job", 0) == 0
+    assert model._translation_qa_event_sequences.get("older-job", 0) == 0
+
+
+@pytest.mark.parametrize("event", ["start", "preview", "qa"])
+def test_new_translation_qa_does_not_count_previous_preview_rows(monkeypatch, event):
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model.project_state.replace({
+        "id": "project-1", "name": "Phim", "revision": 1,
+        "source_cues": [
+            {"id": "cue-1", "index": 1, "text": "你好",
+             "range": {"start_us": 0, "end_us": 1_000_000}},
+            {"id": "cue-2", "index": 2, "text": "再见",
+             "range": {"start_us": 1_000_000, "end_us": 2_000_000}},
+        ],
+    })
+    model.project_state.subtitle_cues.apply_translation_delta([
+        {"id": "cue-1", "index": 1, "text": "Bản dịch cũ"},
+        {"id": "cue-2", "index": 2, "text": "Bản cũ còn 你"},
+    ])
+    monkeypatch.setattr(model.runtime, "request", lambda *args, **kwargs: None)
+    if event == "start":
+        model._begin_translation("gemini-web", "new-model", False, False)
+    else:
+        model._translation_job_id = "current-job"
+        model._selected_translation_cache_id = "current-job"
+        model._set_translation_job_state("paused")
+        model._set_translation_busy(True)
+        qa = {"status": "PENDING", "checked_cues": 0,
+              "completed_cues": 0, "cue_total": 2, "issues": []}
+        if event == "preview":
+            model._action_succeeded("get_translation_preview", {
+                "project_id": "project-1", "job_id": "current-job", "qa": qa,
+                "values": [],
+            }, {"project_id": "project-1", "cache_job_id": "current-job"})
+        else:
+            model._action_succeeded("list_events", [{
+                "sequence": 50, "kind": "translation_qa_status", "payload": qa,
+            }], {"project_id": "project-1", "job_id": "current-job",
+                 "translation_qa_status": True})
+    assert model.translationQa["status"] == "PENDING"
+    assert model.translationQa["checked_cues"] == 0
+    assert model.translationQa["completed_cues"] == 0
+    assert model.translationQa["cue_total"] == 2
+    assert model.translationQa["issues"] == []
+    assert model.project_state.subtitle_cues.get(0)["translated_text"] == "Bản dịch cũ"
+
+
+def test_created_and_discovered_translation_owns_its_cache_selection(monkeypatch):
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model.project_state.replace({"id": "project-1", "name": "Phim", "revision": 1})
+    monkeypatch.setattr(model.runtime, "request", lambda *args, **kwargs: None)
+    model._selected_translation_cache_id = "older-job"
+    model._action_succeeded("create_translation_job", _job("created-job", "translate"), {})
+    assert model.selectedTranslationCacheId == "created-job"
+    model._selected_translation_cache_id = "older-job"
+    model._replace_jobs([_job("discovered-job", "translate")])
+    assert model.selectedTranslationCacheId == "discovered-job"
 
 
 def test_new_terminal_translation_refreshes_all_cache_choices(monkeypatch) -> None:
@@ -4241,6 +5432,48 @@ def test_effect_controls_update_immediately_and_roll_back_on_failure(monkeypatch
     assert "effects/blur/enabled" not in MemorySettings.values
 
 
+def test_overlay_range_is_sent_in_final_display_time(monkeypatch) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    view_model = ApplicationViewModel()
+    view_model._apply_project(
+        {
+            "id": "project-overlay-range",
+            "name": "Overlay range",
+            "revision": 1,
+            "media": [],
+            "tracks": [],
+            "source_cues": [],
+            "translated_cues": [],
+            "overlays": [
+                {
+                    "id": "overlay-1",
+                    "kind": "blur",
+                    "range": {"start_us": 0, "end_us": 1_000_000},
+                }
+            ],
+        }
+    )
+    requests: list[tuple[str, dict, object]] = []
+    monkeypatch.setattr(
+        view_model.runtime,
+        "request",
+        lambda action, payload=None, *, context=None: requests.append(
+            (action, payload or {}, context)
+        ),
+    )
+
+    view_model.setOverlayRange("overlay-1", 1.25, 3.5)
+
+    assert requests[-1][0] == "effect_command"
+    assert requests[-1][1]["values"] == {
+        "start_us": 1_250_000,
+        "end_us": 3_500_000,
+        "display_time": True,
+    }
+
+
 def test_source_blur_cover_toggle_is_immediate_and_new_defaults_are_strong(
     monkeypatch,
 ) -> None:
@@ -4285,10 +5518,7 @@ def test_source_blur_cover_toggle_is_immediate_and_new_defaults_are_strong(
 
     view_model.setOverlayConcealmentMode("overlay-default-blur", "cover")
 
-    assert (
-        view_model.project_state.overlay("overlay-default-blur")["concealment_mode"]
-        == "cover"
-    )
+    assert view_model.project_state.overlay("overlay-default-blur")["concealment_mode"] == "cover"
     assert requests[-1][1]["values"] == {"concealment_mode": "cover"}
     defaults = view_model._default_overlay_import_options()["overlay_preset"]["blur"]
     assert defaults["blur_radius"] == 46
@@ -5123,6 +6353,49 @@ def test_polled_terminal_job_failure_emits_code_reason_and_cache_guidance(
     assert "Cache/checkpoint vẫn được giữ lại" in message
 
 
+def test_polled_tts_replacement_suppresses_old_cancel_banner(monkeypatch) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    view_model = ApplicationViewModel()
+    view_model.project_state.replace({"id": "project-1", "name": "Phim", "revision": 2})
+    notifications: list[tuple[str, str, int]] = []
+    dismissals: list[bool] = []
+    view_model.statusNotificationRequested.connect(
+        lambda message, kind, duration: notifications.append((message, kind, duration))
+    )
+    view_model.statusNotificationDismissRequested.connect(lambda: dismissals.append(True))
+    old = {
+        "id": "tts-old",
+        "state": "running",
+        "spec": {
+            "kind": "tts",
+            "project_id": "project-1",
+            "provider_config": {"purpose": "production"},
+        },
+    }
+    replacement = {
+        "id": "tts-new",
+        "state": "queued",
+        "spec": {
+            "kind": "tts",
+            "project_id": "project-1",
+            "provider_config": {
+                "purpose": "production",
+                "replaces_job_id": "tts-old",
+            },
+        },
+    }
+
+    view_model._replace_jobs([old])
+    view_model._replace_jobs([replacement, {**old, "state": "cancelled", "finished_at": "now"}])
+
+    assert view_model.ttsJobId == "tts-new"
+    assert "tts-old" in view_model._superseded_job_ids
+    assert dismissals == [True]
+    assert notifications == []
+
+
 def test_polled_tts_overlap_failure_is_actionable_and_hides_internal_code(
     monkeypatch,
 ) -> None:
@@ -5244,6 +6517,37 @@ def test_create_job_failure_does_not_reference_unbound_job_kind(monkeypatch) -> 
     assert view_model.ttsBusy is False
     assert "Tạo giọng chưa thể tiếp tục" in view_model.statusMessage
     assert "tts_engine_unavailable" not in view_model.statusMessage
+
+
+def test_voice_generation_waits_for_latest_edit_revision_to_be_saved(monkeypatch):
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model._set_backend_ready(True)
+    model._apply_project({"id": "voice-edits", "name": "Edited", "revision": 2,
+                          "_project_dirty": True, "_saved_revision": 1})
+    requests = []
+    starts = []
+    monkeypatch.setattr(model.runtime, "request",
+                        lambda a, p=None, context=None: requests.append((a, p, context)))
+    monkeypatch.setattr(model, "_start_voice_job",
+                        lambda purpose: starts.append((purpose, model.project_state.revision)))
+    model.startVoiceGeneration()
+    assert requests[-1][0] == "save_project_edits" and not starts
+    first_context = requests[-1][2]
+    model._apply_project({"id": "voice-edits", "name": "Edited", "revision": 3,
+                          "_project_dirty": True, "_saved_revision": 1})
+    model._action_succeeded("save_project_edits", {"id": "voice-edits", "revision": 2,
+        "_saved_revision": 2, "_project_dirty": False}, first_context)
+    QCoreApplication.processEvents()
+    assert not starts and model.projectDirty
+    assert len(requests) == 2 and requests[-1][0] == "save_project_edits"
+    model._action_succeeded("save_project_edits", {"id": "voice-edits", "revision": 3,
+        "_saved_revision": 3, "_project_dirty": False}, requests[-1][2])
+    QCoreApplication.processEvents()
+    assert starts == [("production", 3)]
+    assert not model.projectDirty
 
 
 def test_manual_voice_rerun_releases_playback_and_removes_d1_before_job_creation(
@@ -5621,6 +6925,8 @@ def test_selected_translation_cache_is_not_overwritten_by_another_active_job(
     cached["state"] = "failed"
     cached["error_code"] = "translation_review_required"
 
+    view_model.selectTranslationCache("cache-full")
+    requests.clear()
     view_model._replace_jobs([active, cached])
 
     assert view_model.translationBusy is True
@@ -5782,7 +7088,8 @@ def test_project_state_keeps_multi_hour_microseconds_and_real_track_counts() -> 
     assert model.hasProject is True
     assert model.durationUs == float(duration_us)
     assert model.durationText == "08:20:00"
-    assert model.trackModel.count == 1
+    assert model.trackModel.count == 2  # Independent empty Text line above the media.
+    assert model.tracks._items[0]["id"] == "T1"
     assert model.clipModel.count == 1
 
 
@@ -5945,6 +7252,7 @@ def test_failed_optimistic_subtitle_save_keeps_newer_qa_event(monkeypatch) -> No
         ),
     )
     view_model.updateSubtitleText("translated-1", "Đây là bạn", "translated")
+    view_model._dispatch_background_subtitle_save()
     view_model._set_translation_qa(
         {
             "status": "REVIEW",
@@ -6231,11 +7539,401 @@ def test_full_project_view_keeps_sparse_scene_text_tracks_editable() -> None:
         if model.data(model.index(row, 0), TimelineClipListModel.TrackIdRole) == "S2"
     ]
     assert len(scene_rows) == scene_count
-    assert all(
-        not model.data(index, TimelineClipListModel.AggregateRole)
-        for index in scene_rows
-    )
+    assert all(not model.data(index, TimelineClipListModel.AggregateRole) for index in scene_rows)
     assert model.count <= 480
+
+
+def test_subtitle_track_labels_preserve_canonical_lane_ids_and_legacy_fallback() -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    model = TimelineTrackListModel()
+
+    def labels(tracks: list[dict[str, object]]) -> dict[str, str]:
+        model.replace(tracks)
+        return {
+            str(model.data(model.index(row, 0), TimelineTrackListModel.IdRole)):
+            str(model.data(model.index(row, 0), TimelineTrackListModel.DisplayLabelRole))
+            for row in range(model.count)
+        }
+
+    assert labels([{"id": "S2", "kind": "subtitle", "name": "Scene", "clips": []}]) == {
+        "S2": "S2"
+    }
+    assert labels(
+        [
+            {"id": "S1", "kind": "subtitle", "name": "Dialogue", "clips": []},
+            {"id": "S3", "kind": "subtitle", "name": "Scene 3", "clips": []},
+            {"id": "S10", "kind": "subtitle", "name": "Scene 10", "clips": []},
+        ]
+    ) == {"S1": "S1", "S3": "S3", "S10": "S10"}
+    assert labels(
+        [
+            {"id": "S1", "kind": "subtitle", "name": "Dialogue", "clips": []},
+            {"id": "S3", "kind": "subtitle", "name": "Scene 3", "clips": []},
+            {"id": "S10", "kind": "subtitle", "name": "Scene 10", "clips": []},
+            {"id": "legacy-scene", "kind": "subtitle", "name": "Legacy", "clips": []},
+            {"id": "V8", "kind": "video", "name": "Video", "clips": []},
+            {"id": "B9", "kind": "blur", "name": "Blur", "clips": []},
+        ]
+    ) == {
+        "S1": "S1",
+        "S3": "S3",
+        "S10": "S10",
+        "legacy-scene": "S4",
+        "V8": "V1",
+        "B9": "B1",
+    }
+
+
+def test_timeline_clip_model_materializes_only_tracks_in_vertical_viewport() -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    model = TimelineClipListModel()
+    tracks = [
+        {
+            "id": f"S{track_index + 1}",
+            "kind": "subtitle",
+            "name": f"Phụ đề S{track_index + 1}",
+            "clips": [
+                {
+                    "id": f"clip-{track_index}",
+                    "track_id": f"S{track_index + 1}",
+                    "timeline_range": {"start_us": 0, "end_us": 1_000_000},
+                    "speed": {"numerator": 1, "denominator": 1},
+                    "volume": 1.0,
+                }
+            ],
+        }
+        for track_index in range(50)
+    ]
+    model.setViewport(0, 2_000_000, 0)
+    model.setTrackViewport(10, 14, 1)
+    model.replace(tracks)
+
+    visible_indexes = {
+        model.data(model.index(row, 0), TimelineClipListModel.TrackIndexRole)
+        for row in range(model.count)
+    }
+
+    assert visible_indexes == set(range(9, 16))
+    assert model.count == 7
+
+
+def test_timeline_clip_model_can_narrow_initial_all_track_materialization() -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    model = TimelineClipListModel()
+    tracks = [
+        {
+            "id": f"S{track_index + 1}",
+            "kind": "subtitle",
+            "name": f"Phụ đề S{track_index + 1}",
+            "clips": [
+                {
+                    "id": f"clip-{track_index}",
+                    "track_id": f"S{track_index + 1}",
+                    "timeline_range": {"start_us": 0, "end_us": 1_000_000},
+                    "speed": {"numerator": 1, "denominator": 1},
+                    "volume": 1.0,
+                }
+            ],
+        }
+        for track_index in range(50)
+    ]
+    model.setViewport(0, 2_000_000, 0)
+    model.replace(tracks)
+    assert model.count == 50
+
+    model.setTrackViewport(10, 14, 1)
+
+    visible_indexes = {
+        model.data(model.index(row, 0), TimelineClipListModel.TrackIndexRole)
+        for row in range(model.count)
+    }
+    assert visible_indexes == set(range(9, 16))
+
+
+def test_timeline_clip_model_reuses_prefetched_window_during_small_pans() -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    model = TimelineClipListModel()
+    cues = [
+        {
+            "id": f"cue-{index}",
+            "track_id": "S1",
+            "timeline_range": {
+                "start_us": index * 250_000,
+                "end_us": index * 250_000 + 220_000,
+            },
+            "speed": {"numerator": 1, "denominator": 1},
+            "volume": 1.0,
+        }
+        for index in range(2_000)
+    ]
+    model.setViewport(10_000_000, 20_000_000, 5_000_000)
+    model.replace(
+        [
+            {
+                "id": "S1",
+                "kind": "subtitle",
+                "name": "Phụ đề",
+                "clips": cues,
+            }
+        ]
+    )
+    resets: list[None] = []
+    model.modelReset.connect(lambda: resets.append(None))
+
+    for offset in range(100_000, 5_000_000, 100_000):
+        model.setViewport(
+            10_000_000 + offset,
+            20_000_000 + offset,
+            5_000_000,
+        )
+
+    assert resets == []
+
+    model.setViewport(15_100_000, 25_100_000, 5_000_000)
+    assert resets == []  # Existing clip delegates survive the window refresh.
+
+
+def test_timeline_clip_model_limits_resets_during_continuous_zoom() -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    model = TimelineClipListModel()
+    cues = [
+        {
+            "id": f"cue-{index}",
+            "track_id": "S1",
+            "timeline_range": {
+                "start_us": index * 100_000,
+                "end_us": index * 100_000 + 90_000,
+            },
+            "speed": {"numerator": 1, "denominator": 1},
+            "volume": 1.0,
+        }
+        for index in range(12_000)
+    ]
+    model.setViewport(20_000_000, 80_000_000, 10_000_000)
+    model.replace(
+        [
+            {
+                "id": "S1",
+                "kind": "subtitle",
+                "name": "Phụ đề",
+                "clips": cues,
+            }
+        ]
+    )
+    resets: list[None] = []
+    model.modelReset.connect(lambda: resets.append(None))
+
+    for step in range(1, 251):
+        duration = int(60_000_000 * (0.992**step))
+        prefetch = min(10_000_000, max(250_000, int(duration * 0.25)))
+        model.setViewport(20_000_000, 20_000_000 + duration, prefetch)
+
+    assert len(resets) <= 4
+    assert model.count <= 480
+
+
+def test_bulk_typography_indexes_cues_and_notifies_once() -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    model = SubtitleCueListModel()
+    model.replace(
+        [
+            {
+                "id": f"c{i}",
+                "index": i + 1,
+                "text": "test",
+                "range": {"start_us": i * 1_000_000, "end_us": (i + 1) * 1_000_000},
+            }
+            for i in range(12_000)
+        ],
+        [],
+    )
+
+    class IndexedOnlyList(list):
+        def __iter__(self):
+            raise AssertionError("A bulk edit must not scan all rows per cue")
+
+    model._items = IndexedOnlyList(model._items)
+    notifications = []
+    model.dataChanged.connect(
+        lambda first, last, roles: notifications.append((first.row(), last.row()))
+    )
+    changes = model.optimistic_update_text_format_many(
+        [f"c{i}" for i in range(12_000)],
+        font_size=16,
+        orientation="horizontal",
+        background_color="",
+    )
+    assert len(changes) == 12_000
+    assert notifications == [(0, 11_999)]
+    assert model.find("c11999")["text_font_size"] == 16
+
+
+def test_bulk_typography_notifies_once_for_interleaved_scene_rows() -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    model = SubtitleCueListModel()
+    source = [
+        {
+            "id": f"c{i}",
+            "index": i + 1,
+            "text": "test",
+            "role": "dialogue" if i % 2 == 0 else "scene_text",
+            "range": {"start_us": i * 1_000_000, "end_us": (i + 1) * 1_000_000},
+        }
+        for i in range(1000)
+    ]
+    model.replace(source, [])
+    notifications = []
+    model.dataChanged.connect(
+        lambda first, last, roles: notifications.append((first.row(), last.row()))
+    )
+    model.optimistic_update_text_format_many(
+        [f"c{i}" for i in range(0, 1000, 2)],
+        font_size=16,
+        orientation="horizontal",
+        background_color="",
+    )
+    assert notifications == [(0, 998)]
+    assert model.find("c998")["text_font_size"] == 16
+    assert model.find("c999")["text_font_size"] == 12
+
+
+def test_preview_uses_final_cue_timing_and_style_while_preserving_source_text() -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    model = SubtitleCueListModel()
+    source = {
+        "id": "cue",
+        "index": 1,
+        "text": "原文",
+        "range": {"start_us": 0, "end_us": 1_000_000},
+        "text_color": "#FFFF00",
+    }
+    final = {
+        **source,
+        "text": "Bản dịch",
+        "language": "vi",
+        "text_color": "#FFFFFF",
+        "range": {"start_us": 2_000_000, "end_us": 3_000_000},
+    }
+    model.replace([source], [final])
+    assert not model.at_time(500_000)
+    cue = model.at_time(2_500_000)
+    assert cue["source_text"] == "原文" and cue["translated_text"] == "Bản dịch"
+    assert cue["text_color"] == "#FFFFFF"
+    assert model.regionsAtTime(2_500_000)[0] == cue
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        [],
+        [("a", 0, 1_000_000), ("b", 2_000_000, 3_000_000)],
+        [("a", 0, 1_000_000), ("c", 4_000_000, 5_000_000)],
+        [
+            ("a", 0, 1_000_000),
+            ("d", 1_500_000, 1_800_000),
+            ("b", 2_000_000, 3_000_000),
+            ("c", 4_000_000, 5_000_000),
+        ],
+        [("a", 500_000, 1_500_000), ("b", 2_000_000, 3_000_000),
+         ("c", 4_000_000, 5_000_000)],
+        [("a", 0, 1_000_000), ("c", 1_500_000, 1_800_000),
+         ("b", 2_000_000, 3_000_000)],
+        [("a", 3_000_000, 4_000_000), ("d", 4_250_000, 4_750_000),
+         ("c", 5_000_000, 6_000_000)],
+    ],
+    ids=["clear", "remove-tail", "remove-middle", "insert-middle", "retime", "reorder",
+         "replace-and-retime-retained"],
+)
+def test_subtitle_lookup_is_consistent_during_model_notifications(replacement) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    model = SubtitleCueListModel()
+
+    def cues(specs):
+        return [
+            {
+                "id": cue_id,
+                "index": ord(cue_id) - ord("a") + 1,
+                "text": cue_id,
+                "role": "scene_text" if cue_id == "b" else "dialogue",
+                "range": {"start_us": start_us, "end_us": end_us},
+            }
+            for cue_id, start_us, end_us in specs
+        ]
+
+    model.replace(cues([("a", 0, 1_000_000), ("b", 2_000_000, 3_000_000),
+                       ("c", 4_000_000, 5_000_000)]), [])
+    errors: list[str] = []
+    notifications: list[int] = []
+
+    def inspect_notification(*_args):
+        notifications.append(model.count)
+        try:
+            assert model._start_us == sorted(int(item["start_us"]) for item in model._items)
+            for position in range(0, 6_100_000, 100_000):
+                expected = [
+                    item for item in model._items
+                    if int(item["start_us"]) <= position < int(item["end_us"])
+                ]
+                assert model._items_at_time(position) == expected
+                model.at_time(position)
+                model.regionsAtTime(position)
+                model.sceneTextsAtTime(position)
+            for cue_id in ("a", "b", "c", "d"):
+                expected = next((item for item in model._items if item["cue_id"] == cue_id), {})
+                assert model.find(cue_id) == expected
+        except (AssertionError, IndexError) as error:
+            errors.append(f"{type(error).__name__}: {error}")
+
+    for signal in (model.rowsAboutToBeRemoved, model.rowsRemoved,
+                   model.rowsAboutToBeInserted, model.rowsInserted,
+                   model.dataChanged, model.countChanged):
+        signal.connect(inspect_notification)
+
+    model.replace(cues(replacement), [])
+    assert notifications
+    assert errors == []
+    inspect_notification()
+    assert errors == []
+
+
+def test_timeline_recycles_rows_and_preserves_common_clip_identity_and_role_values() -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    model = TimelineClipListModel()
+    model.setViewport(0, 3_000_000, 0)
+    tracks = [
+        {
+            "id": "S1",
+            "kind": "subtitle",
+            "name": "S1",
+            "clips": [
+                {
+                    "id": f"clip{i}",
+                    "track_id": "S1",
+                    "cue_id": f"c{i}",
+                    "cue_text": f"text{i}",
+                    "timeline_range": {"start_us": i * 1_000_000, "end_us": (i + 1) * 1_000_000},
+                }
+                for i in range(10)
+            ],
+        }
+    ]
+    model.replace(tracks)
+    assert model.data(model.index(0), model.CueTextRole) == "text0"
+    common_row = next(row for row, item in enumerate(model._items) if item["id"] == "clip2")
+    resets = []
+    model.modelReset.connect(lambda: resets.append(True))
+    model.setViewport(2_000_000, 5_000_000, 0)
+    assert model._items[common_row]["id"] == "clip2"
+    assert {item["id"] for item in model._items} == {"clip2", "clip3", "clip4"}
+    for row, item in enumerate(model._items):
+        assert model.data(model.index(row), model.CueTextRole) == item["cue_text"]
+    tracks[0]["clips"][2]["cue_text"] = "edited"
+    model.replace(tracks)
+    assert model.data(model.index(common_row), model.CueTextRole) == "edited"
+    model.setViewport(0, 1_000_000, 0)
+    assert model.count == 1 and model.data(model.index(0), model.IdRole) == "clip0"
+    model.setViewport(15_000_000, 16_000_000, 0)
+    assert model.count == 0 and not resets
 
 
 def test_translation_cache_refresh_batches_contiguous_qml_notifications() -> None:
@@ -6548,6 +8246,49 @@ def test_timeline_voice_cue_model_accepts_live_tts_rows_before_conform_is_applie
     assert model.data(first, VoiceConformCueListModel.IssueCodeRole) == "CUE_SYNC_LIMIT_EXCEEDED"
 
 
+def test_timeline_voice_cue_model_reuses_prefetched_window_while_panning() -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    model = VoiceConformCueListModel()
+    model.setViewport(10_000_000, 20_000_000, 5_000_000)
+    rows = []
+    for index in range(2_000):
+        start_us = index * 250_000
+        end_us = start_us + 220_000
+        rows.append(
+            {
+                "cue_id": f"cue-{index}",
+                "index": index,
+                "source_start_us": start_us,
+                "source_end_us": end_us,
+                "output_start_us": start_us,
+                "output_end_us": end_us,
+                "voice_start_us": start_us,
+                "voice_end_us": end_us,
+                "audio_duration_us": 220_000,
+                "rendered_audio_duration_us": 220_000,
+                "audio_speed": 1.0,
+                "adjusted": False,
+                "unresolved": False,
+                "issue_code": "",
+            }
+        )
+    model.replace_timing_rows(rows)
+    resets: list[None] = []
+    model.modelReset.connect(lambda: resets.append(None))
+
+    for offset in range(100_000, 5_000_000, 100_000):
+        model.setViewport(
+            10_000_000 + offset,
+            20_000_000 + offset,
+            5_000_000,
+        )
+
+    assert resets == []
+
+    model.setViewport(15_100_000, 25_100_000, 5_000_000)
+    assert len(resets) == 1
+
+
 def test_conformed_subtitle_lookup_and_cue_seek_use_output_timeline(monkeypatch) -> None:
     QCoreApplication.instance() or QCoreApplication([])
     plan = build_voice_conform_plan(
@@ -6686,3 +8427,853 @@ def test_preview_color_sampler_clamps_pixels_and_returns_opaque_hex() -> None:
     sampled = ApplicationViewModel.samplePreviewColor(object(), image, 99, -10)
 
     assert sampled == "#123456"
+
+
+def _cuttable_project_snapshot() -> dict:
+    return {
+        "id": "project-cut",
+        "name": "Cut",
+        "revision": 1,
+        "media": [{"id": "video-media", "kind": "video", "path": "C:/video.mp4"}],
+        "tracks": [
+            {
+                "id": "V1",
+                "kind": "video",
+                "name": "Video",
+                "clips": [
+                    {
+                        "id": "video-1",
+                        "track_id": "V1",
+                        "media_id": "video-media",
+                        "timeline_range": {"start_us": 0, "end_us": 10_000_000},
+                        "source_range": {"start_us": 0, "end_us": 10_000_000},
+                        "speed": {"numerator": 1, "denominator": 1},
+                        "volume": 1.0,
+                    }
+                ],
+            },
+            {
+                "id": "S1",
+                "kind": "subtitle",
+                "name": "Phụ đề",
+                "clips": [
+                    {
+                        "id": "subtitle-1",
+                        "track_id": "S1",
+                        "timeline_range": {"start_us": 1_000_000, "end_us": 2_000_000},
+                        "source_range": {"start_us": 1_000_000, "end_us": 2_000_000},
+                        "speed": {"numerator": 1, "denominator": 1},
+                        "volume": 1.0,
+                        "cue_id": "cue-1",
+                        "cue_index": 1,
+                        "cue_text": "Một",
+                    }
+                ],
+            },
+        ],
+        "source_cues": [
+            {
+                "id": "cue-1",
+                "index": 1,
+                "text": "一",
+                "range": {"start_us": 1_000_000, "end_us": 2_000_000},
+            },
+            {
+                "id": "cue-2",
+                "index": 2,
+                "text": "二",
+                "range": {"start_us": 6_000_000, "end_us": 7_000_000},
+            },
+        ],
+        "translated_cues": [],
+        "overlays": [],
+    }
+
+
+def test_timeline_patch_preserves_clip_track_identity_for_every_model_role() -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    model = ProjectStateModel()
+    model.replace(_cuttable_project_snapshot())
+
+    model.apply_timeline_patch(
+        {
+            "_timeline_patch": True,
+            "id": "project-cut",
+            "revision": 2,
+            "track_upserts": [],
+            "removed_track_ids": [],
+            "clip_upserts": [
+                {
+                    "id": "subtitle-1",
+                    "track_id": "S1",
+                    "timeline_range": {"start_us": 2_000_000, "end_us": 3_000_000},
+                    "source_range": {"start_us": 1_000_000, "end_us": 2_000_000},
+                    "speed": {"numerator": 1, "denominator": 1},
+                    "volume": 1.0,
+                    "cue_id": "cue-1",
+                    "cue_index": 1,
+                    "cue_text": "Một",
+                }
+            ],
+            "removed_clip_ids": [],
+        }
+    )
+
+    item = model.clip_info("subtitle-1")
+    assert item is not None and item["track_id"] == "S1"
+    row = next(
+        index
+        for index, value in enumerate(model.clips._items)
+        if value["id"] == "subtitle-1"
+    )
+    index = model.clips.index(row, 0)
+    for role in model.clips.roleNames():
+        model.clips.data(index, role)
+    assert model.clips.data(index, TimelineClipListModel.TrackIdRole) == "S1"
+
+
+def test_invalid_timeline_patch_is_atomic_and_keeps_previous_model() -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    model = ProjectStateModel()
+    model.replace(_cuttable_project_snapshot())
+    before = deepcopy(model._canonical_snapshot)
+    before_rows = deepcopy(model.clips._items)
+
+    with pytest.raises(ValueError, match="owning track"):
+        model.apply_timeline_patch(
+            {
+                "_timeline_patch": True,
+                "id": "project-cut",
+                "revision": 2,
+                "track_upserts": [],
+                "removed_track_ids": [],
+                "clip_upserts": [{"id": "subtitle-1"}],
+                "removed_clip_ids": [],
+            }
+        )
+
+    assert model.revision == 1
+    assert model._canonical_snapshot == before
+    assert model.clips._items == before_rows
+
+
+def test_timeline_cut_patch_projects_canonical_snapshot_and_reindexes_cues() -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    model = ProjectStateModel()
+    model.replace(_cuttable_project_snapshot())
+
+    model.apply_timeline_patch(
+        {
+            "_timeline_patch": True,
+            "id": "project-cut",
+            "revision": 2,
+            "track_upserts": [],
+            "removed_track_ids": [],
+            "clip_upserts": [],
+            "removed_clip_ids": [],
+            "timeline_edit": {
+                "retained_ranges": [
+                    {"start_us": 0, "end_us": 4_000_000},
+                    {"start_us": 6_000_000, "end_us": 10_000_000},
+                ]
+            },
+            "source_cue_upserts": [],
+            "removed_source_cue_ids": ["cue-1"],
+            "source_cue_indices": {"cue-2": 1},
+            "translated_cue_upserts": [],
+            "removed_translated_cue_ids": [],
+            "translated_cue_indices": {},
+        }
+    )
+
+    assert model.durationUs == 8_000_000
+    assert model._canonical_snapshot["timeline_edit"] is not None
+    assert model._canonical_snapshot["source_cues"][0]["id"] == "cue-2"
+    assert model._canonical_snapshot["source_cues"][0]["index"] == 1
+    assert model.subtitle_cues.find("cue-1") == {}
+    assert model.subtitle_cues.find("cue-2")["start_us"] == 4_000_000
+    assert model.sourceToOutputUs(6_500_000) == 4_500_000
+    assert model.outputToSourceUs(4_500_000) == 6_500_000
+    descriptor = model.previewDescriptor(4_500_000)
+    assert descriptor["available"] is True
+    assert descriptor["sourcePositionMs"] == 6_500.0
+
+
+def test_materialized_cut_patch_preserves_both_exact_fragment_ids() -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    model = ProjectStateModel()
+    model.replace(_cuttable_project_snapshot())
+
+    model.apply_timeline_patch(
+        {
+            "_timeline_patch": True,
+            "id": "project-cut",
+            "revision": 2,
+            "track_upserts": [],
+            "removed_track_ids": [],
+            "clip_upserts": [
+                {
+                    "id": "video-1",
+                    "track_id": "V1",
+                    "media_id": "video-media",
+                    "timeline_range": {"start_us": 0, "end_us": 4_000_000},
+                    "source_range": {"start_us": 0, "end_us": 4_000_000},
+                    "speed": {"numerator": 1, "denominator": 1},
+                    "volume": 1.0,
+                },
+                {
+                    "id": "video-1::cut::1",
+                    "track_id": "V1",
+                    "media_id": "video-media",
+                    "timeline_range": {"start_us": 4_000_000, "end_us": 8_000_000},
+                    "source_range": {"start_us": 6_000_000, "end_us": 10_000_000},
+                    "speed": {"numerator": 1, "denominator": 1},
+                    "volume": 1.0,
+                },
+            ],
+            "removed_clip_ids": ["video-1"],
+            "timeline_edit": None,
+        }
+    )
+
+    video_ids = [
+        clip["id"]
+        for track in model._canonical_snapshot["tracks"]
+        if track["id"] == "V1"
+        for clip in track["clips"]
+    ]
+    assert video_ids == ["video-1", "video-1::cut::1"]
+    assert model.clip_info("video-1") is not None
+    assert model.clip_info("video-1::cut::1") is not None
+
+
+def test_timeline_patch_applies_materialized_overlay_and_voice_conform_deltas() -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    model = ProjectStateModel()
+    snapshot = _cuttable_project_snapshot()
+    snapshot["timeline_edit"] = {
+        "retained_ranges": [{"start_us": 0, "end_us": 10_000_000}]
+    }
+    snapshot["voice_conform"] = {"plan": {"segments": []}}
+    snapshot["overlays"] = [
+        {
+            "id": "overlay-keep",
+            "kind": "blur",
+            "range": {"start_us": 1_000_000, "end_us": 4_000_000},
+            "enabled": True,
+        },
+        {
+            "id": "overlay-remove",
+            "kind": "blur",
+            "range": {"start_us": 6_000_000, "end_us": 8_000_000},
+            "enabled": True,
+        },
+    ]
+    model.replace(snapshot)
+
+    model.apply_timeline_patch(
+        {
+            "_timeline_patch": True,
+            "id": "project-cut",
+            "revision": 2,
+            "track_upserts": [],
+            "removed_track_ids": [],
+            "clip_upserts": [],
+            "removed_clip_ids": [],
+            "timeline_edit": None,
+            "voice_conform": None,
+            "overlay_upserts": [
+                {
+                    "id": "overlay-keep",
+                    "kind": "blur",
+                    "range": {"start_us": 500_000, "end_us": 2_500_000},
+                    "enabled": True,
+                }
+            ],
+            "removed_overlay_ids": ["overlay-remove"],
+        }
+    )
+
+    assert model._canonical_snapshot["voice_conform"] is None
+    assert model._canonical_snapshot["overlays"] == [
+        {
+            "id": "overlay-keep",
+            "kind": "blur",
+            "range": {"start_us": 500_000, "end_us": 2_500_000},
+            "enabled": True,
+        }
+    ]
+    assert model.overlays == model._canonical_snapshot["overlays"]
+
+    restored_plan = build_voice_conform_plan(
+        (VoiceConformCueInput("cue-1", 1, 1_000_000, 2_000_000, 1_000_000),),
+        source_duration_us=10_000_000,
+        settings=VoiceConformSettings(mode=VoiceTimingMode.STRETCH_VIDEO),
+    )
+    restored_conform = {
+        "plan": restored_plan.as_json(),
+        "base_voice_media_id": "voice-base",
+        "conformed_voice_media_id": "voice-conformed",
+        "parent_tts_job_id": "tts-parent",
+    }
+    model.apply_timeline_patch(
+        {
+            "_timeline_patch": True,
+            "id": "project-cut",
+            "revision": 3,
+            "track_upserts": [],
+            "removed_track_ids": [],
+            "clip_upserts": [],
+            "removed_clip_ids": [],
+            "voice_conform": restored_conform,
+        }
+    )
+
+    assert model._canonical_snapshot["voice_conform"] == restored_conform
+    assert model.voiceConformApplied is True
+
+
+def test_legacy_media_commands_preserve_selected_fragment_id(monkeypatch) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    view_model = ApplicationViewModel()
+    snapshot = _cuttable_project_snapshot()
+    snapshot["tracks"][0]["clips"].append(
+        {
+            **snapshot["tracks"][0]["clips"][0],
+            "id": "video-1::cut::1",
+            "timeline_range": {"start_us": 4_000_000, "end_us": 8_000_000},
+            "source_range": {"start_us": 6_000_000, "end_us": 10_000_000},
+        }
+    )
+    view_model.project_state.replace(snapshot)
+    view_model.selectClip("video-1::cut::1")
+    requests: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        view_model.runtime,
+        "request",
+        lambda action, payload=None, *, context=None: requests.append(
+            (action, payload or {})
+        ),
+    )
+
+    view_model.resizeSelectedClip(4_000_000, 7_000_000)
+    view_model._set_timeline_busy(False)
+    view_model.moveSelectedClip(3_000_000)
+    view_model._set_timeline_busy(False)
+    view_model.setSelectedSpeed(125.0, False)
+
+    assert [payload["clip_id"] for _, payload in requests] == [
+        "video-1::cut::1",
+        "video-1::cut::1",
+        "video-1::cut::1",
+    ]
+
+
+def test_apply_timeline_cut_sends_revisioned_request_without_clip_selection(monkeypatch) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    view_model = ApplicationViewModel()
+    view_model._set_backend_ready(True)
+    view_model.project_state.replace(_cuttable_project_snapshot())
+    requests: list[tuple[str, dict, dict]] = []
+    monkeypatch.setattr(
+        view_model.runtime,
+        "request",
+        lambda action, params=None, *, context=None: requests.append(
+            (action, params or {}, context or {})
+        ),
+    )
+
+    view_model.applyTimelineCut("remove_range", 2_000_000, 4_000_000)
+
+    action, params, context = requests[-1]
+    assert action == "timeline_command"
+    assert params["command"] == "cut"
+    assert params["operation"] == "remove_range"
+    assert params["range_start_us"] == 2_000_000
+    assert params["range_end_us"] == 4_000_000
+    assert params["base_revision"] == 1
+    assert params["request_id"] == context["request_id"]
+    assert "clip_id" not in params
+    assert view_model.timelineBusy is True
+    assert "timeline_edit" not in view_model.project_state._canonical_snapshot
+
+
+def test_timeline_cut_ack_projects_off_thread_then_commits_as_one_batch(monkeypatch) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    view_model = ApplicationViewModel()
+    view_model._set_backend_ready(True)
+    view_model.project_state.replace(_cuttable_project_snapshot())
+    monkeypatch.setattr(view_model.runtime, "request", lambda *_args, **_kwargs: "ipc")
+    projected: list[tuple[dict, dict, dict]] = []
+    monkeypatch.setattr(
+        view_model.runtime,
+        "project_timeline_patch",
+        lambda snapshot, patch, context: projected.append((snapshot, patch, context)),
+    )
+    view_model.applyTimelineCut("remove_range", 2_000_000, 4_000_000)
+    context = dict(view_model._timeline_cut_context)
+    patch = {
+        "_timeline_patch": True,
+        "id": "project-cut",
+        "revision": 2,
+        "timeline_edit": {
+            "retained_ranges": [
+                {"start_us": 0, "end_us": 2_000_000},
+                {"start_us": 4_000_000, "end_us": 10_000_000},
+            ]
+        },
+        "track_upserts": [],
+        "removed_track_ids": [],
+        "clip_upserts": [],
+        "removed_clip_ids": [],
+    }
+
+    view_model._action_succeeded("timeline_command", patch, context)
+
+    assert len(projected) == 1
+    assert view_model.project_state.revision == 1
+    canonical, display = ProjectStateModel.prepare_timeline_patch(projected[0][0], patch)
+    view_model._timeline_patch_projected(
+        True,
+        {"canonical": canonical, "projected": display, "patch": patch},
+        context,
+    )
+    assert view_model.project_state.revision == 2
+    assert view_model.project_state.durationUs == 8_000_000
+    assert view_model.timelineBusy is False
+
+
+def test_bulk_timeline_patch_is_linear_and_preserves_moves_and_track_order() -> None:
+    from time import perf_counter
+
+    clips = [
+        {"id": f"c{i}", "track_id": "s1", "timeline_range": {
+            "start_us": i * 1000, "end_us": i * 1000 + 500}}
+        for i in range(12_000)
+    ]
+    current = [{"id": "s1", "clips": clips}, {"id": "s2", "clips": []}]
+    before = perf_counter()
+    patched = ProjectStateModel._patched_tracks(
+        current, track_upserts=[], removed_track_ids=[],
+        clip_upserts=[{**clip, "track_id": "s2"} for clip in clips],
+        removed_clip_ids=[], track_order=["s2", "s1"],
+    )
+    elapsed = perf_counter() - before
+    assert elapsed < 1.5, f"Bulk patch blocked for {elapsed:.3f}s"
+    assert [track["id"] for track in patched] == ["s2", "s1"]
+    assert len(patched[0]["clips"]) == 12_000 and not patched[1]["clips"]
+    assert len(current[0]["clips"]) == 12_000 and not current[1]["clips"]
+    assert all(clip["track_id"] == "s2" for clip in patched[0]["clips"])
+
+
+@pytest.mark.parametrize("metadata", [
+    {"unknown": {"cue_index": 1, "payload_revision": 2}},
+    {"c": {"track_id": "s2"}},
+    {"c": {"cue_index": True, "payload_revision": 2}},
+    {"c": {"cue_index": 0, "payload_revision": 2}},
+])
+def test_invalid_clip_metadata_cannot_partially_change_snapshot(metadata):
+    tracks = [{"id": "s1", "clips": [{"id": "c", "track_id": "s1"}]}]
+    original = deepcopy(tracks)
+    with pytest.raises(ValueError, match="metadata"):
+        ProjectStateModel._patched_tracks(tracks, track_upserts=[], removed_track_ids=[],
+            clip_upserts=[], removed_clip_ids=[], clip_metadata=metadata)
+    assert tracks == original
+
+
+def _large_subtitle_editor(monkeypatch):
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model._set_backend_ready(True)
+    model.project_state.replace({"id": "large-edit", "name": "Large", "revision": 1,
+        "source_cues": [{"id": f"c{i}", "index": i + 1, "text": "文字",
+                         "range": {"start_us": i * 1000000, "end_us": (i+1) * 1000000}}
+                        for i in range(1000)]})
+    requests, projections = [], []
+    monkeypatch.setattr(model.runtime, "request",
+        lambda action, params=None, context=None: requests.append((action, params, context)))
+    monkeypatch.setattr(model.runtime, "project_timeline_patch",
+        lambda snapshot, patch, context: projections.append((snapshot, patch, context)))
+    return model, requests, projections
+
+
+def test_large_add_projection_serializes_background_saves_without_losing_cue(monkeypatch):
+    model, requests, projections = _large_subtitle_editor(monkeypatch)
+    model.updateSubtitleText("c0", "Đã sửa", "source")
+    model._send_subtitle_command("add", values={"text": "Mới"}, needs_selection=False)
+    assert len(requests) == 1 and requests[0][2]["background_subtitle_save"]
+    updated = {**model.project_state._canonical_snapshot["source_cues"][0], "text": "Đã sửa"}
+    model._action_succeeded("subtitle_command", {"_subtitle_patch": True,
+        "id": "large-edit", "revision": 2, "source_cue_upserts": [updated]}, requests[0][2])
+    QCoreApplication.instance().processEvents()
+    assert len(requests) == 2 and requests[-1][1]["command"] == "add"
+    context = requests[-1][2]
+    added = {"id": "new", "index": 1001, "text": "Mới",
+             "range": {"start_us": 1000000000, "end_us": 1001000000}}
+    patch = {"_subtitle_patch": True, "id": "large-edit", "revision": 3,
+             "source_cue_upserts": [added]}
+    model._action_succeeded("subtitle_command", patch, context)
+    assert model.subtitleBusy and len(projections) == 1
+    model.updateSubtitleText("c1", "Sau thêm", "source")
+    model._dispatch_background_subtitle_save()
+    assert len(requests) == 2  # Do not apply an N+2 delta before its N+1 base.
+    canonical, display = ProjectStateModel.prepare_subtitle_patch(projections[0][0], patch)
+    model._timeline_patch_projected(True,
+        {"canonical": canonical, "projected": display, "patch": patch}, projections[0][2])
+    model._dispatch_background_subtitle_save()
+    assert len(requests) == 3 and not model.subtitleBusy
+    updated = {**canonical["source_cues"][1], "text": "Sau thêm"}
+    model._action_succeeded("subtitle_command", {"_subtitle_patch": True,
+        "id": "large-edit", "revision": 4, "source_cue_upserts": [updated]}, requests[-1][2])
+    assert model.project_state.revision == 4
+    assert model.project_state.subtitle_cues.find("new")["source_text"] == "Mới"
+    assert model.project_state.subtitle_cues.find("c1")["source_text"] == "Sau thêm"
+
+
+def test_project_refresh_does_not_retire_active_subtitle_delete(monkeypatch):
+    model, requests, projections = _large_subtitle_editor(monkeypatch)
+    model._send_subtitle_command("delete", cue_id="c0")
+    context = requests[-1][2]
+    model._action_succeeded("get_project", deepcopy(model.project_state._canonical_snapshot),
+                           {"project_id": "large-edit"})
+    assert model.subtitleBusy and model._subtitle_command_context == context
+    patch = {"_subtitle_patch": True, "id": "large-edit", "revision": 2,
+             "removed_source_cue_ids": ["c0"]}
+    model._action_succeeded("subtitle_command", patch, context)
+    canonical, display = ProjectStateModel.prepare_subtitle_patch(projections[0][0], patch)
+    model._timeline_patch_projected(True,
+        {"canonical": canonical, "projected": display, "patch": patch}, projections[0][2])
+    assert not model.subtitleBusy and not model.project_state.subtitle_cues.find("c0")
+
+
+@pytest.mark.parametrize("failure", ["projection", "disconnect", "watchdog", "send"])
+def test_large_delete_failure_recovers_and_ignores_late_projection(monkeypatch, failure):
+    model, requests, projections = _large_subtitle_editor(monkeypatch)
+    if failure == "send":
+        def closed(*_args, **_kwargs):
+            raise OSError("closed socket")
+        monkeypatch.setattr(model.runtime, "request", closed)
+    model._send_subtitle_command("delete", cue_id="c0")
+    if failure == "send":
+        assert not model.subtitleBusy and model._timeline_reconcile_pending
+        return
+    patch = {"_subtitle_patch": True, "id": "large-edit", "revision": 2,
+             "removed_source_cue_ids": ["c0"]}
+    model._action_succeeded("subtitle_command", patch, requests[-1][2])
+    deferred_delete = []
+    assert model._defer_until_subtitle_saves_flushed(
+        "second-delete", lambda: deferred_delete.append(True), "Chờ thao tác trước")
+    canonical, display = ProjectStateModel.prepare_subtitle_patch(projections[0][0], patch)
+    context = projections[0][2]
+    model.updateSubtitleText("c1", "Chưa lưu", "source")
+    model._send_effect_command("add_blur", overlay_id="pending-blur")
+    assert model._subtitle_save_queue and model._pending_effect_commands
+    if failure == "projection":
+        model._timeline_patch_projected(False, {"message": "invalid patch"}, context)
+    elif failure == "disconnect":
+        model._set_backend_ready(False)
+    else:
+        model._subtitle_command_timed_out()
+    assert not model.subtitleBusy and not model._subtitle_command_context
+    assert model._timeline_reconcile_pending
+    assert not model._subtitle_flush_callbacks and not deferred_delete
+    model._dispatch_background_subtitle_save()
+    assert not model._subtitle_save_queue and not model._pending_effect_commands
+    assert model.project_state.subtitle_cues.find("c1")["source_text"] == "文字"
+    model._timeline_patch_projected(True,
+        {"canonical": canonical, "projected": display, "patch": patch}, context)
+    assert model.project_state.revision == 1 and model.project_state.subtitle_cues.find("c0")
+
+
+def test_multi_detail_waits_for_subtitle_projection_and_switch_clears_old_context(monkeypatch):
+    model, requests, projections = _large_subtitle_editor(monkeypatch)
+    model._send_subtitle_command("delete", cue_id="c0")
+    context = requests[-1][2]
+    model.openMultiVideoDetail("other")
+    assert len(requests) == 1 and "multi-detail" in model._subtitle_flush_callbacks
+    patch = {"_subtitle_patch": True, "id": "large-edit", "revision": 2,
+             "removed_source_cue_ids": ["c0"]}
+    model._action_succeeded("subtitle_command", patch, context)
+    canonical, display = ProjectStateModel.prepare_subtitle_patch(projections[0][0], patch)
+    model._timeline_patch_projected(True,
+        {"canonical": canonical, "projected": display, "patch": patch}, projections[0][2])
+    QCoreApplication.instance().processEvents()
+    assert any(a == "get_project" and p == {"project_id": "other"} for a,p,_ in requests)
+    model._apply_project({"id": "other", "name": "Other", "revision": 1})
+    model._subtitle_command_timed_out()
+    assert not model.subtitleBusy and not model._subtitle_command_context
+    assert not model._pending_effect_commands and not model._subtitle_save_queue
+    model._timeline_patch_projected(True,
+        {"canonical": canonical, "projected": display, "patch": patch}, projections[0][2])
+    assert model.project_state.projectId == "other"
+
+
+def test_cancelled_coalesced_overlay_drag_restores_saved_geometry_and_settles_preview(monkeypatch):
+    model, requests, _ = _large_subtitle_editor(monkeypatch)
+    project = deepcopy(model.project_state._canonical_snapshot)
+    project["overlays"] = [{"id": "blur", "kind": "blur", "x": .1, "y": .1,
+                            "width": .2, "height": .2, "enabled": True,
+                            "range": {"start_us": 0, "end_us": 1_000_000}}]
+    model.project_state.replace(project)
+    model._send_subtitle_command("delete", cue_id="c0")
+    context = requests[-1][2]
+    settled = []
+    model.overlayGeometrySettled.connect(
+        lambda identity, success: settled.append((identity, success)))
+    model._send_effect_command("update", overlay_id="blur", values={"x": .2})
+    model._send_effect_command("update", overlay_id="blur", values={"x": .3})
+    assert len(model._pending_effect_commands) == 1
+    model._action_failed("subtitle_command", {"message": "write failed"}, context)
+    assert model.project_state.overlays[0]["x"] == .1
+    assert settled == [("blur", False)]
+
+
+def test_timeline_cut_projection_blocks_and_rolls_back_optimistic_subtitle_edits(
+    monkeypatch,
+) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    view_model = ApplicationViewModel()
+    view_model._set_backend_ready(True)
+    view_model.project_state.replace(_cuttable_project_snapshot())
+    requests: list[tuple[str, dict, dict]] = []
+    projected: list[tuple[dict, dict, dict]] = []
+    monkeypatch.setattr(
+        view_model.runtime,
+        "request",
+        lambda action, params=None, *, context=None: requests.append(
+            (action, params or {}, context or {})
+        ),
+    )
+    monkeypatch.setattr(
+        view_model.runtime,
+        "project_timeline_patch",
+        lambda snapshot, patch, context: projected.append((snapshot, patch, context)),
+    )
+    view_model.applyTimelineCut("remove_range", 2_000_000, 4_000_000)
+    context = dict(view_model._timeline_cut_context)
+    patch = {
+        "_timeline_patch": True,
+        "id": "project-cut",
+        "revision": 2,
+        "timeline_edit": {
+            "retained_ranges": [
+                {"start_us": 0, "end_us": 2_000_000},
+                {"start_us": 4_000_000, "end_us": 10_000_000},
+            ]
+        },
+        "track_upserts": [],
+        "removed_track_ids": [],
+        "clip_upserts": [],
+        "removed_clip_ids": [],
+    }
+
+    view_model._action_succeeded("timeline_command", patch, context)
+    view_model.updateSubtitleText("cue-1", "\u5df2\u7f16\u8f91", "source")
+
+    assert [action for action, _params, _context in requests] == ["timeline_command"]
+    assert view_model._subtitle_save_queue == []
+    assert view_model.project_state.subtitle_cues.get(0)["source_text"] == "\u4e00"
+    assert view_model.project_state.revision == 1
+    canonical, display = ProjectStateModel.prepare_timeline_patch(projected[0][0], patch)
+    view_model._timeline_patch_projected(
+        True,
+        {"canonical": canonical, "projected": display, "patch": patch},
+        context,
+    )
+    assert view_model.project_state.revision == 2
+    assert view_model.project_state.durationUs == 8_000_000
+    assert view_model.timelineBusy is False
+
+
+def test_timeline_cut_timeout_reconciles_committed_head_before_next_cut(monkeypatch) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    view_model = ApplicationViewModel()
+    view_model._set_backend_ready(True)
+    view_model.project_state.replace(_cuttable_project_snapshot())
+    requests: list[tuple[str, dict, dict]] = []
+    monkeypatch.setattr(
+        view_model.runtime,
+        "request",
+        lambda action, payload=None, *, context=None: requests.append(
+            (action, payload or {}, context or {})
+        ),
+    )
+    view_model.applyTimelineCut("remove_range", 2_000_000, 4_000_000)
+
+    view_model._timeline_cut_timed_out()
+
+    reconcile = requests[-1]
+    assert reconcile[0] == "get_project"
+    assert reconcile[2]["timeline_reconcile"] is True
+    assert view_model.timelineBusy is True
+    committed = _cuttable_project_snapshot()
+    committed["revision"] = 2
+    committed["timeline_edit"] = {
+        "retained_ranges": [
+            {"start_us": 0, "end_us": 2_000_000},
+            {"start_us": 4_000_000, "end_us": 10_000_000},
+        ]
+    }
+    view_model._action_succeeded("get_project", committed, reconcile[2])
+
+    assert view_model.project_state.revision == 2
+    assert view_model.timelineBusy is False
+    view_model.applyTimelineCut("keep_range", 0, 1_000_000)
+    assert requests[-1][1]["base_revision"] == 2
+
+
+def test_timeline_cut_failure_disconnect_and_stale_ack_release_only_current_request(
+    monkeypatch,
+) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    view_model = ApplicationViewModel()
+    view_model._set_backend_ready(True)
+    view_model.project_state.replace(_cuttable_project_snapshot())
+    monkeypatch.setattr(view_model.runtime, "request", lambda *_args, **_kwargs: "ipc")
+    view_model.setPlayheadMs(7_000)
+    view_model.applyTimelineCut("remove_range", 2_000_000, 4_000_000)
+    context = dict(view_model._timeline_cut_context)
+
+    view_model._action_succeeded(
+        "timeline_command",
+        {"_timeline_patch": True, "id": "project-cut", "revision": 99},
+        {**context, "request_id": "stale"},
+    )
+    assert view_model.project_state.revision == 1
+    assert view_model.timelineBusy is True
+
+    view_model._set_backend_ready(False)
+    assert view_model.timelineBusy is True
+    assert view_model._timeline_reconcile_pending is True
+    assert view_model.playheadUs == 7_000_000
+
+
+def test_timeline_cut_waits_for_background_subtitle_save(monkeypatch) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    view_model = ApplicationViewModel()
+    view_model._set_backend_ready(True)
+    view_model.project_state.replace(_cuttable_project_snapshot())
+    calls: list[str] = []
+    monkeypatch.setattr(
+        view_model.runtime,
+        "request",
+        lambda action, _params=None, *, context=None: calls.append(action),
+    )
+    view_model._subtitle_save_queue.append(
+        {
+            "params": {
+                "project_id": "project-cut",
+                "command": "update_text",
+                "language": "source",
+                "values": {"text": "Đã sửa"},
+                "cue_id": "cue-1",
+            },
+            "context": {
+                "background_subtitle_save": True,
+                "project_id": "project-cut",
+                "optimistic_changes": [],
+            },
+        }
+    )
+
+    view_model.applyTimelineCut("keep_range", 1_000_000, 8_000_000)
+
+    assert calls == ["subtitle_command"]
+    assert "timeline-cut" in view_model._subtitle_flush_callbacks
+    callback = view_model._subtitle_flush_callbacks["timeline-cut"]
+    view_model._subtitle_save_in_flight = False
+    view_model._subtitle_flush_callbacks.clear()
+    callback()
+    assert calls == ["subtitle_command", "timeline_command"]
+
+
+def _cue_role_model(monkeypatch):
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model._set_backend_ready(True)
+    source = [
+        {"id": "c1", "index": 1, "text": "原文", "role": "dialogue",
+         "subtitle_track_id": "S1", "range": {"start_us": 0, "end_us": 1_000_000}},
+        {"id": "c2", "index": 2, "text": "山河", "role": "scene_text",
+         "subtitle_track_id": "S3", "range": {"start_us": 1_000_000, "end_us": 2_000_000}},
+    ]
+    model.project_state.replace({"id": "roles", "name": "Roles", "revision": 1,
+        "source_cues": source, "title_cues": [{"id": "title", "index": 1,
+            "text": "Kênh", "role": "title_text", "subtitle_track_id": "T1",
+            "range": {"start_us": 0, "end_us": 2_000_000}}],
+        "tracks": [{"id": cue["subtitle_track_id"], "kind": "subtitle", "name": "Text",
+                    "clips": [{"id": "clip-" + cue["id"], "track_id": cue["subtitle_track_id"],
+                               "cue_id": cue["id"], "timeline_range": cue["range"]}]}
+                   for cue in source]})
+    requests = []
+    model.runtime.request = lambda action, params=None, context=None: requests.append(
+        (action, params, context))
+    return model, requests
+
+
+def test_cue_classification_is_aggregate_and_conversion_preserves_selection_playhead(monkeypatch):
+    model, requests = _cue_role_model(monkeypatch)
+    assert not model.selectedCueClassification["can_convert"]
+    model.setPlayheadMs(1250)
+    model.selectTimelineCue("c1")
+    assert model.selectedCueClassification == {
+        "count": 1, "role": "dialogue", "track": "S1", "can_convert": True}
+    model.selectTimelineCue("c2", True)
+    assert model.selectedCueClassification == {
+        "count": 2, "role": "mixed", "track": "", "can_convert": True}
+    model.setSelectedCueRole("dialogue")
+    assert requests[-1][1]["command"] == "set_cue_role"
+    assert requests[-1][1]["values"] == {"cue_ids": ["c1", "c2"], "role": "dialogue"}
+    assert model.selectedCueIds == ["c1", "c2"]
+    assert model.playheadUs == 1_250_000
+
+
+def test_cue_conversion_rejects_empty_title_mixed_title_and_invalid_role(monkeypatch):
+    model, requests = _cue_role_model(monkeypatch)
+    model.setSelectedCueRole("scene_text")
+    model.selectTimelineCue("title")
+    assert model.selectedCueClassification["role"] == "title_text"
+    assert not model.selectedCueClassification["can_convert"]
+    model.setSelectedCueRole("dialogue")
+    model.selectTimelineCue("c1", True)
+    assert model.selectedCueIds == ["c1"]  # Timeline keeps title/subtitle groups separate.
+    model._selected_cue_ids = ["title", "c1"]
+    assert not model.selectedCueClassification["can_convert"]
+    model.setSelectedCueRole("scene_text")
+    model.selectTimelineCue("c1")
+    model.setSelectedCueRole("title_text")
+    assert requests == []
+
+
+def test_cue_role_conversion_flushes_text_and_captures_original_selection(monkeypatch):
+    model, requests = _cue_role_model(monkeypatch)
+    model.selectTimelineCue("c1")
+    model.updateSubtitleText("c1", "Đã sửa chữ", "source")
+    model.setSelectedCueRole("scene_text")
+    assert len(requests) == 1
+    assert requests[0][1]["command"] == "update_text"
+    callback = model._subtitle_flush_callbacks["subtitle-command-set_cue_role"]
+    model.selectTimelineCue("c2")
+    model._subtitle_save_in_flight = False
+    model._subtitle_flush_callbacks.clear()
+    callback()
+    assert requests[-1][1]["command"] == "set_cue_role"
+    assert requests[-1][1]["values"]["cue_ids"] == ["c1"]

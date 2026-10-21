@@ -75,6 +75,10 @@ def test_xianxia_prompt_carries_pronoun_title_and_contextual_alias_rules() -> No
     assert "Tu tiên cổ trang" in request.prompt
     assert "Hồng Ly tỷ tỷ" in request.prompt
     assert "阿狗 → A Cẩu" in request.prompt
+    assert "không lạm dụng Hán Việt" in request.prompt
+    assert "thần tiên sống" in request.prompt
+    assert "chỉ dùng 'quý' nếu nguồn/ngữ cảnh" in request.prompt
+    assert "kích thước thì vẫn dùng 'lớn'" in request.prompt
     assert "không đổi từ chó/mèo" in request.prompt.casefold()
     assert bible.custom_rules in request.prompt
 
@@ -514,6 +518,41 @@ def test_integrated_qa_blocks_film_bible_names_and_warns_other_terms() -> None:
         (TranslationValue("cue-name", 1, "Lâm Khả Xuyên uống Tụ Khí Đan."),),
         film_bible=bible,
     )
+
+
+def test_glossary_updates_cannot_downgrade_locked_identity_or_change_its_spelling() -> None:
+    original = FilmTerm("重阳峰", "Trọng Dương Phong", "place")
+    bible = FilmBible(terms=(original,))
+    updated = bible.merge_terms((
+        FilmTerm("重阳峰", "trọng dương phong", "term"),
+        FilmTerm("重阳峰", "Trùng Dương Phong", "place"),
+        FilmTerm("执事厅", "Chấp Sự Sảnh", "place"),
+    ))
+    assert updated.terms == (FilmTerm("执事厅", "Chấp Sự Sảnh", "place"), original)
+    assert bible.terms == (original,)
+    cue = SubtitleCue("cue-place", 1, TimeRange(0, 1_000_000), "我要去重阳峰。", "zh")
+    chunk = plan_chunks(semantic_groups((cue,)))[0]
+    issues = film_bible_translation_qa(
+        chunk, (TranslationValue(cue.id, 1, "Ta muốn đến Trùng Dương Phong."),),
+        film_bible=updated,
+    )
+    assert issues[0].severity is TranslationQaSeverity.BLOCKER
+
+
+def test_translation_and_repair_require_locked_glossary_without_inventing_speakers() -> None:
+    cue = SubtitleCue("cue-consistency", 1, TimeRange(0, 1_000_000), "我要去重阳峰。", "zh")
+    chunk = plan_chunks(semantic_groups((cue,)))[0]
+    custom = "Văn phong hài hước nhưng giữ đúng nghĩa."
+    bible = FilmBible(style_preset="xianxia", custom_rules=custom)
+    requests = (
+        translation_request(chunk, film_bible=bible),
+        repair_request(chunk, (TranslationValue(cue.id, 1, "Ta muốn đến đó."),), (),
+                       film_bible=bible),
+    )
+    for request in requests:
+        assert "chỉ bổ sung mục mới" in request.prompt
+        assert "không tự đoán danh tính người nói" in request.prompt
+        assert custom in request.prompt
 
 
 def test_film_bible_name_match_requires_complete_word_boundary() -> None:

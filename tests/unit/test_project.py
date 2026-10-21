@@ -9,8 +9,27 @@ from ducai_studio.domain.project import (
     TimelineClip,
     TimelineTrack,
     TrackKind,
+    TranslationPreferences,
+    TranslationStylePreset,
 )
 from ducai_studio.domain.timebase import TimeRange
+
+
+def test_translation_style_presets_validate_names_and_remain_unique() -> None:
+    saved = TranslationStylePreset("  Cổ trang  ", "xianxia", "Dùng ta/ngươi.")
+    assert saved.normalized_name == "Cổ trang"
+    preferences = TranslationPreferences(saved_styles=(saved,))
+    assert preferences.saved_styles == (saved,)
+
+    with pytest.raises(ValueError, match="name is required"):
+        TranslationStylePreset("   ")
+    with pytest.raises(ValueError, match="unique"):
+        TranslationPreferences(
+            saved_styles=(
+                TranslationStylePreset("Phong cách"),
+                TranslationStylePreset("phong cách"),
+            )
+        )
 
 
 def test_project_rejects_duplicate_media_ids() -> None:
@@ -32,7 +51,7 @@ def test_subtitle_cue_requires_text_and_valid_confidence() -> None:
     with pytest.raises(ValueError, match="confidence"):
         SubtitleCue("cue", 1, TimeRange(0, 1_000_000), "你好", "zh", confidence=1.1)
 
-    with pytest.raises(ValueError, match="1 đến 100"):
+    with pytest.raises(ValueError, match="số nguyên dương"):
         SubtitleCue(
             "cue",
             1,
@@ -83,7 +102,7 @@ def test_subtitle_cue_requires_text_and_valid_confidence() -> None:
             TimeRange(0, 1_000_000),
             "Xin chào",
             "vi",
-            background_padding_x=101,
+            background_padding_x=-1,
         )
 
     with pytest.raises(ValueError, match="Background style"):

@@ -80,6 +80,50 @@ def test_create_translation_job_snapshots_cues_and_only_credential_references(
     assert job.spec.provider_config["max_chunk_source_chars"] == 6_000
 
 
+def test_translation_cache_metadata_does_not_replace_the_full_worker_spec(tmp_path: Path):
+    service = JobManagerService(database_path=tmp_path / "state.db",
+                                artifact_root=tmp_path / "artifacts", media_probe=StaticProbe())
+    project_id, _ = _project(service, tmp_path)
+    created = service.create_translation_job(
+        project_id=project_id, provider_id="openai-compatible", model_id="test-model",
+        provider_options={"credential_references": ["named-key"],
+                          "base_url": "http://127.0.0.1:8045/v1",
+                          "translation_custom_rules": "Giữ nghĩa chính xác."},
+    )
+    full = service.jobs.get(created["id"])
+    compact, = service.jobs.list_project_jobs(
+        project_id=project_id, kind=JobKind.TRANSLATE,
+        input_fingerprint=full.spec.input_fingerprint, compact_translation=True,
+    )
+    assert compact.spec.provider_config == {
+        "credential_references": ("named-key",), "base_url": "http://127.0.0.1:8045/v1",
+        "translation_style_preset": "auto", "translation_custom_rules": "Giữ nghĩa chính xác.",
+        "qa_policy": "legacy",
+    }
+    assert compact.spec.resume_fingerprint == full.spec.resume_fingerprint
+    assert service.jobs.get(full.id).spec == full.spec
+    assert len(service.jobs.get(full.id).spec.provider_config["source_cues"]) == 2
+
+
+@pytest.mark.parametrize("malformed_config", ["[]", "null", "123", '"text"', "broken"])
+def test_translation_cache_metadata_skips_non_object_configuration(
+    tmp_path: Path, malformed_config: str,
+) -> None:
+    service = JobManagerService(database_path=tmp_path / "state.db",
+                                artifact_root=tmp_path / "artifacts", media_probe=StaticProbe())
+    project_id, _ = _project(service, tmp_path)
+    created = service.create_translation_job(
+        project_id=project_id, provider_id="gemini-api", model_id="test-model",
+        provider_options={"credential_references": ["named-key"]},
+    )
+    with service.database.write_transaction() as connection:
+        connection.execute("UPDATE jobs SET config_json = ? WHERE id = ?",
+                           (malformed_config, created["id"]))
+    assert service.jobs.list_project_jobs(
+        project_id=project_id, kind=JobKind.TRANSLATE, compact_translation=True,
+    ) == ()
+
+
 def test_translation_rerun_rolls_back_active_file_when_project_publish_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -207,6 +251,76 @@ def test_project_translation_style_is_persisted_and_changes_only_translation_cac
     assert second_spec.provider_config["translation_custom_rules"] == (
         "Hồng Ly luôn được gọi là Hồng Ly tỷ tỷ."
     )
+
+
+def test_named_translation_style_is_saved_and_reused_without_overwriting(
+    tmp_path: Path,
+) -> None:
+    service = JobManagerService(
+        database_path=tmp_path / "state.db",
+        artifact_root=tmp_path / "artifacts",
+        media_probe=StaticProbe(),
+    )
+    project_id, _source = _project(service, tmp_path)
+
+    saved = service.save_translation_style(
+        project_id=project_id,
+        name="  Cổ trang riêng  ",
+        preset="xianxia",
+        custom_rules="Giữ xưng hô theo vai vế.",
+    )
+    preferences = saved["translation_preferences"]
+    assert preferences["preset"] == "xianxia"
+    assert preferences["active_style_name"] == "Cổ trang riêng"
+    assert preferences["custom_rules"] == "Giữ xưng hô theo vai vế."
+    assert preferences["saved_styles"] == [
+        {
+            "name": "Cổ trang riêng",
+            "preset": "xianxia",
+            "custom_rules": "Giữ xưng hô theo vai vế.",
+        }
+    ]
+    loaded = service.projects.load(project_id)
+    assert loaded.translation_preferences.saved_styles[0].name == "Cổ trang riêng"
+
+    service.set_translation_preferences(
+        project_id=project_id,
+        preset="neutral",
+        custom_rules="Giữ câu ngắn.",
+    )
+    preserved = service.projects.load(project_id).translation_preferences
+    assert preserved.preset == "neutral"
+    assert preserved.saved_styles[0].name == "Cổ trang riêng"
+    assert preserved.active_style_name == ""
+
+    service.save_translation_style(
+        project_id=project_id,
+        name="Cổ trang riêng 2",
+        preset="xianxia",
+        custom_rules="Giữ xưng hô theo vai vế.",
+    )
+    service.set_translation_preferences(
+        project_id=project_id,
+        preset="xianxia",
+        custom_rules="Giữ xưng hô theo vai vế.",
+        active_style_name="Cổ trang riêng",
+    )
+    reopened = JobManagerService(
+        database_path=tmp_path / "state.db",
+        artifact_root=tmp_path / "artifacts",
+        media_probe=StaticProbe(),
+    )
+    reloaded = reopened.projects.load(project_id).translation_preferences
+    assert reloaded.active_style_name == "Cổ trang riêng"
+    assert len(reloaded.saved_styles) == 2
+
+    with pytest.raises(ValueError, match="Tên văn phong đã tồn tại"):
+        service.save_translation_style(
+            project_id=project_id,
+            name="cổ trang riêng",
+            preset="modern",
+            custom_rules="Không được ghi đè.",
+        )
 
 
 def test_manual_multi_translation_review_requires_all_cues_without_cjk(tmp_path: Path) -> None:
@@ -528,6 +642,7 @@ def test_custom_openai_compatible_translation_job_requires_safe_base_url(
 
 def test_translation_preview_loads_immutable_checkpoint_for_open_project(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = JobManagerService(
         database_path=tmp_path / "state.db",
@@ -597,9 +712,22 @@ def test_translation_preview_loads_immutable_checkpoint_for_open_project(
         {"id": source_cue.id, "index": 1, "text": "Ta muốn tu luyện."}
     ]
 
+    original_get = service.jobs.get
+    lookups = []
+
+    def counted_get(identifier: str):
+        lookups.append(identifier)
+        return original_get(identifier)
+
+    monkeypatch.setattr(service.jobs, "get", counted_get)
+    selected_preview = service.get_translation_preview(project_id, job_id)
+    assert selected_preview["values"] == preview["values"]
+    assert lookups == [job_id]
+
 
 def test_translation_cache_list_and_default_preview_prefer_the_most_complete_cache(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = JobManagerService(
         database_path=tmp_path / "state.db",
@@ -712,7 +840,12 @@ def test_translation_cache_list_and_default_preview_prefer_the_most_complete_cac
     )
     partial_id = make_cache(translated={"1": "Bản mới chưa hoàn tất."}, terminal=False)
 
-    caches = service.list_translation_caches(project_id)
+    # Listing ledgers needs immutable identity, not the source cue payload.
+    # The selected preview/worker still obtains its full validated input.
+    with monkeypatch.context() as patch:
+        patch.setattr(service.jobs, "get", lambda *_args, **_kwargs:
+                      (_ for _ in ()).throw(AssertionError("Selector decoded full job input")))
+        caches = service.list_translation_caches(project_id)
     preview = service.get_translation_preview(project_id)
 
     assert [item["job_id"] for item in caches] == [complete_id, partial_id]

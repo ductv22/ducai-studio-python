@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import runpy
+from pathlib import Path
 
 from PySide6.QtCore import QStandardPaths
 
@@ -14,3 +16,8 @@ def _isolated_writable_location(location):
 
 
 QStandardPaths.writableLocation = staticmethod(_isolated_writable_location)
+
+if os.environ.get("DUCAI_TEST_LICENSE_BOOTSTRAP") == "1":
+    runpy.run_path(
+        Path(__file__).parents[1] / "license-bootstrap" / "sitecustomize.py"
+    )

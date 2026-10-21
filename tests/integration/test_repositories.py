@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import subprocess
 import sys
@@ -105,6 +106,116 @@ def test_queued_job_is_reconciled_after_restart_instead_of_blocking_a_new_stage(
     assert jobs.get(job.id).state is JobState.INTERRUPTED
 
 
+def test_repeated_job_reads_reuse_spec_but_refresh_lifecycle(database: Database) -> None:
+    jobs = JobRepository(database)
+    job = jobs.create(make_spec())
+    first = jobs.get(job.id)
+
+    assert jobs.get(job.id).spec is first.spec
+    requested = jobs.transition(job.id, JobState.START_REQUESTED)
+    assert requested.spec is first.spec
+    assert requested.state is JobState.START_REQUESTED
+    assert first.state is JobState.QUEUED
+    running = jobs.transition(job.id, JobState.RUNNING)
+    assert running.spec is first.spec
+    assert running.started_at is not None
+    failed = jobs.transition(
+        job.id, JobState.FAILED, error_code="provider_timeout", error_payload={"attempt": 2}
+    )
+    assert failed.spec == first.spec
+    assert failed.state is JobState.FAILED
+    assert failed.finished_at is not None
+    assert failed.error_code == "provider_timeout"
+    assert failed.error_payload == {"attempt": 2}
+    # Finished jobs need not retain a potentially huge input in the repository.
+    assert jobs.get(job.id).spec is not failed.spec
+
+
+@pytest.mark.parametrize(
+    ("column", "value", "attribute", "expected"),
+    [
+        ("kind", "translate", "kind", JobKind.TRANSLATE),
+        ("project_id", "project-2", "project_id", "project-2"),
+        ("input_revision", 2, "input_revision", 2),
+        ("provider_id", "openai-compatible", "provider_id", "openai-compatible"),
+        ("provider_version", "v2", "provider_version", "v2"),
+        ("model_id", "other-model", "model_id", "other-model"),
+        ("input_fingerprint", "new-input", "input_fingerprint", "new-input"),
+        ("settings_fingerprint", "new-settings", "settings_fingerprint", "new-settings"),
+        ("config_json", '{"mode":"quality"}', "provider_config", {"mode": "quality"}),
+    ],
+)
+def test_job_spec_reuse_invalidates_for_every_persisted_input(
+    database: Database, column: str, value: object, attribute: str, expected: object
+) -> None:
+    jobs = JobRepository(database)
+    job = jobs.create(make_spec())
+    before = jobs.get(job.id)
+    with database.write_transaction() as connection:
+        connection.execute(f"UPDATE jobs SET {column} = ? WHERE id = ?", (value, job.id))
+
+    after = jobs.get(job.id)
+
+    assert after.spec is not before.spec
+    assert getattr(after.spec, attribute) == expected
+    assert jobs.get(job.id).spec is after.spec
+
+
+def test_job_spec_reuse_observes_retry_credentials_without_new_fingerprint(
+    database: Database,
+) -> None:
+    jobs = JobRepository(database)
+    job = jobs.create(make_spec(provider_config={"credential_references": ["old-ref"]}))
+    before = jobs.get(job.id)
+    jobs.transition(job.id, JobState.START_REQUESTED)
+    jobs.transition(job.id, JobState.FAILED)
+    after = jobs.replace_retry_credential_references(job.id, ("new-ref",))
+
+    assert after.spec.provider_config["credential_references"] == ("new-ref",)
+    assert before.spec.provider_config["credential_references"] == ("old-ref",)
+    assert after.spec.resume_fingerprint == before.spec.resume_fingerprint
+    assert jobs.get(job.id).spec == after.spec
+
+
+def test_job_spec_reuse_revalidates_changed_input_and_cannot_return_deleted_job(
+    database: Database,
+) -> None:
+    jobs = JobRepository(database)
+    job = jobs.create(make_spec())
+    before = jobs.get(job.id)
+    for invalid in ('{"api_key":"unsafe"}', "not-json"):
+        with database.write_transaction() as connection:
+            connection.execute("UPDATE jobs SET config_json = ? WHERE id = ?", (invalid, job.id))
+        with pytest.raises(ValueError):
+            jobs.get(job.id)
+    with database.write_transaction() as connection:
+        connection.execute(
+            "UPDATE jobs SET config_json = ? WHERE id = ?", (json.dumps({"mode": "fast"}), job.id)
+        )
+    assert jobs.get(job.id).spec == before.spec
+    with database.write_transaction() as connection:
+        connection.execute("DELETE FROM jobs WHERE id = ?", (job.id,))
+    with pytest.raises(LookupError, match="Unknown job"):
+        jobs.get(job.id)
+
+
+def test_job_spec_reuse_is_bounded_and_compact_activity_keeps_full_input(
+    database: Database,
+) -> None:
+    jobs = JobRepository(database)
+    job = jobs.create(make_spec(provider_config={"source_cues": [{"id": 1, "text": "Original"}]}))
+    before = jobs.get(job.id)
+    compact = jobs.list_recent_activity()[0][0]
+    assert "source_cues" not in compact.spec.provider_config
+    assert jobs.get(job.id).spec is before.spec
+    assert jobs.get(job.id).spec.provider_config == before.spec.provider_config
+    other = jobs.create(make_spec(), job_id="other-job")
+    jobs.get(other.id)
+    reread = jobs.get(job.id)
+    assert reread.spec is not before.spec
+    assert reread.spec == before.spec
+
+
 def test_compact_progress_events_and_recent_activity_do_not_return_full_config(
     database: Database,
 ) -> None:
@@ -147,6 +258,17 @@ def test_compact_progress_events_and_recent_activity_do_not_return_full_config(
         "phase_total": 10,
     }
     assert result == {"purpose": "production", "status": "PASS"}
+
+
+def test_compact_translation_activity_preserves_style_identity(database: Database) -> None:
+    jobs = JobRepository(database)
+    config = {"translation_style_preset": "xianxia", "translation_custom_rules": "Giữ nghĩa.",
+              "base_url": "http://127.0.0.1:8045/v1", "credential_references": ["local"],
+              "source_cues": [{"index": 1, "text": "你好"}]}
+    jobs.create(make_spec(kind=JobKind.TRANSLATE, provider_config=config))
+    record = jobs.list_recent_activity()[0][0]
+    assert dict(record.spec.provider_config) == {k: v if k != "credential_references" else tuple(v)
+                                              for k, v in config.items() if k != "source_cues"}
 
 
 def test_latest_project_activity_prefers_current_revision_then_latest_finish(
@@ -894,6 +1016,33 @@ def test_project_snapshot_round_trips_scene_text_metadata_and_legacy_defaults(
     assert legacy.source_cues[0].panel_box is None
     assert legacy.ocr_dialogue_region is None
     assert legacy.ocr_exclusion_regions == ()
+    assert legacy.translation_preferences.saved_styles == ()
+    assert legacy.translation_preferences.active_style_name == ""
+
+    named_style = decode_project_snapshot(
+        {
+            "id": "named-style-project",
+            "name": "Named style",
+            "revision": 1,
+            "media": [],
+            "tracks": [],
+            "source_cues": [],
+            "translated_cues": [],
+            "overlays": [],
+            "translation_preferences": {
+                "preset": "auto",
+                "custom_rules": "",
+                "saved_styles": {
+                    "Bản cũ": {
+                        "preset": "modern",
+                        "custom_rules": "Dùng anh/em.",
+                    }
+                },
+            },
+        }
+    )
+    assert named_style.translation_preferences.saved_styles[0].name == "Bản cũ"
+    assert named_style.translation_preferences.saved_styles[0].preset == "modern"
 
 
 def test_project_decoder_splits_legacy_overlapping_scene_text_into_visible_lanes() -> None:
@@ -1193,7 +1342,79 @@ def test_database_migrates_existing_v1_state_without_deleting_jobs(tmp_path: Pat
                 "SELECT version FROM schema_migrations ORDER BY version"
             ).fetchall()
         ]
-    assert versions == [1, 2, 3, 4, 5]
+    assert versions == [1, 2, 3, 4, 5, 6]
+
+
+def test_v6_migration_does_not_rewrite_legacy_project_snapshots(tmp_path: Path) -> None:
+    path = tmp_path / "large-v5-state.db"
+    legacy_snapshot = '{"payload":"' + ("x" * 2_000_000) + '"}'
+    with sqlite3.connect(path) as connection:
+        for version, statement in database_module.MIGRATIONS[:5]:
+            connection.executescript(statement)
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at, checksum) VALUES (?, ?, ?)",
+                (
+                    version,
+                    "2026-09-30T00:00:00Z",
+                    sha256(statement.encode("utf-8")).hexdigest(),
+                ),
+            )
+        connection.execute(
+            """
+            INSERT INTO projects(id, path, name, schema_version, head_revision, updated_at)
+            VALUES ('legacy-large', 'legacy-large.ducai', 'Legacy large', 1, 1, ?)
+            """,
+            ("2026-09-30T00:00:00Z",),
+        )
+        connection.execute(
+            """
+            INSERT INTO project_revisions(
+                project_id, revision, snapshot_json, snapshot_sha256, created_at
+            ) VALUES ('legacy-large', 1, ?, ?, ?)
+            """,
+            (
+                legacy_snapshot,
+                sha256(legacy_snapshot.encode("utf-8")).hexdigest(),
+                "2026-09-30T00:00:00Z",
+            ),
+        )
+        # This makes any accidental v6 full-table backfill fail deterministically
+        # without allocating a multi-gigabyte test database.
+        connection.execute(
+            """
+            CREATE TRIGGER reject_revision_backfill
+            BEFORE UPDATE ON project_revisions
+            BEGIN
+                SELECT RAISE(ABORT, 'legacy snapshot rewrite attempted');
+            END
+            """
+        )
+
+    Database(path).initialize(applied_at="2026-10-01T00:00:00Z")
+
+    with Database(path).connect(read_only=True) as connection:
+        row = connection.execute(
+            """
+            SELECT snapshot_json, snapshot_encoding, snapshot_blob,
+                   uncompressed_size, compressed_size
+            FROM project_revisions
+            WHERE project_id = 'legacy-large' AND revision = 1
+            """
+        ).fetchone()
+        marker = connection.execute(
+            "SELECT checksum FROM schema_migrations WHERE version = 6"
+        ).fetchone()
+
+    assert row is not None
+    assert row["snapshot_json"] == legacy_snapshot
+    assert row["snapshot_encoding"] == "json-v1"
+    assert row["snapshot_blob"] is None
+    assert row["uncompressed_size"] == 0
+    assert row["compressed_size"] == 0
+    assert marker is not None
+    assert marker["checksum"] == sha256(
+        database_module.MIGRATION_6_SQL.encode("utf-8")
+    ).hexdigest()
 
 
 def test_database_v3_backfills_only_tts_purpose_and_adds_activity_index(
@@ -1249,7 +1470,7 @@ def test_database_v3_backfills_only_tts_purpose_and_adds_activity_index(
     assert purposes == {"export-purpose-noise": "", "tts-preview": "preview"}
     assert index_sql is not None
     assert "job_id, kind, sequence DESC" in index_sql["sql"]
-    assert versions == [1, 2, 3, 4, 5]
+    assert versions == [1, 2, 3, 4, 5, 6]
 
 
 def test_v3_to_v4_multi_membership_survives_reopen_and_removal_keeps_project_cache(
@@ -1365,7 +1586,7 @@ def test_v3_to_v4_multi_membership_survives_reopen_and_removal_keeps_project_cac
         assert connection.execute(
             "SELECT 1 FROM multi_project_exclusions WHERE project_id = 'project-kept'"
         ).fetchone()
-    assert versions == [1, 2, 3, 4, 5]
+    assert versions == [1, 2, 3, 4, 5, 6]
     assert reopened.list_items() == []
     assert project_path.read_bytes() == b"project fixture"
     assert cache_path.read_bytes() == b"durable checkpoint"

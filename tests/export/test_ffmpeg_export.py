@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import subprocess
+from array import array
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,6 +16,7 @@ from ducai_studio.application.voice_pipeline import (
     file_sha256,
     write_pcm16_mono,
 )
+from ducai_studio.domain.effects import ExportSettings, ExportSnapshot, RenderClip, SubtitleStyle
 from ducai_studio.domain.voice_conform import (
     VoiceConformCueInput,
     VoiceConformSettings,
@@ -27,6 +29,7 @@ from ducai_studio.providers.export.ffmpeg import (
     _chunk_conform_pieces,
     _conform_output_to_source,
     _hidden_subprocess_kwargs,
+    materialize_export_chunk,
 )
 from ducai_studio.providers.media_probe import FfprobeProvider
 from ducai_studio.workers import export_worker as export_worker_module
@@ -66,6 +69,38 @@ def test_export_progress_is_bounded_to_one_event_per_second(tmp_path: Path, monk
     assert events[0][1]["chunk_total"] == 1
 
 
+def test_export_renderer_change_does_not_adopt_old_chunks_or_delete_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("DUCAI_ARTIFACT_STAGING_ROOT", str(tmp_path / "staging"))
+    worker = ExportWorker("renderer-cache")
+    old_chunk = tmp_path / "old.mp4"
+    old_chunk.write_bytes(b"old renderer cache")
+    checkpoint = tmp_path / "ledger.json"
+    atomic_write_json(
+        checkpoint,
+        {
+            "signature": "legacy",
+            "entries": {"0": {"path": str(old_chunk), "sha256": file_sha256(old_chunk)}},
+        },
+    )
+    reference = {"artifact": {"uri": str(checkpoint)}}
+    assert worker._restore_checkpoint(reference, "new", legacy_signature="legacy") is None
+    assert worker._restore_checkpoint(reference, "new", previous_signature="legacy") is None
+    assert old_chunk.read_bytes() == b"old renderer cache"
+    with pytest.raises(ValueError, match="signature_mismatch"):
+        worker._restore_checkpoint(reference, "new", legacy_signature="unrelated")
+    assert worker._restore_checkpoint(reference, "legacy")["entries"]["0"]["path"] == str(old_chunk)
+
+
+def test_full_frame_subtitle_mask_keeps_odd_dimensions() -> None:
+    from ducai_studio.domain.effects import RenderOverlay, RenderSubtitleBlur
+    from ducai_studio.providers.export.ffmpeg import _overlay_pixels
+
+    mask = RenderSubtitleBlur("c", 1, 0, 1_000_000, 0.1, 0.1, 0.575, 0.385)
+    assert _overlay_pixels(mask, 1000, 200) == (100, 20, 575, 77)
+    manual = RenderOverlay("o", "blur", 0, 1_000_000, 0.1, 0.1, 0.575, 0.385)
+    assert _overlay_pixels(manual, 1000, 200) == (100, 20, 574, 76)
+
+
 def test_conform_output_time_map_splits_chunk_and_maps_audio_source() -> None:
     snapshot = SimpleNamespace(
         timeline_start_us=0,
@@ -82,9 +117,7 @@ def test_conform_output_time_map_splits_chunk_and_maps_audio_source() -> None:
         video=SimpleNamespace(source_start_us=0, source_end_us=2_000_000),
     )
 
-    assert _chunk_conform_pieces(snapshot, 1_000_000, 3_000_000) == (
-        (500_000, 1_500_000, 0.5),
-    )
+    assert _chunk_conform_pieces(snapshot, 1_000_000, 3_000_000) == ((500_000, 1_500_000, 0.5),)
     assert _conform_output_to_source(snapshot, 3_000_000) == 1_500_000
 
 
@@ -238,9 +271,215 @@ def test_real_conform_export_has_video_audio_burned_subtitle_and_mapped_duration
     assert qa["has_audio"] is True
 
 
-def test_export_resume_eta_ignores_instantly_restored_cache(
-    tmp_path: Path, monkeypatch
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="FFmpeg is required for the real multi-segment export contract",
+)
+def test_real_multi_segment_export_preserves_join_frames_audio_and_duration(
+    tmp_path: Path,
 ) -> None:
+    ffmpeg = str(shutil.which("ffmpeg"))
+    source = tmp_path / "three-segment-source.mp4"
+    subprocess.run(
+        [
+            ffmpeg,
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=red:s=160x90:r=24:d=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=330:sample_rate=48000:duration=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=green:s=160x90:r=24:d=0.5",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=660:sample_rate=48000:duration=0.5",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=blue:s=160x90:r=24:d=1.5",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=990:sample_rate=48000:duration=1.5",
+            "-filter_complex",
+            "[0:v][1:a][2:v][3:a][4:v][5:a]concat=n=3:v=1:a=1[v][a]",
+            "-map",
+            "[v]",
+            "-map",
+            "[a]",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-y",
+            str(source),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    first_video = RenderClip(
+        "v-red",
+        "V1",
+        "video",
+        str(source),
+        0,
+        1_000_000,
+        0,
+        1_000_000,
+    )
+    second_video = RenderClip(
+        "v-blue",
+        "V1",
+        "video",
+        str(source),
+        1_000_000,
+        2_500_000,
+        1_500_000,
+        3_000_000,
+    )
+    audio = (
+        RenderClip(
+            "a-red",
+            "A1",
+            "original_audio",
+            str(source),
+            0,
+            1_000_000,
+            0,
+            1_000_000,
+        ),
+        RenderClip(
+            "a-blue",
+            "A1",
+            "original_audio",
+            str(source),
+            1_000_000,
+            2_500_000,
+            1_500_000,
+            3_000_000,
+        ),
+    )
+    snapshot = ExportSnapshot(
+        1,
+        "multi-segment",
+        1,
+        0,
+        2_500_000,
+        160,
+        90,
+        first_video,
+        audio,
+        (),
+        (),
+        ExportSettings(
+            backend="cpu",
+            fps=24,
+            subtitle_style=SubtitleStyle(enabled=False),
+        ),
+        video_segments=(first_video, second_video),
+    )
+    work_dir = tmp_path / "multi-segment-work"
+    output = tmp_path / "multi-segment.mp4"
+    capabilities = probe_ffmpeg_capabilities(ffmpeg)
+    plan = materialize_export_chunk(
+        snapshot,
+        index=0,
+        start_us=0,
+        end_us=2_500_000,
+        work_dir=work_dir,
+        output_path=output,
+        capabilities=capabilities,
+    )
+    subprocess.run(
+        plan.arguments,
+        cwd=work_dir,
+        check=True,
+        capture_output=True,
+        timeout=60,
+    )
+
+    probe = FfprobeProvider().probe(output)
+    assert probe.has_video is True and probe.has_audio is True
+    assert abs(probe.duration_us - 2_500_000) <= 100_000
+
+    def sampled_pixel(at_seconds: float) -> tuple[int, int, int]:
+        result = subprocess.run(
+            [
+                ffmpeg,
+                "-v",
+                "error",
+                "-ss",
+                str(at_seconds),
+                "-i",
+                str(output),
+                "-frames:v",
+                "1",
+                "-vf",
+                "scale=1:1",
+                "-pix_fmt",
+                "rgb24",
+                "-f",
+                "rawvideo",
+                "pipe:1",
+            ],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+        return tuple(result.stdout[:3])  # type: ignore[return-value]
+
+    red = sampled_pixel(0.5)
+    blue = sampled_pixel(1.75)
+    assert red[0] > 180 and red[1] < 80 and red[2] < 80
+    assert blue[2] > 180 and blue[0] < 80 and blue[1] < 80
+
+    pcm = subprocess.run(
+        [
+            ffmpeg,
+            "-v",
+            "error",
+            "-i",
+            str(output),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "48000",
+            "-f",
+            "s16le",
+            "pipe:1",
+        ],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    ).stdout
+    samples = array("h")
+    samples.frombytes(pcm)
+
+    def estimated_frequency(start_s: float, end_s: float) -> float:
+        window = samples[round(start_s * 48_000) : round(end_s * 48_000)]
+        crossings = sum(
+            (left < 0 <= right) or (left >= 0 > right)
+            for left, right in zip(window, window[1:], strict=False)
+        )
+        return crossings / (2 * (end_s - start_s))
+
+    assert estimated_frequency(0.2, 0.8) == pytest.approx(330, abs=15)
+    assert estimated_frequency(1.2, 2.2) == pytest.approx(990, abs=20)
+
+
+def test_export_resume_eta_ignores_instantly_restored_cache(tmp_path: Path, monkeypatch) -> None:
     clock = [200.0]
     monkeypatch.setenv("DUCAI_ARTIFACT_STAGING_ROOT", str(tmp_path))
     monkeypatch.setattr(export_worker_module.time, "monotonic", lambda: clock[0])
@@ -481,7 +720,8 @@ def test_export_checksum_progress_honors_pause_and_resumes_same_file(
         ("resume-checksum", "resumed", {"status": "running"}),
     ]
     checksum_events = [
-        payload for kind, payload in events
+        payload
+        for kind, payload in events
         if kind == "progress" and payload.get("phase") == "finalize_checksum"
     ]
     assert checksum_events[-1]["phase_current"] == target.stat().st_size

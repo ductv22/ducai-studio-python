@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from itertools import count
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -33,6 +34,57 @@ from ducai_studio.domain.subtitles import (
 from ducai_studio.domain.timebase import TimeRange
 from ducai_studio.providers.ocr import DEFAULT_SUBTITLE_BANDS, OcrMode, OcrRequest
 from ducai_studio.workers.ocr_worker import _sampling_intervals
+
+
+@pytest.mark.parametrize(
+    "full,partial",
+    [
+        ("我在嘉元城见到了墨老的家人", "我在嘉元城见到了墨老的家"),
+        ("今日见你出嫁", "今日见你出嫁"),
+        ("现在的我即使出现在你们面前", "你们面前现在的我即使出现在"),
+        ("多亏了他们那个在七玄门的儿子", "玄门的儿子他们那个"),
+        ("我在嘉元城见到了墨老的家人", "我在喜元城贝到了墨老的家"),
+        ("今日见你出嫁", "日贝你出嫁"),
+        ("我就放心了", "我就放心7"),
+    ],
+)
+def test_review_ocr_collapses_same_visual_occurrence_full_partial_and_reordered(full, partial):
+    from ducai_studio.application.subtitle_finalizer import collapse_partial_ocr_cues
+
+    first = SubtitleCue(
+        "full",
+        1,
+        TimeRange(0, 2_000_000),
+        full,
+        "zh",
+        source="ocr_review",
+        confidence=0.98,
+        visual_box=(0.3, 0.85, 0.4, 0.04),
+        visual_box_source="ocr",
+    )
+    second = replace(
+        first,
+        id="partial",
+        index=2,
+        text=partial,
+        confidence=0.87,
+        range=TimeRange(1_000_000, 2_000_000),
+    )
+    result = collapse_partial_ocr_cues((first, second))
+    assert len(result) == 1 and result[0].text == full
+    assert (
+        len(
+            collapse_partial_ocr_cues(
+                (first, replace(second, range=TimeRange(2_100_000, 3_000_000)))
+            )
+        )
+        == 2
+    )
+    assert len(collapse_partial_ocr_cues((first, replace(second, source="manual")))) == 2
+    assert (
+        len(collapse_partial_ocr_cues((first, replace(second, visual_box=(0.3, 0.5, 0.4, 0.04)))))
+        == 2
+    )
 
 
 def _evidence(
@@ -75,6 +127,42 @@ def _candidate(
         "paddle-fast:upper",
         review,
     )
+
+
+def test_coverage_time_index_preserves_nested_unsorted_half_open_intervals():
+    cues = (_candidate("late", 3_000_000, 4_000_000, "后一句"),
+            _candidate("long", 0, 3_500_000, "很长一句"),
+            _candidate("short", 1_000_000, 2_000_000, "短句"),
+            _candidate("same-start", 1_000_000, 1_500_000, "同时出现"))
+    readings = ((0, "很长一句"), (1_000_000, "短句"), (1_499_999, "同时出现"),
+                (1_500_000, "同时出现"), (2_000_000, "短句"),
+                (3_499_999, "很长一句"), (3_500_000, "很长一句"), (4_000_000, "后一句"))
+    rows = tuple(replace(_evidence(str(i), "frame-0", text, .99), timestamp_us=t)
+                 for i, (t, text) in enumerate(readings))
+    expected = [t for t, text in readings if not any(
+        c.range.start_us <= t < c.range.end_us
+        and ocr_pipeline_module.text_similarity(c.text, text) >= .72 for c in cues
+    )]
+    report = measure_hard_sub_coverage(iter((*rows[::-1], rows[0])), iter(cues))
+    assert [gap.timestamp_us for gap in report.unmatched_samples] == expected
+    assert report.subtitle_positive_timestamps == len(readings)
+
+
+def test_coverage_does_not_check_every_cue_for_every_frame():
+    inspections = 0
+    class Interval:
+        def __init__(self, start):
+            self.start_us = start
+        @property
+        def end_us(self):
+            nonlocal inspections
+            inspections += 1
+            return self.start_us + 500_000
+    cues = [SimpleNamespace(range=Interval(i * 1_000_000), text="字幕测试") for i in range(300)]
+    rows = [replace(_evidence(str(i), "frame-0", "字幕测试", .99),
+                    timestamp_us=i * 1_000_000) for i in range(300)]
+    assert measure_hard_sub_coverage(rows, cues).covered_timestamps == 300
+    assert inspections < 1_000
 
 
 def test_ocr_request_preserves_two_independent_bands_and_strict_interval(
@@ -137,10 +225,7 @@ def test_one_character_dialogue_requires_two_stable_high_confidence_burst_frames
     )
 
     assert consensus_candidate(confirmed, visual_range, candidate_id="short") is not None
-    assert (
-        consensus_candidate(confirmed[:1], visual_range, candidate_id="short-noise")
-        is None
-    )
+    assert consensus_candidate(confirmed[:1], visual_range, candidate_id="short-noise") is None
     unstable = (confirmed[0], replace(confirmed[1], box=NormalizedBox(0.12, 0.82, 0.08, 0.09)))
     assert consensus_candidate(unstable, visual_range, candidate_id="short-shift") is None
 
@@ -202,8 +287,9 @@ def test_cross_pass_consensus_recovers_reading_seen_once_by_fast_and_quality() -
     )
 
 
-def test_scene_text_classifier_keeps_transient_vertical_title_and_rejects_persistent_corner(
-) -> None:
+def test_scene_text_classifier_keeps_transient_vertical_title_and_rejects_persistent_corner() -> (
+    None
+):
     panel = NormalizedBox(0.73, 0.18, 0.18, 0.43)
     title_box = NormalizedBox(0.78, 0.24, 0.08, 0.31)
     title = tuple(
@@ -256,6 +342,7 @@ def test_scene_text_classifier_keeps_transient_vertical_title_and_rejects_persis
     assert cues[0].role == "scene_text"
     assert cues[0].orientation == "vertical"
     assert cues[0].style_hint == "calligraphy_brush"
+    assert cues[0].text_font_size == 40
     assert cues[0].background_style == "ink_splash"
     assert cues[0].text_color == "#FFFFFF"
     assert cues[0].background_color == "#000000"
@@ -735,9 +822,7 @@ def test_quality_rescue_reinforces_matches_and_exposes_conflicts() -> None:
         _candidate("quality-two", 2_000_000, 3_000_000, "立刻离开"),
         _candidate("outside", 5_000_000, 6_000_000, "不应加入"),
     )
-    windows = coalesce_rescue_windows(
-        targeted_rescue_windows(fast, duration_us=4_000_000)
-    )
+    windows = coalesce_rescue_windows(targeted_rescue_windows(fast, duration_us=4_000_000))
 
     rescued = apply_quality_rescue(fast, quality, windows)
 
@@ -1013,11 +1098,7 @@ def test_finalizer_removes_repeated_known_channel_marker_without_broad_keyword_f
     items: list[SubtitleCandidate] = []
     for index in range(8):
         start = index * 10_000_000
-        items.append(
-            _candidate(
-                f"channel-{index}", start, start + 900_000, "小李看漫剧"
-            )
-        )
+        items.append(_candidate(f"channel-{index}", start, start + 900_000, "小李看漫剧"))
         items.append(
             _candidate(
                 f"dialogue-{index}",
@@ -1182,9 +1263,7 @@ def test_finalizer_learns_reordered_alphanumeric_overlay_and_ocr_variants() -> N
             ),
         )
         for index, text in enumerate(clean_texts)
-    ) + (
-        _candidate("legitimate-latin", 25_000_000, 26_000_000, "开启VIP通道"),
-    )
+    ) + (_candidate("legitimate-latin", 25_000_000, 26_000_000, "开启VIP通道"),)
 
     result = finalize_ocr_candidates(items, video_duration_us=30_000_000)
 
@@ -1209,6 +1288,53 @@ def test_finalizer_resolves_small_sampling_overlap_at_shared_midpoint() -> None:
     assert "sampling_overlaps_resolved:1" in result.warnings
 
 
+def test_finalizer_collapses_full_partial_occurrence_before_resolving_sampling_boundaries():
+    full = _candidate("full", 0, 2_000_000, "多亏了他们那个在七玄门的儿子")
+    partial = _candidate("partial", 1_000_000, 2_000_000, "玄门的儿子他们那个")
+    evidence = tuple(SubtitleEvidence(
+        item.evidence_ids[0], f"frame-{index}", index * 1_000_000, "lower", item.text,
+        item.confidence, "paddle-fast", "ocr", NormalizedBox(0.3, 0.85, 0.4, 0.04),
+    ) for index, item in enumerate((full, partial)))
+    result = finalize_ocr_candidates((full, partial), video_duration_us=3_000_000,
+                                     evidence=evidence)
+    assert result.status is FinalizationStatus.PASS
+    assert len(result.cues) == 1 and result.cues[0].text == full.text
+    assert result.cues[0].range == full.range
+    assert "same_visual_occurrences_collapsed:1" in result.warnings
+
+
+def test_multiband_sampling_overlap_keeps_fast_short_line_before_longer_dialogue():
+    upper = _candidate("upper-next", 4_100_000, 4_700_000, "走走走吃饭去")
+    short = _candidate("lower-short", 3_300_000, 4_400_000, "快来吃饭了")
+    following = _candidate("lower-next", 4_100_000, 5_400_000, "走走走吃饭去了")
+    identities = count()
+    merged = merge_band_candidates((upper,), (short, following),
+                                   id_factory=lambda: f"merged-{next(identities)}")
+    assert [item.text for item in merged] == [short.text, following.text]
+    assert not any(item.review_reasons for item in merged)
+    result = finalize_ocr_candidates(merged, video_duration_us=6_000_000)
+    assert len(result.cues) == 2 and result.cues[0].text == short.text
+    assert result.cues[0].range.end_us == result.cues[1].range.start_us
+
+
+def test_multiband_time_contained_two_character_misread_remains_a_reviewable_conflict():
+    full = _candidate("full", 3_400_000, 4_700_000, "只是")
+    misread = replace(_candidate("misread", 3_800_000, 4_400_000, "口是"), confidence=0.90)
+    merged = merge_band_candidates((misread,), (full,), id_factory=lambda: "merged")
+    assert len(merged) == 1 and merged[0].text == full.text
+    assert "band_conflict" in merged[0].review_reasons
+
+
+def test_visual_dedup_does_not_merge_different_complete_sentences():
+    from ducai_studio.application.subtitle_finalizer import collapse_partial_ocr_cues
+
+    first = SubtitleCue("a", 1, TimeRange(0, 2_000_000), "今日见你出嫁", "zh",
+                        source="ocr_review", visual_box=(0.3, 0.85, 0.4, 0.04),
+                        visual_box_source="ocr")
+    other = replace(first, id="b", index=2, text="明日见你出嫁")
+    assert len(collapse_partial_ocr_cues((first, other))) == 2
+
+
 def test_finalizer_refuses_conflicts_overlap_and_ambiguous_output_name(tmp_path: Path) -> None:
     result = finalize_ocr_candidates(
         (
@@ -1229,3 +1355,46 @@ def test_finalizer_refuses_conflicts_overlap_and_ambiguous_output_name(tmp_path:
     assert any(item.startswith("cue_overlap") for item in result.blockers)
     with pytest.raises(ValueError, match="PASS"):
         publish_final_srt(tmp_path / "partial.srt", result)
+
+
+def test_review_ocr_collapses_partial_overlap_but_keeps_manual_and_other_region():
+    from dataclasses import replace
+
+    from ducai_studio.application.subtitle_finalizer import collapse_partial_ocr_cues
+    from ducai_studio.domain.project import SubtitleCue
+    from ducai_studio.domain.timebase import TimeRange
+
+    full = SubtitleCue(
+        "full",
+        1,
+        TimeRange(789800000, 791700000),
+        "年纪轻轻就有如此修为",
+        "zh",
+        source="ocr_review",
+        visual_box=(0.37877, 0.90054, 0.23933, 0.05578),
+        visual_box_source="ocr",
+    )
+    partial = SubtitleCue(
+        "partial",
+        2,
+        TimeRange(791000000, 791700000),
+        "年纪轻轻就此修",
+        "zh",
+        source="ocr_review",
+        visual_box=(0.38071, 0.90054, 0.23076, 0.03446),
+        visual_box_source="ocr",
+    )
+    result = collapse_partial_ocr_cues((full, partial))
+    assert len(result) == 1 and result[0].id == "full"
+    assert result[0].text == full.text and result[0].range == full.range
+    assert len(collapse_partial_ocr_cues((full, replace(partial, source="manual")))) == 2
+    another_region = replace(partial, visual_box=(0.1, 0.1, 0.2, 0.03))
+    assert len(collapse_partial_ocr_cues((full, another_region))) == 2
+    assert (
+        len(
+            collapse_partial_ocr_cues(
+                (full, replace(partial, range=TimeRange(792000000, 793000000)))
+            )
+        )
+        == 2
+    )

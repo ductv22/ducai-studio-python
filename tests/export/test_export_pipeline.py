@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 import subprocess
+import wave
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -42,7 +43,8 @@ from ducai_studio.domain.project import (
     TimelineTrack,
     TrackKind,
 )
-from ducai_studio.domain.timebase import TimeRange
+from ducai_studio.domain.timebase import SpeedRatio, TimeRange
+from ducai_studio.domain.timeline_edit import cut_state
 from ducai_studio.providers.export.ffmpeg import (
     FfmpegCapabilities,
     _ass_color,
@@ -70,9 +72,7 @@ def test_scene_text_font_catalog_includes_vietnamese_brush_alternatives() -> Non
 
 
 def test_timed_effect_enable_uses_half_open_project_ranges() -> None:
-    assert _range_enable(0, 100_000, 0, 1_000_000) == (
-        "gte(t,0.000000)*lt(t,0.100000)"
-    )
+    assert _range_enable(0, 100_000, 0, 1_000_000) == ("gte(t,0.000000)*lt(t,0.100000)")
 
 
 def test_schema_two_export_snapshot_decodes_without_dynamic_blur_field() -> None:
@@ -101,11 +101,13 @@ def test_schema_two_export_snapshot_decodes_without_dynamic_blur_field() -> None
     )
     raw = json.loads(json.dumps(asdict(snapshot)))
     raw.pop("subtitle_blurs")
+    raw.pop("video_segments")
 
     decoded = decode_export_snapshot(raw)
 
     assert decoded.schema_version == 2
     assert decoded.subtitle_blurs == ()
+    assert decoded.video_segments == ()
 
 
 def _project(tmp_path: Path) -> ProjectSnapshot:
@@ -137,9 +139,7 @@ def _project(tmp_path: Path) -> ProjectSnapshot:
                 (TimelineClip("d", "D1", timeline, timeline, "voice", volume=0.9),),
             ),
         ),
-        source_cues=(
-            SubtitleCue("cue", 1, TimeRange(1_000_000, 2_000_000), "你好。", "zh"),
-        ),
+        source_cues=(SubtitleCue("cue", 1, TimeRange(1_000_000, 2_000_000), "你好。", "zh"),),
         translated_cues=(
             SubtitleCue("cue", 1, TimeRange(1_000_000, 2_000_000), "Xin chào.", "vi"),
         ),
@@ -171,6 +171,29 @@ def test_default_overlays_cover_full_video_and_logo_asset_can_be_replaced(
     )
     blur = next(item for item in updated.overlays if item.id == DEFAULT_BLUR_ID)
     assert (blur.x, blur.width, blur.blur_radius, blur.enabled) == (0.1, 0.8, 30, False)
+
+
+def test_blur_background_without_project_overlay_matches_preview_fallback_radius(tmp_path):
+    snapshot = build_export_snapshot(_project(tmp_path), media_probe=Probe(),
+        settings=ExportSettings(subtitle_style=SubtitleStyle(background_mode="blur")))
+    assert len(snapshot.subtitle_blurs) == 1
+    assert snapshot.subtitle_blurs[0].blur_radius == 22
+
+
+def test_voice_track_crossing_a_video_layer_keeps_its_full_range(tmp_path):
+    project = _project(tmp_path)
+    second = replace(project.tracks[0].clips[0], id="layer", track_id="V2",
+                     timeline_range=TimeRange(3_000_000, 4_000_000),
+                     source_range=TimeRange(0, 1_000_000))
+    project = replace(project, tracks=(*project.tracks,
+        TimelineTrack("V2", TrackKind.VIDEO, "Layer", (second,))))
+    snapshot = build_export_snapshot(project, settings=ExportSettings(), media_probe=Probe())
+    voice = [item for item in snapshot.audio if item.track_kind == "voice"]
+    assert len(voice) == 1
+    assert (voice[0].timeline_start_us, voice[0].timeline_end_us) == (0, 10_000_000)
+    decoded = decode_export_snapshot(json.loads(json.dumps(asdict(snapshot))))
+    assert decoded == snapshot and [item.track_id for item in decoded.video_segments] == [
+        "V1", "V2", "V1"]
 
 
 def test_effects_editor_supports_multiple_blur_regions_and_deletes_added_region(
@@ -292,7 +315,7 @@ def test_export_snapshot_splits_scene_text_from_dialogue_and_fits_vertical_panel
         panel_height_px=round(0.40 * 1080),
         glyph_width_px=round(0.07 * 1920),
         glyph_height_px=round(0.28 * 1080),
-        font_scale=0.75,
+        font_scale=2.0,  # Final cue formatting, not the source cue's old scale.
         style_hint="calligraphy",
     )
     assert (scene.panel_x, scene.panel_y, scene.panel_width, scene.panel_height) == (
@@ -501,10 +524,10 @@ def test_scene_text_export_preserves_font_and_background_padding(tmp_path: Path)
         style_hint="calligraphy_soft",
         panel_box=(0.18, 0.18, 0.26, 0.18),
         background_color="#121212",
-        background_padding_x=24,
-        background_padding_y=12,
+        background_padding_x=240,
+        background_padding_y=120,
         background_style="ink_splash",
-        letter_spacing_percent=18,
+        letter_spacing_percent=180,
         font_bold=True,
         font_italic=True,
         text_opacity_percent=84,
@@ -524,15 +547,183 @@ def test_scene_text_export_preserves_font_and_background_padding(tmp_path: Path)
 
     assert scene.font_family == "Dancing Script"
     assert scene.background_style == "ink_splash"
-    assert scene.background_padding_x == 24
-    assert scene.background_padding_y == 12
-    assert scene.letter_spacing_percent == 18
+    assert scene.background_padding_x == 240
+    assert scene.background_padding_y == 120
+    assert scene.letter_spacing_percent == 180
     assert scene.font_bold is True
     assert scene.font_italic is True
     assert scene.text_opacity_percent == 84
     assert scene.background_opacity_percent == 93
     assert scene.fade_enabled is True
     assert scene.fade_duration_ms == 450
+    assert scene.source_blur_enabled is False
+
+
+def test_scene_size_above_100_continues_scaling_in_shared_render_layout():
+    params = dict(text="Tên", orientation="horizontal", panel_width_px=500,
+                  panel_height_px=300, glyph_width_px=300, glyph_height_px=100)
+    small = _scene_text_font_size(**params, font_scale=100 / 12)
+    large = _scene_text_font_size(**params, font_scale=300 / 12)
+    assert large > small
+
+
+def test_manual_scene_text_keeps_label_but_skips_source_glyph_blur(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    source_scene = SubtitleCue(
+        "manual-scene",
+        2,
+        TimeRange(3_000_000, 5_000_000),
+        "Tên cảnh",
+        "vi",
+        source="manual_scene_text",
+        visual_box=(0.20, 0.20, 0.24, 0.12),
+        visual_box_source="estimated",
+        role="scene_text",
+        style_hint="calligraphy_brush",
+        panel_box=(0.18, 0.18, 0.30, 0.18),
+        background_color="#000000",
+        text_color="#FFFFFF",
+        background_style="ink_splash",
+        background_opacity_percent=100,
+        fade_enabled=True,
+    )
+    translated_scene = replace(source_scene, text="Tên cảnh", language="vi")
+    snapshot = build_export_snapshot(
+        replace(
+            project,
+            source_cues=(*project.source_cues, source_scene),
+            translated_cues=(*project.translated_cues, translated_scene),
+        ),
+        settings=ExportSettings(),
+        media_probe=Probe(),
+    )
+
+    scene = snapshot.scene_texts[0]
+    assert scene.source_blur_enabled is False
+    plan = materialize_export_chunk(
+        snapshot,
+        index=0,
+        start_us=0,
+        end_us=10_000_000,
+        work_dir=tmp_path / "manual-scene-work",
+        output_path=tmp_path / "manual-scene.mp4",
+        capabilities=FfmpegCapabilities("ffmpeg", "ffmpeg test", False, True, True),
+    )
+    graph = plan.filter_script_path.read_text(encoding="utf-8")
+    ass = plan.ass_path.read_text(encoding="utf-8-sig") if plan.ass_path else ""
+
+    assert "vscene0mask" not in graph
+    assert r"\p1" in ass  # Shared measured glyph outlines, not a second font layout.
+
+
+def test_scene_export_uses_final_translation_style_not_source_style(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    source = SubtitleCue(
+        "scene",
+        2,
+        TimeRange(3_000_000, 5_000_000),
+        "名字",
+        "zh",
+        role="scene_text",
+        visual_box=(0.8, 0.2, 0.1, 0.2),
+        visual_box_source="ocr",
+        panel_box=(0.7, 0.15, 0.2, 0.3),
+        text_color="#FFFF00",
+        background_style="solid",
+        background_color="#123456",
+    )
+    final = replace(
+        source,
+        text="Tô Tiểu Ly",
+        language="vi",
+        text_color="#FFFFFF",
+        style_hint="calligraphy_brush",
+        background_style="ink_splash",
+        panel_box=(0.75, 0.18, 0.15, 0.25),
+        text_font_size=18,
+        background_color="#000000",
+        background_opacity_percent=100,
+    )
+    snapshot = build_export_snapshot(
+        replace(
+            project,
+            source_cues=(*project.source_cues, source),
+            translated_cues=(*project.translated_cues, final),
+        ),
+        settings=ExportSettings(),
+        media_probe=Probe(),
+    )
+    scene = snapshot.scene_texts[0]
+    assert scene.text_color == "#FFFFFF" and scene.background_style == "ink_splash"
+    assert scene.font_family == "Comforter Brush"
+    assert (scene.panel_x, scene.panel_y, scene.panel_width, scene.panel_height) == final.panel_box
+    assert scene.background_color == "#000000" and scene.background_opacity_percent == 100
+
+
+def test_translated_concealment_uses_final_timing_and_legacy_defaults(tmp_path: Path) -> None:
+    project = ensure_default_overlays(_project(tmp_path))
+    final = replace(project.translated_cues[0], range=TimeRange(2_500_000, 3_500_000))
+    snapshot = build_export_snapshot(
+        replace(project, translated_cues=(final,)), settings=ExportSettings(), media_probe=Probe()
+    )
+    blur = snapshot.subtitle_blurs[0]
+    assert (blur.start_us, blur.end_us) == (final.range.start_us, final.range.end_us)
+    assert blur.tracking_mode == "translated_text"
+    raw = json.loads(json.dumps(asdict(snapshot)))
+    for key in ("tracking_mode", "padding_x", "padding_y"):
+        raw["subtitle_blurs"][0].pop(key)
+    decoded = decode_export_snapshot(raw).subtitle_blurs[0]
+    assert decoded.tracking_mode == "source_subtitle" and decoded.padding_x == 0.012
+
+
+def test_legacy_scene_text_export_defaults_to_source_glyph_blur() -> None:
+    scene = RenderSceneText(
+        "legacy-scene",
+        1,
+        0,
+        1_000_000,
+        "Tên cảnh",
+        0.2,
+        0.2,
+        0.2,
+        0.1,
+        0.18,
+        0.18,
+        0.26,
+        0.16,
+    )
+    snapshot = ExportSnapshot(
+        4,
+        "legacy-project",
+        1,
+        0,
+        1_000_000,
+        1920,
+        1080,
+        RenderClip(
+            "video",
+            "V1",
+            "video",
+            "movie.mp4",
+            0,
+            1_000_000,
+            0,
+            1_000_000,
+        ),
+        (),
+        (),
+        (),
+        ExportSettings(),
+        (),
+        (),
+        (scene,),
+    )
+    raw = json.loads(json.dumps(asdict(snapshot)))
+    raw["scene_texts"][0].pop("source_blur_enabled")
+
+    decoded = decode_export_snapshot(raw)
+
+    assert decoded.scene_texts[0].source_blur_enabled is True
 
 
 def test_s1_dialogue_export_preserves_per_cue_typography_and_position(
@@ -860,10 +1051,14 @@ def test_chunk_plan_opens_cue_scoped_master_wav_once_on_windows(tmp_path: Path) 
     source = (tmp_path / "movie.mp4").resolve()
     voice = (tmp_path / "voice.wav").resolve()
     source.write_bytes(b"source")
-    voice.write_bytes(b"voice")
     cue_duration_us = 600_000
     cue_count = 1_000
     duration_us = cue_duration_us * cue_count
+    with wave.open(str(voice), "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(1)
+        writer.setframerate(8_000)
+        writer.writeframes(b"\x81" * round(duration_us * 8_000 / 1_000_000))
     voice_clips = tuple(
         RenderClip(
             f"voice-{index}",
@@ -912,11 +1107,136 @@ def test_chunk_plan_opens_cue_scoped_master_wav_once_on_windows(tmp_path: Path) 
     )
     graph = plan.filter_script_path.read_text(encoding="utf-8")
 
-    assert plan.arguments.count(str(voice)) == 1
+    assert plan.arguments.count(str(voice)) == 0
+    assert len(plan.temporary_paths) == 1
+    assert plan.arguments.count(str(plan.temporary_paths[0])) == 1
     assert len(subprocess.list2cmdline(plan.arguments)) < 32_767
-    assert graph.count("atrim=start=") >= cue_count
+    assert graph.count("atrim=start=") == 1
+    assert "amix=inputs=1:duration=longest:normalize=0" in graph
     assert graph.count("apad=whole_dur=") == 1
     assert ",apad," not in graph
+    with wave.open(str(plan.temporary_paths[0]), "rb") as reader:
+        assert reader.getnframes() == round(duration_us * 8_000 / 1_000_000)
+        assert reader.readframes(1) == b"\x81"
+
+
+def test_precomposed_pcm_voice_chunk_preserves_samples_and_timeline_gaps(
+    tmp_path: Path,
+) -> None:
+    source = (tmp_path / "movie.mp4").resolve()
+    voice = (tmp_path / "voice.wav").resolve()
+    source.write_bytes(b"source")
+    source_samples = bytes((index % 100) + 1 for index in range(400))
+    with wave.open(str(voice), "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(1)
+        writer.setframerate(1_000)
+        writer.writeframes(source_samples)
+    clips = tuple(
+        RenderClip(
+            f"voice-{index}",
+            "D1",
+            "voice",
+            str(voice),
+            index * 100_000,
+            index * 100_000 + 50_000,
+            index * 50_000,
+            index * 50_000 + 50_000,
+        )
+        for index in range(8)
+    )
+    snapshot = ExportSnapshot(
+        1,
+        "project",
+        1,
+        0,
+        800_000,
+        852,
+        480,
+        RenderClip("video", "V1", "video", str(source), 0, 800_000, 0, 800_000),
+        clips,
+        (),
+        (),
+        ExportSettings(subtitle_style=SubtitleStyle(enabled=False)),
+    )
+
+    plan = materialize_export_chunk(
+        snapshot,
+        index=0,
+        start_us=0,
+        end_us=800_000,
+        work_dir=tmp_path / "precomposed-voice-work",
+        output_path=tmp_path / "precomposed-voice.mp4",
+        capabilities=FfmpegCapabilities("ffmpeg", "ffmpeg test", False, True, True),
+    )
+
+    assert len(plan.temporary_paths) == 1
+    with wave.open(str(plan.temporary_paths[0]), "rb") as reader:
+        rendered = reader.readframes(reader.getnframes())
+    for index in range(8):
+        destination = index * 100
+        source_start = index * 50
+        assert (
+            rendered[destination : destination + 50]
+            == source_samples[source_start : source_start + 50]
+        )
+        assert rendered[destination + 50 : destination + 100] == b"\x80" * 50
+
+
+def test_overlapping_voice_cues_keep_the_compatible_ffmpeg_mix_path(
+    tmp_path: Path,
+) -> None:
+    source = (tmp_path / "movie.mp4").resolve()
+    voice = (tmp_path / "voice.wav").resolve()
+    source.write_bytes(b"source")
+    with wave.open(str(voice), "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(8_000)
+        writer.writeframes(b"\0\0" * 8_000)
+    clips = tuple(
+        RenderClip(
+            f"voice-{index}",
+            "D1",
+            "voice",
+            str(voice),
+            0,
+            500_000,
+            index * 50_000,
+            index * 50_000 + 500_000,
+        )
+        for index in range(8)
+    )
+    snapshot = ExportSnapshot(
+        1,
+        "project",
+        1,
+        0,
+        500_000,
+        852,
+        480,
+        RenderClip("video", "V1", "video", str(source), 0, 500_000, 0, 500_000),
+        clips,
+        (),
+        (),
+        ExportSettings(subtitle_style=SubtitleStyle(enabled=False)),
+    )
+
+    plan = materialize_export_chunk(
+        snapshot,
+        index=0,
+        start_us=0,
+        end_us=500_000,
+        work_dir=tmp_path / "overlap-fallback-work",
+        output_path=tmp_path / "overlap-fallback.mp4",
+        capabilities=FfmpegCapabilities("ffmpeg", "ffmpeg test", False, True, True),
+    )
+    graph = plan.filter_script_path.read_text(encoding="utf-8")
+
+    assert plan.temporary_paths == ()
+    assert plan.arguments.count(str(voice)) == 1
+    assert graph.count("atrim=start=") == 8
+    assert "amix=inputs=8:duration=longest:normalize=0" in graph
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is unavailable")
@@ -1093,17 +1413,19 @@ def test_grayscale_filter_blends_with_user_saturation() -> None:
     assert filters == ["eq=brightness=0.0000:contrast=1.0000:saturation=0.6000"]
 
 
-def test_export_snapshot_rejects_multi_video_without_silently_flattening(
+def test_export_snapshot_keeps_chronological_video_segments_with_offsets_and_speed(
     tmp_path: Path,
 ) -> None:
     project = _project(tmp_path)
     track = project.tracks[0]
+    source_bytes = (tmp_path / "movie.mp4").read_bytes()
     second = TimelineClip(
         "v2",
         "V1",
-        TimeRange(10_000_000, 20_000_000),
-        TimeRange(0, 10_000_000),
+        TimeRange(10_000_000, 14_000_000),
+        TimeRange(2_000_000, 10_000_000),
         "video",
+        speed=SpeedRatio(2, 1),
     )
     project = ProjectSnapshot(
         project.id,
@@ -1113,7 +1435,90 @@ def test_export_snapshot_rejects_multi_video_without_silently_flattening(
         tracks=(TimelineTrack("V1", TrackKind.VIDEO, "Video", (*track.clips, second)),),
     )
 
-    with pytest.raises(ValueError, match="exactly one"):
+    snapshot = build_export_snapshot(
+        project,
+        settings=ExportSettings(subtitle_style=SubtitleStyle(enabled=False)),
+        media_probe=Probe(),
+    )
+
+    assert snapshot.timeline_end_us == 14_000_000
+    assert [item.clip_id for item in snapshot.video_segments] == ["v", "v2"]
+    assert snapshot.video_segments[1].source_start_us == 2_000_000
+    assert snapshot.video_segments[1].speed_numerator == 2
+    assert (tmp_path / "movie.mp4").read_bytes() == source_bytes
+
+    plan = materialize_export_chunk(
+        snapshot,
+        index=0,
+        start_us=8_000_000,
+        end_us=12_000_000,
+        work_dir=tmp_path / "split-work",
+        output_path=tmp_path / "split.mp4",
+        capabilities=FfmpegCapabilities("ffmpeg", "ffmpeg test", False, True, True),
+    )
+    graph = plan.filter_script_path.read_text(encoding="utf-8")
+    assert plan.arguments.count(str((tmp_path / "movie.mp4").resolve())) == 2
+    assert "setpts=0.500000000000*PTS" in graph
+    assert "concat=n=2:v=1:a=0[vsegments]" in graph
+
+
+def test_export_snapshot_materializes_middle_cut_before_collecting_tracks(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    project = replace(
+        project,
+        timeline_edit=cut_state(project, "remove_range", 2_000_000, 5_000_000),
+    )
+
+    snapshot = build_export_snapshot(
+        project,
+        settings=ExportSettings(subtitle_style=SubtitleStyle(enabled=False)),
+        media_probe=Probe(),
+    )
+
+    assert snapshot.timeline_end_us == 7_000_000
+    assert [
+        (
+            item.timeline_start_us,
+            item.timeline_end_us,
+            item.source_start_us,
+            item.source_end_us,
+        )
+        for item in snapshot.video_segments
+    ] == [
+        (0, 2_000_000, 0, 2_000_000),
+        (2_000_000, 7_000_000, 5_000_000, 10_000_000),
+    ]
+    assert [
+        (
+            item.timeline_start_us,
+            item.timeline_end_us,
+            item.source_start_us,
+            item.source_end_us,
+        )
+        for item in snapshot.audio
+    ] == [
+        (0, 2_000_000, 0, 2_000_000),
+        (2_000_000, 7_000_000, 5_000_000, 10_000_000),
+    ]
+
+
+def test_export_snapshot_rejects_video_timeline_gap(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    track = project.tracks[0]
+    second = TimelineClip(
+        "v2",
+        "V1",
+        TimeRange(11_000_000, 21_000_000),
+        TimeRange(0, 10_000_000),
+        "video",
+    )
+    project = replace(
+        project,
+        tracks=(TimelineTrack("V1", TrackKind.VIDEO, "Video", (*track.clips, second)),),
+        translated_cues=(),
+    )
+
+    with pytest.raises(ValueError, match="gap"):
         build_export_snapshot(
             project,
             settings=ExportSettings(subtitle_style=SubtitleStyle(enabled=False)),
@@ -1341,9 +1746,15 @@ def test_dynamic_subtitle_blur_groups_one_full_frame_source_per_radius(
     assert graph.count("boxblur=luma_radius=") == 2
     assert graph.count("luma_power=1") == 2
     assert "luma_power=2" not in graph
-    assert graph.count("drawbox=") == 100
+    assert graph.count("drawbox=") == 0
     assert graph.count("maskedmerge") == 2
     assert graph.index("maskedmerge") < graph.index("null[vout]")
+    mask_files = sorted((tmp_path / "dynamic-blur-work").glob("subtitle-mask-*.ass"))
+    assert len(mask_files) == 2
+    assert (
+        sum(path.read_text(encoding="utf-8-sig").count("Dialogue: 0,") for path in mask_files)
+        == 100
+    )
 
 
 def test_dynamic_subtitle_cover_uses_strong_blur_and_dark_veil(
@@ -1406,7 +1817,10 @@ def test_dynamic_subtitle_cover_uses_strong_blur_and_dark_veil(
 
     assert "luma_power=2" in graph
     assert "chroma_power=2" in graph
-    assert "color=black@0.900000" in graph
+    cover_path = next((tmp_path / "covered-blur-work").glob("subtitle-cover-*.ass"))
+    cover_ass = cover_path.read_text(encoding="utf-8-sig")
+    assert "\\c&H000000&" in cover_ass
+    assert "\\1a&H1A&" in cover_ass
     assert graph.count("boxblur=luma_radius=") == 1
 
 
@@ -1444,9 +1858,7 @@ def test_scene_text_conceals_glyph_only_and_writes_positioned_calligraphy_ass(
         duration_us,
         852,
         480,
-        RenderClip(
-            "video", "V1", "video", str(source), 0, duration_us, 0, duration_us
-        ),
+        RenderClip("video", "V1", "video", str(source), 0, duration_us, 0, duration_us),
         (),
         (),
         (),
@@ -1467,9 +1879,9 @@ def test_scene_text_conceals_glyph_only_and_writes_positioned_calligraphy_ass(
     )
     graph = plan.filter_script_path.read_text(encoding="utf-8")
     ass = plan.ass_path.read_text(encoding="utf-8-sig") if plan.ass_path else ""
-
     assert "vscene0mask" in graph
-    assert "color=0x121212@0.900000" in graph
-    assert "\\fnPlaywrite VN" in ass
+    assert not list((tmp_path / "scene-work").glob("scene-fill-*.ass"))
+    assert "\\c&H121212&" in ass
+    assert "\\alpha&H1A&" in ass
+    assert r"\p1" in ass
     assert "\\pos(" in ass
-    assert "Hải\\NVương\\NThú" in ass

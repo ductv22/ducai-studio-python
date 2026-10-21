@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
+from threading import Event, Thread
 
 import pytest
 
@@ -28,6 +29,8 @@ from ducai_studio.providers.translation.contracts import (
     TranslationPurpose,
     TranslationRequest,
 )
+from ducai_studio.providers.translation.gemini_api import HttpResponse
+from ducai_studio.providers.translation.openai_compatible import OpenAICompatibleProvider
 from ducai_studio.workers.protocol import PROTOCOL_VERSION, WorkerMessage
 from ducai_studio.workers.translation_worker import (
     TranslationWorker,
@@ -1467,6 +1470,78 @@ def test_cancel_checkpoints_cached_translations_before_stopping(tmp_path, monkey
         "stopped",
         {"status": "cancel", "command_id": "cancel-command"},
     )
+
+
+@pytest.mark.parametrize("action", ["pause", "cancel"])
+def test_api_control_is_handled_while_http_response_is_pending(tmp_path, monkeypatch, action):
+    entered, release, paused = Event(), Event(), Event()
+    observations = []
+
+    class BlockingTransport:
+        def post(self, *_args, **_kwargs):
+            entered.set()
+            assert release.wait(3), "Test transport was not released"
+            return HttpResponse(200, json.dumps({"choices": [{"message": {
+                "content": '{"translations":[]}'}, "finish_reason": "stop"}]}).encode(), {})
+
+    provider = OpenAICompatibleProvider(
+        provider_id="openai-compatible", model_id="test-model", base_url="http://localhost/v1",
+        credential_references=["test-key"], credential_resolver=lambda _: "test-secret",
+        transport=BlockingTransport(),
+    )
+    worker, events, _ = _configure_worker(tmp_path, monkeypatch, provider, count=2)
+    worker.ledger = replace(worker.ledger, translations={1: "Bản dịch đã lưu."})
+
+    def capture(kind, payload):
+        events.append((kind, payload))
+        if kind == "paused":
+            paused.set()
+        return WorkerMessage(PROTOCOL_VERSION, worker.job_id, f"event-{len(events)}",
+                             kind, payload)
+
+    worker.send = capture
+
+    def command(name):
+        worker.commands.put(WorkerMessage(PROTOCOL_VERSION, worker.job_id, name,
+                                         "control", {"action": name, "command_id": name}))
+
+    def control():
+        assert entered.wait(1)
+        command(action)
+        if action == "pause":
+            observations.append(paused.wait(1))
+            observations.append(not release.is_set())
+            release.set()
+            # A finished HTTP response must not be published during pause.
+            observations.append(not any(k == "provider_request" for k, _ in events))
+            command("resume")
+        else:
+            # Keep HTTP blocked until the worker has processed cancel.
+            if not paused.wait(1):
+                release.set()
+
+    controller = Thread(target=control)
+    controller.start()
+    try:
+        request = TranslationRequest("pending", TranslationPurpose.TRANSLATE, "Return JSON")
+        if action == "cancel":
+            with pytest.raises(translation_worker_module.WorkerStopped):
+                worker._generate(request)
+            assert not release.is_set()
+            assert not any(k == "provider_request" for k, _ in events)
+        else:
+            worker._generate(request)
+            assert observations == [True, True, True]
+            assert [k for k, _ in events].count("provider_request") == 1
+            assert any(k == "resumed" for k, _ in events)
+        checkpoint = next(p for k, p in events if k == "checkpoint")
+        assert json.loads(Path(checkpoint["artifact_path"]).read_text("utf-8"))[
+            "translations"] == {"1": "Bản dịch đã lưu."}
+    finally:
+        paused.set()
+        release.set()
+        controller.join(3)
+    assert not controller.is_alive()
 
 
 def test_complete_ordered_partial_response_is_salvaged_without_retranslation(

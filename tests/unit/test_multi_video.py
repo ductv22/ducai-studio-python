@@ -23,6 +23,7 @@ from ducai_studio.domain.project import (
     TranslationPreferences,
 )
 from ducai_studio.infrastructure.database import Database
+from ducai_studio.infrastructure.licensing_state import LicensingState
 from ducai_studio.infrastructure.multi_video_repository import MultiVideoRepository
 from ducai_studio.job_manager.multi_video_coordinator import MultiVideoCoordinator
 from ducai_studio.job_manager.service import JobManagerService
@@ -101,6 +102,7 @@ class MemoryMultiRepository:
 class FakeServer(QObject):
     def __init__(self, items: list[dict[str, object]], jobs: dict[str, object]) -> None:
         super().__init__()
+        self.licensing = LicensingState()
         repository = MemoryMultiRepository(items)
         self.service = SimpleNamespace(
             multi_videos=repository,

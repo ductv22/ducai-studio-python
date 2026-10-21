@@ -33,6 +33,67 @@ def _snapshot() -> ProjectSnapshot:
     )
 
 
+def test_normalization_reuses_unchanged_immutable_cues_and_reindexes_when_needed() -> None:
+    cues = _snapshot().source_cues
+    normalized = SubtitleEditor._normalize_cues(reversed(cues))
+    assert normalized == cues
+    assert all(current is previous for current, previous in zip(normalized, cues, strict=True))
+    sparse = (replace(cues[1], index=17), cues[0])
+    restored = SubtitleEditor._normalize_cues(sparse)
+    assert restored == cues
+    assert restored[0] is cues[0] and restored[1] is not sparse[0]
+
+
+def test_single_text_edit_preserves_other_cue_objects_and_undo_snapshot() -> None:
+    original = _snapshot()
+    editor = SubtitleEditor(original)
+    updated = editor.update_text("cue-1", "新文字")
+    assert updated.source_cues[0].revision == original.source_cues[0].revision + 1
+    assert updated.source_cues[1] is original.source_cues[1]
+    assert editor.undo() is not updated
+    assert editor.snapshot.source_cues[0] is original.source_cues[0]
+    assert editor.redo().source_cues[1] is original.source_cues[1]
+
+
+def test_delete_removes_cue_despite_unrelated_existing_overlap() -> None:
+    cues = tuple(SubtitleCue(f'c{i}', i, TimeRange(a, b), '字幕', 'zh')
+                 for i, (a, b) in enumerate(((0, 100), (200, 500), (400, 600)), 1))
+    editor = SubtitleEditor(ProjectSnapshot('p', 'Overlap', 1, source_cues=cues))
+    updated = editor.delete('c1')
+    assert [c.id for c in updated.source_cues] == ['c2', 'c3']
+    assert [c.range for c in updated.source_cues] == [c.range for c in cues[1:]]
+    assert editor.undo().source_cues == cues
+
+
+def test_delete_preserves_sparse_translation_pairing() -> None:
+    source = tuple(SubtitleCue(f'c{i}', i, TimeRange(i*100, i*100+90), '字幕', 'zh')
+                   for i in range(1, 4))
+    translated = (replace(source[2], id='vi3', text='Câu thứ ba', language='vi'),)
+    editor = SubtitleEditor(ProjectSnapshot('p', 'Sparse', 1, source_cues=source,
+                                            translated_cues=translated))
+    updated = editor.delete('c1')
+    assert updated.translated_cues[0].index == 2
+    assert updated.source_cues[1].index == updated.translated_cues[0].index
+
+
+@pytest.mark.parametrize('selected,remaining', [('c1', ['c2', 'c3']),
+                                               ('c3', ['c1', 'c2'])])
+def test_delete_shared_cue_id_wins_over_legacy_sparse_index(selected, remaining):
+    source = tuple(SubtitleCue(f'c{i}', i, TimeRange(i*100, i*100+90), '字幕', 'zh')
+                   for i in range(1, 4))
+    translated = (replace(source[2], index=1, text='Câu thứ ba', language='vi'),)
+    editor = SubtitleEditor(ProjectSnapshot('p', 'Sparse', 1, source_cues=source,
+                                            translated_cues=translated))
+    updated = editor.delete(selected)
+    assert [c.id for c in updated.source_cues] == remaining
+    if selected == 'c1':
+        assert updated.translated_cues[0].id == 'c3'
+        assert updated.translated_cues[0].index == 2
+    else:
+        assert not updated.translated_cues
+
+
+
 def _paired_snapshot() -> ProjectSnapshot:
     return ProjectSnapshot(
         "project",
@@ -47,6 +108,24 @@ def _paired_snapshot() -> ProjectSnapshot:
             SubtitleCue("vi-2", 2, TimeRange(2_000_000, 4_000_000), "Xe này là xe mới", "vi"),
         ),
     )
+
+
+@pytest.mark.parametrize("lane_delta,expected_lane", [(0, "S1"), (1, "S2"), (-1, "S1")])
+def test_legacy_dialogue_move_uses_s1_when_cue_has_no_explicit_lane(
+    lane_delta: int, expected_lane: str,
+) -> None:
+    cue = SubtitleCue("legacy", 1, TimeRange(1_000_000, 2_000_000), "旧字幕", "zh")
+    snapshot = ProjectSnapshot("p", "Legacy", 1, source_cues=(cue,), tracks=(
+        TimelineTrack("V1", TrackKind.VIDEO, "Video", (
+            TimelineClip("v", "V1", TimeRange(0, 10_000_000)),)),
+        TimelineTrack("S1", TrackKind.SUBTITLE, "Sub", (
+            TimelineClip("sub", "S1", cue.range, cue_id=cue.id),)),
+    ))
+    moved = SubtitleEditor(snapshot).move_scene_texts(
+        (cue.id,), delta_us=100_000, lane_delta=lane_delta)
+    assert moved.source_cues[0].subtitle_track_id == expected_lane
+    assert moved.tracks[-1].id == expected_lane
+    assert moved.source_cues[0].range == TimeRange(1_100_000, 2_100_000)
 
 
 def test_subtitle_split_merge_keeps_stable_first_id_and_integer_timeline() -> None:
@@ -241,10 +320,14 @@ def test_shared_text_format_updates_source_and_translation_for_any_subtitle_trac
     assert updated.source_cues[0].orientation == "vertical"
     assert updated.translated_cues[0].background_color == "#223344"
     assert editor.undo().source_cues[0].text_font_size == 12
-    with pytest.raises(SubtitleEditError, match="1 đến 100"):
+    larger = editor.set_text_format(
+        source.id, font_size=240, orientation="horizontal", background_color="#223344"
+    )
+    assert larger.source_cues[0].text_font_size == 240
+    with pytest.raises(SubtitleEditError, match="số nguyên dương"):
         editor.set_text_format(
             source.id,
-            font_size=101,
+            font_size=0,
             orientation="horizontal",
             background_color="",
         )
@@ -289,13 +372,20 @@ def test_shared_text_format_persists_calligraphy_and_tight_background_padding() 
         assert cue.background_padding_x == 24
         assert cue.background_padding_y == 12
 
+    larger = editor.set_text_format_many(
+        (source.id,), font_size=240, orientation="horizontal", background_color="#000000",
+        background_padding_x=350, background_padding_y=200, letter_spacing_percent=120,
+    )
+    assert larger.source_cues[0].background_padding_x == 350
+    assert larger.translated_cues[0].background_padding_y == 200
+    assert larger.source_cues[0].letter_spacing_percent == 120
     with pytest.raises(SubtitleEditError, match="Nền ngang"):
         editor.set_text_format_many(
             (source.id,),
             font_size=12,
             orientation="horizontal",
             background_color="",
-            background_padding_x=101,
+            background_padding_x=-1,
         )
 
     with pytest.raises(SubtitleEditError, match="Kiểu nền"):
@@ -366,6 +456,92 @@ def test_new_scene_text_uses_brush_white_on_opaque_black_ink_by_default() -> Non
     assert cue.text_color == "#FFFFFF"
     assert cue.background_color == "#000000"
     assert cue.background_opacity_percent == 100
+    assert cue.fade_enabled is True
+    assert cue.fade_duration_ms == 300
+
+
+def test_resize_selected_scene_texts_applies_one_shared_edge_delta() -> None:
+    first = SubtitleCue(
+        "scene-1",
+        1,
+        TimeRange(1_000_000, 2_000_000),
+        "人物",
+        "zh",
+        role="scene_text",
+        subtitle_track_id="S2",
+    )
+    second = SubtitleCue(
+        "scene-2",
+        2,
+        TimeRange(3_000_000, 4_500_000),
+        "法宝",
+        "zh",
+        role="scene_text",
+        subtitle_track_id="S3",
+    )
+    video = TimelineClip("video-1", "V1", TimeRange(0, 10_000_000))
+    editor = SubtitleEditor(
+        ProjectSnapshot(
+            "project",
+            "Phim",
+            1,
+            tracks=(TimelineTrack("V1", TrackKind.VIDEO, "Video", (video,)),),
+            source_cues=(first, second),
+            translated_cues=(
+                replace(first, text="Nhân vật", language="vi"),
+                replace(second, text="Pháp bảo", language="vi"),
+            ),
+        )
+    )
+
+    updated = editor.resize_scene_texts(
+        ("scene-1", "scene-2"),
+        edge="right",
+        delta_us=600_000,
+    )
+
+    assert [cue.range for cue in updated.source_cues] == [
+        TimeRange(1_000_000, 2_600_000),
+        TimeRange(3_000_000, 5_100_000),
+    ]
+    assert [cue.range for cue in updated.translated_cues] == [
+        TimeRange(1_000_000, 2_600_000),
+        TimeRange(3_000_000, 5_100_000),
+    ]
+    assert updated.revision == 2
+
+
+def test_resize_selected_scene_texts_clamps_group_at_minimum_duration() -> None:
+    first = SubtitleCue(
+        "scene-1",
+        1,
+        TimeRange(1_000_000, 1_500_000),
+        "甲",
+        "zh",
+        role="scene_text",
+        subtitle_track_id="S2",
+    )
+    second = SubtitleCue(
+        "scene-2",
+        2,
+        TimeRange(2_000_000, 3_000_000),
+        "乙",
+        "zh",
+        role="scene_text",
+        subtitle_track_id="S3",
+    )
+    editor = SubtitleEditor(
+        ProjectSnapshot("project", "Phim", 1, source_cues=(first, second))
+    )
+
+    updated = editor.resize_scene_texts(
+        ("scene-1", "scene-2"),
+        edge="left",
+        delta_us=900_000,
+    )
+
+    assert updated.source_cues[0].range == TimeRange(1_400_000, 1_500_000)
+    assert updated.source_cues[1].range == TimeRange(2_400_000, 3_000_000)
 
 
 def test_scene_text_lane_allocator_splits_overlap_and_reuses_lowest_lane() -> None:
@@ -546,6 +722,28 @@ def test_batch_format_geometry_and_lane_move_are_one_revision_each() -> None:
         "S3",
         "S4",
     }
+
+
+def test_dialogue_group_geometry_uses_measured_panels_not_ocr_boxes() -> None:
+    first = SubtitleCue("one", 1, TimeRange(0, 1_000_000), "甲", "zh",
+                        visual_box=(.45, .9, .05, .03), visual_box_source="ocr")
+    second = replace(first, id="two", index=2, range=TimeRange(1_000_000, 2_000_000))
+    unselected = replace(first, id="three", index=3)
+    editor = SubtitleEditor(ProjectSnapshot("p", "P", 1,
+                            source_cues=(first, second, unselected),
+                            translated_cues=(replace(first, language="vi", text="Một"),
+                                             replace(second, language="vi", text="Hai"))))
+    result = editor.transform_cue_geometry(("one", "two"), delta_x=.1, delta_y=-.1,
+             panel_seeds={"one": (.3, .8, .4, .1), "two": (.4, .8, .2, .1)})
+    assert result.revision == 2
+    assert result.source_cues[0].panel_box == pytest.approx((.4, .7, .4, .1))
+    assert result.source_cues[1].panel_box == pytest.approx((.5, .7, .2, .1))
+    assert result.source_cues[2] == unselected
+    assert result.translated_cues[0].panel_box == result.source_cues[0].panel_box
+    assert result.source_cues[0].visual_box == first.visual_box
+    undone = editor.undo()
+    assert undone.source_cues == (first, second, unselected)
+    assert editor.redo().source_cues == result.source_cues
 
 
 def test_group_lane_move_resolves_collision_with_one_shared_offset() -> None:

@@ -8,6 +8,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from ducai_studio.infrastructure import runtime_program
 from ducai_studio.infrastructure.update_install import (
     current_install_root,
     prepare_update_handoff,
@@ -133,3 +134,29 @@ def test_current_install_root_requires_packaged_executable(tmp_path: Path) -> No
     executable = tmp_path / "DUCAISTUDIO2.EXE"
     executable.write_bytes(b"exe")
     assert current_install_root(executable) == tmp_path.resolve()
+
+
+def test_current_install_root_resolves_frozen_interpreter_alias(monkeypatch, tmp_path):
+    executable = tmp_path / "DucaiStudio2.exe"
+    executable.touch()
+    monkeypatch.setattr(runtime_program.sys, "executable", str(tmp_path / "python.exe"))
+    monkeypatch.setattr(runtime_program.sys, "argv", [str(executable)])
+
+    assert current_install_root() == tmp_path.resolve()
+
+
+def test_current_install_root_rejects_source_python_even_with_app_argv(monkeypatch, tmp_path):
+    python = tmp_path / "python.exe"
+    executable = tmp_path / "DucaiStudio2.exe"
+    python.touch()
+    executable.touch()
+    monkeypatch.setattr(runtime_program.sys, "executable", str(python))
+    monkeypatch.setattr(runtime_program.sys, "argv", [str(executable)])
+
+    with pytest.raises(RuntimeError, match="đóng gói"):
+        current_install_root()
+
+
+def test_current_install_root_rejects_missing_packaged_path(tmp_path):
+    with pytest.raises(RuntimeError, match="đóng gói"):
+        current_install_root(tmp_path / "DucaiStudio2.exe")

@@ -127,11 +127,10 @@ def _ping_job_manager(server_name: str) -> None:
                 responses = decoder.feed(bytes(socket.readAll()))
                 if responses:
                     response = responses[0]
-                    assert response.payload == {
-                        "request_id": "ui-smoke-ping",
-                        "ok": True,
-                        "result": {"status": "ready"},
-                    }
+                    assert response.payload["request_id"] == "ui-smoke-ping"
+                    assert response.payload["ok"] is True
+                    assert response.payload["result"]["status"] == "ready"
+                    assert response.payload["result"]["license"]["active"] is True
                     return
         raise AssertionError("Timed out waiting for the Job Manager ready response")
     finally:
@@ -167,20 +166,21 @@ def _request_job_manager(
         socket.abort()
 
 
-def _wait_job_manager_state(
-    server_name: str, job_id: str, expected: str, timeout: float = 5
+def _wait_job_repository_state(
+    database_path: Path, job_id: str, expected: str, timeout: float = 5
 ) -> None:
+    repository = JobRepository(Database(database_path))
+    actual = "missing"
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        response = _request_job_manager(
-            server_name,
-            f"wait-{time.monotonic_ns()}",
-            "get_job",
-            {"job_id": job_id},
-        )
-        if response.payload["result"]["state"] == expected:
+        try:
+            actual = repository.get(job_id).state.value
+        except LookupError:
+            actual = "missing"
+        if actual == expected:
             return
-    raise AssertionError(f"Job {job_id} did not reach {expected}")
+        time.sleep(0.05)
+    raise AssertionError(f"Job {job_id} did not reach {expected}; last state was {actual}")
 
 
 if sys.platform == "win32":
@@ -366,6 +366,8 @@ def test_ui_import_command_creates_project_and_auto_timeline_tracks(tmp_path: Pa
     data_root = tmp_path / "import-data"
     environment = _ui_environment(data_root, exit_ms=5000)
     environment["DUCAI_SMOKE_IMPORT_PATH"] = QUrl.fromLocalFile(str(media)).toString()
+    environment.pop("QT_FFMPEG_DEBUG", None)
+    environment["QT_FORCE_STDERR_LOGGING"] = "1"
     process = subprocess.Popen(
         [sys.executable, "-m", "ducai_studio"],
         cwd=PROJECT_ROOT,
@@ -405,7 +407,12 @@ def test_ui_import_command_creates_project_and_auto_timeline_tracks(tmp_path: Pa
 def test_repeated_window_close_waits_for_cooperative_shutdown(tmp_path: Path) -> None:
     data_root = tmp_path / "double-close-data"
     environment = _ui_environment(data_root, exit_ms=60_000)
-    environment["DUCAI_SMOKE_DOUBLE_CLOSE_MS"] = "3000"
+    # Leave enough time for the owned fixture worker to acknowledge `started`
+    # even when this smoke runs after the full CPU/GPU test suite.  The old
+    # three-second wall-clock deadline could begin cooperative shutdown while
+    # this test was still polling the running state, hiding a successful
+    # checkpoint behind a timed-out IPC request.
+    environment["DUCAI_SMOKE_DOUBLE_CLOSE_MS"] = "8000"
     process = subprocess.Popen(
         [sys.executable, "-m", "ducai_studio"],
         cwd=PROJECT_ROOT,
@@ -451,7 +458,7 @@ def test_repeated_window_close_waits_for_cooperative_shutdown(tmp_path: Path) ->
             },
         )
         assert started.payload["result"]["state"] == "start_requested"
-        _wait_job_manager_state(server_name, job_id, "running")
+        _wait_job_repository_state(data_root / "state.db", job_id, "running")
         _stdout, stderr = process.communicate(timeout=12)
         assert process.returncode == 0, f"UI exited with {process.returncode}\n{stderr}"
         assert stderr == "", f"QML or teardown warning:\n{stderr}"

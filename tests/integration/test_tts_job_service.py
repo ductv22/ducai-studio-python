@@ -223,6 +223,128 @@ def test_create_tts_job_has_exact_cues_and_final_import_replaces_voice_track(
     assert voice_tracks[0]["clips"][0]["timeline_range"]["end_us"] == 5_000_000
 
 
+def test_voice_generation_and_import_join_reordered_scene_dialogue_by_identity(tmp_path):
+    service = JobManagerService(database_path=tmp_path / "state.db",
+                                artifact_root=tmp_path / "artifacts",
+                                media_probe=FixtureProbe())
+    project_id = _project_with_translation(service, tmp_path)
+    original = service.projects.load(project_id)
+    scene = replace(original.source_cues[1], range=TimeRange(0, 4_000_000),
+                    role="scene_text", subtitle_track_id="S2")
+    translation = replace(original.translated_cues[1], range=scene.range,
+                          role=scene.role, subtitle_track_id=scene.subtitle_track_id)
+    edited = replace(original, revision=original.revision + 1,
+                     source_cues=(original.source_cues[0], scene),
+                     translated_cues=(translation, original.translated_cues[0]))
+    service.projects.save(project_path=tmp_path / "project.ducai", snapshot=edited)
+    job = service.create_tts_job(project_id=project_id, provider_id="piper",
+        voice_id="nghitts-chieu-thanh", provider_options={"data_root": str(_data_root(tmp_path))})
+    assert job["spec"]["input_revision"] == edited.revision
+    assert job["spec"]["provider_config"]["cues"] == [{
+        "id": original.source_cues[0].id, "index": 1,
+        "start_us": 0, "end_us": 1_000_000, "text": "Xin chào.",
+    }]
+    assert not service.tts_job_needs_rebase(job["id"])
+    assert service.rebase_tts_retry(job["id"]) is None
+    output = Path(job["spec"]["provider_config"]["output_path"])
+    write_pcm16_mono(output, array("f", [0.0]) * (48_000 * 5), 48_000)
+    imported = service.import_final_voice_wav(job["id"], str(output))
+    assert imported["translated_cues"][0]["id"] == translation.id
+    assert imported["translated_cues"][1]["text"] == "Xin chào."
+    assert any(track["id"] == "D1" for track in imported["tracks"])
+
+
+def test_voice_retry_ignores_translation_order_but_uses_latest_text(tmp_path):
+    service = JobManagerService(database_path=tmp_path / "state.db",
+                                artifact_root=tmp_path / "artifacts",
+                                media_probe=FixtureProbe())
+    project_id = _project_with_translation(service, tmp_path)
+    original = service.create_tts_job(project_id=project_id, provider_id="piper",
+        voice_id="nghitts-chieu-thanh", provider_options={"data_root": str(_data_root(tmp_path))})
+    snapshot = service.projects.load(project_id)
+    changed = replace(snapshot, revision=snapshot.revision + 1,
+                      translated_cues=tuple(reversed(snapshot.translated_cues)))
+    service.projects.save(project_path=tmp_path / "project.ducai", snapshot=changed)
+    assert not service.tts_job_needs_rebase(original["id"])
+    assert service.rebase_tts_retry(original["id"]) is None
+    cue_id = snapshot.translated_cues[0].id
+    service.subtitle_command(project_id=project_id, command="update_text",
+        cue_id=cue_id, language="translated", params={"text": "Câu vừa chỉnh sửa."},
+        deferred=True)
+    latest = service.projects.load(project_id)
+    replacement = service.rebase_tts_retry(original["id"])
+    assert replacement["spec"]["input_revision"] == latest.revision
+    assert replacement["spec"]["provider_config"]["cues"][0]["text"] == "Câu vừa chỉnh sửa."
+    assert service.projects.persisted_head_revision(project_id) == latest.revision
+
+
+@pytest.mark.parametrize("apply_cut", [False, True])
+def test_voice_job_uses_unsaved_text_timing_add_delete_and_cut_edits(tmp_path, apply_cut):
+    from ducai_studio.domain.timeline_edit import project_for_timeline, range_on_timeline
+
+    service = JobManagerService(database_path=tmp_path / "state.db",
+                                artifact_root=tmp_path / "artifacts",
+                                media_probe=FixtureProbe())
+    project_id = _project_with_translation(service, tmp_path)
+    original = service.projects.load(project_id)
+    first, second = original.source_cues
+    service.subtitle_command(project_id=project_id, command="update_text",
+        cue_id=first.id, language="translated", params={"text": "Thoại đã sửa."}, deferred=True)
+    service.subtitle_command(project_id=project_id, command="move_scene_texts",
+        cue_id=first.id, params={"cue_ids": [first.id], "delta_us": 100_000}, deferred=True)
+    service.subtitle_command(project_id=project_id, command="add_subtitle_cue",
+        params={"text": "Thoại thêm tay.", "start_us": 2_500_000, "end_us": 3_500_000,
+                "cue_role": "dialogue", "visual_box": [.1, .8, .8, .1]}, deferred=True)
+    service.subtitle_command(project_id=project_id, command="delete", cue_id=second.id,
+                             deferred=True)
+    if apply_cut:
+        service.timeline_command(project_id=project_id, command="cut", operation="keep_from",
+                                 range_start_us=1_150_000, range_end_us=5_000_000, deferred=True)
+    working = service.projects.load(project_id)
+    assert service.projects.has_pending_edits(project_id)
+    job = service.create_tts_job(project_id=project_id, provider_id="piper",
+        voice_id="nghitts-chieu-thanh", provider_options={"data_root": str(_data_root(tmp_path))})
+    assert job["spec"]["input_revision"] == working.revision
+    cues = job["spec"]["provider_config"]["cues"]
+    expected_text = ["Thoại thêm tay."] if apply_cut else ["Thoại đã sửa.", "Thoại thêm tay."]
+    assert [cue["text"] for cue in cues] == expected_text
+    if not apply_cut:
+        assert cues[0]["id"] == first.id
+        assert (cues[0]["start_us"], cues[0]["end_us"]) == (100_000, 1_100_000)
+    visible = {cue.id: cue for cue in project_for_timeline(working).source_cues}
+    for cue in cues:
+        slot = TimeRange(cue["start_us"], cue["end_us"])
+        assert range_on_timeline(working, slot) == visible[cue["id"]].range
+    assert service.projects.persisted_head_revision(project_id) == working.revision
+    assert not service.projects.has_pending_edits(project_id)
+    assert service.projects.load(project_id, original.revision) == original
+
+
+@pytest.mark.parametrize("invalid", ["missing", "duplicate_source", "duplicate_translation",
+                                     "identity", "index", "range", "empty"])
+def test_voice_inputs_reject_invalid_pairs_without_mutating_project(tmp_path, invalid):
+    service = JobManagerService(database_path=tmp_path / "state.db",
+                                artifact_root=tmp_path / "artifacts",
+                                media_probe=FixtureProbe())
+    project_id = _project_with_translation(service, tmp_path)
+    snapshot = service.projects.load(project_id)
+    source, translated = snapshot.source_cues, snapshot.translated_cues
+    with pytest.raises(ValueError):
+        if invalid == "missing":
+            translated = translated[:-1]
+        elif invalid == "duplicate_source":
+            source = (source[0], source[0])
+        elif invalid == "duplicate_translation":
+            translated = (translated[0], translated[0])
+        else:
+            values = {"identity": {"id": "unlinked"}, "index": {"index": 3},
+                      "range": {"range": TimeRange(50_000, 1_000_000)}, "empty": {"text": ""}}
+            translated = (replace(translated[0], **values[invalid]), translated[1])
+        malformed = replace(snapshot, source_cues=source, translated_cues=translated)
+        service._tts_cues_for_snapshot(malformed)
+    assert service.projects.load(project_id) == snapshot
+
+
 def test_create_tts_job_excludes_scene_text_from_voice_requests(tmp_path: Path) -> None:
     service = JobManagerService(
         database_path=tmp_path / "state.db",
@@ -739,6 +861,128 @@ def test_final_voice_import_rejects_stale_cue_timestamps_without_mutation(
     assert all(track.id != "D1" for track in reloaded.tracks)
 
 
+def test_final_voice_import_accepts_visual_only_revision(tmp_path: Path) -> None:
+    service = JobManagerService(
+        database_path=tmp_path / "state.db",
+        artifact_root=tmp_path / "artifacts",
+        media_probe=FixtureProbe(),
+    )
+    project_id = _project_with_translation(service, tmp_path)
+    job = service.create_tts_job(
+        project_id=project_id,
+        provider_id="piper",
+        voice_id="nghitts-chieu-thanh",
+        provider_options={"data_root": str(_data_root(tmp_path))},
+    )
+    output = Path(job["spec"]["provider_config"]["output_path"])
+    write_pcm16_mono(output, array("f", [0.0]) * (48_000 * 5), 48_000)
+    snapshot = service.projects.load(project_id)
+    summary = service.projects.get_summary(project_id)
+    visual_only = replace(
+        snapshot,
+        revision=snapshot.revision + 1,
+        translated_cues=(
+            replace(snapshot.translated_cues[0], text_font_size=48, text_color="#00FF00"),
+            *snapshot.translated_cues[1:],
+        ),
+    )
+    service.projects.save(project_path=summary["path"], snapshot=visual_only)
+
+    imported = service.import_final_voice_wav(str(job["id"]), str(output))
+
+    assert imported["revision"] == visual_only.revision + 1
+    assert any(track["id"] == "D1" for track in imported["tracks"])
+    assert imported["translated_cues"][0]["text_font_size"] == 48
+
+
+def test_tts_retry_ignores_visual_revision_but_rebases_changed_dialogue(tmp_path: Path) -> None:
+    service = JobManagerService(
+        database_path=tmp_path / "state.db",
+        artifact_root=tmp_path / "artifacts",
+        media_probe=FixtureProbe(),
+    )
+    project_id = _project_with_translation(service, tmp_path)
+    original = service.create_tts_job(
+        project_id=project_id,
+        provider_id="piper",
+        voice_id="nghitts-chieu-thanh",
+        provider_options={
+            "data_root": str(_data_root(tmp_path)),
+            "voice_read_speed": 1.3,
+            "batch_size": 7,
+        },
+    )
+    snapshot = service.projects.load(project_id)
+    summary = service.projects.get_summary(project_id)
+    visual_only = replace(
+        snapshot,
+        revision=snapshot.revision + 1,
+        translated_cues=(
+            replace(snapshot.translated_cues[0], text_font_size=48, text_color="#00FF00"),
+            *snapshot.translated_cues[1:],
+        ),
+    )
+    service.projects.save(project_path=summary["path"], snapshot=visual_only)
+
+    assert service.tts_job_needs_rebase(str(original["id"])) is False
+    assert service.rebase_tts_retry(str(original["id"])) is None
+
+    dialogue_changed = replace(
+        visual_only,
+        revision=visual_only.revision + 1,
+        translated_cues=(
+            replace(visual_only.translated_cues[0], text="Nội dung thoại mới."),
+            *visual_only.translated_cues[1:],
+        ),
+    )
+    service.projects.save(project_path=summary["path"], snapshot=dialogue_changed)
+
+    replacement = service.rebase_tts_retry(str(original["id"]))
+
+    assert replacement is not None
+    assert replacement["replacement"] is True
+    assert replacement["replaced_job_id"] == original["id"]
+    assert replacement["spec"]["input_revision"] == dialogue_changed.revision
+    config = replacement["spec"]["provider_config"]
+    assert config["replaces_job_id"] == original["id"]
+    assert config["voice_id"] == "nghitts-chieu-thanh"
+    assert config["voice_read_speed"] == 1.3
+    assert config["batch_size"] == 7
+    assert config["cues"][0]["text"] == "Nội dung thoại mới."
+
+
+def test_tts_input_fingerprint_includes_voice_settings(tmp_path: Path) -> None:
+    service = JobManagerService(
+        database_path=tmp_path / "state.db",
+        artifact_root=tmp_path / "artifacts",
+        media_probe=FixtureProbe(),
+    )
+    project_id = _project_with_translation(service, tmp_path)
+    data_root = _data_root(tmp_path)
+    first = service.create_tts_job(
+        project_id=project_id,
+        provider_id="piper",
+        voice_id="nghitts-chieu-thanh",
+        provider_options={"data_root": str(data_root), "voice_read_speed": 1.0},
+    )
+    service.transition_job(str(first["id"]), JobState.CANCEL_REQUESTED.value)
+    service.transition_job(str(first["id"]), JobState.CANCELLED.value)
+
+    second = service.create_tts_job(
+        project_id=project_id,
+        provider_id="piper",
+        voice_id="nghitts-chieu-thanh",
+        provider_options={"data_root": str(data_root), "voice_read_speed": 1.15},
+    )
+
+    first_config = first["spec"]["provider_config"]
+    second_config = second["spec"]["provider_config"]
+    assert first_config["tts_input_fingerprint_schema"] == "ducai-tts-input-v2"
+    assert second_config["tts_input_fingerprint_schema"] == "ducai-tts-input-v2"
+    assert first_config["cues"] == second_config["cues"]
+    assert first["spec"]["input_fingerprint"] != second["spec"]["input_fingerprint"]
+
+
 def test_create_tts_job_accepts_only_existing_force_cue_ids(tmp_path: Path) -> None:
     service = JobManagerService(
         database_path=tmp_path / "state.db",
@@ -893,9 +1137,11 @@ def test_create_timing_override_job_reuses_parent_voice_cache_contract(
     assert retried["spec"]["provider_config"]["allow_timeline_overflow"] is True
 
 
+@pytest.mark.parametrize("reorder_translations", [False, True])
 def test_reset_then_reapply_creates_new_conform_job_and_reuses_variant_cache(
     tmp_path: Path,
     monkeypatch,
+    reorder_translations,
 ) -> None:
     service = JobManagerService(
         database_path=tmp_path / "state.db",
@@ -982,6 +1228,8 @@ def test_reset_then_reapply_creates_new_conform_job_and_reuses_variant_cache(
         ),
     )
     summary = service.projects.get_summary(project_id)
+    if reorder_translations:
+        drifted = replace(drifted, translated_cues=tuple(reversed(drifted.translated_cues)))
     service.projects.save(project_path=summary["path"], snapshot=drifted)
 
     full_estimate = service.estimate_voice_conform(

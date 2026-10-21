@@ -26,6 +26,190 @@ def _host_module():
     return module
 
 
+class ByteCrop:
+    shape = (4, 4, 3)
+    dtype = "uint8"
+
+    def __init__(self, pixels):
+        self.pixels = pixels
+
+    def tobytes(self):
+        return self.pixels
+
+
+def test_host_reports_execution_workers_after_inference_fallback(monkeypatch):
+    module = _host_module()
+    runtime = SimpleNamespace(provider_id="paddle-fast", model_id="original",
+                              execution_device="gpu:0", worker_count=3)
+
+    def recognize(frames, _bands):
+        runtime.worker_count = 1
+        runtime.execution_fallback_reason = "ocr_predictor_timeout"
+        runtime.execution_recovery_attempts = 1
+        runtime.execution_recovery_reason = "ocr_predictor_exited"
+        return [None] * len(frames)
+
+    runtime.recognize_batched = recognize
+    video = SimpleNamespace(duration_us=1_000_000, fps=25., close=lambda: None,
+                            read_many=lambda times: [ByteCrop(b"x") for _ in times])
+    host = module.OcrEngineHost(runtime_factory=lambda *_args: runtime,
+                               video_factory=lambda _path: video)
+    monkeypatch.setattr(host, "_crop", lambda frame, *_args: frame)
+    assert host.open({"mode": "fast", "media_path": "fixture"})["worker_count"] == 3
+    result = host.recognize({"timestamps_us": [0], "bands": [{"name": "upper"}]})
+    assert result["execution_device"] == "gpu:0"
+    assert result["worker_count"] == 1
+    assert result["execution_fallback_reason"] == "ocr_predictor_timeout"
+    assert result["execution_recovery_attempts"] == 1
+    assert result["execution_recovery_reason"] == "ocr_predictor_exited"
+    assert result["evidence"] == []
+    host.close()
+
+
+def test_identical_crop_cache_preserves_every_reading_without_reinference():
+    host = _host_module().OcrEngineHost()
+    calls = []
+
+    def recognize(crops, bands):
+        calls.append((crops, bands))
+        return [{"text": str(crop.pixels), "confidence": .98} for crop in crops]
+
+    first = host._recognize_cached([ByteCrop(b"a"), ByteCrop(b"a"), ByteCrop(b"b")],
+                                    ["dialogue"] * 3, recognize)
+    assert len(first) == 3 and first[0] == first[1]
+    assert len(calls[0][0]) == 2
+    again = host._recognize_cached([ByteCrop(b"a"), ByteCrop(b"b")],
+                                    ["dialogue"] * 2, recognize)
+    assert again == [first[0], first[2]] and len(calls) == 1
+    host._recognize_cached([ByteCrop(b"a"), ByteCrop(b"c")], ["scene", "dialogue"], recognize)
+    assert len(calls[1][0]) == 2  # Reading mode and even a one-byte change are independent.
+    host.close()
+    host._recognize_cached([ByteCrop(b"a")], ["dialogue"], recognize)
+    assert len(calls) == 3
+
+
+def test_reading_cache_bounded_eviction_and_empty_observations():
+    host = _host_module().OcrEngineHost()
+    host.READING_CACHE_LIMIT = 2
+    calls = []
+
+    def recognize(crops, _bands):
+        calls.append(len(crops))
+        return [None for _ in crops]
+
+    assert host._recognize_cached([ByteCrop(bytes([i])) for i in range(4)],
+                                  ["dialogue"] * 4, recognize) == [None] * 4
+    assert len(host._reading_cache) == 2
+    assert host._recognize_cached([ByteCrop(b"\x03")], ["dialogue"], recognize) == [None]
+    assert calls == [4]
+    host._recognize_cached([ByteCrop(b"\x00")], ["dialogue"], recognize)
+    assert calls == [4, 1]
+
+
+class ArrayBox:
+    """Array protocol used by ML runtimes, without requiring NumPy in GUI tests."""
+
+    def __init__(self, values):
+        self.values = values
+
+    def __bool__(self):
+        raise ValueError("The truth value of an array is ambiguous")
+
+    def __iter__(self):
+        return iter(self.values)
+
+    def tolist(self):
+        return self.values
+
+
+def test_combined_reading_accepts_array_geometry_without_truth_test() -> None:
+    module = _host_module()
+    reading = module._combine_reading(
+        ["保留测试字幕"], [0.99],
+        [ArrayBox([[10, 10], [110, 10], [110, 30], [10, 30]])], 120, 40,
+    )
+    assert reading["text"] == "保留测试字幕"
+    assert reading["box"] == pytest.approx([1 / 12, .25, 5 / 6, .5])
+
+
+@pytest.mark.parametrize("use_boxes", [True, False])
+def test_paddle_reading_accepts_array_boxes_and_polygon_fallback(use_boxes: bool) -> None:
+    module = _host_module()
+    runtime = module.PaddleRuntime.__new__(module.PaddleRuntime)
+    data = {
+        "rec_texts": ["保留"], "rec_scores": [0.99],
+        "rec_boxes": ArrayBox([[10, 10, 110, 30]] if use_boxes else []),
+        "rec_polys": ArrayBox([[[10, 10], [110, 10], [110, 30], [10, 30]]]),
+    }
+    runtime.engine = SimpleNamespace(predict=lambda _frames: [SimpleNamespace(json=data)])
+    reading = runtime.recognize([SimpleNamespace(shape=(40, 120, 3))])[0]
+    assert reading["text"] == "保留"
+    assert reading["box"] == pytest.approx([1 / 12, .25, 5 / 6, .5])
+
+
+@pytest.mark.parametrize("mode", ["fast", "quality"])
+@pytest.mark.parametrize("device", ["cpu", "gpu:0"])
+def test_paddle_preserves_serial_constructor_models_and_input_order(monkeypatch, mode, device):
+    calls, batches = [], []
+
+    def factory(**kwargs):
+        calls.append(kwargs)
+
+        def predict(frames):
+            batches.append([frame.identity for frame in frames])
+            return [SimpleNamespace(json={"rec_texts": [f"文字{frame.identity}"],
+                "rec_scores": [.99], "rec_boxes": [[1, 1, 10, 8]]}) for frame in frames]
+
+        return SimpleNamespace(predict=predict)
+
+    monkeypatch.setitem(sys.modules, "paddleocr", SimpleNamespace(PaddleOCR=factory))
+    monkeypatch.setitem(sys.modules, "paddle", SimpleNamespace(
+        is_compiled_with_cuda=lambda: True, version=SimpleNamespace(cuda=lambda: "12.6"),
+        device=SimpleNamespace(cuda=SimpleNamespace(device_count=lambda: 1,
+                                  get_device_capability=lambda _index: (8, 6))),
+    ))
+    module = _host_module()
+    runtime = module.PaddleRuntime(mode, device, 12)
+    detection_model, recognition_model = module.PADDLE_MODELS[mode]
+    assert calls == [{
+        "lang": "ch", "device": device,
+        "text_detection_model_name": detection_model,
+        "text_recognition_model_name": recognition_model,
+        "text_recognition_batch_size": 12,
+        "use_doc_orientation_classify": False,
+        "use_doc_unwarping": False,
+        "use_textline_orientation": False,
+    }]
+    frames = [SimpleNamespace(shape=(20, 80, 3), identity=i) for i in range(5)]
+    readings = runtime.recognize_batched(frames, ["dialogue"] * 5)
+    assert batches == [[0, 1, 2, 3, 4]]
+    assert [reading["text"] for reading in readings] == [f"文字{i}" for i in range(5)]
+    assert runtime.provider_id == f"paddle-{mode}" and runtime.model_id == recognition_model
+
+
+def test_paddle_keeps_result_count_and_band_validation(monkeypatch):
+    monkeypatch.setitem(sys.modules, "paddle", SimpleNamespace(
+        is_compiled_with_cuda=lambda: True, version=SimpleNamespace(cuda=lambda: "12.6"),
+        device=SimpleNamespace(cuda=SimpleNamespace(device_count=lambda: 1,
+                                  get_device_capability=lambda _index: (8, 6))),
+    ))
+    engine = SimpleNamespace(predict=lambda _frames: [])
+    monkeypatch.setitem(sys.modules, "paddleocr", SimpleNamespace(PaddleOCR=lambda **_kw: engine))
+    runtime = _host_module().PaddleRuntime("fast", "gpu:0", 12)
+    frame = SimpleNamespace(shape=(20, 80, 3))
+    with pytest.raises(ValueError, match="paddle_band_count_mismatch"):
+        runtime.recognize_batched([frame], [])
+    with pytest.raises(RuntimeError, match="paddle_result_count_mismatch"):
+        runtime.recognize_batched([frame], ["dialogue"])
+
+    def fail(_frames):
+        raise RuntimeError("invalid model weights")
+
+    engine.predict = fail
+    with pytest.raises(RuntimeError, match="invalid model weights"):
+        runtime.recognize_batched([frame], ["dialogue"])
+
+
 def test_combined_reading_joins_split_chinese_segments_in_reading_order() -> None:
     module = _host_module()
 
@@ -42,6 +226,45 @@ def test_combined_reading_joins_split_chinese_segments_in_reading_order() -> Non
     assert reading["confidence"] > 0.93
     assert reading["box"] == [1 / 12, 0.25, 0.75, 0.5]
     assert [item["text"] for item in reading["segments"]] == ["我已", "成仙"]
+
+
+def test_same_subtitle_row_one_pixel_jitter_does_not_rotate_fragments():
+    module = _host_module()
+    reading = module._combine_reading(
+        ["你们面前", "现在的我即使出现在"], [.98, .98],
+        [[200, 10, 285, 31], [10, 11, 195, 32]], 300, 50, band="lower",
+    )
+    assert reading["text"] == "现在的我即使出现在你们面前"
+    reading = module._combine_reading(
+        ["了", "我就放心"], [.98, .98],
+        [[200, 10, 220, 31], [10, 11, 195, 32]], 300, 50, band="upper",
+    )
+    assert reading["text"] == "我就放心了"
+
+
+def test_dialogue_mode_keeps_subtitle_row_not_tall_map_columns():
+    module = _host_module()
+    reading = module._combine_reading(
+        ["五指湖", "中心区域有一圈环形山脉", "11a"], [.80, .999, .65],
+        [[20, 0, 34, 100], [70, 70, 280, 95], [10, 5, 25, 22]],
+        300, 110, band="dialogue",
+    )
+    assert reading["text"] == "中心区域有一圈环形山脉"
+    assert reading["segment_count"] == 1
+
+
+def test_dialogue_mode_preserves_two_subtitle_rows_and_single_glyph():
+    module = _host_module()
+    reading = module._combine_reading(
+        ["第一行对白", "第二行对白"], [.99, .99],
+        [[40, 40, 220, 60], [40, 70, 220, 90]], 300, 110, band="dialogue",
+    )
+    assert reading["text"] == "第一行对白第二行对白"
+    for text in ("爹", "娘", "不过"):
+        reading = module._combine_reading(
+            [text], [.99], [[120, 60, 140, 85]], 300, 110, band="dialogue",
+        )
+        assert reading["text"] == text
 
 
 def test_scene_segments_group_vertical_glyphs_without_merging_distant_logo() -> None:
@@ -70,6 +293,65 @@ def test_crop_relative_box_is_mapped_to_full_frame_coordinates() -> None:
     )
 
     assert box == pytest.approx([0.3, 0.8, 0.4, 0.1])
+
+
+def test_scene_segments_join_horizontal_fragments_not_separate_cards():
+    module = _host_module()
+    grouped = module._group_scene_segments([
+        {"text": "太南", "confidence": .95, "box": [.1, .3, .12, .04]},
+        {"text": "小会", "confidence": .96, "box": [.23, .301, .12, .04]},
+        {"text": "黄枫谷", "confidence": .96, "box": [.70, .3, .15, .04]},
+    ])
+    assert [row["text"] for row in grouped] == ["太南小会", "黄枫谷"]
+
+
+def test_scene_vertical_columns_do_not_absorb_neighbor_or_top_horizontal_row():
+    module = _host_module()
+    grouped = module._group_scene_segments([
+        {"text": "弟", "confidence": .95, "box": [.50, .2, .10, .12]},
+        {"text": "子", "confidence": .95, "box": [.50, .4, .10, .12]},
+        {"text": "一", "confidence": .95, "box": [.50, .6, .10, .12]},
+        {"text": "名", "confidence": .95, "box": [.50, .8, .10, .12]},
+        {"text": "十塊靈石", "confidence": .95, "box": [.35, .2, .11, .72]},
+        {"text": "上方文字", "confidence": .95, "box": [.35, .0, .32, .05]},
+    ])
+    assert {row["text"] for row in grouped} == {"弟子一名", "十塊靈石", "上方文字"}
+
+
+@pytest.mark.parametrize("target_box, expected_count", [
+    (None, 1), ([.17, .765, .35, .03], 1), ([.17, .765, .35, .13], 0),
+])
+def test_scene_roi_retains_textured_horizontal_and_empty_frame_probes(
+    monkeypatch, target_box, expected_count,
+):
+    module = _host_module()
+    host = module.OcrEngineHost()
+    frame = SimpleNamespace(shape=(1080, 1920, 3))
+    host.video = SimpleNamespace(read_many=lambda times: [frame] * len(times))
+    monkeypatch.setattr(host, "_crop", lambda *args: frame)
+    monkeypatch.setattr(module, "_scene_segment_metadata", lambda *args: {
+        "scene_confidence": .58, "orientation": "horizontal", "style_hint": "display",
+    })
+    host.runtime = SimpleNamespace(
+        provider_id="paddle-quality", model_id="medium",
+        recognize_batched=lambda *args: [
+            {"text": "天南", "segments": [{"text": "天南", "confidence": .93,
+                                          "box": [.1, .1, .5, .2]}]},
+            {"text": "", "segments": []},
+        ],
+    )
+    result = host.recognize({
+        "timestamps_us": [0, 400_000],
+        "bands": [{"name": "scene-roi-0", "reading_mode": "scene", "x1": .1,
+                   "y1": .75, "x2": .8, "y2": .9, "scale": 2.0,
+                   "target_box": target_box}],
+        "exclusion_regions_by_band": {"scene-roi-0": [[.1, .92, .8, .06]]},
+    })
+    assert len(result["evidence"]) == expected_count
+    if expected_count:
+        assert result["evidence"][0]["band"] == "scene"
+        assert result["evidence"][0]["box"] == pytest.approx([.17, .765, .35, .03])
+    assert len(result["scene_probes"]) == 2
 
 
 def test_combined_reading_removes_platform_overlay_segment_from_lower_band() -> None:
@@ -1194,3 +1476,19 @@ def test_crop_masks_full_frame_exclusion_without_mutating_decoded_frame(
     assert crop.copied is True
     assert frame.view.copied is False
     assert rectangle_calls == [(crop, (30, 10), (70, 30), (0, 0, 0), -1)]
+def test_dialogue_row_geometry_uses_pixels_on_wide_shallow_crop():
+    reading = _host_module()._combine_reading(
+        ["五指洲", "中心区域有一圈环形山脉"], [.485, .9998],
+        [[200, 47, 218, 87], [262, 66, 484, 90]], 750, 104, band="dialogue",
+    )
+    assert reading["text"] == "中心区域有一圈环形山脉"
+    assert reading["segment_count"] == 1
+
+
+def test_dialogue_row_keeps_narrow_single_glyph_beside_long_fragment():
+    reading = _host_module()._combine_reading(
+        ["川", "你好世界"], [.99, .99], [[10, 70, 20, 95], [23, 70, 153, 95]],
+        750, 104, band="dialogue",
+    )
+    assert reading["text"] == "川你好世界"
+    assert reading["segment_count"] == 2

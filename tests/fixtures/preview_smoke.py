@@ -19,12 +19,15 @@ from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
+from shiboken6 import delete
 
+from ducai_studio.ui.qt_runtime import configure_qt_plugin_dll_search
 from ducai_studio.ui.viewmodels.application_view_model import ApplicationViewModel
 
 
 def main() -> int:
     media_path = Path(os.environ["DUCAI_PREVIEW_FIXTURE"]).resolve()
+    configure_qt_plugin_dll_search()
     QStandardPaths.setTestModeEnabled(True)
     QCoreApplication.setOrganizationName("DUCAI STUDIO TEST")
     QCoreApplication.setApplicationName("preview-smoke")
@@ -106,7 +109,17 @@ def main() -> int:
         }
     )
 
-    engine = QQmlApplicationEngine(app)
+    engine = QQmlApplicationEngine(app_model)
+    from ducai_studio.ui.subtitle_artwork_provider import SubtitleArtworkProvider
+    engine.addImageProvider("subtitle-artwork", SubtitleArtworkProvider())
+    from ducai_studio.ui.timeline_media_provider import TimelineMediaProvider
+    engine.addImageProvider("timeline-media", TimelineMediaProvider(media_path.parent / "tiles"))
+    engine.warnings.connect(
+        lambda warnings: print(
+            "\n".join(error.toString() for error in warnings),
+            file=sys.stderr,
+        )
+    )
     engine.addImportPath(str(qml_root))
     engine.setInitialProperties({"appModel": app_model})
     engine.load(QUrl.fromLocalFile(str(qml_root / "Main.qml")))
@@ -357,7 +370,13 @@ def main() -> int:
     loader.timeout.connect(wait_until_loaded)
     loader.start()
     QTimer.singleShot(8_000, lambda: fail(16))
-    return app.exec()
+    result = app.exec()
+    preview.pause()
+    window.setProperty("shutdownComplete", True)
+    window.close()
+    delete(engine)
+    app.processEvents()
+    return result
 
 
 if __name__ == "__main__":

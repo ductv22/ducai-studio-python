@@ -1,12 +1,17 @@
 import ctypes
+import json
+import os
+import shutil
 import subprocess
 import sys
 import time
 from ctypes import wintypes
 from pathlib import Path
 
+import pytest
 from PySide6.QtCore import QCoreApplication
 
+from ducai_studio.job_manager import worker_supervisor as supervisor_module
 from ducai_studio.job_manager.worker_supervisor import WorkerSupervisor
 from ducai_studio.workers.protocol import PROTOCOL_VERSION, WorkerMessage
 
@@ -126,6 +131,63 @@ def test_supervisor_waits_for_cooperative_checkpoint_before_termination() -> Non
         supervisor.shutdown()
 
 
+@pytest.mark.parametrize("phase", ["grace", "kill"])
+def test_stop_timer_cannot_terminate_a_retried_worker_with_same_job_id(monkeypatch, phase):
+    application = QCoreApplication.instance() or QCoreApplication([])
+    supervisor = WorkerSupervisor()
+    timers, events = [], []
+    monkeypatch.setattr(supervisor_module.QTimer, "singleShot",
+                        lambda delay, callback: timers.append(callback))
+    supervisor.eventReceived.connect(lambda _job, message: events.append(message.kind))
+    fixture = Path(__file__).parents[1] / "fixtures" / "control_worker.py"
+    job_id = "reused-control-job"
+    try:
+        supervisor.start(job_id=job_id, program=sys.executable,
+                         arguments=[str(fixture), job_id])
+        assert pump_until(application, lambda: "ready" in events)
+        if phase == "kill":
+            supervisor._terminate(job_id)
+            assert timers
+            supervisor.force_shutdown()
+        else:
+            supervisor.request_stop(job_id)
+            assert pump_until(application, lambda: not supervisor.has_worker(job_id))
+        old_callback = timers[-1]
+        events.clear()
+        supervisor.start(job_id=job_id, program=sys.executable,
+                         arguments=[str(fixture), job_id])
+        assert pump_until(application, lambda: "ready" in events)
+        timer_count = len(timers)
+        old_callback()
+        assert len(timers) == timer_count, "Old stop scheduled termination of the new worker"
+        assert not pump_until(application, lambda: not supervisor.has_worker(job_id), timeout=0.2)
+        supervisor.send(job_id, kind="control", payload={"action": "start", "command_id": "new"})
+        assert pump_until(application, lambda: "started" in events, timeout=1)
+        assert supervisor.has_worker(job_id)
+    finally:
+        supervisor.force_shutdown()
+
+
+def test_control_send_returns_to_event_loop_without_blocking_pipe_wait(monkeypatch):
+    application = QCoreApplication.instance() or QCoreApplication([])
+    supervisor = WorkerSupervisor()
+    fixture = Path(__file__).parents[1] / "fixtures" / "control_worker.py"
+    events, waits = [], []
+    supervisor.eventReceived.connect(lambda _job, message: events.append(message.kind))
+    try:
+        supervisor.start(job_id="nonblocking-stop", program=sys.executable,
+                         arguments=[str(fixture), "nonblocking-stop"])
+        assert pump_until(application, lambda: "ready" in events)
+        monkeypatch.setattr(supervisor._workers["nonblocking-stop"].process,
+                            "waitForBytesWritten", lambda timeout: waits.append(timeout) or True)
+        supervisor.request_stop("nonblocking-stop")
+        assert waits == []
+        assert pump_until(application, lambda: not supervisor.has_worker("nonblocking-stop"))
+        assert "stopped" in events
+    finally:
+        supervisor.force_shutdown()
+
+
 def test_supervisor_treats_stderr_as_log_not_lifecycle_failure() -> None:
     application = QCoreApplication.instance() or QCoreApplication([])
     supervisor = WorkerSupervisor()
@@ -212,3 +274,68 @@ def test_preowned_launcher_captures_worker_child_before_execution(tmp_path: Path
                 check=False,
                 capture_output=True,
             )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows console creation contract")
+@pytest.mark.parametrize("launcher_kind", ["console", "gui", "hidden-console"])
+@pytest.mark.parametrize("program_kind", ["python", "cmd", "powershell"])
+def test_preowned_launcher_hides_console_and_preserves_child_streams(
+    program_kind: str, launcher_kind: str,
+) -> None:
+    launcher = Path(sys.executable)
+    if launcher_kind == "gui":
+        launcher = launcher.with_name("pythonw.exe")
+        if not launcher.is_file():
+            pytest.skip("Windows GUI-subsystem Python is unavailable")
+    startup = subprocess.STARTUPINFO()
+    startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startup.wShowWindow = subprocess.SW_HIDE
+    flags = (
+        subprocess.CREATE_NEW_CONSOLE
+        if launcher_kind == "hidden-console" else subprocess.CREATE_NO_WINDOW
+    )
+    fixture = Path(__file__).parents[1] / "fixtures" / "hidden-child-probe.py"
+    python_arguments = [str(fixture)]
+    if program_kind in {"python", "cmd"}:
+        if program_kind == "python":
+            program = sys.executable
+            arguments = python_arguments
+        else:
+            program = shutil.which("cmd.exe")
+            if program is None:
+                pytest.skip("Windows CMD is unavailable")
+            arguments = [
+                "/d", "/c", sys.executable, *python_arguments,
+            ]
+    else:
+        program = shutil.which("powershell.exe")
+        if program is None:
+            pytest.skip("Windows PowerShell is unavailable")
+        arguments = [
+            "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+            "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; "
+            "public static class ConsoleProbe { [DllImport(\"kernel32.dll\")] "
+            "public static extern IntPtr GetConsoleWindow(); }'; "
+            "$report = @{console=[ConsoleProbe]::GetConsoleWindow().ToInt64(); "
+            "input=[Console]::In.ReadLine()}; "
+            "[Console]::Out.WriteLine(($report | ConvertTo-Json -Compress)); "
+            "[Console]::Error.WriteLine('child diagnostic'); exit 17",
+        ]
+    environment = os.environ.copy()
+    environment["DUCAI_WORKER_PROGRAM"] = program
+    environment["DUCAI_WORKER_ARGUMENTS_JSON"] = json.dumps(arguments)
+    completed = subprocess.run(
+        [str(launcher), "-m", "ducai_studio.workers.preowned_launcher"],
+        input=b"DUCAI_LAUNCH\nafter-gate\n",
+        capture_output=True,
+        timeout=20,
+        creationflags=flags,
+        startupinfo=startup,
+        env=environment,
+    )
+
+    assert completed.returncode == 17
+    assert completed.stderr.strip() == b"child diagnostic"
+    report = json.loads(completed.stdout)
+    assert report["input"] == "after-gate"
+    assert report["console"] == 0

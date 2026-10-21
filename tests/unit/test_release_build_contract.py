@@ -96,6 +96,58 @@ def test_release_always_bundles_the_licensed_scene_text_font() -> None:
     assert "[IO.Path]::GetRelativePath" not in build_script
 
 
+def test_release_refreshes_runtime_qml_even_when_reusing_compiled_deployment() -> None:
+    build_script = (PROJECT_ROOT / "scripts" / "build-release.ps1").read_text(
+        encoding="utf-8"
+    )
+    assert '$qmlSource = Join-Path $projectRoot "src\\ducai_studio\\ui\\qml"' in build_script
+    assert '$qmlTarget = Join-Path $releaseRoot "ui\\qml"' in build_script
+    assert 'Copy-Item -Path (Join-Path $qmlSource "*")' in build_script
+    assert build_script.index('$qmlTarget =') < build_script.index('$files = Get-ChildItem')
+
+
+def test_release_labels_and_packages_the_exact_freshly_compiled_executable() -> None:
+    build_script = (PROJECT_ROOT / "scripts" / "build-release.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    fresh_path = "$executablePath = $freshExecutable.FullName"
+    identity_write = (
+        "Set-Content -LiteralPath $deploymentIdentity -Value $version -Encoding ascii"
+    )
+    selected_executable = "$executable = Get-Item -LiteralPath $executablePath"
+    package_selected = (
+        'Copy-Item -LiteralPath $executable.FullName -Destination '
+        '(Join-Path $releaseRoot "DucaiStudio2.exe") -Force'
+    )
+
+    assert "$buildStartedUtc = [DateTime]::UtcNow" in build_script
+    assert "Where-Object { $_.LastWriteTimeUtc -ge $buildStartedUtc }" in build_script
+    assert fresh_path in build_script
+    assert build_script.index(fresh_path) < build_script.index(identity_write)
+    assert selected_executable in build_script
+    assert package_selected in build_script
+    assert build_script.index(selected_executable) < build_script.index(package_selected)
+    assert (
+        'Move-Item -LiteralPath $generatedMain -Destination '
+        '(Join-Path $releaseRoot "DucaiStudio2.exe")'
+    ) not in build_script
+
+
+def test_artifact_checker_uses_owner_local_wheel_for_source_parity() -> None:
+    checker = (
+        PROJECT_ROOT / "tests" / "fixtures" / "release-artifact-check.py"
+    ).read_text(encoding="utf-8")
+
+    assert 'parser.add_argument("--validation-wheel", type=Path)' in checker
+    assert '(root / "dist").glob(f"ducai_studio-{__version__}-*.whl")' in checker
+    assert 'release.glob("ducai_studio-*.whl")' not in checker
+    assert "The validation wheel version must match the customer release." in checker
+    assert "The validation wheel must remain outside the customer release." in checker
+    assert 'root / "tests/fixtures/license-bootstrap"' in checker
+    assert '"DUCAI_TEST_LICENSE_BOOTSTRAP": "1"' in checker
+
+
 def test_portable_manifest_hashes_bundled_engine_runtimes() -> None:
     build_script = (
         PROJECT_ROOT / "scripts" / "build-portable-release.ps1"

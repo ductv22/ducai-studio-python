@@ -6,6 +6,7 @@ from PySide6.QtCore import QCoreApplication, QObject
 
 from ducai_studio.domain.jobs import JobState
 from ducai_studio.domain.multi_video import MultiItemState, MultiStage
+from ducai_studio.infrastructure.licensing_state import LicensingState
 from ducai_studio.job_manager.multi_video_coordinator import MultiVideoCoordinator
 
 
@@ -38,6 +39,7 @@ class _Repository:
 class _Server(QObject):
     def __init__(self, repository: _Repository, job: object | None = None) -> None:
         super().__init__()
+        self.licensing = LicensingState()
         self.service = SimpleNamespace(
             multi_videos=repository,
             jobs=SimpleNamespace(get=lambda _job_id: job),

@@ -70,6 +70,9 @@ def test_codex_cli_runs_windows_cmd_shim_through_command_interpreter(
         return FakeProcess(command, **kwargs)
 
     monkeypatch.setattr("os.name", "nt")
+    # Pin the simulated Windows architecture: uncached platform.machine()
+    # may itself launch cmd, outside this test's provider-process fake.
+    monkeypatch.setattr("platform.machine", lambda: "AMD64")
     monkeypatch.setenv("COMSPEC", "C:/Windows/System32/cmd.exe")
     monkeypatch.setattr("shutil.which", lambda _value: "C:/Users/test/codex.CMD")
     monkeypatch.setattr("subprocess.Popen", fake_popen)

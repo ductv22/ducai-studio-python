@@ -4,6 +4,8 @@ import pytest
 
 from ducai_studio.domain.voice_conform import (
     VoiceConformCueInput,
+    VoiceConformPlan,
+    VoiceConformSegment,
     VoiceConformSettings,
     VoiceTimingMode,
     build_voice_conform_plan,
@@ -186,3 +188,59 @@ def test_duration_growth_disabled_marks_stretching_plan_unresolved() -> None:
     assert plan.applicable is False
     assert plan.unresolved_cue_ids == ("cue-1",)
     assert "duration" in plan.cues[0].issue_message
+
+
+def test_indexed_time_mapping_preserves_all_boundaries_and_rounding() -> None:
+    segments = (
+        VoiceConformSegment(0, 7, 0, 11, 7 / 11),
+        VoiceConformSegment(7, 12, 11, 14, 5 / 3),
+        VoiceConformSegment(12, 16, 14, 19, 4 / 5),
+    )
+    plan = VoiceConformPlan(1, VoiceConformSettings(), 16, 19, segments, (), (), "map")
+
+    def reference(value, source):
+        prefix, target = ("source", "output") if source else ("output", "source")
+        total = getattr(plan, prefix + "_duration_us")
+        target_total = getattr(plan, target + "_duration_us")
+        position = max(0, min(total, int(value)))
+        if position == total:
+            return target_total
+        segment = next(s for s in segments if getattr(s, prefix + "_start_us")
+                       <= position < getattr(s, prefix + "_end_us"))
+        start, end = (getattr(segment, prefix + edge) for edge in ("_start_us", "_end_us"))
+        a, b = (getattr(segment, target + edge) for edge in ("_start_us", "_end_us"))
+        quotient, remainder = divmod((position - start) * (b - a), end - start)
+        return a + quotient + int(2 * remainder >= end - start)
+
+    for value in (-100, *[i / 4 for i in range(85)], 100):
+        assert plan.source_to_output_us(value) == reference(value, True)
+        assert plan.output_to_source_us(value) == reference(value, False)
+    assert set(plan.as_json()) == {
+        "schema_version", "settings", "source_duration_us", "output_duration_us",
+        "segments", "cues", "unresolved_cue_ids", "fingerprint",
+    }
+
+
+def test_time_queries_do_not_scan_every_conform_segment() -> None:
+    class CountedSegments(tuple):
+        scans = 0
+        reads = 0
+
+        def __iter__(self):
+            self.scans += 1
+            return super().__iter__()
+
+        def __getitem__(self, index):
+            self.reads += 1
+            return super().__getitem__(index)
+
+    count = 12_000
+    segments = CountedSegments(VoiceConformSegment(i * 10, (i + 1) * 10,
+                              i * 20, (i + 1) * 20, 0.5) for i in range(count))
+    plan = VoiceConformPlan(1, VoiceConformSettings(), count * 10, count * 20,
+                            segments, (), (), "large-map")
+    segments.scans = segments.reads = 0
+    assert plan.source_to_output_us(count * 10 - 5) == count * 20 - 10
+    assert plan.output_to_source_us(count * 20 - 10) == count * 10 - 5
+    assert segments.scans == 0
+    assert segments.reads <= 32
