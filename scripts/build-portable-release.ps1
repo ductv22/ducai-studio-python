@@ -5,7 +5,10 @@ param(
     [switch]$SkipTests,
     [switch]$Clean,
     [switch]$IncludeWhisper,
-    [switch]$CreateArchive
+    [switch]$CreateArchive,
+    [string]$ArchiveVolumeSize = "",
+    [ValidateRange(0, 9)]
+    [int]$ArchiveCompressionLevel = 3
 )
 
 $ErrorActionPreference = "Stop"
@@ -37,7 +40,13 @@ function Remove-OwnedOutput([string]$Path, [string]$Prefix) {
     Remove-Item -LiteralPath $resolved -Recurse -Force
 }
 
-function Copy-Tree([string]$Source, [string]$Destination, [string[]]$ExtraExcluded = @()) {
+function Copy-Tree(
+    [string]$Source,
+    [string]$Destination,
+    [string[]]$ExtraExcluded = @(),
+    [string[]]$ExtraExcludedFiles = @(),
+    [switch]$KeepBytecode
+) {
     if (-not (Test-Path -LiteralPath $Source -PathType Container)) {
         throw "Thiếu thư mục bắt buộc: $Source"
     }
@@ -46,10 +55,12 @@ function Copy-Tree([string]$Source, [string]$Destination, [string[]]$ExtraExclud
         "__pycache__", ".pytest_cache", ".ruff_cache", "tests", "test",
         "docs", "examples", "benchmarks", "benchmark", ".git"
     ) + $ExtraExcluded
+    $excludedFiles = @("*.pyo", "*.pdb") + $ExtraExcludedFiles
+    if (-not $KeepBytecode) { $excludedFiles += "*.pyc" }
     $arguments = @(
         $Source, $Destination, "/E", "/COPY:DAT", "/DCOPY:DAT", "/R:1", "/W:1",
         "/NFL", "/NDL", "/NJH", "/NJS", "/NP", "/XD"
-    ) + $excluded + @("/XF", "*.pyc", "*.pyo", "*.pdb")
+    ) + $excluded + @("/XF") + $excludedFiles
     & robocopy @arguments | Out-Null
     if ($LASTEXITCODE -gt 7) {
         throw "Không sao chép được $Source (robocopy $LASTEXITCODE)."
@@ -156,9 +167,28 @@ function Rewrite-RuntimeMetadata([string]$MetadataPath) {
     if ($metadata.PSObject.Properties.Name -contains "runtime_root") {
         $metadata.PSObject.Properties.Remove("runtime_root")
     }
+    if ((Split-Path (Split-Path $MetadataPath -Parent) -Leaf) -eq "whisper_runtime") {
+        $metadata.model_path = "model_cache/whisper/Systran--faster-whisper-large-v3"
+    }
     $metadata | ConvertTo-Json -Depth 12 |
         Set-Content -LiteralPath $MetadataPath -Encoding UTF8
 }
+
+function Get-PortableArchiveArguments {
+    param(
+        [ValidateRange(0, 9)]
+        [int]$CompressionLevel = 3,
+        [ValidatePattern('^(?:[1-9][0-9]*[kmg])?$')]
+        [string]$VolumeSize = ""
+    )
+    $arguments = @("a", "-t7z", "-mx=$CompressionLevel", "-mmt=4", "-y")
+    if ($VolumeSize) { $arguments += "-v$VolumeSize" }
+    return $arguments
+}
+
+# Validate archive options before copying any runtime or starting a GUI build.
+$compressionArguments = @(Get-PortableArchiveArguments `
+    -CompressionLevel $ArchiveCompressionLevel -VolumeSize $ArchiveVolumeSize)
 
 if (-not (Test-Path -LiteralPath $sourceDataPath -PathType Container)) {
     throw "Không tìm thấy DUCAI_STUDIO_DATA nguồn: $sourceDataPath"
@@ -177,7 +207,15 @@ if (Test-Path -LiteralPath $portableRoot) {
 }
 
 New-Item -ItemType Directory -Path $portableRoot -Force | Out-Null
-Copy-Tree $releaseRoot $portableRoot
+# Engine hosts are deliberately compiled; runtime libraries are copied separately.
+Copy-Tree $releaseRoot $portableRoot -KeepBytecode `
+    -ExtraExcluded @("src", "DUCAI_STUDIO_DATA") `
+    -ExtraExcludedFiles @("*.py", "*.pyw", "*.whl", "*.pem", "*.key", ".env", ".env.*", "manifest.json")
+foreach ($hostName in @("ocr_engine_host", "tts_engine_host", "whisper_engine_host")) {
+    if (-not (Test-Path -LiteralPath (Join-Path $portableRoot "engine_hosts\$hostName.pyc"))) {
+        throw "Thiếu engine host đã biên dịch: $hostName.pyc"
+    }
+}
 
 $ffmpegCommand = Get-Command ffmpeg -ErrorAction Stop
 $ffprobeCommand = Get-Command ffprobe -ErrorAction Stop
@@ -269,6 +307,8 @@ DUCAI STUDIO $version PORTABLE
 4. Máy nhận cần Windows 64-bit. GPU NVIDIA và driver tương thích CUDA 12.8
    được khuyến nghị cho VieNeu/Paddle GPU.
 5. Gemini Web dùng Chrome hoặc Edge đã cài trên máy; API cần key riêng của người nhận.
+6. Với bản có khóa kích hoạt, mở Cài đặt > Kích hoạt và nhập key được cấp cho
+   máy nhận. Bộ runtime đầy đủ không thay thế key kích hoạt hoặc tài khoản dịch.
 
 Gói không chứa project, media, SRT, cache voice, cookie trình duyệt, API key,
 profile đăng nhập hoặc profile clone giọng của người đóng gói.
@@ -384,9 +424,16 @@ if ($CreateArchive) {
         if (Test-Path -LiteralPath $archive) { Remove-Item -LiteralPath $archive -Force }
         Push-Location $outputRootPath
         try {
-            & $sevenZipPath a -t7z -mx=3 -mmt=on -y $archive `
-                (Split-Path $portableRoot -Leaf)
+            if ($ArchiveVolumeSize) {
+                if (Get-ChildItem -LiteralPath $outputRootPath -Filter "$((Split-Path $archive -Leaf)).*" -File) {
+                    throw "Các phần archive đã tồn tại; dùng thư mục output mới để tránh ghi đè."
+                }
+            }
+            & $sevenZipPath @compressionArguments $archive (Split-Path $portableRoot -Leaf)
             if ($LASTEXITCODE -ne 0) { throw "Không nén được gói portable bằng 7-Zip." }
+            $testArchive = if ($ArchiveVolumeSize) { "$archive.001" } else { $archive }
+            & $sevenZipPath t $testArchive
+            if ($LASTEXITCODE -ne 0) { throw "Archive portable không vượt qua kiểm tra toàn vẹn." }
             if (Test-Path -LiteralPath $staleArchive) {
                 Remove-Item -LiteralPath $staleArchive -Force
             }
@@ -395,6 +442,10 @@ if ($CreateArchive) {
             Pop-Location
         }
     } else {
+        if ($ArchiveVolumeSize) { throw "Nén chia phần yêu cầu 7-Zip." }
+        if ($ArchiveCompressionLevel -ne 3) {
+            throw "Mức nén được chọn yêu cầu 7-Zip; không chuyển âm thầm sang tar.xz."
+        }
         $archive = "$portableRoot.tar.xz"
         $staleArchive = "$portableRoot.7z"
         if (Test-Path -LiteralPath $archive) { Remove-Item -LiteralPath $archive -Force }
@@ -404,9 +455,16 @@ if ($CreateArchive) {
             Remove-Item -LiteralPath $staleArchive -Force
         }
     }
-    $archiveHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-    Write-Output "ARCHIVE=$archive"
-    Write-Output "ARCHIVE_SHA256=$archiveHash"
+    $archiveFiles = if ($ArchiveVolumeSize) {
+        @(Get-ChildItem -LiteralPath $outputRootPath -Filter "$((Split-Path $archive -Leaf)).*" -File | Sort-Object Name)
+    } else {
+        @(Get-Item -LiteralPath $archive)
+    }
+    foreach ($archiveFile in $archiveFiles) {
+        $archiveHash = (Get-FileHash -LiteralPath $archiveFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        Write-Output "ARCHIVE=$($archiveFile.FullName)"
+        Write-Output "ARCHIVE_SHA256=$archiveHash"
+    }
 }
 Write-Output "PORTABLE=$portableRoot"
 Write-Output "PORTABLE_BYTES=$totalBytes"

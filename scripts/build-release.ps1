@@ -35,6 +35,8 @@ if (Test-Path -LiteralPath $releaseRoot) {
 
 Push-Location $projectRoot
 try {
+    & $python (Join-Path $PSScriptRoot "check-license-release.py")
+    if ($LASTEXITCODE -ne 0) { throw "Licensing trust root validation failed." }
     if (-not $SkipTests) {
         & $python -m ruff check src tests
         if ($LASTEXITCODE -ne 0) { throw "Ruff gate failed." }
@@ -54,6 +56,7 @@ try {
 
     $deploymentRoot = Join-Path $projectRoot "deployment\DucaiStudio2.dist"
     $deploymentIdentity = Join-Path $deploymentRoot "DUCAI_BUILD_VERSION"
+    $executablePath = ""
     if ($ReuseExistingDeployment) {
         if (
             -not (Test-Path -LiteralPath $deploymentIdentity -PathType Leaf) -or
@@ -72,16 +75,30 @@ try {
         $env:PATH = "$(Join-Path $projectRoot '.venv\Scripts');$env:PATH"
         $env:PYTHONPATH = Join-Path $projectRoot "src"
         $env:NUITKA_ASSUME_YES_FOR_DOWNLOADS = "yes"
+        $buildStartedUtc = [DateTime]::UtcNow
         & $deploy -f --name DucaiStudio2 --mode standalone --nuitka-version 4.1.1 --extra-ignore-dirs DucaiStudio2.dist,deployment --extra-modules QtMultimedia,QtNetwork src/ducai_studio/__main__.py
         if ($LASTEXITCODE -ne 0) { throw "pyside6-deploy failed." }
         if (-not (Test-Path -LiteralPath $deploymentRoot -PathType Container)) {
             throw "Deployment directory is missing after pyside6-deploy."
         }
+        # Some deploy versions swallow compiler failures. Never label the
+        # previous deployment with the new version when no fresh EXE exists.
+        $freshExecutable = @("__main__.exe", "DucaiStudio2.exe") |
+            ForEach-Object { Get-Item -LiteralPath (Join-Path $deploymentRoot $_) -ErrorAction SilentlyContinue } |
+            Where-Object { $_.LastWriteTimeUtc -ge $buildStartedUtc } |
+            Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -First 1
+        if ($null -eq $freshExecutable) {
+            throw "No freshly compiled executable; refusing to relabel an old deployment."
+        }
+        $executablePath = $freshExecutable.FullName
         Set-Content -LiteralPath $deploymentIdentity -Value $version -Encoding ascii
     }
-    $executablePath = Join-Path $deploymentRoot "DucaiStudio2.exe"
-    if (-not (Test-Path -LiteralPath $executablePath -PathType Leaf)) {
+    if (-not $executablePath) {
         $executablePath = Join-Path $deploymentRoot "__main__.exe"
+        if (-not (Test-Path -LiteralPath $executablePath -PathType Leaf)) {
+            $executablePath = Join-Path $deploymentRoot "DucaiStudio2.exe"
+        }
     }
     if (-not (Test-Path -LiteralPath $executablePath -PathType Leaf)) {
         throw "Executable was not found in deployment\DucaiStudio2.dist after deploy."
@@ -90,9 +107,10 @@ try {
 
     New-Item -ItemType Directory -Path $releaseRoot -Force | Out-Null
     Copy-Item -Path (Join-Path $executable.DirectoryName "*") -Destination $releaseRoot -Recurse
+    Copy-Item -LiteralPath $executable.FullName -Destination (Join-Path $releaseRoot "DucaiStudio2.exe") -Force
     $generatedMain = Join-Path $releaseRoot "__main__.exe"
     if (Test-Path -LiteralPath $generatedMain) {
-        Move-Item -LiteralPath $generatedMain -Destination (Join-Path $releaseRoot "DucaiStudio2.exe")
+        Remove-Item -LiteralPath $generatedMain -Force
     }
 
     # Qt loads multimedia backends dynamically, so Nuitka cannot infer these
@@ -127,10 +145,19 @@ try {
         Sort-Object LastWriteTime -Descending |
         Select-Object -First 1
     if ($null -eq $wheel) { throw "DUCAI STUDIO wheel was not found." }
-    Copy-Item -LiteralPath $wheel.FullName -Destination (Join-Path $releaseRoot $wheel.Name)
+    # The customer runtime is compiled; never distribute the editable source wheel.
     Copy-Item -LiteralPath (Join-Path $projectRoot "README.md") -Destination $releaseRoot
     Copy-Item -LiteralPath (Join-Path $projectRoot "THIRD_PARTY_NOTICES.md") -Destination $releaseRoot
     Copy-Item -LiteralPath (Join-Path $projectRoot "docs\user-guide.md") -Destination $releaseRoot
+    # QML is loaded at runtime, not compiled into the executable. Refresh it
+    # from the tested source even when the matching compiled deployment is reused.
+    $qmlSource = Join-Path $projectRoot "src\ducai_studio\ui\qml"
+    $qmlTarget = Join-Path $releaseRoot "ui\qml"
+    if (-not (Test-Path -LiteralPath (Join-Path $qmlSource "Main.qml") -PathType Leaf)) {
+        throw "QML entry point is missing from the source tree."
+    }
+    New-Item -ItemType Directory -Path $qmlTarget -Force | Out-Null
+    Copy-Item -Path (Join-Path $qmlSource "*") -Destination $qmlTarget -Recurse -Force
     # Keep the executable's runtime lookup deterministic even when a reused
     # Nuitka deployment predates a newly bundled face. The release always owns
     # the authoritative, licensed font set from the current source tree.
@@ -181,6 +208,8 @@ Set DUCAI_STUDIO_DATA_ROOT to move the shared data directory.
 Run Diagnostics in the app before producing the first video.
 "@ | Set-Content -LiteralPath (Join-Path $releaseRoot "DUCAI_STUDIO_DATA.README.txt") -Encoding UTF8
 
+    & $python (Join-Path $PSScriptRoot "check-license-release.py") --release $releaseRoot
+    if ($LASTEXITCODE -ne 0) { throw "Private licensing material found in customer build." }
     $files = Get-ChildItem $releaseRoot -Recurse -File | Sort-Object FullName
     $hashes = [ordered]@{}
     $releasePrefixLength = $releaseRoot.TrimEnd('\').Length + 1
@@ -195,6 +224,8 @@ Run Diagnostics in the app before producing the first video.
         platform = "windows-x86_64"
         gui_package = "DucaiStudio2.exe"
         external_data_root = "DUCAI_STUDIO_DATA"
+        activation = "offline-device-license-v1"
+        license_token_formats = @("DUCAI-L1", "DUCAI-L2", "DUCAI-L3")
         managed_engines = @(
             "PaddleOCR external Python runtime",
             "Whisper external runtime and optional large-v3 model",

@@ -1,0 +1,50 @@
+DUCAI STUDIO a153 — GÓI THỬ RIÊNG OCR RTX 50
+CHƯA PHẢI BẢN CẬP NHẬT CHUNG / KHÔNG GHI ĐÈ BẢN ĐANG DÙNG
+
+CÁCH THỬ
+1. Dùng 7-Zip hoặc WinRAR giải nén TOÀN BỘ file .7z vào thư mục NGẮN, KHÔNG DẤU,
+   có quyền ghi, ví dụ E:\DUCAI-RTX50 hoặc C:\DUCAI-RTX50. Khoảng trắng dùng được.
+   Không chép đè vào bản DUCAI cũ và không di chuyển riêng file EXE.
+   Paddle hiện không nạp được model ở đường dẫn có dấu/tiếng Trung; đường dẫn
+   quá dài còn làm Windows không nạp DLL CUDA. Launcher sẽ báo và dừng nếu gặp
+   các đường dẫn này. Chuyển cả thư mục sang đường dẫn trên, không cần đổi driver
+   hoặc registry để sửa lỗi đường dẫn. Không bỏ qua launcher để mở riêng EXE.
+2. Lưu công việc và đóng bản DUCAI khác. Mở Mo-ban-thu-RTX50.vbs trong thư mục
+   vừa giải nén. Nó chỉ mở DucaiStudio2.exe với runtime OCR đi kèm và thư mục
+   dự án thử riêng RTX50_TEST_STATE. Không mở CMD/PowerShell, không cài driver,
+   không sửa Windows và không ghi đè lựa chọn runtime cũ đã lưu trong DUCAI.
+   Không mở trực tiếp EXE cho lượt thử này, để tránh dùng lại cấu hình cũ.
+3. Vào Cài đặt → Chạy chẩn đoán. Paddle phải báo “Paddle CUDA sẵn sàng”.
+   Lần đầu nạp thư viện có thể lâu; nếu quá 45 giây, chạy lại chẩn đoán MỘT lần.
+   Chẩn đoán qua chưa chứng minh model OCR đã nạp được: bước 4 vẫn phải hiện GPU.
+   Chẩn đoán vẫn dùng được trước khi kích hoạt. Nếu cần nhập key, dùng key
+   hợp lệ của CHÍNH máy đang thử; gói không kèm key của người đóng gói.
+4. Tạo dự án TEST MỚI, nhập video khoảng 2 phút, chọn vùng thoại rồi chạy OCR mới.
+   Không tiếp tục checkpoint cũ, không mở/xóa/chạy lại dự án đang làm.
+   Trong lúc quét phải hiện GPU, không phải “CPU · OCR tương thích”.
+5. Gửi lại: ảnh chẩn đoán, phiên bản a153, thời gian thực khi xong, kết quả QA
+   và ảnh vùng phụ đề nếu còn lỗi. Nếu Paddle chưa sẵn sàng, gửi thêm ảnh
+   DxDiag tab Display (có tên GPU và Driver Version/Date), không phải tab System.
+   Không cần gửi key kích hoạt, key dịch hay dữ liệu cá nhân.
+
+Nếu báo driver không phù hợp, lấy đúng thông báo trước khi đổi driver. Gói này
+không tự tải/cài driver; không cần cài Python hay CUDA Toolkit theo phỏng đoán.
+“Gemini CLI chưa cài”, thiếu Piper/VieNeu/Whisper không phải lỗi OCR của gói này.
+
+PHẠM VI VÀ GIỚI HẠN
+- Kèm Python 3.11, Paddle GPU 3.2.2 CUDA 12.9/cuDNN 9.9, PaddleOCR 3.7.0,
+  PaddleX 3.7.2, bốn model OCR gốc và FFmpeg. Không kèm runtime TTS/Whisper,
+  không phải gói đầy đủ cho người mới dùng hằng ngày.
+- Giữ nguyên model, số frame, vùng quét, độ chính xác tính toán và QA.
+- GUI/font hỗ trợ đường dẫn có dấu, nhưng runtime model Paddle của gói thử này
+  vẫn cần đường dẫn ngắn, không dấu như hướng dẫn. Không tự chép model ra ổ khác.
+- Đã thử trên RTX 3060; điều này KHÔNG chứng minh RTX 5060 Ti đã hết lỗi.
+  CUDA 12.9 giữ đủ câu trên mẫu đã thử nhưng có khác biệt evidence thô và một
+  cue trong mẫu 5 phút kết thúc muộn hơn 0,6 giây. Cần kiểm tra trên video thật
+  trước khi đưa runtime này thành bản cập nhật chung.
+- Dự án, video, cache và key cá nhân của người đóng gói không nằm trong gói.
+  Muốn dùng lại bản ổn định, đóng gói thử và mở lại bản cũ như trước.
+
+rtx50-test-manifest.json ghi SHA-256 của toàn bộ payload. manifest.json chỉ ghi
+các file ứng dụng; runtime nằm ngoài phạm vi manifest ứng dụng. File pyvenv.cfg
+được DUCAI tự sửa đường dẫn home theo nơi giải nén ở lần mở đầu tiên.
