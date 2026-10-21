@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import zlib
 from dataclasses import asdict
 from enum import Enum
 from hashlib import sha256
@@ -15,9 +16,11 @@ from ducai_studio.domain.project import (
     ProjectSnapshot,
     SubtitleCue,
     TimelineClip,
+    TimelineEditState,
     TimelineTrack,
     TrackKind,
     TranslationPreferences,
+    TranslationStylePreset,
     VoiceConformState,
     normalize_legacy_subtitle_lanes,
 )
@@ -26,6 +29,11 @@ from ducai_studio.domain.voice_conform import decode_voice_conform_plan
 
 from .database import Database
 from .job_repository import utc_now_text
+
+PROJECT_SNAPSHOT_ENCODING_JSON = "json-v1"
+PROJECT_SNAPSHOT_ENCODING_ZLIB = "zlib-json-v1"
+PROJECT_SNAPSHOT_ZLIB_LEVEL = 3
+MAX_PROJECT_SNAPSHOT_BYTES = 256 * 1024 * 1024
 
 
 def _json_value(value: Any) -> Any:
@@ -40,6 +48,17 @@ def _json_value(value: Any) -> Any:
 
 def encode_project_snapshot(snapshot: ProjectSnapshot) -> tuple[str, str]:
     payload = _json_value(asdict(snapshot))
+    # Keep byte-for-byte compatibility for legacy projects that never had
+    # timeline bookmarks.  The decoder treats a missing field as empty; only
+    # an actual user mark needs to be written to the snapshot.
+    if not snapshot.timeline_markers:
+        payload.pop("timeline_markers", None)
+    if not snapshot.translation_preferences.saved_styles:
+        preferences = payload.get("translation_preferences")
+        if isinstance(preferences, dict):
+            preferences.pop("saved_styles", None)
+    if not snapshot.translation_preferences.active_style_name:
+        payload["translation_preferences"].pop("active_style_name", None)
     encoded = json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
     )
@@ -210,6 +229,7 @@ def _clip(value: Any) -> TimelineClip:
             raw.get("content_warning", False), "clip.content_warning"
         ),
         issue_code=_string(raw.get("issue_code", ""), "clip.issue_code"),
+        muted=_boolean(raw.get("muted", False), "clip.muted"),
     )
 
 
@@ -296,6 +316,31 @@ def decode_project_snapshot(value: Any) -> ProjectSnapshot:
     preferences = _object(
         raw.get("translation_preferences", {}), "translation_preferences"
     )
+    raw_saved_styles = preferences.get("saved_styles", [])
+    if isinstance(raw_saved_styles, dict):
+        # Accept the short-lived map shape used by early development builds.
+        raw_saved_styles = [
+            {"name": name, **(_object(value, "translation_preferences.saved_styles")
+                                if isinstance(value, dict) else {})}
+            for name, value in raw_saved_styles.items()
+        ]
+    saved_styles = tuple(
+        TranslationStylePreset(
+            name=_string(item.get("name"), "translation_preferences.saved_styles[].name"),
+            preset=_string(
+                item.get("preset", "auto"),
+                "translation_preferences.saved_styles[].preset",
+            ),
+            custom_rules=_string(
+                item.get("custom_rules", ""),
+                "translation_preferences.saved_styles[].custom_rules",
+            ),
+        )
+        for item in (
+            _object(entry, "translation_preferences.saved_styles[]")
+            for entry in _sequence(raw_saved_styles, "translation_preferences.saved_styles")
+        )
+    )
     snapshot = ProjectSnapshot(
         id=_string(raw.get("id"), "id"),
         name=_string(raw.get("name"), "name"),
@@ -310,7 +355,34 @@ def decode_project_snapshot(value: Any) -> ProjectSnapshot:
             for cue in _sequence(raw.get("translated_cues", []), "translated_cues")
         ),
         overlays=overlays,
+        title_cues=tuple(
+            _cue(cue) for cue in _sequence(raw.get("title_cues", []), "title_cues")
+        ),
         voice_conform=voice_conform,
+        timeline_edit=(
+            TimelineEditState(
+                retained_ranges=tuple(
+                    TimeRange(_integer(item.get("start_us"), "cut.start_us"),
+                              _integer(item.get("end_us"), "cut.end_us"))
+                    for item in _sequence(
+                        _object(raw["timeline_edit"], "timeline_edit").get("retained_ranges"),
+                        "timeline_edit.retained_ranges",
+                    )
+                ),
+                schema_version=_integer(raw["timeline_edit"].get("schema_version", 1),
+                                        "timeline_edit.schema_version"),
+            ) if raw.get("timeline_edit") is not None else None
+        ),
+        timeline_markers=tuple(
+            sorted(
+                {
+                    _integer(item, "timeline_markers[]")
+                    for item in _sequence(
+                        raw.get("timeline_markers", []), "timeline_markers"
+                    )
+                }
+            )
+        ),
         translation_preferences=TranslationPreferences(
             preset=_string(
                 preferences.get("preset", "auto"),
@@ -319,6 +391,11 @@ def decode_project_snapshot(value: Any) -> ProjectSnapshot:
             custom_rules=_string(
                 preferences.get("custom_rules", ""),
                 "translation_preferences.custom_rules",
+            ),
+            saved_styles=saved_styles,
+            active_style_name=_string(
+                preferences.get("active_style_name", ""),
+                "translation_preferences.active_style_name",
             ),
         ),
         ocr_dialogue_region=_optional_box(
@@ -342,12 +419,50 @@ def decode_project_snapshot(value: Any) -> ProjectSnapshot:
 class ProjectRepository:
     def __init__(self, database: Database) -> None:
         self.database = database
+        # Editor drafts belong to the single Job Manager, not SQLite or QML.
+        # Historical job revisions remain durable and immutable.
+        self._edit_drafts: dict[str, tuple[int, str, ProjectSnapshot]] = {}
+
+    def has_pending_edits(self, project_id: str) -> bool:
+        return project_id in self._edit_drafts
+
+    def stage_edits(self, *, project_path: str | Path, snapshot: ProjectSnapshot) -> None:
+        draft = self._edit_drafts.get(snapshot.id)
+        base = draft[0] if draft else self.persisted_head_revision(snapshot.id)
+        if self.persisted_head_revision(snapshot.id) != base:
+            raise RuntimeError("Dự án đã được lưu ở phiên khác; bản đang chỉnh vẫn được giữ")
+        current = draft[2].revision if draft else base
+        if snapshot.revision <= current:
+            raise ValueError("Bản đang chỉnh phải tiếp nối revision hiện tại")
+        self._edit_drafts[snapshot.id] = (base, str(project_path), snapshot)
+
+    def flush_edits(self, project_id: str) -> int:
+        draft = self._edit_drafts.get(project_id)
+        if draft:
+            self.save(project_path=draft[1], snapshot=draft[2])
+        return self.persisted_head_revision(project_id)
+
+    def flush_all_edits(self) -> None:
+        for project_id in tuple(self._edit_drafts):
+            self.flush_edits(project_id)
 
     def save(self, *, project_path: str | Path, snapshot: ProjectSnapshot) -> str:
+        draft = self._edit_drafts.get(snapshot.id)
+        if draft and (snapshot.revision < draft[2].revision or (
+                snapshot.revision == draft[2].revision and snapshot != draft[2])):
+            raise RuntimeError("Không thể ghi đè bản đang chỉnh bằng snapshot cũ")
         path = str(Path(project_path).expanduser().resolve())
         encoded, digest = encode_project_snapshot(snapshot)
+        raw_bytes = encoded.encode("utf-8")
+        compressed = zlib.compress(raw_bytes, level=PROJECT_SNAPSHOT_ZLIB_LEVEL)
         now = utc_now_text()
         with self.database.write_transaction() as connection:
+            if draft:
+                head = connection.execute("SELECT head_revision FROM projects WHERE id = ?",
+                                          (snapshot.id,)).fetchone()
+                if head is None or int(head[0]) != draft[0]:
+                    raise RuntimeError(
+                        "Dự án đã thay đổi ở phiên khác; chưa lưu, bản chỉnh vẫn được giữ")
             connection.execute(
                 """
                 INSERT INTO projects(id, path, name, schema_version, head_revision, updated_at)
@@ -371,10 +486,20 @@ class ProjectRepository:
             connection.execute(
                 """
                 INSERT OR IGNORE INTO project_revisions(
-                    project_id, revision, snapshot_json, snapshot_sha256, created_at
-                ) VALUES (?, ?, ?, ?, ?)
+                    project_id, revision, snapshot_json, snapshot_sha256, created_at,
+                    snapshot_encoding, snapshot_blob, uncompressed_size, compressed_size
+                ) VALUES (?, ?, '', ?, ?, ?, ?, ?, ?)
                 """,
-                (snapshot.id, snapshot.revision, encoded, digest, now),
+                (
+                    snapshot.id,
+                    snapshot.revision,
+                    digest,
+                    now,
+                    PROJECT_SNAPSHOT_ENCODING_ZLIB,
+                    compressed,
+                    len(raw_bytes),
+                    len(compressed),
+                ),
             )
             row = connection.execute(
                 """
@@ -385,9 +510,13 @@ class ProjectRepository:
             ).fetchone()
             if row is None or row["snapshot_sha256"] != digest:
                 raise RuntimeError("Project revision is immutable and its content does not match")
+        self._edit_drafts.pop(snapshot.id, None)
         return digest
 
     def load_json(self, project_id: str, revision: int | None = None) -> dict[str, Any]:
+        draft = self._edit_drafts.get(project_id)
+        if draft and (revision is None or revision == draft[2].revision):
+            return _json_value(asdict(draft[2]))
         with self.database.connect(read_only=True) as connection:
             target_revision = revision
             if target_revision is None:
@@ -399,16 +528,61 @@ class ProjectRepository:
                 target_revision = int(row["head_revision"])
             row = connection.execute(
                 """
-                SELECT snapshot_json FROM project_revisions
+                SELECT snapshot_json, snapshot_sha256, snapshot_encoding,
+                       snapshot_blob, uncompressed_size
+                FROM project_revisions
                 WHERE project_id = ? AND revision = ?
                 """,
                 (project_id, target_revision),
             ).fetchone()
         if row is None:
             raise LookupError(f"Unknown project revision: {project_id}/{target_revision}")
-        return json.loads(row["snapshot_json"])
+        encoding = str(row["snapshot_encoding"] or PROJECT_SNAPSHOT_ENCODING_JSON)
+        if encoding == PROJECT_SNAPSHOT_ENCODING_JSON:
+            encoded = str(row["snapshot_json"])
+            raw_bytes = encoded.encode("utf-8")
+        elif encoding == PROJECT_SNAPSHOT_ENCODING_ZLIB:
+            blob = row["snapshot_blob"]
+            if not isinstance(blob, bytes):
+                raise RuntimeError("Compressed project revision has no payload")
+            expected_size = int(row["uncompressed_size"] or 0)
+            if expected_size <= 0 or expected_size > MAX_PROJECT_SNAPSHOT_BYTES:
+                raise RuntimeError("Compressed project revision size is invalid")
+            try:
+                raw_bytes = zlib.decompress(blob)
+            except zlib.error as exc:
+                raise RuntimeError("Compressed project revision is damaged") from exc
+            if len(raw_bytes) != expected_size:
+                raise RuntimeError("Compressed project revision size does not match")
+            try:
+                encoded = raw_bytes.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise RuntimeError("Compressed project revision is not UTF-8") from exc
+        else:
+            raise RuntimeError(f"Unsupported project revision encoding: {encoding}")
+        if len(raw_bytes) > MAX_PROJECT_SNAPSHOT_BYTES:
+            raise RuntimeError("Project revision exceeds the safe decode limit")
+        if sha256(raw_bytes).hexdigest() != str(row["snapshot_sha256"]):
+            raise RuntimeError("Project revision checksum does not match")
+        return json.loads(encoded)
+
+    def head_revision(self, project_id: str) -> int:
+        draft = self._edit_drafts.get(project_id)
+        return draft[2].revision if draft else self.persisted_head_revision(project_id)
+
+    def persisted_head_revision(self, project_id: str) -> int:
+        with self.database.connect(read_only=True) as connection:
+            row = connection.execute(
+                "SELECT head_revision FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+        if row is None:
+            raise LookupError(f"Unknown project: {project_id}")
+        return int(row["head_revision"])
 
     def load(self, project_id: str, revision: int | None = None) -> ProjectSnapshot:
+        draft = self._edit_drafts.get(project_id)
+        if draft and (revision is None or revision == draft[2].revision):
+            return draft[2]
         return decode_project_snapshot(self.load_json(project_id, revision))
 
     def list_summaries(self, *, limit: int | None = 100) -> tuple[dict[str, Any], ...]:
@@ -483,4 +657,5 @@ class ProjectRepository:
             )
             if deleted.rowcount != 1:
                 raise RuntimeError("Project deletion did not remove exactly one project")
+        self._edit_drafts.pop(project_id, None)
         return job_ids

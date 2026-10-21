@@ -27,6 +27,19 @@ class NormalizedBox:
 
 
 @dataclass(frozen=True, slots=True)
+class SceneTextProbe:
+    """A scanned region, including frames on which no scene text was found."""
+
+    timestamp_us: TimeUs
+    box: NormalizedBox
+    source_scope: str = ""
+
+    def __post_init__(self) -> None:
+        if type(self.timestamp_us) is not int or self.timestamp_us < 0:
+            raise ValueError("Scene probe timestamp must be non-negative")
+
+
+@dataclass(frozen=True, slots=True)
 class SubtitleEvidence:
     id: str
     frame_id: str
@@ -43,6 +56,7 @@ class SubtitleEvidence:
     panel_box: NormalizedBox | None = None
     background_color: str = ""
     scene_confidence: float = 0.0
+    source_scope: str = ""
 
     def __post_init__(self) -> None:
         required = (
@@ -63,6 +77,8 @@ class SubtitleEvidence:
             raise ValueError("Evidence confidence must be between zero and one")
         if self.evidence_kind not in {"global", "burst", "scene"}:
             raise ValueError("Evidence kind is invalid")
+        if not isinstance(self.source_scope, str):
+            raise TypeError("Evidence source scope must be a string")
         if self.orientation not in {"horizontal", "vertical"}:
             raise ValueError("Evidence orientation is invalid")
         if self.style_hint not in {"standard", "display", "calligraphy"}:

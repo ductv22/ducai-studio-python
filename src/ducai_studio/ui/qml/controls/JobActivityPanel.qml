@@ -89,6 +89,7 @@ Panel {
         const labels = {
             "preparing": "Đang chuẩn bị",
             "fast": "Quét phụ đề nhanh",
+            "scene_quality": "Đọc lại chữ trong cảnh bằng Quality",
             "quality": "Rà soát vùng nghi vấn",
             "rapid_fallback": "Chuyển OCR tương thích",
             "extract_audio": "Đang tách audio 16 kHz",
@@ -101,11 +102,12 @@ Panel {
             "translation_qa": "Kiểm tra bản dịch",
             "qa_repair": "Sửa cue chưa đạt QA",
             "recovery_backoff": "Chờ tự khôi phục dịch vụ",
-            "cache_restore": "Đang dò và khôi phục cache",
+            "cache_restore": "Đang kiểm tra cache",
             "runtime_check": "Đang kiểm tra bộ máy giọng nói",
             "model_loading": "Đang nạp VieNeu lên GPU",
             "voice_binding": "Đang chuẩn bị giọng đã chọn",
             "warm_ready": "VieNeu đã sẵn sàng từ lượt trước",
+            "warmup": "Đang làm nóng bộ máy giọng nói",
             "synthesis": "Đang tổng hợp giọng",
             "targeted_retry": "Tạo lại cue lỗi",
             "timeline_assembly": "Đang ghép timeline giọng",
@@ -128,6 +130,12 @@ Panel {
     }
 
     function progressSummary(model) {
+        if (model.kind === "ocr" && model.phase === "finalize") {
+            return (model.phaseDetail || phaseLabel(model.phase))
+                + (model.phaseTotal > 0 ? " · "
+                    + percentLabel(model.phaseCurrent, model.phaseTotal) + "%" : "")
+                + " · đã chạy " + durationLabel(model.elapsedMs)
+        }
         if (model.kind === "tts" && !model.phase && activeState(model.state)) {
             return "Đang khởi động tác vụ và chuẩn bị dò cache"
                 + " · chưa có batch cue hoàn tất"
@@ -149,8 +157,10 @@ Panel {
                 + (model.phaseDetail ? " · " + model.phaseDetail : "")
                 + " · đã chạy " + durationLabel(model.elapsedMs)
         }
-        if (model.kind === "tts" && model.phase === "synthesis") {
-            return "Đã tổng hợp " + model.phaseCurrent + "/" + model.phaseTotal
+        if (model.kind === "tts"
+                && (model.phase === "warmup" || model.phase === "synthesis")) {
+            return (model.phase === "warmup" ? "Đang làm nóng · " : "Đã tổng hợp ")
+                + model.phaseCurrent + "/" + model.phaseTotal
                 + " cue cần tạo · tổng đã đạt " + model.current + "/" + model.total
                 + (model.phaseDetail ? " · " + model.phaseDetail : "")
                 + " · batch hiện tại " + durationLabel(model.progressAgeMs)
@@ -416,14 +426,25 @@ Panel {
                             elide: Text.ElideRight
                         }
                         Text {
-                            visible: jobRow.model.etaMs !== undefined
+                            readonly property bool measuringTts:
+                                jobRow.model.kind === "tts"
+                                && ["warmup", "synthesis"].indexOf(
+                                    jobRow.model.phase
+                                ) >= 0
+                                && (jobRow.model.etaMs === undefined
+                                    || jobRow.model.etaMs === null)
+                            visible: measuringTts || (
+                                jobRow.model.etaMs !== undefined
                                 && jobRow.model.etaMs !== null
                                 && (jobRow.model.total > 0 || jobRow.model.phaseTotal > 0)
-                            text: (jobRow.model.kind === "export"
-                                    && String(jobRow.model.phase).indexOf("finalize_") === 0
-                                    ? "pha xong ~" : "xong ~")
-                                + root.clockLabel("", jobRow.model.etaMs)
-                                + " · còn " + root.durationLabel(jobRow.model.etaMs)
+                            )
+                            text: measuringTts
+                                ? "Đang đo tốc độ…"
+                                : ((jobRow.model.kind === "export"
+                                        && String(jobRow.model.phase).indexOf("finalize_") === 0
+                                        ? "pha xong ~" : "xong ~")
+                                    + root.clockLabel("", jobRow.model.etaMs)
+                                    + " · còn " + root.durationLabel(jobRow.model.etaMs))
                             color: Theme.textSecondary
                             font.family: Theme.timecodeFamily
                             font.pixelSize: 10

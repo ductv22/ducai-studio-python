@@ -5,15 +5,19 @@ import math
 import os
 import queue
 import shutil
+import sqlite3
 import sys
 import threading
 import time
 import wave
+from collections import deque
 from collections.abc import Callable
+from concurrent.futures import TimeoutError as FutureTimeout
 from contextlib import contextmanager, suppress
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, replace
 from hashlib import sha256
 from pathlib import Path
+from statistics import median
 from typing import Any
 from uuid import uuid4
 
@@ -29,7 +33,6 @@ from ducai_studio.application.voice_pipeline import (
     file_sha256,
     measured_voice_timing_issues,
     plan_fit,
-    process_voice_segment,
     read_pcm16_mono,
     write_pcm16_mono,
 )
@@ -46,6 +49,14 @@ from ducai_studio.providers.tts.contracts import (
     TtsRuntimeUnavailable,
 )
 from ducai_studio.providers.tts.host_client import EngineHostError
+from ducai_studio.providers.tts.postprocess_client import WavPreparationPool
+from ducai_studio.providers.tts.wav_preparation import (
+    ArtifactApproval,
+    PreparedVoice,
+    prepare_artifact,
+    prepare_base_audio,
+    resolved_wav_path,
+)
 from ducai_studio.workers.protocol import PROTOCOL_VERSION, WorkerMessage
 
 
@@ -114,17 +125,6 @@ def _exclusive_cache_lock(
             lock_path.unlink()
 
 
-@dataclass(frozen=True, slots=True)
-class ArtifactApproval:
-    """Result of the non-destructive audio/fit gate."""
-
-    approved: bool
-    retryable_inference: bool = False
-    blocker: str = ""
-    required_speed: float | None = None
-    qa: AudioQualityReport | None = None
-
-
 class TtsWorker:
     def __init__(
         self,
@@ -144,6 +144,9 @@ class TtsWorker:
         self.provider: TtsProvider | None = None
         self.provider_factory = provider_factory
         self.audio_processor_factory = audio_processor_factory
+        self._wav_pool: WavPreparationPool | None = None
+        self._wav_parallel_disabled = False
+        self._wav_staging_directories: set[Path] = set()
         self.cues: tuple[TtsCueRequest, ...] = ()
         self.force_cue_ids: frozenset[str] = frozenset()
         self._legacy_request_fingerprints: dict[str, str] = {}
@@ -152,7 +155,7 @@ class TtsWorker:
         self._raw_job_identity_cache: dict[Path, bool] = {}
         self._matching_prior_ledger_cache: tuple[dict[str, Any], ...] | None = None
         self._prior_raw_index: dict[str, tuple[Path, ...]] | None = None
-        self._global_cache_index: dict[tuple[str, str], tuple[dict[str, Any], ...]] | None = None
+        self._warm_batch_rates: deque[float] = deque(maxlen=7)
         self._next_start_us: dict[int, int | None] = {}
         self.ineligible: dict[str, str] = {}
         self.ledger: dict[str, Any] = {}
@@ -236,6 +239,7 @@ class TtsWorker:
             self.send("failed", _tts_failure_payload(exc))
             return 2
         finally:
+            self._close_wav_pool(force=True)
             if self.provider is not None:
                 self.provider.close()
 
@@ -445,7 +449,10 @@ class TtsWorker:
             "ineligible": self.ineligible,
             "blockers": {},
         }
-        self.provider = self._provider_from_config()
+        # Cache discovery is deliberately completed before starting the heavy
+        # provider runtime. A cache-only resume must not spend minutes loading
+        # VieNeu onto the GPU when no inference is required.
+        self.provider = None
 
     def _configure_conform(self, start_payload: dict[str, Any]) -> None:
         raw_plan = self.config.get("conform_plan")
@@ -596,10 +603,15 @@ class TtsWorker:
         return raw
 
     def _execute(self) -> None:
-        if self.job_mode == "voice_conform":
-            self._execute_conform()
-            return
-        assert self.provider is not None
+        try:
+            if self.job_mode == "voice_conform":
+                self._execute_conform()
+            else:
+                self._execute_synthesis()
+        finally:
+            self._close_wav_pool(force=True)
+
+    def _execute_synthesis(self) -> None:
         self._job_started = time.monotonic()
         entries = self.ledger.get("entries", {})
         if not isinstance(entries, dict):
@@ -683,17 +695,33 @@ class TtsWorker:
             if str(self.spec.get("provider_id", "")) == "vieneu-3.8"
             else float(self.config.get("engine_speed", 1.0))
         )
+        if missing:
+            self._phase = "model_loading"
+            self._phase_detail = "Đang nạp bộ máy giọng nói sau khi đã kiểm tra cache"
+            self._send_stage_progress(
+                "model_loading",
+                phase_current=0,
+                phase_total=len(missing),
+                eta_ms=None,
+                extra={"phase_detail": self._phase_detail},
+            )
+            self.provider = self._provider_from_config()
+        assert self.provider is not None or not missing
         for offset in range(0, len(missing), batch_size):
             self._control_point()
             group = tuple(missing[offset : offset + batch_size])
-            self._phase = "synthesis"
+            batch_started = time.monotonic()
+            batch_terminal_before = self._terminal_cue_count()
+            first_warm_batch = offset == 0 and not self._warm_batch_rates
+            self._phase = "warmup" if first_warm_batch else "synthesis"
             provider_label = (
                 "VieNeu ở 1,00×"
                 if str(self.spec.get("provider_id", "")) == "vieneu-3.8"
                 else f"Piper ở {provider_speed:.2f}×"
             )
+            phase_action = "Đang làm nóng bằng batch đầu" if first_warm_batch else "Đang tổng hợp"
             self._phase_detail = (
-                f"Đang tổng hợp {provider_label} · batch {offset // batch_size + 1}/"
+                f"{phase_action} {provider_label} · batch {offset // batch_size + 1}/"
                 f"{max(1, math.ceil(len(missing) / batch_size))}"
             )
             self._send_progress()
@@ -707,10 +735,7 @@ class TtsWorker:
             )
             artifacts = {artifact.cue_id: artifact for artifact in result.artifacts}
             retry_cues: list[TtsCueRequest] = []
-            for cue in group:
-                self._control_point()
-                artifact = artifacts.get(cue.cue_id)
-                approval = self._evaluate_artifact(cue, artifact)
+            for cue, approval in self._evaluate_group(group, artifacts):
                 if approval.retryable_inference:
                     retry_cues.append(cue)
                 elif not approval.approved:
@@ -731,11 +756,14 @@ class TtsWorker:
                     batch_size=min(batch_size, len(retry_cues)),
                 )
                 retry_artifacts = {artifact.cue_id: artifact for artifact in retry.artifacts}
-                for cue in retry_cues:
-                    approval = self._evaluate_artifact(cue, retry_artifacts.get(cue.cue_id))
+                for cue, approval in self._evaluate_group(tuple(retry_cues), retry_artifacts):
                     if not approval.approved:
                         self._record_blocker(cue, approval)
             self._checkpoint()
+            batch_elapsed = max(0.001, time.monotonic() - batch_started)
+            batch_completed = max(0, self._terminal_cue_count() - batch_terminal_before)
+            if batch_completed > 0:
+                self._warm_batch_rates.append(batch_completed / batch_elapsed)
             self._send_progress()
         # A cache-only run adopts every cue into this job's in-memory ledger,
         # but it never enters the synthesis loop above. Persist that adopted
@@ -743,6 +771,7 @@ class TtsWorker:
         # D1 clip per cue instead of falling back to a single legacy clip.
         if not missing:
             self._checkpoint()
+        self._close_wav_pool()
         self._publish_result()
 
     def _execute_conform(self) -> None:
@@ -1043,19 +1072,119 @@ class TtsWorker:
     ) -> ArtifactApproval:
         if artifact is None:
             return ArtifactApproval(False, retryable_inference=True, blocker="tts_artifact_missing")
-        processed = self.processed_root / f"{cue.index:06d}-{cue.request_fingerprint[:16]}.wav"
+        prepared = prepare_artifact(
+            cue, artifact.wav_path, directory=self._preparation_directory(),
+            cache_root=Path(str(self.config["cache_root"])).expanduser().resolve(),
+            settings=self.settings, next_start_us=self._next_start_us.get(cue.index),
+            allow_timing_failure=self._allow_timing_failure(),
+            processor_factory=self.audio_processor_factory,
+        )
+        return self._adopt_and_clean(cue, prepared)
+
+    def _allow_timing_failure(self) -> bool:
+        return (
+            self.config.get("defer_timing_conform") is True
+            and self.config.get("purpose") == "production"
+        ) or self.config.get("allow_timeline_overflow") is True or self.qa_non_blocking
+
+    def _close_wav_pool(self, *, force: bool = False) -> None:
+        pool, self._wav_pool = self._wav_pool, None
         try:
-            qa = process_voice_segment(artifact.wav_path, processed, self.settings)
-        except (OSError, ValueError, EOFError, wave.Error):
-            return ArtifactApproval(False, retryable_inference=True, blocker="tts_audio_invalid")
-        if not qa.ok:
-            return ArtifactApproval(
-                False,
-                retryable_inference=True,
-                blocker="tts_audio_quality_failed",
-                qa=qa,
-            )
-        return self._evaluate_base_audio(cue, processed, qa)
+            if pool is not None:
+                pool.close(force=force)
+        finally:
+            for directory in tuple(self._wav_staging_directories):
+                self._clean_preparation_directory(directory)
+
+    def _preparation_directory(self) -> Path:
+        directory = self.processed_root / uuid4().hex
+        self._wav_staging_directories.add(directory)
+        return directory
+
+    def _clean_preparation_directory(self, directory: Path) -> None:
+        if directory not in self._wav_staging_directories:
+            return
+        resolved = resolved_wav_path(directory)
+        root = resolved_wav_path(self.processed_root)
+        if resolved == root or not resolved.is_relative_to(root):
+            raise ValueError("tts_wav_cleanup_out_of_range")
+        for name in ("base.wav", "base.wav.tmp", "variant.wav", "variant.wav.tmp.wav"):
+            with suppress(OSError):
+                (resolved / name).unlink(missing_ok=True)
+        with suppress(OSError):
+            resolved.rmdir()
+        self._wav_staging_directories.discard(directory)
+
+    def _evaluate_group(self, group, artifacts):
+        """Prepare only this bounded batch in parallel, commit in source order."""
+        use_pool = (
+            len(group) > 1
+            and not self._wav_parallel_disabled
+            and self.audio_processor_factory is FfmpegAudioProcessor
+            and self.config.get("wav_cpu_processes", 3) != 1
+        )
+        futures = {}
+        if use_pool:
+            try:
+                if self._wav_pool is None:
+                    self._wav_pool = WavPreparationPool(self.processed_root, workers=3)
+                ffmpeg = FfmpegAudioProcessor().executable
+                for cue in group:
+                    artifact = artifacts.get(cue.cue_id)
+                    if artifact is None:
+                        continue
+                    futures[cue.cue_id] = self._wav_pool.submit({
+                        "cue": asdict(cue), "source": str(artifact.wav_path),
+                        "directory": str(self._preparation_directory()),
+                        "cache_root": str(Path(str(self.config["cache_root"])).resolve()),
+                        "settings": asdict(self.settings),
+                        "next_start_us": self._next_start_us.get(cue.index),
+                        "allow_timing_failure": self._allow_timing_failure(), "ffmpeg": ffmpeg,
+                    })
+            except Exception:
+                self._disable_wav_parallel()
+                futures.clear()
+        if futures:
+            self._phase = "base_read_speed"
+            self._phase_detail = "Đang xử lý WAV bằng 3 tiến trình CPU; giữ nguyên model GPU"
+            self._send_progress()
+        progress_at = time.monotonic()
+        for cue in group:
+            self._control_point()
+            future = futures.get(cue.cue_id) if not self._wav_parallel_disabled else None
+            if future is None:
+                approval = self._evaluate_artifact(cue, artifacts.get(cue.cue_id))
+            else:
+                while True:
+                    self._control_point()
+                    try:
+                        prepared = future.result(timeout=0.1)
+                        break
+                    except FutureTimeout:
+                        if time.monotonic() - progress_at >= 1.0:
+                            self._send_progress()
+                            progress_at = time.monotonic()
+                    except Exception:
+                        self._disable_wav_parallel()
+                        prepared = None
+                        break
+                self._control_point()
+                approval = (
+                    self._adopt_and_clean(cue, prepared) if prepared is not None
+                    else self._evaluate_artifact(cue, artifacts.get(cue.cue_id))
+                )
+            yield cue, approval
+            if time.monotonic() - progress_at >= 1.0:
+                self._send_progress()
+                progress_at = time.monotonic()
+
+    def _disable_wav_parallel(self) -> None:
+        self._wav_parallel_disabled = True
+        self._close_wav_pool(force=True)
+        self.send("warning", {
+            "code": "tts_wav_parallel_fallback",
+            "message": "Xử lý WAV song song chưa sẵn sàng; tiếp tục tuần tự, giữ nguyên cache.",
+        })
 
     def _evaluate_base_audio(
         self,
@@ -1063,30 +1192,84 @@ class TtsWorker:
         base_path: Path,
         base_qa: AudioQualityReport,
     ) -> ArtifactApproval:
-        """Create the selected speed variant directly from the immutable 1x WAV."""
-
-        next_start = self._next_start_us.get(cue.index)
-        fit = plan_fit(
-            cue,
-            audio_duration_us=base_qa.duration_us,
-            next_start_us=next_start,
-            settings=self.settings,
+        prepared = prepare_base_audio(
+            cue, base_path, base_qa, directory=self._preparation_directory(),
+            cache_root=Path(str(self.config["cache_root"])).expanduser().resolve(),
+            settings=self.settings, next_start_us=self._next_start_us.get(cue.index),
+            allow_timing_failure=self._allow_timing_failure(),
+            processor_factory=self.audio_processor_factory,
         )
-        defer_timing = (
-            self.config.get("defer_timing_conform") is True
-            and self.config.get("purpose") == "production"
-        ) or self.config.get("allow_timeline_overflow") is True
-        if not fit.fits and not defer_timing and not self.qa_non_blocking:
-            return ArtifactApproval(
-                False,
-                blocker=fit.blocker,
-                required_speed=fit.required_total_speed,
-                qa=base_qa,
-            )
+        return self._adopt_and_clean(cue, prepared)
 
+    def _adopt_and_clean(self, cue: TtsCueRequest, prepared: PreparedVoice) -> ArtifactApproval:
+        try:
+            return self._adopt_prepared(cue, prepared)
+        finally:
+            # Cache/raw paths are never removed. These are private preparation
+            # files already adopted or rejected by the owner, not resume inputs.
+            for path in (prepared.base_path, prepared.variant_path):
+                if path is not None:
+                    self._clean_preparation_directory(path.parent)
+
+    def _adopt_prepared(self, cue: TtsCueRequest, prepared: PreparedVoice) -> ArtifactApproval:
+        """Only the TTS owner can publish immutable files, metadata and ledger."""
+        if not prepared.base_sha256:
+            return prepared.approval
+        cache_root = Path(str(self.config["cache_root"])).expanduser().resolve()
+        base_cache_path = cache_root / f"{cue.request_fingerprint}.base.wav"
+        with _exclusive_cache_lock(
+            base_cache_path.with_suffix(".lock"), control_point=self._control_point,
+        ):
+            # Another owner may have committed the same request while this
+            # batch was preparing. Keep its verified winner unless the user
+            # explicitly requested regeneration of this cue.
+            if cue.cue_id not in self.force_cue_ids and base_cache_path.is_file():
+                try:
+                    candidate = json.loads(base_cache_path.with_suffix(".json").read_text(
+                        encoding="utf-8",
+                    ))
+                    winner_hash = file_sha256(base_cache_path)
+                    if (
+                        candidate.get("cache_tier") == "base"
+                        and candidate.get("request_fingerprint") == cue.request_fingerprint
+                        and candidate.get("cache_sha256") == winner_hash
+                        and winner_hash != prepared.base_sha256
+                    ):
+                        raw_qa = dict(candidate["qa"])
+                        raw_qa["reasons"] = tuple(raw_qa.get("reasons", ()))
+                        winner_qa = AudioQualityReport(**raw_qa)
+                        if winner_qa.ok:
+                            prepared = prepare_base_audio(
+                                cue, base_cache_path, winner_qa,
+                                directory=self._preparation_directory(), cache_root=cache_root,
+                                settings=self.settings,
+                                next_start_us=self._next_start_us.get(cue.index),
+                                allow_timing_failure=self._allow_timing_failure(),
+                                processor_factory=self.audio_processor_factory,
+                            )
+                except (OSError, KeyError, TypeError, ValueError, AttributeError):
+                    pass
+            return self._adopt_prepared_locked(cue, prepared)
+
+    def _adopt_prepared_locked(
+        self, cue: TtsCueRequest, prepared: PreparedVoice,
+    ) -> ArtifactApproval:
+        if not prepared.base_sha256:
+            return prepared.approval
+        base_path, base_qa, fit = prepared.base_path, prepared.base_qa, prepared.fit
+        if base_path is None or base_qa is None or fit is None:
+            raise ValueError("tts_wav_prepared_base_missing")
+        if file_sha256(base_path) != prepared.base_sha256 or fit.cue_id != cue.cue_id:
+            raise ValueError("tts_wav_prepared_base_changed")
+        expected_fit = plan_fit(
+            cue, audio_duration_us=base_qa.duration_us,
+            next_start_us=self._next_start_us.get(cue.index), settings=self.settings,
+        )
+        if fit != expected_fit:
+            raise ValueError("tts_wav_prepared_timing_changed")
         cache_root = Path(str(self.config["cache_root"])).expanduser().resolve()
         cache_root.mkdir(parents=True, exist_ok=True)
-        base_sha256 = file_sha256(base_path)
+        base_sha256 = prepared.base_sha256
         base_cache_path = cache_root / f"{cue.request_fingerprint}.base.wav"
         if not base_cache_path.is_file() or file_sha256(base_cache_path) != base_sha256:
             temp_base = base_cache_path.with_name(base_cache_path.name + f".{uuid4().hex}.tmp")
@@ -1107,83 +1290,40 @@ class TtsWorker:
             "qa": asdict(base_qa),
             "base_qa": asdict(base_qa),
         }
-        atomic_write_json(base_cache_path.with_suffix(".json"), base_metadata)
+        base_metadata_path = base_cache_path.with_suffix(".json")
+        atomic_write_json(base_metadata_path, base_metadata)
+        self._index_global_cache_metadata(base_metadata_path, base_metadata)
 
+        if not prepared.approval.approved:
+            return prepared.approval
+        cache_path = cache_root / f"{prepared.variant_fingerprint}.wav"
+        with _exclusive_cache_lock(
+            cache_path.with_suffix(".lock"), control_point=self._control_point,
+        ):
+            return self._publish_prepared_variant(cue, prepared, base_cache_path)
+
+    def _publish_prepared_variant(
+        self, cue: TtsCueRequest, prepared: PreparedVoice, base_cache_path: Path,
+    ) -> ArtifactApproval:
+        fit, base_qa = prepared.fit, prepared.base_qa
+        assert fit is not None and base_qa is not None
+        base_sha256 = file_sha256(base_cache_path)
+        if base_sha256 != prepared.base_sha256:
+            raise ValueError("tts_wav_committed_base_changed")
+        cache_root = base_cache_path.parent
         total_speed = fit.applied_total_speed
-        processor = self.audio_processor_factory() if total_speed > 1.0005 else None
-        processor_identity = (
-            f"{type(processor).__module__}.{type(processor).__qualname__}:"
-            f"{getattr(processor, 'executable', '')}"
-            if processor is not None
-            else "pcm-copy-v1"
-        )
-        variant_fingerprint = stable_fingerprint(
-            {
-                "schema": "ducai-voice-speed-variant-v1",
-                "base_wav_sha256": base_sha256,
-                "total_speed": round(total_speed, 8),
-                "processor": processor_identity,
-                "sample_rate": self.settings.sample_rate,
-                "qa_settings": {
-                    key: value
-                    for key, value in asdict(self.settings).items()
-                    if key not in {"voice_read_speed", "max_absolute_speed", "adaptive_timing"}
-                },
-            }
-        )
+        processor_identity = prepared.processor_identity
+        variant_fingerprint = prepared.variant_fingerprint
         cache_path = cache_root / f"{variant_fingerprint}.wav"
         metadata_path = cache_path.with_suffix(".json")
-        qa: AudioQualityReport | None = None
-        if cache_path.is_file() and metadata_path.is_file():
-            try:
-                cached_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-                if (
-                    isinstance(cached_metadata, dict)
-                    and cached_metadata.get("variant_fingerprint") == variant_fingerprint
-                    and cached_metadata.get("base_cache_sha256") == base_sha256
-                    and cached_metadata.get("cache_sha256") == file_sha256(cache_path)
-                    and isinstance(cached_metadata.get("qa"), dict)
-                ):
-                    qa = AudioQualityReport(**dict(cached_metadata["qa"]))
-            except (OSError, TypeError, ValueError, json.JSONDecodeError):
-                qa = None
-        if qa is None:
-            self._phase = (
-                "cue_timing_fit"
-                if total_speed > self.settings.voice_read_speed + 1e-9
-                else "base_read_speed"
-            )
-            self._phase_detail = (
-                f"Đang khớp cue dài {cue.index} ở tổng {total_speed:.2f}×"
-                if self._phase == "cue_timing_fit"
-                else f"Đang tạo WAV tốc độ gốc {self.settings.voice_read_speed:.2f}×"
-            )
+        qa, variant_path = prepared.approval.qa, prepared.variant_path
+        if qa is None or variant_path is None:
+            raise ValueError("tts_wav_prepared_variant_missing")
+        if file_sha256(variant_path) != prepared.variant_sha256:
+            raise ValueError("tts_wav_prepared_variant_changed")
+        if variant_path.resolve() != cache_path:
             temp_variant = cache_path.with_name(cache_path.name + f".{uuid4().hex}.tmp.wav")
-            if processor is None:
-                shutil.copyfile(base_cache_path, temp_variant)
-            else:
-                processor.time_stretch(
-                    base_cache_path,
-                    temp_variant,
-                    speed=total_speed,
-                    sample_rate=self.settings.sample_rate,
-                )
-            samples, sample_rate = read_pcm16_mono(temp_variant)
-            qa = analyze_audio(
-                samples,
-                sample_rate,
-                self.settings,
-                repaired_onset=base_qa.repaired_onset,
-            )
-            expected_duration_us = int(math.ceil(base_qa.duration_us / total_speed))
-            if not qa.ok or abs(qa.duration_us - expected_duration_us) > 50_000:
-                temp_variant.unlink(missing_ok=True)
-                return ArtifactApproval(
-                    False,
-                    blocker="tts_fit_validation_failed",
-                    required_speed=fit.required_total_speed,
-                    qa=qa,
-                )
+            shutil.copyfile(variant_path, temp_variant)
             os.replace(temp_variant, cache_path)
 
         metadata = {
@@ -1205,6 +1345,7 @@ class TtsWorker:
             "fit": asdict(fit),
         }
         atomic_write_json(metadata_path, metadata)
+        self._index_global_cache_metadata(metadata_path, metadata)
         self.ledger.setdefault("entries", {})[cue.cue_id] = metadata
         self.ledger.setdefault("blockers", {}).pop(cue.cue_id, None)
         return ArtifactApproval(True, qa=qa)
@@ -1255,19 +1396,19 @@ class TtsWorker:
             if not fingerprint:
                 continue
             candidates: list[dict[str, Any]] = []
-            cache_path = cache_root / f"{fingerprint}.wav"
-            metadata_path = cache_path.with_suffix(".json")
-            raw = self._read_global_cache_metadata(
-                cue,
-                fingerprint=fingerprint,
-                cache_path=cache_path if cache_path.is_file() else None,
-                metadata_path=metadata_path if metadata_path.is_file() else None,
-            )
-            if raw is not None:
-                candidates.append(raw)
-            candidates.extend(
-                self._global_cache_metadata_index().get((cue.cue_id, fingerprint), ())
-            )
+            for suffix in (".base", ""):
+                cache_path = cache_root / f"{fingerprint}{suffix}.wav"
+                metadata_path = cache_path.with_suffix(".json")
+                raw = self._read_global_cache_metadata(
+                    cue,
+                    fingerprint=fingerprint,
+                    cache_path=cache_path if cache_path.is_file() else None,
+                    metadata_path=metadata_path if metadata_path.is_file() else None,
+                )
+                if raw is not None:
+                    candidates.append(raw)
+                    self._index_global_cache_metadata(metadata_path, raw)
+            candidates.extend(self._indexed_global_cache_metadata(cue.cue_id, fingerprint))
             seen_paths: set[str] = set()
             for candidate in candidates:
                 candidate_path = str(candidate.get("cache_path", ""))
@@ -1332,26 +1473,178 @@ class TtsWorker:
                     return True
         return False
 
-    def _global_cache_metadata_index(
-        self,
-    ) -> dict[tuple[str, str], tuple[dict[str, Any], ...]]:
-        if self._global_cache_index is not None:
-            return self._global_cache_index
+    def _cache_index_path(self) -> Path:
         cache_root = Path(str(self.config["cache_root"])).expanduser().resolve()
-        collected: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        cache_root.mkdir(parents=True, exist_ok=True)
+        return cache_root / "voice-cache-index-v1.sqlite3"
+
+    def _open_cache_index(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self._cache_index_path(), timeout=5.0)
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA synchronous = NORMAL")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cache_metadata (
+                cue_id TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                metadata_path TEXT NOT NULL,
+                updated_ns INTEGER NOT NULL,
+                PRIMARY KEY(cue_id, request_fingerprint, metadata_path)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS cache_metadata_lookup_idx
+            ON cache_metadata(cue_id, request_fingerprint, updated_ns DESC)
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cache_index_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_ns INTEGER NOT NULL
+            )
+            """
+        )
+        return connection
+
+    def _ensure_cache_index_bootstrapped(self) -> None:
+        """Import arbitrary legacy metadata filenames into the sidecar once.
+
+        Modern cache entries use deterministic fingerprint filenames and are
+        looked up directly.  Older DUCAI releases allowed any JSON filename,
+        so a fresh sidecar needs one compatibility scan.  Persisting the
+        completion marker prevents that expensive scan from recurring for
+        every cue or every TTS job.
+        """
+
+        try:
+            with self._open_cache_index() as connection:
+                row = connection.execute(
+                    "SELECT value FROM cache_index_state WHERE key = 'legacy_bootstrap'"
+                ).fetchone()
+                if row is not None and str(row[0]) == "complete":
+                    return
+        except sqlite3.Error:
+            return
+
+        cache_root = Path(str(self.config["cache_root"])).expanduser().resolve()
+        metadata_rows: list[tuple[str, str, str, int]] = []
         for metadata_path in cache_root.glob("*.json"):
+            self._control_point()
             try:
                 raw = json.loads(metadata_path.read_text(encoding="utf-8"))
+                cue_id = raw.get("cue_id") if isinstance(raw, dict) else None
+                fingerprint = (
+                    raw.get("request_fingerprint") if isinstance(raw, dict) else None
+                )
+                if not isinstance(cue_id, str) or not cue_id:
+                    continue
+                if not isinstance(fingerprint, str) or not fingerprint:
+                    continue
+                metadata_rows.append(
+                    (
+                        cue_id,
+                        fingerprint,
+                        str(metadata_path.resolve()),
+                        metadata_path.stat().st_mtime_ns,
+                    )
+                )
             except (OSError, TypeError, ValueError, json.JSONDecodeError):
                 continue
-            if not isinstance(raw, dict):
+        try:
+            with self._open_cache_index() as connection:
+                connection.executemany(
+                    """
+                    INSERT INTO cache_metadata(
+                        cue_id, request_fingerprint, metadata_path, updated_ns
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(cue_id, request_fingerprint, metadata_path)
+                    DO UPDATE SET updated_ns = excluded.updated_ns
+                    """,
+                    metadata_rows,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO cache_index_state(key, value, updated_ns)
+                    VALUES ('legacy_bootstrap', 'complete', ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value,
+                        updated_ns = excluded.updated_ns
+                    """,
+                    (time.time_ns(),),
+                )
+        except sqlite3.Error:
+            # Cache files stay authoritative. A read-only or damaged sidecar
+            # may cost performance, but must never make voice synthesis fail.
+            return
+
+    def _index_global_cache_metadata(
+        self, metadata_path: Path, metadata: dict[str, Any]
+    ) -> None:
+        cue_id = metadata.get("cue_id")
+        fingerprint = metadata.get("request_fingerprint")
+        if not isinstance(cue_id, str) or not cue_id:
+            return
+        if not isinstance(fingerprint, str) or not fingerprint:
+            return
+        try:
+            updated_ns = metadata_path.stat().st_mtime_ns
+            with self._open_cache_index() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO cache_metadata(
+                        cue_id, request_fingerprint, metadata_path, updated_ns
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(cue_id, request_fingerprint, metadata_path)
+                    DO UPDATE SET updated_ns = excluded.updated_ns
+                    """,
+                    (cue_id, fingerprint, str(metadata_path.resolve()), updated_ns),
+                )
+        except (OSError, sqlite3.Error):
+            # The WAV cache remains authoritative; index maintenance is only
+            # an acceleration and must never make synthesis fail.
+            return
+
+    def _indexed_global_cache_metadata(
+        self, cue_id: str, fingerprint: str
+    ) -> tuple[dict[str, Any], ...]:
+        self._ensure_cache_index_bootstrapped()
+        try:
+            with self._open_cache_index() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT metadata_path FROM cache_metadata
+                    WHERE cue_id = ? AND request_fingerprint = ?
+                    ORDER BY updated_ns DESC LIMIT 16
+                    """,
+                    (cue_id, fingerprint),
+                ).fetchall()
+        except sqlite3.Error:
+            return ()
+        values: list[dict[str, Any]] = []
+        stale: list[str] = []
+        for (raw_path,) in rows:
+            path = Path(str(raw_path)).expanduser().resolve()
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                stale.append(str(path))
                 continue
-            cue_id = raw.get("cue_id")
-            fingerprint = raw.get("request_fingerprint")
-            if isinstance(cue_id, str) and cue_id and isinstance(fingerprint, str) and fingerprint:
-                collected.setdefault((cue_id, fingerprint), []).append(raw)
-        self._global_cache_index = {key: tuple(values) for key, values in collected.items()}
-        return self._global_cache_index
+            if isinstance(raw, dict):
+                values.append(raw)
+        if stale:
+            try:
+                with self._open_cache_index() as connection:
+                    connection.executemany(
+                        "DELETE FROM cache_metadata WHERE metadata_path = ?",
+                        ((path,) for path in stale),
+                    )
+            except sqlite3.Error:
+                pass
+        return tuple(values)
 
     def _read_global_cache_metadata(
         self,
@@ -2030,9 +2323,8 @@ class TtsWorker:
         blockers = self.ledger.get("blockers", {})
         terminal = completed + (len(blockers) if isinstance(blockers, dict) else 0)
         elapsed_ms = max(1, int((time.monotonic() - self._job_started) * 1_000))
-        synthesis_elapsed_ms = max(1, int((time.monotonic() - self._synthesis_started) * 1_000))
         synthesis_terminal = max(0, terminal - self._synthesis_baseline_terminal)
-        rate = synthesis_terminal / (synthesis_elapsed_ms / 1_000)
+        rate = median(self._warm_batch_rates) if len(self._warm_batch_rates) >= 2 else 0.0
         remaining = max(0, len(self.cues) - terminal)
         eta_ms = int(remaining / rate * 1_000) if rate > 0 else None
         self.send(
@@ -2048,7 +2340,15 @@ class TtsWorker:
                 "phase_total": max(0, len(self.cues) - self._synthesis_baseline_terminal),
                 "ineligible_cues": len(self.ineligible),
                 "blocked_cues": len(self.ledger.get("blockers", {})),
+                "eta_state": "ready" if eta_ms is not None else "measuring",
             },
+        )
+
+    def _terminal_cue_count(self) -> int:
+        entries = self.ledger.get("entries", {})
+        blockers = self.ledger.get("blockers", {})
+        return (len(entries) if isinstance(entries, dict) else 0) + (
+            len(blockers) if isinstance(blockers, dict) else 0
         )
 
     def _send_stage_progress(
@@ -2100,7 +2400,7 @@ class TtsWorker:
             atomic_write_json(self.ledger_path, self.ledger)
             source = self.job_staging / f"ledger-{uuid4().hex}.json.partial"
             shutil.copyfile(self.ledger_path, source)
-        digest = sha256(source.read_bytes()).hexdigest()
+        digest = file_sha256(source)
         entries = self.ledger.get("entries", {})
         completed_ids = set(entries) if isinstance(entries, dict) else set()
         completed_cues = [cue for cue in self.cues if cue.cue_id in completed_ids]
@@ -2128,6 +2428,11 @@ class TtsWorker:
 def main() -> int:
     if len(sys.argv) != 2 or not sys.argv[1].strip():
         return 2
+    from ducai_studio.infrastructure.licensing_state import worker_activation_exit_code
+
+    denied = worker_activation_exit_code()
+    if denied:
+        return denied
     return TtsWorker(sys.argv[1]).run()
 
 

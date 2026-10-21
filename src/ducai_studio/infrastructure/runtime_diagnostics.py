@@ -9,6 +9,7 @@ import sys
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from time import monotonic
 
 from ducai_studio.external_runtime import (
     isolated_python_environment,
@@ -19,6 +20,7 @@ from ducai_studio.providers.translation.gemini_web import _browser_executable
 from ducai_studio.providers.tts import VoiceCatalog, discover_data_root
 from ducai_studio.providers.tts.vieneu import VieNeuTtsProvider
 
+from .process_tree import ProcessTreeGuard
 from .runtime_program import runtime_program_path
 from .whisper_runtime import (
     WHISPER_CTRANSLATE2_VERSION,
@@ -26,6 +28,47 @@ from .whisper_runtime import (
     whisper_model_path,
     whisper_runtime_python,
 )
+
+_PADDLE_CUDA_PROBE_TIMEOUT_SECONDS = 45
+_PROBE_LAUNCH_GATE = b"DUCAI_LAUNCH\n"
+_PADDLE_CUDA_PROBE = """
+import json
+import runpy
+import sys
+result = {"state": "cuda_failed"}
+support = {}
+try:
+    support = runpy.run_path(sys.argv[1])
+    import paddle
+    result.update(cuda_compiled=paddle.is_compiled_with_cuda(),
+                  cuda_version=str(paddle.version.cuda() or ""),
+                  cudnn_version=str(paddle.version.cudnn() or ""))
+    result["device_count"] = paddle.device.cuda.device_count() if result["cuda_compiled"] else 0
+    if not result["cuda_compiled"]:
+        result["state"] = "cpu_only"
+    elif not result["device_count"]:
+        result["state"] = "cuda_unavailable"
+    else:
+        result["gpu_name"] = paddle.device.cuda.get_device_name(0)
+        result["compute_capability"] = list(paddle.device.cuda.get_device_capability(0))
+        support["_validate_paddle_gpu"](paddle, "gpu:0")
+        paddle.set_device("gpu:0")
+        image = paddle.ones([1, 1, 8, 8], dtype="float32")
+        weight = paddle.ones([1, 1, 3, 3], dtype="float32")
+        convolution = paddle.nn.functional.conv2d(image, weight)
+        matrix = paddle.ones([4, 4], dtype="float32")
+        multiplied = paddle.matmul(matrix, matrix)
+        if (not image.place.is_gpu_place()
+                or float(convolution.sum().item()) != 324.0
+                or float(multiplied.sum().item()) != 64.0):
+            raise RuntimeError("cuda_probe_mismatch")
+        result["state"] = "cuda_ready"
+except Exception as error:
+    result["error_type"] = type(error).__name__
+    if "_error_code" in support:
+        result["error_code"] = support["_error_code"](error)
+print("DUCAI_CUDA_PROBE=" + json.dumps(result))
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +119,51 @@ def run_runtime_diagnostics(
         else "ready"
     )
     return RuntimeDiagnosticReport("ducai-runtime-diagnostics-v1", overall, tuple(checks))
+
+
+def isolated_runtime_diagnostics(
+    *, data_root: str | None, cancelled: Callable[[], bool],
+) -> dict[str, object] | None:
+    """Keep slow native probes outside the manager and own their entire lifetime."""
+    if cancelled():
+        return None
+    with ProcessTreeGuard() as guard:
+        process = subprocess.Popen(
+            [str(runtime_program_path()), "-m", __name__, "--report", data_root or ""],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            env=isolated_python_environment(),
+        )
+        try:
+            guard.assign_pid(process.pid)
+            deadline = monotonic() + 300
+            launch_gate: bytes | None = _PROBE_LAUNCH_GATE
+            while not cancelled():
+                if monotonic() >= deadline:
+                    raise TimeoutError("Chẩn đoán quá thời gian. Hãy thử lại khi máy rảnh.")
+                try:
+                    stdout, _stderr = process.communicate(launch_gate, timeout=0.2)
+                    break
+                except subprocess.TimeoutExpired:
+                    launch_gate = None
+            else:
+                return None
+            if process.returncode != 0:
+                raise RuntimeError("Tiến trình chẩn đoán không hoàn tất. Hãy thử lại.")
+            line = next((line for line in reversed(stdout.decode("utf-8", "replace").splitlines())
+                         if line.startswith("DUCAI_DIAGNOSTICS=")), "")
+            value = json.loads(line.removeprefix("DUCAI_DIAGNOSTICS="))
+            if not isinstance(value, dict) or value.get("schema") != "ducai-runtime-diagnostics-v1":
+                raise ValueError("Không đọc được kết quả chẩn đoán.")
+            return value
+        finally:
+            guard.close()
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
 
 
 def _check_gui_python(path: Path) -> RuntimeCheck:
@@ -140,13 +228,97 @@ def _check_paddle_runtime(data_root: Path) -> RuntimeCheck:
         runtime, "paddlepaddle"
     )
     ready = bool(version and paddle)
+    cuda = _paddle_cuda_probe(runtime) if ready else {"state": "probe_unavailable"}
+    state = cuda["state"]
+    if not ready:
+        summary = "Runtime thiếu paddleocr/PaddlePaddle"
+    elif state == "cuda_ready":
+        summary = "Paddle CUDA sẵn sàng: " + str(cuda.get("gpu_name", "GPU"))
+    elif state == "cpu_only":
+        summary = "Paddle chỉ có CPU; runtime này không thể dùng GPU OCR"
+    elif state == "cuda_unavailable":
+        summary = "Paddle chưa thấy GPU CUDA; kiểm tra driver NVIDIA/runtime"
+    elif state == "cuda_failed":
+        summary = "Paddle đã cài nhưng phép thử CUDA lỗi; OCR có thể chuyển sang CPU"
+        if cuda.get("error_code") == "ocr_cuda_blackwell_runtime_incompatible":
+            summary = "RTX 50 cần runtime Paddle CUDA 12.9 trở lên; bản hiện tại không phù hợp"
+        elif cuda.get("error_code") == "ocr_cuda_driver_incompatible":
+            summary = "Driver NVIDIA chưa phù hợp với runtime CUDA của Paddle"
+        elif cuda.get("error_code") == "ocr_cuda_library_missing":
+            summary = "Paddle không nạp được thư viện CUDA/cuDNN; kiểm tra gói runtime"
+    else:
+        summary = "Paddle đã cài; chưa xác minh được CUDA, không thể kết luận GPU sẵn sàng"
+        reason = cuda.get("probe_reason")
+        if reason == "probe_timeout":
+            seconds = cuda.get("timeout_seconds", _PADDLE_CUDA_PROBE_TIMEOUT_SECONDS)
+            summary = f"Kiểm tra CUDA quá {seconds} giây; chưa thể xác nhận GPU sẵn sàng"
+        elif reason == "probe_process_failed":
+            summary = "Không chạy được tiến trình kiểm tra CUDA; chưa thể xác nhận GPU sẵn sàng"
+        elif reason == "probe_exited":
+            code = cuda.get("return_code")
+            suffix = f" (mã 0x{code & 0xFFFFFFFF:08X})" if type(code) is int else ""
+            summary = "Tiến trình kiểm tra CUDA thoát lỗi" + suffix
+        elif reason == "probe_invalid_output":
+            summary = "Không đọc được kết quả kiểm tra CUDA; chưa thể xác nhận GPU sẵn sàng"
     return RuntimeCheck(
         "paddle-ocr",
-        "ready" if ready else "blocked",
-        "Paddle OCR runtime sẵn sàng" if ready else "Runtime thiếu paddleocr/PaddlePaddle",
+        "ready" if ready and state == "cuda_ready" else "degraded" if ready else "blocked",
+        summary,
         f"paddleocr={version or '?'}; paddle={paddle or '?'}",
         str(runtime),
+        cuda,
     )
+
+
+def _paddle_cuda_probe(runtime: Path) -> dict[str, object]:
+    unavailable: dict[str, object] = {
+        "state": "probe_unavailable", "probe_reason": "probe_invalid_output",
+    }
+    try:
+        with ProcessTreeGuard() as guard:
+            process = subprocess.Popen(
+                [str(runtime_program_path()), "-m",
+                 "ducai_studio.infrastructure.runtime_diagnostics", str(runtime)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                cwd=isolated_python_working_directory(runtime),
+                env=isolated_python_environment(),
+            )
+            try:
+                # Own the venv launcher and real interpreter before the probe
+                # can start. A timeout must not leave its CUDA child running.
+                guard.assign_pid(process.pid)
+                stdout, _stderr = process.communicate(
+                    _PROBE_LAUNCH_GATE, timeout=_PADDLE_CUDA_PROBE_TIMEOUT_SECONDS,
+                )
+            finally:
+                guard.close()
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+                for stream in (process.stdin, process.stdout, process.stderr):
+                    if stream is not None:
+                        stream.close()
+        if process.returncode != 0:
+            return {"state": "probe_unavailable", "probe_reason": "probe_exited",
+                    "return_code": process.returncode}
+        line = next((line for line in reversed(stdout.decode("utf-8", "replace").splitlines())
+                     if line.startswith("DUCAI_CUDA_PROBE=")), "")
+        value = json.loads(line.removeprefix("DUCAI_CUDA_PROBE="))
+        if not isinstance(value, dict) or value.get("state") not in {
+            "cuda_ready", "cuda_failed", "cpu_only", "cuda_unavailable",
+        }:
+            return unavailable
+        allowed = {"state", "cuda_compiled", "cuda_version", "cudnn_version", "device_count",
+                   "gpu_name", "compute_capability", "error_type", "error_code"}
+        return {key: item for key, item in value.items() if key in allowed}
+    except subprocess.TimeoutExpired:
+        return {"state": "probe_unavailable", "probe_reason": "probe_timeout",
+                "timeout_seconds": _PADDLE_CUDA_PROBE_TIMEOUT_SECONDS}
+    except (OSError, subprocess.SubprocessError):
+        return {"state": "probe_unavailable", "probe_reason": "probe_process_failed"}
+    except ValueError:
+        return unavailable
 
 
 def _check_whisper_runtime(data_root: Path) -> RuntimeCheck:
@@ -283,9 +455,40 @@ def _python_package_version(runtime: Path, package: str) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
+def main(arguments: list[str] | None = None) -> int:
+    """Launch only fixed diagnostics, also before app activation."""
+    arguments = sys.argv[1:] if arguments is None else arguments
+    report_mode = len(arguments) == 2 and arguments[0] == "--report"
+    if not report_mode and (len(arguments) != 1 or not Path(arguments[0]).is_file()):
+        return 64
+    # The parent owns our process tree before releasing this exact byte gate.
+    # This route never accepts arbitrary Python code or job commands.
+    gate = b"".join(os.read(sys.stdin.fileno(), 1) for _ in range(len(_PROBE_LAUNCH_GATE)))
+    if gate != _PROBE_LAUNCH_GATE:
+        return 65
+    if report_mode:
+        result = run_runtime_diagnostics(data_root=arguments[1] or None).to_dict()
+        print("DUCAI_DIAGNOSTICS=" + json.dumps(result, ensure_ascii=False), flush=True)
+        return 0
+    source_host = Path(__file__).parents[1] / "engine_hosts" / "ocr_engine_host.py"
+    host = (source_host if source_host.is_file() else
+            runtime_program_path().parent / "engine_hosts" / "ocr_engine_host.pyc")
+    child = subprocess.Popen(
+        [arguments[0], "-c", _PADDLE_CUDA_PROBE, str(host)],
+        stdin=sys.stdin.buffer, stdout=sys.stdout.buffer, stderr=sys.stderr.buffer,
+        env=isolated_python_environment(), close_fds=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    return child.wait()
+
+
 def _metadata_version(path: Path) -> str:
     try:
         value = json.loads(path.read_text(encoding="utf-8-sig"))
         return str(value.get("version", "")) if isinstance(value, dict) else ""
     except (OSError, TypeError, json.JSONDecodeError):
         return ""
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

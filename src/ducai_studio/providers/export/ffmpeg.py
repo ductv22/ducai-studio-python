@@ -4,7 +4,8 @@ import math
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
+import wave
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from ducai_studio.domain.effects import (
@@ -23,6 +24,9 @@ from ducai_studio.domain.effects import (
 EXPORT_AUDIO_SAMPLE_RATE = 48_000
 MIX_PEAK_CEILING_DBFS = -1.5
 MIX_PEAK_LIMIT = 10 ** (MIX_PEAK_CEILING_DBFS / 20.0)
+PCM_VOICE_PRECOMPOSE_MIN_CLIPS = 8
+PCM_VOICE_PRECOMPOSE_MAX_BYTES = 512 * 1024 * 1024
+PCM_COPY_BLOCK_FRAMES = 262_144
 
 
 def _hidden_subprocess_kwargs() -> dict[str, object]:
@@ -56,6 +60,7 @@ class ExportChunkPlan:
     filter_script_path: Path
     arguments: tuple[str, ...]
     backend: str
+    temporary_paths: tuple[Path, ...] = ()
 
     @property
     def duration_us(self) -> int:
@@ -117,6 +122,242 @@ def chunk_ranges(snapshot: ExportSnapshot) -> tuple[tuple[int, int], ...]:
     return tuple(result)
 
 
+type _ActiveAudio = tuple[RenderClip, int, int, int, int, bool, bool, bool]
+type _VideoPiece = tuple[RenderClip, int, int, int, int]
+
+
+def _chunk_video_pieces(
+    snapshot: ExportSnapshot,
+    start_us: int,
+    end_us: int,
+) -> tuple[_VideoPiece, ...]:
+    """Return source ranges for every edited V1 segment crossing a chunk."""
+
+    if not snapshot.video_segments:
+        return ()
+    pieces: list[_VideoPiece] = []
+    cursor = start_us
+    for segment in snapshot.video_segments:
+        intersection_start = max(start_us, segment.timeline_start_us)
+        intersection_end = min(end_us, segment.timeline_end_us)
+        if intersection_end <= intersection_start:
+            continue
+        if intersection_start != cursor:
+            raise ValueError("Export video chunk contains an uncovered timeline gap")
+        speed = segment.speed_numerator / segment.speed_denominator
+        source_start = segment.source_start_us + int(
+            round((intersection_start - segment.timeline_start_us) * speed)
+        )
+        source_duration = int(round((intersection_end - intersection_start) * speed))
+        pieces.append(
+            (
+                segment,
+                intersection_start,
+                intersection_end,
+                source_start,
+                source_duration,
+            )
+        )
+        cursor = intersection_end
+    if cursor != end_us:
+        raise ValueError("Export video chunk contains an uncovered timeline gap")
+    return tuple(pieces)
+
+
+def _timeline_frames(timestamp_us: int, sample_rate: int) -> int:
+    return max(0, round(timestamp_us * sample_rate / 1_000_000))
+
+
+def _write_silence(
+    writer: wave.Wave_write,
+    frame_count: int,
+    *,
+    silence_frame: bytes,
+) -> None:
+    frame_width = len(silence_frame)
+    silence = silence_frame * min(PCM_COPY_BLOCK_FRAMES, frame_count)
+    remaining = frame_count
+    while remaining > 0:
+        current = min(remaining, PCM_COPY_BLOCK_FRAMES)
+        writer.writeframesraw(silence[: current * frame_width])
+        remaining -= current
+
+
+def _write_pcm_voice_chunk(
+    source_path: Path,
+    output_path: Path,
+    items: list[_ActiveAudio],
+    *,
+    chunk_start_us: int,
+    chunk_end_us: int,
+) -> None:
+    with wave.open(str(source_path), "rb") as reader:
+        if reader.getcomptype() != "NONE":
+            raise ValueError("Voice master is not uncompressed PCM")
+        channels = reader.getnchannels()
+        sample_width = reader.getsampwidth()
+        sample_rate = reader.getframerate()
+        if not 1 <= channels <= 8 or not 1 <= sample_width <= 4 or sample_rate <= 0:
+            raise ValueError("Voice master PCM format is unsupported")
+        frame_width = channels * sample_width
+        silence_frame = (b"\x80" if sample_width == 1 else b"\0" * sample_width) * channels
+        total_frames = _timeline_frames(chunk_end_us - chunk_start_us, sample_rate)
+        if total_frames * frame_width > PCM_VOICE_PRECOMPOSE_MAX_BYTES:
+            raise ValueError("Precomposed voice chunk would be too large")
+
+        ordered = sorted(items, key=lambda item: (item[1], item[2], item[0].clip_id))
+        previous_end = chunk_start_us
+        for item in ordered:
+            if item[1] < previous_end:
+                raise ValueError("Overlapping voice cues cannot be precomposed safely")
+            previous_end = item[2]
+
+        output_path.unlink(missing_ok=True)
+        with wave.open(str(output_path), "wb") as writer:
+            writer.setnchannels(channels)
+            writer.setsampwidth(sample_width)
+            writer.setframerate(sample_rate)
+            cursor_frame = 0
+            for (
+                _clip,
+                intersection_start,
+                intersection_end,
+                source_start,
+                source_duration,
+                _conformed_original,
+                _same_as_video,
+                _reuse_video,
+            ) in ordered:
+                destination_start = _timeline_frames(
+                    intersection_start - chunk_start_us, sample_rate
+                )
+                destination_end = _timeline_frames(intersection_end - chunk_start_us, sample_rate)
+                if destination_start < cursor_frame or destination_end <= destination_start:
+                    raise ValueError("Voice cue frame range is invalid")
+                source_frame = _timeline_frames(source_start, sample_rate)
+                source_frames = _timeline_frames(source_duration, sample_rate)
+                destination_frames = destination_end - destination_start
+                if abs(source_frames - destination_frames) > 1:
+                    raise ValueError("Voice cue source and timeline durations do not match")
+                if source_frame >= reader.getnframes():
+                    raise ValueError("Voice cue starts outside the master WAV")
+
+                _write_silence(
+                    writer,
+                    destination_start - cursor_frame,
+                    silence_frame=silence_frame,
+                )
+                reader.setpos(source_frame)
+                remaining = destination_frames
+                while remaining > 0:
+                    requested = min(remaining, PCM_COPY_BLOCK_FRAMES)
+                    data = reader.readframes(requested)
+                    if len(data) % frame_width:
+                        raise ValueError("Voice master returned a partial PCM frame")
+                    copied = len(data) // frame_width
+                    if copied:
+                        writer.writeframesraw(data)
+                    if copied < requested:
+                        _write_silence(
+                            writer,
+                            requested - copied,
+                            silence_frame=silence_frame,
+                        )
+                    remaining -= requested
+                cursor_frame = destination_end
+            _write_silence(
+                writer,
+                total_frames - cursor_frame,
+                silence_frame=silence_frame,
+            )
+            writer.writeframes(b"")
+
+
+def _precompose_pcm_voice_groups(
+    active_audio: list[_ActiveAudio],
+    *,
+    chunk_start_us: int,
+    chunk_end_us: int,
+    work_dir: Path,
+    chunk_index: int,
+) -> tuple[list[_ActiveAudio], tuple[Path, ...]]:
+    candidates: dict[tuple[str, str], list[tuple[int, _ActiveAudio]]] = {}
+    for position, item in enumerate(active_audio):
+        clip = item[0]
+        if (
+            clip.track_kind != "voice"
+            or clip.speed_numerator != clip.speed_denominator
+            or not math.isclose(clip.volume, 1.0, rel_tol=0.0, abs_tol=1e-9)
+            or item[5]
+            or item[6]
+            or item[7]
+        ):
+            continue
+        path = Path(clip.path).expanduser().resolve()
+        if path.suffix.lower() != ".wav":
+            continue
+        candidates.setdefault((clip.track_id, os.path.normcase(str(path))), []).append(
+            (position, item)
+        )
+
+    replacements: dict[int, _ActiveAudio] = {}
+    removed: set[int] = set()
+    temporary_paths: list[Path] = []
+    for group_number, group in enumerate(candidates.values()):
+        if len(group) < PCM_VOICE_PRECOMPOSE_MIN_CLIPS:
+            continue
+        first_position = min(position for position, _item in group)
+        items = [item for _position, item in group]
+        source_path = Path(items[0][0].path).expanduser().resolve()
+        output_path = work_dir / f"voice-chunk-{chunk_index:05d}-{group_number:02d}.wav"
+        try:
+            _write_pcm_voice_chunk(
+                source_path,
+                output_path,
+                items,
+                chunk_start_us=chunk_start_us,
+                chunk_end_us=chunk_end_us,
+            )
+        except (EOFError, OSError, ValueError, wave.Error):
+            output_path.unlink(missing_ok=True)
+            continue
+        synthetic = RenderClip(
+            f"precomposed-{items[0][0].track_id}-{chunk_index}-{group_number}",
+            items[0][0].track_id,
+            "voice",
+            str(output_path),
+            chunk_start_us,
+            chunk_end_us,
+            0,
+            chunk_end_us - chunk_start_us,
+            1,
+            1,
+            1.0,
+            False,
+        )
+        replacements[first_position] = (
+            synthetic,
+            chunk_start_us,
+            chunk_end_us,
+            0,
+            chunk_end_us - chunk_start_us,
+            False,
+            False,
+            False,
+        )
+        removed.update(position for position, _item in group)
+        temporary_paths.append(output_path)
+
+    collapsed: list[_ActiveAudio] = []
+    for position, item in enumerate(active_audio):
+        replacement = replacements.get(position)
+        if replacement is not None:
+            collapsed.append(replacement)
+        if position not in removed:
+            collapsed.append(item)
+    return collapsed, tuple(temporary_paths)
+
+
 def materialize_export_chunk(
     snapshot: ExportSnapshot,
     *,
@@ -139,8 +380,28 @@ def materialize_export_chunk(
     duration_s = _seconds(duration_us)
     video = snapshot.video
     video_speed = video.speed_numerator / video.speed_denominator
+    video_pieces = _chunk_video_pieces(snapshot, start_us, end_us)
     conform_pieces = _chunk_conform_pieces(snapshot, start_us, end_us)
-    if conform_pieces:
+    if video_pieces:
+        source_start_us = video_pieces[0][3]
+        source_duration_us = video_pieces[0][4]
+        args = [
+            capabilities.ffmpeg_path,
+            "-hide_banner",
+            "-nostdin",
+            "-y",
+        ]
+        for segment, _piece_start, _piece_end, source_start, source_duration in video_pieces:
+            args += [
+                "-ss",
+                _seconds(source_start),
+                "-t",
+                _seconds(source_duration),
+                "-i",
+                segment.path,
+            ]
+        video_input_count = len(video_pieces)
+    elif conform_pieces:
         source_start_us = conform_pieces[0][0]
         source_duration_us = sum(item[1] - item[0] for item in conform_pieces)
         args = [
@@ -151,6 +412,7 @@ def materialize_export_chunk(
             "-i",
             video.path,
         ]
+        video_input_count = 1
     else:
         source_start_us = video.source_start_us + int(
             round((start_us - video.timeline_start_us) * video_speed)
@@ -168,6 +430,7 @@ def materialize_export_chunk(
             "-i",
             video.path,
         ]
+        video_input_count = 1
 
     active_overlays = [
         overlay
@@ -184,20 +447,18 @@ def materialize_export_chunk(
     active_scene_texts = [
         cue
         for cue in snapshot.scene_texts
-        if cue.review_state == "accepted"
-        and cue.end_us > start_us
-        and cue.start_us < end_us
+        if cue.review_state == "accepted" and cue.end_us > start_us and cue.start_us < end_us
     ]
+    active_title_texts = [cue for cue in snapshot.title_texts
+                         if cue.end_us > start_us and cue.start_us < end_us]
     logo_inputs: list[tuple[int, RenderOverlay]] = []
-    next_input = 1
+    next_input = video_input_count
     for logo in logos:
         args += ["-i", logo.asset_path]
         logo_inputs.append((next_input, logo))
         next_input += 1
 
-    active_audio: list[
-        tuple[RenderClip, int, int, int, int, bool, bool, bool]
-    ] = []
+    active_audio: list[_ActiveAudio] = []
     for clip in snapshot.audio:
         if clip.muted or clip.volume <= 0:
             continue
@@ -210,21 +471,23 @@ def materialize_export_chunk(
             round((intersection_start - clip.timeline_start_us) * speed)
         )
         source_duration = int(round((intersection_end - intersection_start) * speed))
-        conformed_original = bool(
-            conform_pieces and clip.track_kind == "original_audio"
-        )
+        conformed_original = bool(conform_pieces and clip.track_kind == "original_audio")
         same_as_video = os.path.normcase(os.path.abspath(video.path)) == os.path.normcase(
             os.path.abspath(clip.path)
         )
-        reuse_video = not conformed_original and _can_reuse_video_input_for_audio(
-            video=video,
-            audio=clip,
-            chunk_start_us=start_us,
-            chunk_end_us=end_us,
-            video_source_start_us=source_start_us,
-            video_source_duration_us=source_duration_us,
-            audio_source_start_us=source_start,
-            audio_source_duration_us=source_duration,
+        reuse_video = (
+            not video_pieces
+            and not conformed_original
+            and _can_reuse_video_input_for_audio(
+                video=video,
+                audio=clip,
+                chunk_start_us=start_us,
+                chunk_end_us=end_us,
+                video_source_start_us=source_start_us,
+                video_source_duration_us=source_duration_us,
+                audio_source_start_us=source_start,
+                audio_source_duration_us=source_duration,
+            )
         )
         active_audio.append(
             (
@@ -238,6 +501,14 @@ def materialize_export_chunk(
                 reuse_video,
             )
         )
+
+    active_audio, temporary_paths = _precompose_pcm_voice_groups(
+        active_audio,
+        chunk_start_us=start_us,
+        chunk_end_us=end_us,
+        work_dir=work_dir,
+        chunk_index=index,
+    )
 
     # Cue-scoped D1 clips normally point at different source ranges inside one
     # mastered WAV. Opening that WAV once per cue makes a 10-minute Windows
@@ -269,9 +540,7 @@ def materialize_export_chunk(
             grouped_inputs[key] = group
         elif not conformed_original:
             group["start_us"] = min(int(group["start_us"]), source_start)
-            group["end_us"] = max(
-                int(group["end_us"]), source_start + source_duration
-            )
+            group["end_us"] = max(int(group["end_us"]), source_start + source_duration)
 
     for group in grouped_inputs.values():
         group["input_index"] = next_input
@@ -287,9 +556,7 @@ def materialize_export_chunk(
         args += ["-i", str(group["path"])]
         next_input += 1
 
-    audio_inputs: list[
-        tuple[int, RenderClip, int, int, int, int, int, bool]
-    ] = []
+    audio_inputs: list[tuple[int, RenderClip, int, int, int, int, int, bool]] = []
     for (
         clip,
         intersection_start,
@@ -344,7 +611,40 @@ def materialize_export_chunk(
     output_height -= output_height % 2
     graph: list[str] = []
     video_input_label = "0:v"
-    if conform_pieces:
+    if video_pieces:
+        piece_labels: list[str] = []
+        for number, (
+            segment,
+            piece_start,
+            piece_end,
+            _source_start,
+            _source_duration,
+        ) in enumerate(video_pieces):
+            speed = segment.speed_numerator / segment.speed_denominator
+            label = f"vsegment{number}"
+            piece_duration = _seconds(piece_end - piece_start)
+            filters = [
+                f"setpts={1.0 / speed:.12f}*PTS",
+                f"scale={output_width}:{output_height}:flags=lanczos",
+                f"fps={snapshot.settings.fps}",
+                "format=yuv420p",
+                f"trim=duration={piece_duration}",
+                "setpts=PTS-STARTPTS",
+            ]
+            graph.append(f"[{number}:v]" + ",".join(filters) + f"[{label}]")
+            piece_labels.append(f"[{label}]")
+        graph.append(
+            "".join(piece_labels)
+            + f"concat=n={len(piece_labels)}:v=1:a=0[vsegments]"
+        )
+        video_input_label = "vsegments"
+        video_filters = [
+            *_video_filter_chain(snapshot.settings.video_filter),
+            "format=yuv420p",
+            f"trim=duration={duration_s}",
+            "setpts=PTS-STARTPTS",
+        ]
+    elif conform_pieces:
         piece_labels: list[str] = []
         for number, (piece_start, piece_end, piece_speed) in enumerate(conform_pieces):
             label = f"vconform{number}"
@@ -354,10 +654,7 @@ def materialize_export_chunk(
                 f"setpts=(PTS-STARTPTS)/{piece_speed:.12f}[{label}]"
             )
             piece_labels.append(f"[{label}]")
-        graph.append(
-            "".join(piece_labels)
-            + f"concat=n={len(piece_labels)}:v=1:a=0[vconformed]"
-        )
+        graph.append("".join(piece_labels) + f"concat=n={len(piece_labels)}:v=1:a=0[vconformed]")
         video_input_label = "vconformed"
         video_filters: list[str] = []
     else:
@@ -373,10 +670,50 @@ def materialize_export_chunk(
             "setpts=PTS-STARTPTS",
         ]
     )
-    graph.append(
-        f"[{video_input_label}]" + ",".join(video_filters or ["null"]) + "[vprep]"
-    )
+    graph.append(f"[{video_input_label}]" + ",".join(video_filters or ["null"]) + "[vprep]")
     current_label = "vprep"
+    active_subtitles = [
+        cue for cue in snapshot.subtitles if cue.end_us > start_us and cue.start_us < end_us
+    ]
+    from ducai_studio.providers.subtitle_artwork import (
+        artwork_payload,
+        concealment_rect,
+        layout_batch,
+    )
+
+    rendered_cues = [*active_scene_texts, *active_subtitles, *active_title_texts]
+    artwork_values = (
+        layout_batch(
+            [
+                artwork_payload(cue, output_width, output_height, snapshot.settings.subtitle_style)
+                for cue in rendered_cues
+            ]
+        )
+        if rendered_cues
+        else []
+    )
+    artworks = {cue.cue_id: value for cue, value in zip(rendered_cues, artwork_values, strict=True)}
+    active_subtitle_blurs = [
+        replace(
+            blur,
+            **dict(
+                zip(
+                    ("x", "y", "width", "height"),
+                    concealment_rect(
+                        artworks[blur.cue_id],
+                        output_width,
+                        output_height,
+                        blur.padding_x,
+                        blur.padding_y,
+                    ),
+                    strict=True,
+                )
+            ),
+        )
+        if blur.tracking_mode == "translated_text" and blur.cue_id in artworks
+        else blur
+        for blur in active_subtitle_blurs
+    ]
     blur_groups: dict[tuple[int, bool], list[RenderSubtitleBlur]] = {}
     for blur in active_subtitle_blurs:
         key = (blur.blur_radius, blur.concealment_mode == "cover")
@@ -386,9 +723,7 @@ def materialize_export_chunk(
     ):
         base_label = f"vsubblur{group_number}base"
         source_label = f"vsubblur{group_number}src"
-        graph.append(
-            f"[{current_label}]split=2[{base_label}][{source_label}]"
-        )
+        graph.append(f"[{current_label}]split=2[{base_label}][{source_label}]")
         radius = max(1, min(requested_radius, output_width // 2, output_height // 2))
         chroma_radius = max(1, min(6, radius // 2))
         blurred_label = f"vsubblur{group_number}full"
@@ -397,47 +732,73 @@ def materialize_export_chunk(
             f"[{source_label}]boxblur=luma_radius={radius}:luma_power={power}:"
             f"chroma_radius={chroma_radius}:chroma_power={power}[{blurred_label}]"
         )
-        mask_filters = [
-            f"color=c=black:s={output_width}x{output_height}:r={snapshot.settings.fps}:"
-            f"d={duration_s}"
-        ]
+        mask_rectangles: list[_AssRectangle] = []
         for blur in group:
             x, y, width, height = _overlay_pixels(blur, output_width, output_height)
-            enable = _range_enable(blur.start_us, blur.end_us, start_us, end_us)
-            mask_filters.append(
-                f"drawbox=x={x}:y={y}:w={width}:h={height}:"
-                f"color=white@{blur.opacity:.6f}:t=fill:enable='{enable}'"
+            mask_rectangles.append(
+                _AssRectangle(
+                    blur.start_us,
+                    blur.end_us,
+                    x,
+                    y,
+                    width,
+                    height,
+                    "#FFFFFF",
+                    max(0, min(100, round(blur.opacity * 100))),
+                )
             )
-        mask_label = f"vsubblur{group_number}mask"
-        graph.append(",".join(mask_filters) + f",format=gray[{mask_label}]")
-        next_label = f"vsubblur{group_number}out"
-        graph.append(
-            f"[{base_label}][{blurred_label}][{mask_label}]maskedmerge[{next_label}]"
+        mask_path = work_dir / f"subtitle-mask-{index:05d}-{group_number:02d}.ass"
+        _write_rectangle_ass(
+            mask_path,
+            mask_rectangles,
+            chunk_start_us=start_us,
+            chunk_end_us=end_us,
+            width=output_width,
+            height=output_height,
         )
+        mask_label = f"vsubblur{group_number}mask"
+        graph.append(
+            f"color=c=black:s={output_width}x{output_height}:r={snapshot.settings.fps}:"
+            f"d={duration_s},ass=filename='{mask_path.name}',format=gray[{mask_label}]"
+        )
+        next_label = f"vsubblur{group_number}out"
+        graph.append(f"[{base_label}][{blurred_label}][{mask_label}]maskedmerge[{next_label}]")
         current_label = next_label
         covered = [blur for blur in group if blur.concealment_mode == "cover"]
         if covered:
-            cover_filters = []
+            cover_rectangles: list[_AssRectangle] = []
             for blur in covered:
-                x, y, width, height = _overlay_pixels(
-                    blur, output_width, output_height
+                x, y, width, height = _overlay_pixels(blur, output_width, output_height)
+                cover_rectangles.append(
+                    _AssRectangle(
+                        blur.start_us,
+                        blur.end_us,
+                        x,
+                        y,
+                        width,
+                        height,
+                        "#000000",
+                        90,
+                    )
                 )
-                enable = _range_enable(blur.start_us, blur.end_us, start_us, end_us)
-                cover_filters.append(
-                    f"drawbox=x={x}:y={y}:w={width}:h={height}:"
-                    f"color=black@0.900000:t=fill:enable='{enable}'"
-                )
-            cover_label = f"vsubblur{group_number}covered"
-            graph.append(
-                f"[{current_label}]" + ",".join(cover_filters) + f"[{cover_label}]"
+            cover_path = work_dir / f"subtitle-cover-{index:05d}-{group_number:02d}.ass"
+            _write_rectangle_ass(
+                cover_path,
+                cover_rectangles,
+                chunk_start_us=start_us,
+                chunk_end_us=end_us,
+                width=output_width,
+                height=output_height,
             )
+            cover_label = f"vsubblur{group_number}covered"
+            graph.append(f"[{current_label}]ass=filename='{cover_path.name}'[{cover_label}]")
             current_label = cover_label
     scene_blur_groups: dict[int, list[RenderSceneText]] = {}
     for cue in active_scene_texts:
+        if not cue.source_blur_enabled:
+            continue
         scene_blur_groups.setdefault(cue.blur_radius, []).append(cue)
-    for group_number, (requested_radius, group) in enumerate(
-        sorted(scene_blur_groups.items())
-    ):
+    for group_number, (requested_radius, group) in enumerate(sorted(scene_blur_groups.items())):
         base_label = f"vscene{group_number}base"
         source_label = f"vscene{group_number}src"
         graph.append(f"[{current_label}]split=2[{base_label}][{source_label}]")
@@ -448,26 +809,42 @@ def materialize_export_chunk(
             f"[{source_label}]boxblur=luma_radius={radius}:luma_power=2:"
             f"chroma_radius={chroma_radius}:chroma_power=2[{blurred_label}]"
         )
-        mask_filters = [
-            f"color=c=black:s={output_width}x{output_height}:r={snapshot.settings.fps}:"
-            f"d={duration_s}"
-        ]
+        mask_rectangles: list[_AssRectangle] = []
         for cue in group:
             x, y, width, height = _scene_glyph_pixels(cue, output_width, output_height)
-            enable = _range_enable(cue.start_us, cue.end_us, start_us, end_us)
-            mask_filters.append(
-                f"drawbox=x={x}:y={y}:w={width}:h={height}:"
-                f"color=white@1.000000:t=fill:enable='{enable}'"
+            mask_rectangles.append(
+                _AssRectangle(
+                    cue.start_us,
+                    cue.end_us,
+                    x,
+                    y,
+                    width,
+                    height,
+                    "#FFFFFF",
+                    100,
+                )
             )
-        mask_label = f"vscene{group_number}mask"
-        graph.append(",".join(mask_filters) + f",format=gray[{mask_label}]")
-        next_label = f"vscene{group_number}merged"
-        graph.append(
-            f"[{base_label}][{blurred_label}][{mask_label}]maskedmerge[{next_label}]"
+        mask_path = work_dir / f"scene-mask-{index:05d}-{group_number:02d}.ass"
+        _write_rectangle_ass(
+            mask_path,
+            mask_rectangles,
+            chunk_start_us=start_us,
+            chunk_end_us=end_us,
+            width=output_width,
+            height=output_height,
         )
+        mask_label = f"vscene{group_number}mask"
+        graph.append(
+            f"color=c=black:s={output_width}x{output_height}:r={snapshot.settings.fps}:"
+            f"d={duration_s},ass=filename='{mask_path.name}',format=gray[{mask_label}]"
+        )
+        next_label = f"vscene{group_number}merged"
+        graph.append(f"[{base_label}][{blurred_label}][{mask_label}]maskedmerge[{next_label}]")
         current_label = next_label
-        fills = []
+        fill_rectangles: list[_AssRectangle] = []
         for cue in group:
+            if cue.cue_id in artworks:
+                continue  # The measured artwork owns its background exactly once.
             if not cue.background_color or cue.background_style != "solid":
                 continue
             x, y, width, height = _scene_label_background_pixels(
@@ -475,15 +852,30 @@ def materialize_export_chunk(
                 output_width,
                 output_height,
             )
-            enable = _range_enable(cue.start_us, cue.end_us, start_us, end_us)
-            fills.append(
-                f"drawbox=x={x}:y={y}:w={width}:h={height}:"
-                f"color=0x{cue.background_color[1:]}@"
-                f"{cue.background_opacity_percent / 100:.6f}:t=fill:enable='{enable}'"
+            fill_rectangles.append(
+                _AssRectangle(
+                    cue.start_us,
+                    cue.end_us,
+                    x,
+                    y,
+                    width,
+                    height,
+                    cue.background_color,
+                    cue.background_opacity_percent,
+                )
             )
-        if fills:
+        if fill_rectangles:
+            fill_path = work_dir / f"scene-fill-{index:05d}-{group_number:02d}.ass"
+            _write_rectangle_ass(
+                fill_path,
+                fill_rectangles,
+                chunk_start_us=start_us,
+                chunk_end_us=end_us,
+                width=output_width,
+                height=output_height,
+            )
             filled_label = f"vscene{group_number}filled"
-            graph.append(f"[{current_label}]" + ",".join(fills) + f"[{filled_label}]")
+            graph.append(f"[{current_label}]ass=filename='{fill_path.name}'[{filled_label}]")
             current_label = filled_label
     if blurs:
         split_labels = ["vmain", *(f"vblur{number}src" for number in range(len(blurs)))]
@@ -504,8 +896,7 @@ def materialize_export_chunk(
             next_label = f"vfx{number}"
             enable = _enable_expression(blur, start_us, end_us)
             graph.append(
-                f"[{current_label}][vblur{number}]overlay={x}:{y}:enable='{enable}'"
-                f"[{next_label}]"
+                f"[{current_label}][vblur{number}]overlay={x}:{y}:enable='{enable}'[{next_label}]"
             )
             current_label = next_label
 
@@ -525,21 +916,22 @@ def materialize_export_chunk(
 
     ass_path: Path | None = None
     active_subtitles = [
-        cue
-        for cue in snapshot.subtitles
-        if cue.end_us > start_us and cue.start_us < end_us
+        cue for cue in snapshot.subtitles if cue.end_us > start_us and cue.start_us < end_us
     ]
-    if snapshot.settings.subtitle_style.enabled and (active_subtitles or active_scene_texts):
+    painted_subtitles = active_subtitles if snapshot.settings.subtitle_style.enabled else []
+    painted_scenes = active_scene_texts if snapshot.settings.subtitle_style.enabled else []
+    if painted_subtitles or painted_scenes or active_title_texts:
         ass_path = work_dir / f"subtitles-{index:05d}.ass"
         _write_ass(
             ass_path,
-            active_subtitles,
+            painted_subtitles,
             chunk_start_us=start_us,
             chunk_end_us=end_us,
             width=output_width,
             height=output_height,
             style=snapshot.settings.subtitle_style,
-            scene_texts=active_scene_texts,
+            scene_texts=[*painted_scenes, *active_title_texts],
+            artworks=artworks,
         )
         next_label = "vsub"
         font_directory = _bundled_font_directory()
@@ -548,9 +940,7 @@ def materialize_export_chunk(
             if font_directory is not None
             else ""
         )
-        graph.append(
-            f"[{current_label}]ass=filename='{ass_path.name}'{font_option}[{next_label}]"
-        )
+        graph.append(f"[{current_label}]ass=filename='{ass_path.name}'{font_option}[{next_label}]")
         current_label = next_label
     graph.append(f"[{current_label}]null[vout]")
 
@@ -568,28 +958,18 @@ def materialize_export_chunk(
         speed = clip.speed_numerator / clip.speed_denominator
         delay_samples = max(
             0,
-            round(
-                (intersection_start - start_us)
-                * EXPORT_AUDIO_SAMPLE_RATE
-                / 1_000_000
-            ),
+            round((intersection_start - start_us) * EXPORT_AUDIO_SAMPLE_RATE / 1_000_000),
         )
         expected_duration = _seconds(intersection_end - intersection_start)
-        conformed_original = bool(
-            conform_pieces and clip.track_kind == "original_audio"
-        )
+        conformed_original = bool(conform_pieces and clip.track_kind == "original_audio")
         input_label = f"{input_index}:a"
         if conformed_original:
-            audio_pieces = _chunk_conform_pieces(
-                snapshot, intersection_start, intersection_end
-            )
+            audio_pieces = _chunk_conform_pieces(snapshot, intersection_start, intersection_end)
             if not audio_pieces:
                 raise ValueError("Conformed audio chunk has no time-map segment")
             source_anchor = _conform_output_to_source(snapshot, clip.timeline_start_us)
             piece_labels = []
-            for piece_number, (piece_start, piece_end, piece_speed) in enumerate(
-                audio_pieces
-            ):
+            for piece_number, (piece_start, piece_end, piece_speed) in enumerate(audio_pieces):
                 clip_source_start = clip.source_start_us + int(
                     round((piece_start - source_anchor) * speed)
                 )
@@ -602,14 +982,11 @@ def materialize_export_chunk(
                     "asetpts=PTS-STARTPTS",
                     *_atempo_filters(speed * piece_speed),
                 ]
-                graph.append(
-                    f"[{input_index}:a]" + ",".join(piece_filters) + f"[{piece_label}]"
-                )
+                graph.append(f"[{input_index}:a]" + ",".join(piece_filters) + f"[{piece_label}]")
                 piece_labels.append(f"[{piece_label}]")
             joined_label = f"aconformed{number}"
             graph.append(
-                "".join(piece_labels)
-                + f"concat=n={len(piece_labels)}:v=0:a=1[{joined_label}]"
+                "".join(piece_labels) + f"concat=n={len(piece_labels)}:v=0:a=1[{joined_label}]"
             )
             input_label = joined_label
             filters = []
@@ -634,20 +1011,14 @@ def materialize_export_chunk(
         graph.append(f"[{input_label}]" + ",".join(filters) + f"[{label}]")
         audio_labels.append(f"[{label}]")
     if silent_input is not None:
-        graph.append(
-            f"[{silent_input}:a]atrim=duration={duration_s},asetpts=PTS-STARTPTS[aout]"
-        )
+        graph.append(f"[{silent_input}:a]atrim=duration={duration_s},asetpts=PTS-STARTPTS[aout]")
     else:
-        mix_filters = [
-            f"amix=inputs={len(audio_labels)}:duration=longest:normalize=0"
-        ]
+        mix_filters = [f"amix=inputs={len(audio_labels)}:duration=longest:normalize=0"]
         if len(audio_labels) > 1:
             # FFmpeg enables alimiter auto-level by default, which raises the
             # limited mix back toward 0 dBFS. Keep the intended headroom and
             # compensate the look-ahead delay so audio stays sample-aligned.
-            mix_filters.append(
-                f"alimiter=limit={MIX_PEAK_LIMIT:.8f}:level=0:latency=1"
-            )
+            mix_filters.append(f"alimiter=limit={MIX_PEAK_LIMIT:.8f}:level=0:latency=1")
         # Padding each delayed cue before amix makes FFmpeg discard its leading
         # timeline gap, collapsing every cue to the start of the chunk. Mix the
         # finite cues first, then pad the completed timeline exactly once.
@@ -657,9 +1028,7 @@ def materialize_export_chunk(
                 f"atrim=duration={duration_s}",
             ]
         )
-        graph.append(
-            "".join(audio_labels) + ",".join(mix_filters) + "[aout]"
-        )
+        graph.append("".join(audio_labels) + ",".join(mix_filters) + "[aout]")
 
     filter_script = work_dir / f"filter-{index:05d}.txt"
     filter_script.write_text(";\n".join(graph), encoding="utf-8", newline="\n")
@@ -696,6 +1065,7 @@ def materialize_export_chunk(
         filter_script,
         tuple(args),
         backend,
+        temporary_paths,
     )
 
 
@@ -825,6 +1195,12 @@ def decode_export_snapshot(raw: object) -> ExportSnapshot:
             RenderSceneText(**_dict(item, "scene text"))
             for item in _list(raw.get("scene_texts", []), "scene_texts")
         ),
+        tuple(
+            RenderClip(**_dict(item, "video segment"))
+            for item in _list(raw.get("video_segments", []), "video_segments")
+        ),
+        tuple(RenderSceneText(**_dict(item, "title text"))
+              for item in _list(raw.get("title_texts", []), "title_texts")),
     )
 
 
@@ -914,8 +1290,11 @@ def _overlay_pixels(
     y = max(0, min(output_height - 2, int(round(overlay.y * output_height))))
     width = max(2, min(output_width - x, int(round(overlay.width * output_width))))
     height = max(2, min(output_height - y, int(round(overlay.height * output_height))))
-    width -= width % 2
-    height -= height % 2
+    if not isinstance(overlay, RenderSubtitleBlur):
+        # Crop-based manual overlays require even dimensions. Full-frame ASS
+        # masks do not: trimming an odd mask drops its last row/column.
+        width -= width % 2
+        height -= height % 2
     return x, y, max(2, width), max(2, height)
 
 
@@ -976,9 +1355,7 @@ def _scene_ink_background_pixels(
 ) -> tuple[int, int, int, int]:
     """Expand the tight text panel enough for organic brush fringes and splats."""
 
-    x, y, width, height = _scene_label_background_pixels(
-        cue, output_width, output_height
-    )
+    x, y, width, height = _scene_label_background_pixels(cue, output_width, output_height)
     extra_x = max(3, round(cue.font_size * (0.34 if cue.orientation == "vertical" else 0.22)))
     extra_y = max(3, round(cue.font_size * (0.22 if cue.orientation == "vertical" else 0.34)))
     left = max(0, x - extra_x)
@@ -992,15 +1369,42 @@ _INK_SHAPES = {
     "ink_splash": (
         0.72,
         (
-            (0.46, 0.01), (0.63, 0.04), (0.58, 0.09), (0.79, 0.12),
-            (0.68, 0.17), (0.88, 0.22), (0.75, 0.27), (0.92, 0.34),
-            (0.77, 0.39), (0.89, 0.45), (0.73, 0.50), (0.86, 0.57),
-            (0.74, 0.62), (0.91, 0.69), (0.75, 0.74), (0.83, 0.81),
-            (0.63, 0.84), (0.70, 0.92), (0.55, 0.89), (0.61, 0.99),
-            (0.43, 0.95), (0.33, 1.00), (0.30, 0.90), (0.12, 0.85),
-            (0.25, 0.79), (0.07, 0.73), (0.23, 0.67), (0.10, 0.60),
-            (0.25, 0.54), (0.08, 0.48), (0.27, 0.42), (0.12, 0.35),
-            (0.29, 0.30), (0.09, 0.23), (0.31, 0.18), (0.22, 0.10),
+            (0.46, 0.01),
+            (0.63, 0.04),
+            (0.58, 0.09),
+            (0.79, 0.12),
+            (0.68, 0.17),
+            (0.88, 0.22),
+            (0.75, 0.27),
+            (0.92, 0.34),
+            (0.77, 0.39),
+            (0.89, 0.45),
+            (0.73, 0.50),
+            (0.86, 0.57),
+            (0.74, 0.62),
+            (0.91, 0.69),
+            (0.75, 0.74),
+            (0.83, 0.81),
+            (0.63, 0.84),
+            (0.70, 0.92),
+            (0.55, 0.89),
+            (0.61, 0.99),
+            (0.43, 0.95),
+            (0.33, 1.00),
+            (0.30, 0.90),
+            (0.12, 0.85),
+            (0.25, 0.79),
+            (0.07, 0.73),
+            (0.23, 0.67),
+            (0.10, 0.60),
+            (0.25, 0.54),
+            (0.08, 0.48),
+            (0.27, 0.42),
+            (0.12, 0.35),
+            (0.29, 0.30),
+            (0.09, 0.23),
+            (0.31, 0.18),
+            (0.22, 0.10),
             (0.41, 0.08),
         ),
         (
@@ -1013,16 +1417,46 @@ _INK_SHAPES = {
     "ink_wash": (
         0.82,
         (
-            (0.43, 0.00), (0.62, 0.02), (0.58, 0.06), (0.78, 0.08),
-            (0.70, 0.12), (0.96, 0.16), (0.76, 0.20), (0.88, 0.25),
-            (0.74, 0.30), (0.93, 0.35), (0.80, 0.40), (0.89, 0.46),
-            (0.73, 0.51), (0.95, 0.57), (0.78, 0.62), (0.88, 0.68),
-            (0.76, 0.74), (0.91, 0.80), (0.72, 0.85), (0.78, 0.91),
-            (0.61, 0.94), (0.56, 1.00), (0.39, 0.97), (0.28, 0.93),
-            (0.32, 0.88), (0.11, 0.84), (0.23, 0.78), (0.06, 0.73),
-            (0.24, 0.67), (0.10, 0.61), (0.26, 0.56), (0.05, 0.50),
-            (0.25, 0.45), (0.12, 0.39), (0.28, 0.34), (0.07, 0.28),
-            (0.27, 0.23), (0.04, 0.18), (0.29, 0.13), (0.17, 0.08),
+            (0.43, 0.00),
+            (0.62, 0.02),
+            (0.58, 0.06),
+            (0.78, 0.08),
+            (0.70, 0.12),
+            (0.96, 0.16),
+            (0.76, 0.20),
+            (0.88, 0.25),
+            (0.74, 0.30),
+            (0.93, 0.35),
+            (0.80, 0.40),
+            (0.89, 0.46),
+            (0.73, 0.51),
+            (0.95, 0.57),
+            (0.78, 0.62),
+            (0.88, 0.68),
+            (0.76, 0.74),
+            (0.91, 0.80),
+            (0.72, 0.85),
+            (0.78, 0.91),
+            (0.61, 0.94),
+            (0.56, 1.00),
+            (0.39, 0.97),
+            (0.28, 0.93),
+            (0.32, 0.88),
+            (0.11, 0.84),
+            (0.23, 0.78),
+            (0.06, 0.73),
+            (0.24, 0.67),
+            (0.10, 0.61),
+            (0.26, 0.56),
+            (0.05, 0.50),
+            (0.25, 0.45),
+            (0.12, 0.39),
+            (0.28, 0.34),
+            (0.07, 0.28),
+            (0.27, 0.23),
+            (0.04, 0.18),
+            (0.29, 0.13),
+            (0.17, 0.08),
             (0.38, 0.06),
         ),
         (
@@ -1037,14 +1471,36 @@ _INK_SHAPES = {
     "ink_cloud": (
         0.96,
         (
-            (0.38, 0.02), (0.56, 0.00), (0.70, 0.05), (0.78, 0.11),
-            (0.91, 0.17), (0.84, 0.24), (0.94, 0.31), (0.85, 0.38),
-            (0.92, 0.46), (0.84, 0.54), (0.94, 0.62), (0.83, 0.69),
-            (0.89, 0.77), (0.77, 0.84), (0.73, 0.92), (0.58, 0.98),
-            (0.43, 1.00), (0.30, 0.95), (0.22, 0.89), (0.24, 0.82),
-            (0.10, 0.76), (0.17, 0.68), (0.07, 0.61), (0.16, 0.53),
-            (0.06, 0.45), (0.17, 0.37), (0.09, 0.29), (0.20, 0.22),
-            (0.17, 0.14), (0.30, 0.09),
+            (0.38, 0.02),
+            (0.56, 0.00),
+            (0.70, 0.05),
+            (0.78, 0.11),
+            (0.91, 0.17),
+            (0.84, 0.24),
+            (0.94, 0.31),
+            (0.85, 0.38),
+            (0.92, 0.46),
+            (0.84, 0.54),
+            (0.94, 0.62),
+            (0.83, 0.69),
+            (0.89, 0.77),
+            (0.77, 0.84),
+            (0.73, 0.92),
+            (0.58, 0.98),
+            (0.43, 1.00),
+            (0.30, 0.95),
+            (0.22, 0.89),
+            (0.24, 0.82),
+            (0.10, 0.76),
+            (0.17, 0.68),
+            (0.07, 0.61),
+            (0.16, 0.53),
+            (0.06, 0.45),
+            (0.17, 0.37),
+            (0.09, 0.29),
+            (0.20, 0.22),
+            (0.17, 0.14),
+            (0.30, 0.09),
         ),
         (
             (0.11, 0.27, 0.022, 0.016),
@@ -1055,13 +1511,32 @@ _INK_SHAPES = {
     "brush_stroke": (
         0.62,
         (
-            (0.36, 0.01), (0.52, 0.04), (0.66, 0.00), (0.75, 0.06),
-            (0.70, 0.12), (0.83, 0.19), (0.78, 0.29), (0.86, 0.40),
-            (0.80, 0.50), (0.85, 0.61), (0.77, 0.72), (0.82, 0.82),
-            (0.69, 0.91), (0.62, 1.00), (0.54, 0.94), (0.45, 1.00),
-            (0.40, 0.93), (0.27, 0.88), (0.22, 0.78), (0.18, 0.67),
-            (0.23, 0.56), (0.16, 0.45), (0.22, 0.34), (0.17, 0.24),
-            (0.28, 0.15), (0.24, 0.08),
+            (0.36, 0.01),
+            (0.52, 0.04),
+            (0.66, 0.00),
+            (0.75, 0.06),
+            (0.70, 0.12),
+            (0.83, 0.19),
+            (0.78, 0.29),
+            (0.86, 0.40),
+            (0.80, 0.50),
+            (0.85, 0.61),
+            (0.77, 0.72),
+            (0.82, 0.82),
+            (0.69, 0.91),
+            (0.62, 1.00),
+            (0.54, 0.94),
+            (0.45, 1.00),
+            (0.40, 0.93),
+            (0.27, 0.88),
+            (0.22, 0.78),
+            (0.18, 0.67),
+            (0.23, 0.56),
+            (0.16, 0.45),
+            (0.22, 0.34),
+            (0.17, 0.24),
+            (0.28, 0.15),
+            (0.24, 0.08),
         ),
         (
             (0.12, 0.18, 0.016, 0.010),
@@ -1075,12 +1550,12 @@ def _ink_splash_ass_drawing(
     cue: RenderSceneText,
     output_width: int,
     output_height: int,
+    *,
+    bounds: tuple[int, int, int, int] | None = None,
 ) -> str:
     """Create a deterministic, aspect-safe ASS vector ink silhouette."""
 
-    x, y, width, height = _scene_ink_background_pixels(
-        cue, output_width, output_height
-    )
+    x, y, width, height = bounds or _scene_ink_background_pixels(cue, output_width, output_height)
 
     cap_scale, body_points, splat_points = _INK_SHAPES.get(
         cue.background_style, _INK_SHAPES["ink_splash"]
@@ -1096,16 +1571,12 @@ def _ink_splash_ass_drawing(
             return value / edge * cap
         if value >= 1.0 - edge:
             return length - (1.0 - value) / edge * cap
-        return cap + (value - edge) / (1.0 - edge * 2.0) * max(
-            0.0, length - cap * 2.0
-        )
+        return cap + (value - edge) / (1.0 - edge * 2.0) * max(0.0, length - cap * 2.0)
 
     def orient(u: float, v: float) -> tuple[float, float]:
         cross = u * thickness
         along = long_coordinate(v)
-        local_x, local_y = (
-            (cross, along) if vertical else (along, thickness - cross)
-        )
+        local_x, local_y = (cross, along) if vertical else (along, thickness - cross)
         if cue.index % 2 == 0:
             local_x = width - local_x
         return x + local_x, y + local_y
@@ -1139,9 +1610,7 @@ def _ink_splash_ass_drawing(
         cross_radius = max(1.0, thickness * cross_scale)
         long_radius = max(1.0, thickness * long_scale)
         radius_x, radius_y = (
-            (cross_radius, long_radius)
-            if vertical
-            else (long_radius, cross_radius)
+            (cross_radius, long_radius) if vertical else (long_radius, cross_radius)
         )
         splats.append(
             "m "
@@ -1185,10 +1654,71 @@ def _range_enable(
     end = min(chunk_end, item_end_us) - chunk_start
     # Project ranges are half-open.  ``between`` includes both endpoints and
     # therefore concealed one extra frame at a cue boundary.
-    return (
-        f"gte(t,{start / 1_000_000:.6f})"
-        f"*lt(t,{end / 1_000_000:.6f})"
+    return f"gte(t,{start / 1_000_000:.6f})*lt(t,{end / 1_000_000:.6f})"
+
+
+@dataclass(frozen=True, slots=True)
+class _AssRectangle:
+    start_us: int
+    end_us: int
+    x: int
+    y: int
+    width: int
+    height: int
+    color: str
+    opacity_percent: int
+
+
+def _write_rectangle_ass(
+    path: Path,
+    rectangles: list[_AssRectangle],
+    *,
+    chunk_start_us: int,
+    chunk_end_us: int,
+    width: int,
+    height: int,
+) -> None:
+    header = (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        f"PlayResX: {width}\n"
+        f"PlayResY: {height}\n"
+        "WrapStyle: 2\n"
+        "ScaledBorderAndShadow: yes\n\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, "
+        "ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, "
+        "MarginR, MarginV, Encoding\n"
+        "Style: Rectangle,Arial,1,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,"
+        "0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, "
+        "Effect, Text\n"
     )
+    lines = [header]
+    for rectangle in rectangles:
+        start = max(chunk_start_us, rectangle.start_us) - chunk_start_us
+        end = min(chunk_end_us, rectangle.end_us) - chunk_start_us
+        if end <= start or rectangle.width <= 0 or rectangle.height <= 0:
+            continue
+        right = rectangle.x + rectangle.width
+        bottom = rectangle.y + rectangle.height
+        drawing = (
+            f"m {rectangle.x} {rectangle.y} "
+            f"l {right} {rectangle.y} {right} {bottom} {rectangle.x} {bottom}"
+        )
+        override = (
+            r"{\an7\pos(0,0)\p1\bord0\shad0"
+            + _ass_primary_override(rectangle.color)
+            + _ass_alpha_override(rectangle.opacity_percent)
+            + "}"
+        )
+        lines.append(
+            f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Rectangle,,0,0,0,,"
+            f"{override}{drawing}{{\\p0}}\n"
+        )
+    path.write_text("".join(lines), encoding="utf-8-sig", newline="\n")
 
 
 def _write_ass(
@@ -1201,6 +1731,7 @@ def _write_ass(
     height: int,
     style: SubtitleStyle,
     scene_texts: list[RenderSceneText] | None = None,
+    artworks: dict[str, dict] | None = None,
 ) -> None:
     style_format = (
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
@@ -1257,17 +1788,28 @@ def _write_ass(
         end = min(chunk_end_us, cue.end_us) - chunk_start_us
         if end <= start:
             continue
-        fade_ms = min(
-            cue.fade_duration_ms,
-            max(0, (cue.end_us - cue.start_us) // 2_000),
-        ) if cue.fade_enabled else 0
+        fade_ms = (
+            min(
+                cue.fade_duration_ms,
+                max(0, (cue.end_us - cue.start_us) // 2_000),
+            )
+            if cue.fade_enabled
+            else 0
+        )
         fade_in_ms = fade_ms if cue.start_us >= chunk_start_us else 0
         fade_out_ms = fade_ms if cue.end_us <= chunk_end_us else 0
-        fade_override = (
-            f"\\fad({fade_in_ms},{fade_out_ms})"
-            if fade_in_ms or fade_out_ms
-            else ""
-        )
+        fade_override = f"\\fad({fade_in_ms},{fade_out_ms})" if fade_in_ms or fade_out_ms else ""
+        if artworks and cue.cue_id in artworks:
+            lines.extend(
+                _artwork_ass_events(
+                    artworks[cue.cue_id],
+                    start,
+                    end,
+                    layer=1,
+                    fade=fade_override,
+                )
+            )
+            continue
         if cue.background_style in _INK_SHAPES:
             drawing = _ink_splash_ass_drawing(cue, width, height)
             ink_color = cue.background_color or "#080808"
@@ -1299,13 +1841,15 @@ def _write_ass(
             + r"\bord2\shad1}"
         )
         lines.append(
-            f"Dialogue: 1,{_ass_time(start)},{_ass_time(end)},Default,,0,0,0,,"
-            f"{override}{text}\n"
+            f"Dialogue: 1,{_ass_time(start)},{_ass_time(end)},Default,,0,0,0,,{override}{text}\n"
         )
     for cue in cues:
         start = max(chunk_start_us, cue.start_us) - chunk_start_us
         end = min(chunk_end_us, cue.end_us) - chunk_start_us
         if end <= start:
+            continue
+        if artworks and cue.cue_id in artworks:
+            lines.extend(_artwork_ass_events(artworks[cue.cue_id], start, end, layer=3))
             continue
         text = _ass_text(cue.text)
         cue_style = background_style_names.get(
@@ -1318,9 +1862,7 @@ def _write_ass(
             override_values.append(_ass_primary_override(cue.text_color))
         if cue.font_family:
             override_values.append(f"\\fn{_ass_override_text(cue.font_family)}")
-        override_values.append(
-            f"\\fsp{round(cue.font_size * cue.letter_spacing_percent / 100)}"
-        )
+        override_values.append(f"\\fsp{round(cue.font_size * cue.letter_spacing_percent / 100)}")
         override_values.append(r"\b1" if cue.font_bold else r"\b0")
         override_values.append(r"\i1" if cue.font_italic else r"\i0")
         override_values.append(_ass_alpha_override(cue.text_opacity_percent))
@@ -1339,6 +1881,46 @@ def _write_ass(
             f"{override}{text}\n"
         )
     path.write_text("".join(lines), encoding="utf-8-sig", newline="\n")
+
+
+def _artwork_ass_events(layout: dict, start: int, end: int, *, layer: int, fade: str = "") -> list:
+    lines = []
+    for drawing, color, opacity, border, outline in (
+        (
+            layout["background_path"],
+            layout["background_color"],
+            layout["background_opacity"],
+            0,
+            "#000000",
+        ),
+        (
+            layout["text_path"],
+            layout["text_color"],
+            layout["text_opacity"],
+            layout["outline_width"],
+            layout["outline_color"],
+        ),
+    ):
+        if not drawing:
+            continue
+        tags = (
+            r"{\an7\pos(0,0)\p1\shad0"
+            + f"\\bord{border}"
+            + _ass_primary_override(color)
+            + _ass_primary_override(outline).replace("\\c", "\\3c")
+            + _ass_global_alpha_override(opacity)
+            + fade
+            + "}"
+        )
+        lines.append(
+            f"Dialogue: {layer},{_ass_time(start)},{_ass_time(end)},Default,,0,0,0,,"
+            + tags
+            + drawing
+            + r"{\p0}"
+            + "\n"
+        )
+        layer += 1
+    return lines
 
 
 def _ass_color(value: str, opacity_percent: int = 100) -> str:
@@ -1393,14 +1975,9 @@ def _video_filter_chain(settings: VideoFilterSettings) -> list[str]:
         )
     elif settings.preset_id == "grayscale":
         saturation *= 1 - intensity
-    if (
-        abs(brightness) > 1e-9
-        or abs(contrast - 1) > 1e-9
-        or abs(saturation - 1) > 1e-9
-    ):
+    if abs(brightness) > 1e-9 or abs(contrast - 1) > 1e-9 or abs(saturation - 1) > 1e-9:
         filters.append(
-            f"eq=brightness={brightness:.4f}:contrast={contrast:.4f}:"
-            f"saturation={saturation:.4f}"
+            f"eq=brightness={brightness:.4f}:contrast={contrast:.4f}:saturation={saturation:.4f}"
         )
     return filters
 

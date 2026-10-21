@@ -208,6 +208,7 @@ def split_clip(
         "timing_unresolved": clip.timing_unresolved,
         "content_warning": clip.content_warning,
         "issue_code": clip.issue_code,
+        "muted": clip.muted,
     }
     return (
         TimelineClip(

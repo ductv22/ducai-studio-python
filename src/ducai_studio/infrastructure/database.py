@@ -2,11 +2,29 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from hashlib import sha256
 from pathlib import Path
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
+
+
+class _ManagedConnection(sqlite3.Connection):
+    """Close SQLite handles when repository code leaves a ``with`` block.
+
+    ``sqlite3.Connection.__exit__`` commits or rolls back but deliberately does
+    not close the native handle.  The repositories use short-lived connections,
+    and leaked WAL handles prevent the database optimizer from atomically
+    swapping files on Windows.
+    """
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
+        try:
+            return bool(super().__exit__(exc_type, exc_value, traceback))
+        finally:
+            self.close()
+
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
@@ -182,12 +200,49 @@ CREATE TABLE IF NOT EXISTS multi_project_exclusions (
 );
 """
 
+MIGRATION_6_SQL = """
+ALTER TABLE project_revisions
+ADD COLUMN snapshot_encoding TEXT NOT NULL DEFAULT 'json-v1';
+ALTER TABLE project_revisions
+ADD COLUMN snapshot_blob BLOB;
+ALTER TABLE project_revisions
+ADD COLUMN uncompressed_size INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE project_revisions
+ADD COLUMN compressed_size INTEGER NOT NULL DEFAULT 0;
+UPDATE project_revisions
+SET uncompressed_size = length(CAST(snapshot_json AS BLOB)),
+    compressed_size = length(CAST(snapshot_json AS BLOB))
+WHERE uncompressed_size = 0;
+"""
+
+# Keep the released migration text above immutable: its SHA-256 is already
+# stored by installations that opened a121.  The final UPDATE was intended as
+# metadata backfill, but on a large legacy database it rewrites every multi-MB
+# snapshot before the Job Manager can open its socket.  The decoder does not
+# need these sizes for json-v1 rows, and the manual database optimizer fills
+# them while converting those rows to zlib-json-v1.  New v5 -> v6 upgrades
+# therefore execute only the constant-time schema additions while recording
+# the original, release-stable checksum.
+MIGRATION_6_EXECUTION_SQL = """
+ALTER TABLE project_revisions
+ADD COLUMN snapshot_encoding TEXT NOT NULL DEFAULT 'json-v1';
+ALTER TABLE project_revisions
+ADD COLUMN snapshot_blob BLOB;
+ALTER TABLE project_revisions
+ADD COLUMN uncompressed_size INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE project_revisions
+ADD COLUMN compressed_size INTEGER NOT NULL DEFAULT 0;
+"""
+
+MIGRATION_EXECUTION_OVERRIDES = {6: MIGRATION_6_EXECUTION_SQL}
+
 MIGRATIONS = (
     (1, SCHEMA_SQL),
     (2, MIGRATION_2_SQL),
     (3, MIGRATION_3_SQL),
     (4, MIGRATION_4_SQL),
     (5, MIGRATION_5_SQL),
+    (6, MIGRATION_6_SQL),
 )
 
 
@@ -210,7 +265,7 @@ class Database:
 
     def initialize(self, *, applied_at: str) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.connect() as connection:
+        with closing(self.connect()) as connection:
             # journal_mode persists in the database file. Reapplying it on
             # every connection needlessly takes a journal lock and is brittle
             # on Windows after hard-killed sibling processes.
@@ -236,7 +291,8 @@ class Database:
                     continue
                 try:
                     connection.execute("BEGIN IMMEDIATE")
-                    for migration_statement in iter_sql_statements(statement):
+                    execution_script = MIGRATION_EXECUTION_OVERRIDES.get(version, statement)
+                    for migration_statement in iter_sql_statements(execution_script):
                         connection.execute(migration_statement)
                     connection.execute(
                         """
@@ -252,9 +308,13 @@ class Database:
 
     def connect(self, *, read_only: bool = False) -> sqlite3.Connection:
         if read_only:
-            connection = sqlite3.connect(f"file:{self.path.as_posix()}?mode=ro", uri=True)
+            connection = sqlite3.connect(
+                f"file:{self.path.as_posix()}?mode=ro",
+                uri=True,
+                factory=_ManagedConnection,
+            )
         else:
-            connection = sqlite3.connect(self.path)
+            connection = sqlite3.connect(self.path, factory=_ManagedConnection)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 5000")

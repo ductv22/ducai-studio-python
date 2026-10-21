@@ -24,6 +24,7 @@ class OcrBandProfile:
     x2: float
     y2: float
     scale: float
+    reading_mode: str = "dialogue"
 
     def __post_init__(self) -> None:
         if not self.name.strip():
@@ -35,7 +36,7 @@ class OcrBandProfile:
 
 
 DEFAULT_SUBTITLE_BANDS = (
-    OcrBandProfile("upper", 0.06, 0.765, 0.94, 0.935, 0.90),
+    OcrBandProfile("upper", 0.06, 0.765, 0.94, 0.982, 1.0),
     OcrBandProfile("lower", 0.08, 0.885, 0.92, 0.982, 0.75),
 )
 

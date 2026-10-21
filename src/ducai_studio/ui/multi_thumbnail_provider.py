@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import subprocess
 from pathlib import Path
 
 from PySide6.QtCore import QSize, QUrl
@@ -76,7 +77,7 @@ class MultiThumbnailProvider(QQuickImageProvider):
             size.setWidth(image.width())
             size.setHeight(image.height())
             return image
-        except (FileNotFoundError, KeyError, TypeError, ValueError, RuntimeError):
+        except (OSError, KeyError, TypeError, ValueError, RuntimeError, subprocess.TimeoutExpired):
             return QImage()
 
 

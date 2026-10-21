@@ -23,6 +23,19 @@ from ducai_studio.domain.jobs import (
 
 from .database import Database
 
+_JOB_SPEC_COLUMNS = (
+    "id",
+    "kind",
+    "project_id",
+    "input_revision",
+    "provider_id",
+    "provider_version",
+    "model_id",
+    "input_fingerprint",
+    "settings_fingerprint",
+    "config_json",
+)
+
 
 def utc_now_text() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -31,6 +44,7 @@ def utc_now_text() -> str:
 class JobRepository:
     def __init__(self, database: Database) -> None:
         self.database = database
+        self._cached_spec: tuple[tuple[object, ...], JobSpec] | None = None
 
     def create(self, spec: JobSpec, *, job_id: str | None = None) -> JobRecord:
         identifier = job_id or str(uuid4())
@@ -78,8 +92,24 @@ class JobRepository:
         with self.database.connect(read_only=True) as connection:
             row = connection.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
         if row is None:
+            if self._cached_spec is not None and self._cached_spec[0][0] == job_id:
+                self._cached_spec = None
             raise LookupError(f"Unknown job: {job_id}")
-        return self._record_from_row(row)
+        # Every read still observes durable state. Only the validated immutable
+        # input is reused, and exact JSON equality detects credential/options
+        # updates even when their content-resume fingerprint stays unchanged.
+        key = tuple(row[column] for column in _JOB_SPEC_COLUMNS)
+        cached = self._cached_spec
+        if cached is not None and cached[0] == key:
+            record = self._record_from_row(row, spec=cached[1])
+        else:
+            self._cached_spec = None
+            record = self._record_from_row(row)
+        # Retain at most one large input, never a growing history of old jobs.
+        self._cached_spec = (
+            None if record.state in TERMINAL_JOB_STATES else (key, record.spec)
+        )
+        return record
 
     def replace_retry_credential_references(
         self,
@@ -493,11 +523,14 @@ class JobRepository:
         project_id: str,
         kind: JobKind | None = None,
         input_fingerprint: str | None = None,
+        compact_translation: bool = False,
     ) -> tuple[JobRecord, ...]:
         """Return every matching project job without a global-history cutoff."""
 
         if not project_id.strip():
             raise ValueError("Project id is required")
+        if compact_translation and kind is not JobKind.TRANSLATE:
+            raise ValueError("Compact cache metadata requires translation jobs")
         clauses = ["project_id = ?"]
         parameters: list[object] = [project_id]
         if kind is not None:
@@ -508,16 +541,46 @@ class JobRepository:
                 raise ValueError("Input fingerprint must be non-empty")
             clauses.append("input_fingerprint = ?")
             parameters.append(input_fingerprint)
+        columns = "*"
+        if compact_translation:
+            fields = ("base_url", "credential_references", "translation_style_preset",
+                      "translation_custom_rules", "qa_policy")
+            projected_config = ", ".join(
+                f"'{key}', json_extract(config_json, '$.{key}')" for key in fields
+            )
+            columns = ", ".join(key for key in _JOB_SPEC_COLUMNS if key != "config_json")
+            columns += (", state, created_at, started_at, finished_at, error_code, error_json, "
+                        "CASE WHEN json_valid(config_json) THEN "
+                        "CASE WHEN json_type(config_json) = 'object' THEN "
+                        f"json_object({projected_config}) ELSE NULL END "
+                        "ELSE NULL END AS config_json")
         with self.database.connect(read_only=True) as connection:
             rows = connection.execute(
                 f"""
-                SELECT * FROM jobs
+                SELECT {columns} FROM jobs
                 WHERE {' AND '.join(clauses)}
                 ORDER BY created_at DESC, id DESC
                 """,
                 tuple(parameters),
             ).fetchall()
-        return tuple(self._record_from_row(row) for row in rows)
+        if not compact_translation:
+            return tuple(self._record_from_row(row) for row in rows)
+        records = []
+        for row in rows:
+            if row["config_json"] is None:
+                continue
+            compact_row = dict(row)
+            config = json.loads(compact_row["config_json"])
+            compact_row["config_json"] = json.dumps(
+                {key: value for key, value in config.items() if value is not None}
+            )
+            try:
+                records.append(self._record_from_row(compact_row))
+            except (KeyError, TypeError, ValueError):
+                # One invalid historical identity cannot hide every valid
+                # ledger. Runnable inputs still pass full validation in get().
+                continue
+        return tuple(records)
 
     def list_recent_activity(
         self, *, limit: int = 100
@@ -551,7 +614,18 @@ class JobRepository:
                                     config_json, '$.timing_repair_job_id'
                                 )
                             )
-                            ELSE '{}'
+                            ELSE json_object(
+                                'base_url', json_extract(config_json, '$.base_url'),
+                                'credential_references', json_extract(
+                                    config_json, '$.credential_references'
+                                ),
+                                'translation_style_preset', json_extract(
+                                    config_json, '$.translation_style_preset'
+                                ),
+                                'translation_custom_rules', json_extract(
+                                    config_json, '$.translation_custom_rules'
+                                )
+                            )
                         END AS config_json,
                         created_at, started_at, finished_at, error_code, error_json
                     FROM jobs
@@ -981,18 +1055,19 @@ class JobRepository:
         )
 
     @staticmethod
-    def _record_from_row(row: Any) -> JobRecord:
-        spec = JobSpec(
-            kind=JobKind(row["kind"]),
-            project_id=row["project_id"],
-            input_revision=int(row["input_revision"]),
-            provider_id=row["provider_id"],
-            provider_version=row["provider_version"],
-            model_id=row["model_id"],
-            input_fingerprint=row["input_fingerprint"],
-            settings_fingerprint=row["settings_fingerprint"],
-            provider_config=json.loads(row["config_json"]),
-        )
+    def _record_from_row(row: Any, *, spec: JobSpec | None = None) -> JobRecord:
+        if spec is None:
+            spec = JobSpec(
+                kind=JobKind(row["kind"]),
+                project_id=row["project_id"],
+                input_revision=int(row["input_revision"]),
+                provider_id=row["provider_id"],
+                provider_version=row["provider_version"],
+                model_id=row["model_id"],
+                input_fingerprint=row["input_fingerprint"],
+                settings_fingerprint=row["settings_fingerprint"],
+                provider_config=json.loads(row["config_json"]),
+            )
         return JobRecord(
             id=row["id"],
             spec=spec,

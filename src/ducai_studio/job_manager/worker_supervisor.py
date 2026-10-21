@@ -155,11 +155,12 @@ class WorkerSupervisor(QObject):
             if command_id is not None:
                 payload["command_id"] = command_id
             self.send(job_id, kind="control", payload=payload)
-            handle.process.waitForBytesWritten(1_000)
         except Exception:
-            self._terminate(job_id)
+            self._terminate(job_id, handle)
             return
-        QTimer.singleShot(grace_ms, lambda: self._terminate(job_id))
+        # QProcess flushes its queued write through the event loop. Blocking
+        # that loop delays controls for every worker and GUI client.
+        QTimer.singleShot(grace_ms, lambda: self._terminate(job_id, handle))
 
     def shutdown(self) -> None:
         for job_id in tuple(self._workers):
@@ -234,15 +235,19 @@ class WorkerSupervisor(QObject):
         handle.process.deleteLater()
         self.workerFinished.emit(job_id, exit_code)
 
-    def _terminate(self, job_id: str) -> None:
+    def _terminate(self, job_id: str, expected: _WorkerHandle | None = None) -> None:
         handle = self._workers.get(job_id)
-        if handle is None or handle.process.state() is QProcess.ProcessState.NotRunning:
+        if (handle is None or (expected is not None and handle is not expected)
+                or handle.process.state() is QProcess.ProcessState.NotRunning):
             return
         handle.process.terminate()
-        QTimer.singleShot(2_000, lambda: self._kill(job_id))
+        # A cached job can be retried with the same id before this timer fires.
+        # Its previous process must never own the new process's stop deadline.
+        QTimer.singleShot(2_000, lambda: self._kill(job_id, handle))
 
-    def _kill(self, job_id: str) -> None:
+    def _kill(self, job_id: str, expected: _WorkerHandle | None = None) -> None:
         handle = self._workers.get(job_id)
-        if handle is None or handle.process.state() is QProcess.ProcessState.NotRunning:
+        if (handle is None or (expected is not None and handle is not expected)
+                or handle.process.state() is QProcess.ProcessState.NotRunning):
             return
         handle.process.kill()

@@ -18,6 +18,7 @@ SpinBox {
     Accessible.focusable: true
 
     property string accessibleName: "Giá trị số"
+    property bool emphasized: false
     readonly property int indicatorWidth: 28
 
     contentItem: TextInput {
@@ -46,11 +47,12 @@ SpinBox {
             : (control.up.hovered ? Theme.surfaceHover : Theme.surfaceRaised)
         radius: Theme.radiusSmall
         border.width: 1
-        border.color: Theme.borderSubtle
+        border.color: control.emphasized && control.enabled ? Theme.iconMuted : Theme.borderSubtle
         Text {
             anchors.centerIn: parent
             text: "+"
-            color: control.enabled ? Theme.textSecondary : Theme.textMuted
+            color: control.enabled
+                ? (control.emphasized ? Theme.textPrimary : Theme.textSecondary) : Theme.textMuted
             font.family: Theme.fontFamily
             font.pixelSize: 14
             font.weight: Font.DemiBold
@@ -66,11 +68,12 @@ SpinBox {
             : (control.down.hovered ? Theme.surfaceHover : Theme.surfaceRaised)
         radius: Theme.radiusSmall
         border.width: 1
-        border.color: Theme.borderSubtle
+        border.color: control.emphasized && control.enabled ? Theme.iconMuted : Theme.borderSubtle
         Text {
             anchors.centerIn: parent
             text: "−"
-            color: control.enabled ? Theme.textSecondary : Theme.textMuted
+            color: control.enabled
+                ? (control.emphasized ? Theme.textPrimary : Theme.textSecondary) : Theme.textMuted
             font.family: Theme.fontFamily
             font.pixelSize: 14
             font.weight: Font.DemiBold

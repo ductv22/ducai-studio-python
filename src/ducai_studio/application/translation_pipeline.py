@@ -35,6 +35,14 @@ _ANCIENT_STYLE_PRESETS = frozenset({"xianxia", "wuxia", "palace"})
 STYLE_QA_CODES = frozenset(
     {"ancient_modern_pronoun", "ancient_title_order", "ancient_alias_mismatch"}
 )
+_CONSISTENCY_RULE = (
+    "NHẤT QUÁN: tên, địa danh và thuật ngữ trong FILM_BIBLE đã được chốt; "
+    "dùng đúng cách gọi đã có, không tự đổi cách viết hoặc loại mục. "
+    "glossary_updates chỉ bổ sung mục mới, không lặp lại hay thay thế mục đã chốt. "
+    "Giữ xưng hô theo từng cặp nhân vật có bằng chứng trong nguồn và ngữ cảnh; "
+    "không tự đoán danh tính người nói từ một đại từ đơn lẻ hoặc ép cùng xưng hô "
+    "cho những người khác nhau."
+)
 
 
 def contains_cjk(value: str) -> bool:
@@ -105,10 +113,9 @@ class FilmBible:
     def merge_terms(self, values: Iterable[FilmTerm]) -> FilmBible:
         merged = {term.source.casefold(): term for term in self.terms}
         for item in values:
-            current = merged.get(item.source.casefold())
-            if current is not None and current.vietnamese.casefold() != item.vietnamese.casefold():
-                continue
-            merged[item.source.casefold()] = item
+            # Repeated entries must not downgrade a locked name/place to a
+            # generic term, which would weaken the deterministic identity gate.
+            merged.setdefault(item.source.casefold(), item)
         return replace(self, terms=tuple(merged[key] for key in sorted(merged)))
 
     @property
@@ -435,6 +442,12 @@ def _style_prompt(film_bible: FilmBible) -> str:
         f"{film_bible.resolved_style}.",
         "- Giữ nhất quán xưng hô, danh xưng, thuật ngữ và quan hệ xuyên suốt phim; "
         "chỉ suy luận vai vế khi có bằng chứng trong nguồn/FILM_BIBLE.",
+        "- Viết tiếng Việt tự nhiên, dễ đọc; không bê nguyên trật tự từ tiếng Trung "
+        "và không lạm dụng Hán Việt. Giữ tên riêng, vai vế và thuật ngữ thể loại cần thiết, "
+        "còn câu thoại thông thường dùng cách diễn đạt quen thuộc.",
+        "- Ví dụ trật tự nghĩa: 'thần tiên sống', không phải 'sống thần tiên'. "
+        "Với dược liệu, chỉ dùng 'quý' nếu nguồn/ngữ cảnh nói về giá trị; nếu nói "
+        "kích thước thì vẫn dùng 'lớn'. Không thay từ máy móc hoặc thêm ý nguồn không có.",
     ]
     if film_bible.resolved_style in _ANCIENT_STYLE_PRESETS:
         lines.extend(
@@ -612,6 +625,7 @@ def translation_request(
         part
         for part in (
             rules,
+            _CONSISTENCY_RULE,
             _style_prompt(film_bible),
             "Không xóa, gộp, tách hoặc đổi ID. Xuống dòng bên trong text khi câu dài.",
             'Trả đúng JSON: {"translations":[{"id":1,"text":"..."}],'
@@ -774,6 +788,7 @@ def repair_request(
             "Sửa đúng các lỗi QA trong bản dịch. Không thêm tình tiết, không xóa/gộp/tách/đổi ID. "
             "Giữ câu đã đúng; trả đủ mọi ID kể cả cue không cần sửa."
             + timing_rule,
+            _CONSISTENCY_RULE,
             _style_prompt(film_bible),
             "Tự kiểm tra lại ngay trong cùng lượt sau khi sửa. Không chạy một vòng QA riêng.",
             'Trả đúng JSON: {"translations":[{"id":1,"text":"..."}],'

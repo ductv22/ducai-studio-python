@@ -7,10 +7,11 @@ import math
 import os
 import re
 import zlib
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 from uuid import uuid4
 
 from PySide6.QtCore import (
@@ -40,10 +41,14 @@ from ducai_studio.domain.project import (
     SCENE_TEXT_DEFAULT_BACKGROUND_COLOR,
     SCENE_TEXT_DEFAULT_BACKGROUND_OPACITY_PERCENT,
     SCENE_TEXT_DEFAULT_BACKGROUND_STYLE,
+    SCENE_TEXT_DEFAULT_FADE_DURATION_MS,
+    SCENE_TEXT_DEFAULT_FADE_ENABLED,
     SCENE_TEXT_DEFAULT_STYLE_HINT,
     SCENE_TEXT_DEFAULT_TEXT_COLOR,
 )
 from ducai_studio.infrastructure.ipc.client import JobManagerClient
+from ducai_studio.infrastructure.licensing_state import UNLICENSED_ACTIONS
+from ducai_studio.infrastructure.offline_license import ActivationRequired
 from ducai_studio.infrastructure.process_tree import ProcessTreeGuard
 from ducai_studio.infrastructure.runtime_program import runtime_program_path
 from ducai_studio.infrastructure.voice_installer import PiperVoiceInstaller
@@ -59,6 +64,7 @@ from ducai_studio.providers.translation.openai_compatible import (
 )
 from ducai_studio.providers.tts import VoiceCatalog, discover_data_root
 
+from .license_view_model import LicenseViewModel
 from .project_job_models import (
     JobListModel,
     MultiVideoListModel,
@@ -80,15 +86,12 @@ class NavigationItem:
 NAVIGATION = (
     NavigationItem("dashboard", "Tổng quan", "TG", "house"),
     NavigationItem("projects", "Dự án", "DA", "folder"),
-    NavigationItem("import", "Nhập media", "NM", "file-down"),
+    NavigationItem("timeline", "Timeline", "TL", "panels-top-left"),
     NavigationItem("transcribe", "Trích xuất", "TX", "scan-text"),
     NavigationItem("translate", "Dịch thuật", "DT", "languages"),
     NavigationItem("subtitles", "Biên tập phụ đề", "PD", "captions"),
     NavigationItem("voice", "Phòng thu giọng", "GV", "mic-vocal"),
     NavigationItem("multi", "Multi video", "MV", "list-todo"),
-    NavigationItem("timeline", "Timeline", "TL", "panels-top-left"),
-    NavigationItem("effects", "Hiệu ứng", "HU", "wand-sparkles"),
-    NavigationItem("mixer", "Trộn âm", "TA", "sliders-horizontal"),
     NavigationItem("export", "Xuất video", "XV", "upload"),
     NavigationItem("queue", "Hàng đợi", "HD", "list-todo"),
     NavigationItem("settings", "Cài đặt", "CD", "settings"),
@@ -184,6 +187,49 @@ class _ProjectSnapshotDecodeTask(QRunnable):
         return snapshot
 
 
+class _TimelinePatchProjectionTask(QRunnable):
+    """Prepare a potentially large compact timeline patch off the UI thread."""
+
+    def __init__(
+        self,
+        runtime: JobRuntime,
+        snapshot: dict,
+        patch: dict,
+        context: object,
+    ) -> None:
+        super().__init__()
+        self.runtime = runtime
+        self.snapshot = snapshot
+        self.patch = patch
+        self.context = context
+
+    def run(self) -> None:  # pragma: no cover - exercised through Qt signal tests
+        try:
+            prepare = (ProjectStateModel.prepare_subtitle_patch
+                       if self.patch.get("_subtitle_patch") is True
+                       else ProjectStateModel.prepare_timeline_patch)
+            canonical, projected = prepare(
+                self.snapshot,
+                self.patch,
+            )
+        except Exception as exc:
+            self.runtime.timelinePatchProjected.emit(
+                False,
+                {"message": str(exc)},
+                self.context,
+            )
+            return
+        self.runtime.timelinePatchProjected.emit(
+            True,
+            {
+                "canonical": canonical,
+                "projected": projected,
+                "patch": self.patch,
+            },
+            self.context,
+        )
+
+
 class _VoiceInstallTask(QRunnable):
     """Run network and digest work outside the GUI thread."""
 
@@ -210,10 +256,44 @@ class _VoiceInstallTask(QRunnable):
         self.emit_event(self.voice_id, "installed", 100, "")
 
 
-def _default_ocr_engine_python() -> str:
-    configured = os.environ.get("DUCAI_PADDLE_PYTHON")
+class _SubtitleGeometryMeasureTask(QRunnable):
+    """Measure a large selection without creating glyph paths or blocking QML."""
+
+    def __init__(self, cues: list[dict], style, width: int, height: int,
+                 context: dict, emit_result: Callable) -> None:
+        super().__init__()
+        self.cues, self.style = cues, style
+        self.width, self.height = width, height
+        self.context, self.emit_result = context, emit_result
+
+    def run(self) -> None:
+        from ducai_studio.providers.subtitle_artwork import editor_payload, layout_json
+
+        try:
+            seeds = {}
+            for cue in self.cues:
+                payload = editor_payload(cue, self.width, self.height, self.style)
+                layout = layout_json(json.dumps(payload, sort_keys=True), include_paths=False)
+                x, y, width, height = layout["placement_rect"]
+                seeds[cue["cue_id"]] = [x / self.width, y / self.height,
+                                        width / self.width, height / self.height]
+        except Exception as exc:
+            self.emit_result(False, {"message": str(exc)}, self.context)
+            return
+        self.emit_result(True, seeds, self.context)
+
+
+def _configured_ocr_engine_python() -> str | None:
+    configured = os.environ.get("DUCAI_PADDLE_PYTHON", "").strip()
     if configured and Path(configured).expanduser().is_file():
         return str(Path(configured).expanduser().resolve())
+    return None
+
+
+def _default_ocr_engine_python() -> str:
+    configured = _configured_ocr_engine_python()
+    if configured is not None:
+        return configured
     shared_data = discover_data_root()
     local_data = Path(
         QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppLocalDataLocation)
@@ -407,6 +487,7 @@ class JobRuntime(QObject):
     actionSucceeded = Signal(str, object, object)
     actionFailed = Signal(str, object, object)
     projectPayloadDecoded = Signal(str, bool, object, object)
+    timelinePatchProjected = Signal(bool, object, object)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -428,8 +509,11 @@ class JobRuntime(QObject):
         self.client = JobManagerClient(self)
         self.process_tree = ProcessTreeGuard()
         self._ready = False
+        self._licensed = False
         self._state = "stopped"
         self._attempts = 0
+        self._startup_deadline = 0.0
+        self._last_client_error = ""
         self._shutting_down = False
         self._pending_requests: dict[str, tuple[str, object]] = {}
         self._decode_pool = QThreadPool(self)
@@ -448,6 +532,9 @@ class JobRuntime(QObject):
     def start(self) -> None:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self.artifact_root.mkdir(parents=True, exist_ok=True)
+        self._attempts = 0
+        self._startup_deadline = monotonic() + 60.0
+        self._last_client_error = ""
         self._set_state("starting")
         self.statusChanged.emit("Đang khởi động Job Manager")
         self.process.setProgram(str(runtime_program_path()))
@@ -502,9 +589,18 @@ class JobRuntime(QObject):
 
     @Slot()
     def _connect(self) -> None:
+        if self._ready or self._shutting_down or self._state != "starting":
+            return
+        if self._startup_deadline and monotonic() >= self._startup_deadline:
+            self._set_state("error")
+            self.statusChanged.emit(
+                "Job Manager khởi động quá lâu. Dữ liệu dự án vẫn được giữ nguyên; "
+                "hãy đóng ứng dụng rồi mở lại."
+            )
+            return
         self._attempts += 1
         self.client.connect_to(self.server_name)
-        if not self._ready and self._attempts < 20:
+        if not self._ready:
             QTimer.singleShot(100, self._connect)
 
     @Slot(bool)
@@ -520,6 +616,7 @@ class JobRuntime(QObject):
         if self._ready:
             self._ready = False
             self.readyChanged.emit(False)
+            self._fail_pending_requests("Kết nối Job Manager bị gián đoạn")
             self._set_state("error")
             self.statusChanged.emit(
                 "Kết nối Job Manager bị gián đoạn; dữ liệu hiện tại vẫn được giữ nguyên."
@@ -552,7 +649,7 @@ class JobRuntime(QObject):
                 action_label = action or "Yêu cầu"
                 raw_message = str(error.get("message") or error.get("reason") or "không thành công")
                 code = str(error.get("code", error.get("error_code", ""))).strip()
-                message_text = self._localized_error_message(code, raw_message)
+                message_text = ApplicationViewModel._localized_error_message(code, raw_message)
                 self.statusChanged.emit(f"{action_label}: {message_text}")
             self.actionFailed.emit(action, error, context)
             return
@@ -573,11 +670,9 @@ class JobRuntime(QObject):
             self._set_state("ready")
             self.readyChanged.emit(True)
             self.statusChanged.emit("Sẵn sàng")
-            self._job_poll_timer.start()
-            self._request("list_projects")
-            self._request("list_jobs")
-            self._request("multi_list")
-            self._request("list_credentials")
+            self._update_license_admission(result.get("license", {}))
+        elif action in {"get_license_status", "activate_license"} and isinstance(result, dict):
+            self._update_license_admission(result)
         elif action == "list_projects":
             self.projectsReceived.emit(result)
         elif action == "list_jobs":
@@ -627,11 +722,31 @@ class JobRuntime(QObject):
         )
         self.actionFailed.emit(action, error, context)
 
+    def project_timeline_patch(
+        self,
+        snapshot: dict,
+        patch: dict,
+        context: object,
+    ) -> None:
+        self._decode_pool.start(
+            _TimelinePatchProjectionTask(self, snapshot, patch, context)
+        )
+
     @Slot(str)
     def _client_error(self, error: str) -> None:
-        if not self._ready and self._attempts < 20:
+        self._last_client_error = error
+        startup_failure = not self._ready and self._state == "starting"
+        if startup_failure and (not self._startup_deadline or monotonic() < self._startup_deadline):
+            return
+        if not startup_failure and self._state == "error":
             return
         self._set_state("error")
+        if startup_failure:
+            self.statusChanged.emit(
+                "Không thể khởi động Job Manager. Dữ liệu dự án vẫn được giữ nguyên; "
+                "hãy đóng ứng dụng rồi mở lại."
+            )
+            return
         self.statusChanged.emit(f"Job Manager: {error}")
 
     @Slot(QProcess.ProcessError)
@@ -647,6 +762,7 @@ class JobRuntime(QObject):
         self._ready = False
         if was_ready:
             self.readyChanged.emit(False)
+        self._fail_pending_requests("Job Manager đã dừng trước khi xác nhận thao tác")
         if self._shutting_down:
             self._complete_shutdown()
         else:
@@ -665,6 +781,13 @@ class JobRuntime(QObject):
         self.client.disconnect()
         self._set_state("stopped")
         self.shutdownComplete.emit()
+
+    def _fail_pending_requests(self, message: str) -> None:
+        pending, self._pending_requests = self._pending_requests, {}
+        for action, context in pending.values():
+            self.actionFailed.emit(action, {
+                "code": "transport_disconnected", "message": message,
+            }, context)
 
     def _set_state(self, value: str) -> None:
         if value == self._state:
@@ -689,7 +812,31 @@ class JobRuntime(QObject):
     ) -> str:
         if not self._ready:
             raise RuntimeError("Job Manager is not ready")
+        if not self._licensed and action not in UNLICENSED_ACTIONS:
+            exc = ActivationRequired()
+            error = {"code": type(exc).__name__, "message": str(exc)}
+            QTimer.singleShot(0, lambda: self.actionFailed.emit(action, error, context or {}))
+            self.statusChanged.emit(str(exc))
+            return str(uuid4())
+        if action in {"subtitle_command", "timeline_command", "effect_command"}:
+            params = {**(params or {}), "deferred": True}
         return self._request(action, params, context=context)
+
+    @property
+    def ready(self) -> bool:
+        return self._ready
+
+    def _update_license_admission(self, status: dict) -> None:
+        licensed = status.get("active") is True
+        if licensed == self._licensed:
+            return
+        self._licensed = licensed
+        if not licensed:
+            self._job_poll_timer.stop()
+            return
+        self._job_poll_timer.start()
+        for action in ("list_projects", "list_jobs", "multi_list", "list_credentials"):
+            self._request(action)
 
     def _request(
         self,
@@ -710,12 +857,15 @@ class JobRuntime(QObject):
 class ApplicationViewModel(QObject):
     currentWorkspaceChanged = Signal()
     currentIndexChanged = Signal()
+    timelineSettingsRequested = Signal()
     statusMessageChanged = Signal()
     statusNotificationRequested = Signal(str, str, int)
+    statusNotificationDismissRequested = Signal()
     backendReadyChanged = Signal()
     runtimeStateChanged = Signal()
     projectNameChanged = Signal()
     saveStateChanged = Signal()
+    projectAutosaveRequested = Signal()
     shuttingDownChanged = Signal()
     quitReady = Signal()
     importDialogRequested = Signal()
@@ -728,20 +878,25 @@ class ApplicationViewModel(QObject):
     jobHistoryBusyChanged = Signal()
     projectDeleteChanged = Signal()
     selectedClipChanged = Signal()
+    videoClipboardChanged = Signal()
     selectedTrackChanged = Signal()
     playheadChanged = Signal()
     previewMasterVolumeChanged = Signal()
     timelineBusyChanged = Signal()
+    timelineCutSettled = Signal(bool, str, float)
     timelineHistoryChanged = Signal()
+    timelineNavigationChanged = Signal()
     ocrBusyChanged = Signal()
     ocrSettingsChanged = Signal()
     selectedCueChanged = Signal()
     subtitleBusyChanged = Signal()
+    subtitleGeometrySettled = Signal(int, bool)
     subtitleExportBusyChanged = Signal()
     subtitleHistoryChanged = Signal()
     translationBusyChanged = Signal()
     translationPreferencesBusyChanged = Signal()
     translationSettingsChanged = Signal()
+    translationModelCatalogChanged = Signal()
     translationCachesChanged = Signal()
     translationQaChanged = Signal()
     translationQaNavigationRequested = Signal(int)
@@ -759,9 +914,12 @@ class ApplicationViewModel(QObject):
     exportBusyChanged = Signal()
     exportPreviewChanged = Signal()
     diagnosticsChanged = Signal()
+    databaseMaintenanceChanged = Signal()
     legacyMigrationChanged = Signal()
     overlaySelectionRequested = Signal(str)
     overlayGeometrySettled = Signal(str, bool)
+    sceneTimingSettled = Signal(int, bool)
+    subtitleGeometryMeasured = Signal(bool, object, object)
     multiVideoChanged = Signal()
     multiPreviewReady = Signal(object, bool)
     parallelJobWarningRequested = Signal(str)
@@ -787,6 +945,7 @@ class ApplicationViewModel(QObject):
             saved_workspace if saved_workspace in valid_workspaces else "dashboard"
         )
         self._current_index = self._screen_index(self._current_workspace)
+        self._activation_return_workspace = self._current_workspace
         self._status_message = "Đang chuẩn bị nền tảng"
         self._backend_ready = False
         self._runtime_state = "stopped"
@@ -816,14 +975,28 @@ class ApplicationViewModel(QObject):
         self._pending_media_path = ""
         self._pending_media_intent = ""
         self._selected_clip_id = ""
+        self._video_clipboard_project_id = ""
         self._selected_track_id = ""
         self._selected_track_ids: set[str] = set()
         self._playhead_us = 0
+        self._timeline_seek_step_ms = max(
+            1,
+            min(1_000, self.settings.value("timeline/seekStepMs", 100, type=int)),
+        )
         self._preview_master_volume_percent = max(
             0,
             min(100, self.settings.value("preview/masterVolumePercent", 90, type=int)),
         )
         self._timeline_busy = False
+        self._active_timeline_cut_request_id = ""
+        self._timeline_cut_timeout_timer = QTimer(self)
+        self._timeline_cut_timeout_timer.setSingleShot(True)
+        self._timeline_cut_timeout_timer.setInterval(30_000)
+        self._timeline_cut_timeout_timer.timeout.connect(self._timeline_cut_timed_out)
+        self._timeline_cut_context: dict[str, object] = {}
+        self._timeline_reconcile_pending = False
+        self._timeline_reconcile_generation = 0
+        self._timeline_reconcile_project_id = ""
         self._pending_effect_commands: list[dict[str, object]] = []
         self._effect_generations: dict[str, int] = {}
         self._can_undo_timeline = False
@@ -845,15 +1018,31 @@ class ApplicationViewModel(QObject):
         except (TypeError, ValueError):
             saved_ocr_fps = 1.25
         self._ocr_sample_fps = round(max(0.67, min(2.5, saved_ocr_fps)), 2)
+        self._ocr_scene_text_enabled = self.settings.value(
+            "ocr/sceneTextEnabled", True, type=bool
+        )
         self._reloaded_ocr_jobs: set[str] = set()
         self._translation_busy = False
+        self._translation_catalog_generation = 0
+        self._translation_catalog_models: list[str] = []
+        self._translation_catalog_provider = ""
+        self._translation_catalog_busy = False
+        self._translation_catalog_status = "Gợi ý model. Có thể chọn hoặc nhập tên thủ công."
+
         self._translation_preferences_busy = False
         self._translation_job_id = ""
         self._translation_job_state = ""
         self._translation_provider_id = ""
         self._translation_model_id = ""
+        self._translation_base_url = ""
+        self._translation_job_credential_references: list[str] = []
+        self._translation_job_style_preset = "auto"
+        self._translation_job_custom_rules = ""
+        self._translation_style_control_pending: dict[str, object] | None = None
+        self._translation_switch_pending: dict[str, object] | None = None
         self._translation_caches: list[dict[str, object]] = []
         self._selected_translation_cache_id = ""
+        self._translation_cache_selection_explicit = False
         self._translation_cache_refresh_pending = False
         self._translation_cache_refresh_marker: tuple[str, str, str, str] = (
             "",
@@ -872,6 +1061,7 @@ class ApplicationViewModel(QObject):
         # marker so a failure/completion notice is emitted once per transition
         # instead of either spamming every poll or silently disappearing.
         self._terminal_job_notification_markers: dict[str, tuple[object, ...]] = {}
+        self._superseded_job_ids: set[str] = set()
         self._jobs_snapshot_initialized = False
         self._translation_qa: dict[str, object] = {
             "status": "NONE",
@@ -951,6 +1141,7 @@ class ApplicationViewModel(QObject):
         self._last_export_source = ""
         self._last_export_qa_path = ""
         self._runtime_diagnostics: dict[str, object] = {}
+        self._database_maintenance: dict[str, object] = {"state": "idle"}
         self._legacy_migration_report: dict[str, object] = {}
         self._legacy_source_path = ""
         saved_voice = self.settings.value("voice/selectedId", "", type=str)
@@ -968,11 +1159,56 @@ class ApplicationViewModel(QObject):
         self._selected_cue_id = ""
         self._selected_cue_ids: list[str] = []
         self._subtitle_busy = False
+        self._subtitle_command_generation = 0
+        self._subtitle_command_context: dict[str, object] = {}
+        self._subtitle_command_watchdog = QTimer(self)
+        self._subtitle_command_watchdog.setSingleShot(True)
+        self._subtitle_command_watchdog.setInterval(120_000)
+        self._subtitle_command_watchdog.timeout.connect(self._subtitle_command_timed_out)
+        self._scene_timing_generation = 0
+        self._scene_timing_context: dict[str, object] = {}
+        self._subtitle_geometry_generation = 0
+        self._subtitle_geometry_context: dict = {}
+        self._subtitle_save_in_flight = False
+        self._subtitle_save_generation = 0
+        self._subtitle_save_context: dict[str, object] = {}
+        self._subtitle_save_queue: list[dict[str, object]] = []
+        self._subtitle_flush_callbacks: dict[str, Callable[[], None]] = {}
+        self._subtitle_save_timer = QTimer(self)
+        self._subtitle_save_timer.setSingleShot(True)
+        self._subtitle_save_timer.setInterval(150)
+        self._subtitle_save_timer.timeout.connect(self._dispatch_background_subtitle_save)
+        self._subtitle_save_watchdog = QTimer(self)
+        self._subtitle_save_watchdog.setSingleShot(True)
+        self._subtitle_save_watchdog.setInterval(120_000)
+        self._subtitle_save_watchdog.timeout.connect(self._background_subtitle_save_timed_out)
+        self._project_dirty = False
+        self._draft_project_id = ""
+        self._last_saved_revision = 0
+        self._project_save_generation = 0
+        self._project_save_context: dict[str, object] = {}
+        self._project_after_save_callbacks: dict[str, Callable[[], None]] = {}
+        self._project_autosave_timer = QTimer(self)
+        self._project_autosave_timer.setSingleShot(True)
+        self._project_autosave_timer.setInterval(300_000)
+        self._project_autosave_timer.timeout.connect(self._request_project_autosave)
+        self._project_save_watchdog = QTimer(self)
+        self._project_save_watchdog.setSingleShot(True)
+        self._project_save_watchdog.setInterval(30_000)
+        self._project_save_watchdog.timeout.connect(self._project_save_timed_out)
+        self._database_maintenance_timer = QTimer(self)
+        self._database_maintenance_timer.setInterval(500)
+        self._database_maintenance_timer.timeout.connect(self._poll_database_optimization)
         self._pending_manual_scene_text_commands: list[dict[str, object]] = []
         self._subtitle_export_busy = False
         self._can_undo_subtitle = False
         self._can_redo_subtitle = False
         self.runtime = JobRuntime(self)
+        self.license_model = LicenseViewModel(self.runtime, self)
+        self.license_model.changed.connect(self._license_changed)
+        if not self.license_model.active:
+            self._current_workspace = "settings"
+            self._current_index = self._screen_index("settings")
         self.updater_model = UpdateViewModel(self.runtime, self.settings, self)
         self.runtime.statusChanged.connect(self._set_status)
         self.runtime.stateChanged.connect(self._set_runtime_state)
@@ -983,7 +1219,10 @@ class ApplicationViewModel(QObject):
         self.runtime.multiVideosReceived.connect(self._replace_multi_videos)
         self.runtime.actionSucceeded.connect(self._action_succeeded)
         self.runtime.actionFailed.connect(self._action_failed)
+        self.runtime.timelinePatchProjected.connect(self._timeline_patch_projected)
         self.voiceInstallEvent.connect(self._handle_voice_install_event)
+        self.subtitleGeometryMeasured.connect(self._subtitle_geometry_measured,
+                                               Qt.ConnectionType.QueuedConnection)
 
     @Property(QObject, constant=True)
     def navigationModel(self) -> QObject:
@@ -992,6 +1231,24 @@ class ApplicationViewModel(QObject):
     @Property(QObject, constant=True)
     def updater(self) -> QObject:
         return self.updater_model
+
+    @Property(QObject, constant=True)
+    def activation(self) -> QObject:
+        return self.license_model
+
+    def _license_changed(self) -> None:
+        if not self.license_model.active:
+            self.navigate("settings")
+        elif self._activation_return_workspace:
+            target, self._activation_return_workspace = self._activation_return_workspace, ""
+            self.navigate(target)
+
+    def _features_available(self) -> bool:
+        if self.license_model.active:
+            return True
+        self.navigate("settings")
+        self._set_status("Chưa kích hoạt. Hãy nhập key tại Cài đặt → Kích hoạt.")
+        return False
 
     @Property(QObject, constant=True)
     def projectModel(self) -> QObject:
@@ -1175,6 +1432,16 @@ class ApplicationViewModel(QObject):
             return 100.0
         return float(volume) * 100.0
 
+    @Property(bool, notify=selectedClipChanged)
+    def selectedClipMuted(self) -> bool:
+        clip = self.project_state.clip_info(self._selected_clip_id)
+        return bool(clip.get("muted", False)) if clip else False
+
+    @Property(bool, notify=videoClipboardChanged)
+    def canPasteVideo(self) -> bool:
+        return bool(self._video_clipboard_project_id
+                    and self._video_clipboard_project_id == self.project_state.projectId)
+
     @Property(str, notify=selectedClipChanged)
     def selectedClipCueText(self) -> str:
         clip = self.project_state.clip_info(self._selected_clip_id)
@@ -1253,6 +1520,19 @@ class ApplicationViewModel(QObject):
     def playheadUs(self) -> float:
         return float(self._playhead_us)
 
+    @Property(int, notify=timelineNavigationChanged)
+    def timelineSeekStepMs(self) -> int:
+        return self._timeline_seek_step_ms
+
+    @Slot(int)
+    def setTimelineSeekStepMs(self, value: int) -> None:
+        normalized = max(1, min(1_000, int(value)))
+        if normalized == self._timeline_seek_step_ms:
+            return
+        self._timeline_seek_step_ms = normalized
+        self.settings.setValue("timeline/seekStepMs", normalized)
+        self.timelineNavigationChanged.emit()
+
     @Property(bool, notify=timelineBusyChanged)
     def timelineBusy(self) -> bool:
         return self._timeline_busy
@@ -1271,7 +1551,11 @@ class ApplicationViewModel(QObject):
 
     @Property(str, notify=ocrSettingsChanged)
     def ocrEnginePython(self) -> str:
-        return self.settings.value("engines/paddlePython", _default_ocr_engine_python(), type=str)
+        # Explicit process-local overrides must match runtime diagnostics even
+        # when a different installation's Python was saved in user settings.
+        return _configured_ocr_engine_python() or self.settings.value(
+            "engines/paddlePython", _default_ocr_engine_python(), type=str,
+        )
 
     @Property(str, notify=ocrSettingsChanged)
     def ocrExtractionMethod(self) -> str:
@@ -1307,6 +1591,18 @@ class ApplicationViewModel(QObject):
         """The OCR sampling rate shared by single-video and Multi runs."""
 
         return self._ocr_sample_fps
+
+    @Property(bool, notify=ocrSettingsChanged)
+    def ocrSceneTextEnabled(self) -> bool:
+        return self._ocr_scene_text_enabled
+
+    @Slot(bool)
+    def setOcrSceneTextEnabled(self, enabled: bool) -> None:
+        if self._ocr_scene_text_enabled == enabled:
+            return
+        self._ocr_scene_text_enabled = enabled
+        self.settings.setValue("ocr/sceneTextEnabled", enabled)
+        self.ocrSettingsChanged.emit()
 
     @Property(str, notify=ocrBusyChanged)
     def ocrJobId(self) -> str:
@@ -1475,6 +1771,27 @@ class ApplicationViewModel(QObject):
     def exportSubtitleEnabled(self) -> bool:
         return self.settings.value("export/subtitleEnabled", True, type=bool)
 
+    @Property(bool, notify=exportSettingsChanged)
+    def exportSubtitleBackgroundEnabled(self) -> bool:
+        return self.settings.value("export/subtitleBackgroundEnabled", True, type=bool)
+
+    @Property(str, notify=exportSettingsChanged)
+    def exportSubtitleBackgroundMode(self) -> str:
+        value = self.settings.value("export/subtitleBackgroundMode", "black", type=str)
+        return value if value in {"black", "blur"} else "black"
+
+    @Slot(bool)
+    def setExportSubtitleBackgroundEnabled(self, enabled: bool) -> None:
+        self.settings.setValue("export/subtitleBackgroundEnabled", enabled)
+        self.exportSettingsChanged.emit()
+
+    @Slot(str)
+    def setExportSubtitleBackgroundMode(self, mode: str) -> None:
+        if mode not in {"black", "blur"}:
+            return
+        self.settings.setValue("export/subtitleBackgroundMode", mode)
+        self.exportSettingsChanged.emit()
+
     @Property(str, notify=exportSettingsChanged)
     def exportFontFamily(self) -> str:
         return self.settings.value("export/fontFamily", "Arial", type=str)
@@ -1561,6 +1878,14 @@ class ApplicationViewModel(QObject):
     def runtimeDiagnostics(self) -> dict[str, object]:
         return self._runtime_diagnostics
 
+    @Property("QVariantMap", notify=databaseMaintenanceChanged)
+    def databaseMaintenance(self) -> dict[str, object]:
+        return dict(self._database_maintenance)
+
+    @Property(bool, notify=databaseMaintenanceChanged)
+    def databaseMaintenanceBusy(self) -> bool:
+        return self._database_maintenance.get("state") in {"running", "cancelling"}
+
     @Property("QVariantMap", notify=legacyMigrationChanged)
     def legacyMigrationReport(self) -> dict[str, object]:
         return self._legacy_migration_report
@@ -1644,6 +1969,21 @@ class ApplicationViewModel(QObject):
     def selectedCue(self) -> dict:
         return self.project_state.subtitle_cues.find(self._selected_cue_id)
 
+    @Property("QVariantMap", notify=selectedCueChanged)
+    def selectedCueClassification(self) -> dict:
+        cue_ids = self._selected_cue_ids or (
+            [self._selected_cue_id] if self._selected_cue_id else []
+        )
+        cues = [self.project_state.subtitle_cues.find(cue_id) for cue_id in cue_ids]
+        roles = {cue.get("cue_role", "dialogue") for cue in cues if cue}
+        lanes = {cue.get("subtitle_track_id", "") for cue in cues if cue}
+        return {
+            "count": len(cue_ids),
+            "role": next(iter(roles)) if len(roles) == 1 else ("mixed" if roles else ""),
+            "track": next(iter(lanes)) if len(lanes) == 1 else "",
+            "can_convert": bool(cues) and all(cues) and roles <= {"dialogue", "scene_text"},
+        }
+
     @Property(bool, notify=subtitleBusyChanged)
     def subtitleBusy(self) -> bool:
         return self._subtitle_busy
@@ -1671,6 +2011,11 @@ class ApplicationViewModel(QObject):
     @Slot()
     def requestQuit(self) -> None:
         if self._shutting_down:
+            return
+        if self._defer_until_subtitle_saves_flushed(
+            "quit", self.requestQuit, "Đang lưu thay đổi cuối trước khi đóng ứng dụng…",
+            durable=True,
+        ):
             return
         self._shutting_down = True
         self.shuttingDownChanged.emit()
@@ -1730,6 +2075,43 @@ class ApplicationViewModel(QObject):
         self._set_status("Đang kiểm tra runtime và engine ở tiến trình nền")
 
     @Slot()
+    def optimizeProjectDatabase(self) -> None:
+        if not self._backend_ready or self.databaseMaintenanceBusy:
+            return
+        if self._defer_until_subtitle_saves_flushed(
+            "database-optimizer",
+            self.optimizeProjectDatabase,
+            "Đang lưu project trước khi tối ưu database…",
+            durable=True,
+        ):
+            return
+        self._database_maintenance = {"state": "running"}
+        self.databaseMaintenanceChanged.emit()
+        self.runtime.request("optimize_project_database")
+        self._set_status("Đang tạo database tối ưu và kiểm tra toàn vẹn trước khi đổi file…")
+
+    @Slot()
+    def cancelProjectDatabaseOptimization(self) -> None:
+        if not self._backend_ready or not self.databaseMaintenanceBusy:
+            return
+        if self._database_maintenance.get("state") == "cancelling":
+            return
+        self._database_maintenance = {
+            **self._database_maintenance,
+            "state": "cancelling",
+        }
+        self.databaseMaintenanceChanged.emit()
+        self.runtime.request("cancel_database_optimization")
+        self._set_status("Đang hủy tối ưu tại checkpoint an toàn trước khi đổi database…")
+
+    @Slot()
+    def _poll_database_optimization(self) -> None:
+        if not self._backend_ready or not self.databaseMaintenanceBusy:
+            self._database_maintenance_timer.stop()
+            return
+        self.runtime.request("get_database_optimization")
+
+    @Slot()
     def showLegacyImportDialog(self) -> None:
         if not self._backend_ready:
             self._set_status("Job Manager chưa sẵn sàng để đọc dự án cũ")
@@ -1765,6 +2147,8 @@ class ApplicationViewModel(QObject):
 
     @Slot(float)
     def startOcr(self, sample_fps: float = 1.25) -> None:
+        if not self._features_available():
+            return
         if self._guard_manual_parallel("ocr", (sample_fps,)):
             return
         if not self._backend_ready or not self.project_state.hasProject:
@@ -1772,6 +2156,13 @@ class ApplicationViewModel(QObject):
             return
         if self._ocr_busy:
             self._set_status("OCR đang chạy; có thể tạm dừng hoặc hủy tác vụ hiện tại")
+            return
+        if self._defer_until_subtitle_saves_flushed(
+            "ocr",
+            lambda: self.startOcr(sample_fps),
+            "Đang lưu project trước khi tạo tác vụ OCR…",
+            durable=True,
+        ):
             return
         method = self._ocr_extraction_method
         if method == "frame_ocr" and (
@@ -1804,6 +2195,7 @@ class ApplicationViewModel(QObject):
             {
                 "project_id": self.project_state.projectId,
                 "sample_interval_us": interval_us,
+                "scene_text_enabled": self._ocr_scene_text_enabled,
                 "engine_python": str(runtime),
                 "device": "auto" if method == "whisper_audio" else "gpu:0",
                 "extraction_method": method,
@@ -1889,7 +2281,10 @@ class ApplicationViewModel(QObject):
             )
 
     @Slot(str, str)
-    def setTranslationPreferences(self, preset: str, custom_rules: str) -> None:
+    @Slot(str, str, str)
+    def setTranslationPreferences(
+        self, preset: str, custom_rules: str, active_style_name: str = ""
+    ) -> None:
         if not self._backend_ready or not self.project_state.hasProject:
             return
         if self._translation_preferences_busy:
@@ -1907,6 +2302,8 @@ class ApplicationViewModel(QObject):
                     "project_id": project_id,
                     "preset": preset,
                     "custom_rules": custom_rules,
+                    "compact": True,
+                    **({"active_style_name": active_style_name} if active_style_name else {}),
                 },
                 context={"project_id": project_id},
             )
@@ -1915,6 +2312,46 @@ class ApplicationViewModel(QObject):
             self._set_status(f"Không thể gửi yêu cầu lưu văn phong: {exc}")
             return
         self._set_status("Đang lưu văn phong dịch cho project")
+
+    @Slot(str, str, str)
+    def saveTranslationStyle(self, name: str, preset: str, custom_rules: str) -> None:
+        if not self._backend_ready or not self.project_state.hasProject:
+            return
+        if self._translation_preferences_busy:
+            self._set_status("Văn phong đang được lưu; hãy chờ thao tác hiện tại hoàn tất")
+            return
+        normalized_name = name.strip()
+        if not normalized_name:
+            self._set_status("Hãy đặt tên cho văn phong trước khi lưu")
+            return
+        if len(normalized_name) > 80:
+            self._set_status("Tên văn phong tối đa 80 ký tự")
+            return
+        if any(ord(character) < 32 for character in normalized_name):
+            self._set_status("Tên văn phong không được chứa ký tự điều khiển")
+            return
+        if len(custom_rules) > 4_000:
+            self._set_status("Quy tắc riêng tối đa 4.000 ký tự")
+            return
+        project_id = self.project_state.projectId
+        self._set_translation_preferences_busy(True)
+        try:
+            self.runtime.request(
+                "save_translation_style",
+                {
+                    "project_id": project_id,
+                    "name": normalized_name,
+                    "preset": preset,
+                    "custom_rules": custom_rules,
+                    "compact": True,
+                },
+                context={"project_id": project_id, "translation_style_name": normalized_name},
+            )
+        except (OSError, RuntimeError) as exc:
+            self._set_translation_preferences_busy(False)
+            self._set_status(f"Không thể gửi yêu cầu lưu văn phong: {exc}")
+            return
+        self._set_status(f"Đang lưu văn phong ‘{normalized_name}’")
 
     @Slot(str, str, bool, bool, str)
     @Slot(str, str, bool, bool, str, str)
@@ -1927,6 +2364,9 @@ class ApplicationViewModel(QObject):
         credential_input: str = "",
         base_url: str = "",
     ) -> None:
+        if self._translation_preferences_busy:
+            self._set_status("Đang lưu văn phong mới; chưa bắt đầu tác vụ dịch")
+            return
         if self._guard_manual_parallel(
             "translate",
             (provider_id, model_id, headed, guest, credential_input, base_url),
@@ -1938,8 +2378,22 @@ class ApplicationViewModel(QObject):
         if self.project_state.subtitle_cues.rowCount() <= 0:
             self._set_status("Project chưa có cue nguồn để dịch")
             return
-        if self._translation_busy:
+        if self._translation_busy and self._translation_job_state not in {"paused", "queued"}:
             self._set_status("Dịch đang chạy; hãy dùng Tạm dừng hoặc Hủy")
+            return
+        if self._defer_until_subtitle_saves_flushed(
+            "translation",
+            lambda: self.startTranslation(
+                provider_id,
+                model_id,
+                headed,
+                guest,
+                credential_input,
+                base_url,
+            ),
+            "Đang lưu phụ đề trước khi tạo tác vụ dịch…",
+            durable=True,
+        ):
             return
         provider_id = provider_id.strip().casefold()
         model_id = model_id.strip()
@@ -1955,11 +2409,25 @@ class ApplicationViewModel(QObject):
         if not model_id:
             self._set_status("Hãy nhập model dịch")
             return
+        matches_selection = self.translationSelectionMatches(provider_id, model_id, base_url)
+        if self._translation_job_state in {"paused", "queued"} and not (
+            matches_selection and not credential_input.strip()
+        ):
+            self._translation_switch_pending = {
+                "project_id": self.project_state.projectId, "job_id": self._translation_job_id,
+                "arguments": (provider_id, model_id, headed, guest, credential_input, base_url),
+            }
+            self._set_translation_job_state("cancel_requested")
+            self.runtime.request("cancel_job", {"job_id": self._translation_job_id},
+                                 context={"job_kind": "translate", "switch_provider": True})
+            self._set_status(
+                "Đang dừng lượt dịch cũ an toàn để dùng lựa chọn mới; cache được giữ lại"
+            )
+            return
         stopped_job_matches_selection = (
             bool(self._translation_job_id)
             and self._translation_job_state in {"cancelled", "failed", "interrupted", "review"}
-            and self._translation_provider_id == provider_id
-            and self._translation_model_id == model_id
+            and matches_selection
         )
         if (
             provider_id in {"gemini-api", *OPENAI_COMPATIBLE_PROVIDER_IDS}
@@ -2006,6 +2474,77 @@ class ApplicationViewModel(QObject):
             return
         self._begin_translation(provider_id, model_id, headed, guest, base_url=base_url.strip())
 
+    @Slot(str, str, str, result=bool)
+    @Slot(str, str, str, str, result=bool)
+    def translationSelectionMatches(
+        self, provider_id: str, model_id: str, base_url: str, reference: str = "",
+    ) -> bool:
+        provider_id = provider_id.strip().casefold()
+        reference = reference or self.uiStringValue(
+            "translation/selectedCredential/" + provider_id, ""
+        )
+        credentials_match = (not reference or not self._translation_job_credential_references
+                             or self._translation_job_credential_references == [reference])
+        return (self._translation_provider_id == provider_id
+                and self._translation_model_id == model_id.strip()
+                and (provider_id != "openai-compatible"
+                     or self._translation_base_url.rstrip("/") == base_url.strip().rstrip("/"))
+                and credentials_match
+                and self._translation_job_style_preset == self.project_state.translationStylePreset
+                and self._translation_job_custom_rules == self.project_state.translationCustomRules)
+
+    def _bind_translation_configuration(self, config: object) -> None:
+        config = config if isinstance(config, Mapping) else {}
+        previous = (self._translation_base_url, self._translation_job_credential_references,
+                    self._translation_job_style_preset, self._translation_job_custom_rules)
+        self._translation_base_url = str(config.get("base_url", ""))
+        self._translation_job_credential_references = list(
+            config.get("credential_references") or []
+        )
+        self._translation_job_style_preset = str(config.get("translation_style_preset", "auto"))
+        self._translation_job_custom_rules = str(config.get("translation_custom_rules", ""))
+        if previous != (self._translation_base_url, self._translation_job_credential_references,
+                        self._translation_job_style_preset, self._translation_job_custom_rules):
+            self.translationBusyChanged.emit()
+
+    def _translation_controls_own_preview(self) -> bool:
+        return self._translation_busy and self._translation_job_state in {
+            "queued", "start_requested", "running", "pause_requested", "paused",
+            "resume_requested", "cancel_requested",
+        }
+
+    def _translation_preview_matches_job(self, job_id: str) -> bool:
+        # Before create-job acknowledgement there is no current job ID. Reject
+        # older replies rather than temporarily rebinding the new selection.
+        if self._translation_cache_selection_explicit and self._selected_translation_cache_id:
+            return job_id == self._selected_translation_cache_id
+        if self._translation_controls_own_preview():
+            return bool(self._translation_job_id) and job_id == self._translation_job_id
+        return (not self._selected_translation_cache_id
+                or job_id == self._selected_translation_cache_id)
+
+    def _selected_translation_api_references(self, provider_id: str) -> list[str]:
+        references = self._translation_api_references(provider_id)
+        selected = self.uiStringValue("translation/selectedCredential/" + provider_id, "")
+        return [selected] if selected in references else references
+
+    def _complete_translation_switch(self, jobs: list[dict]) -> None:
+        pending = self._translation_switch_pending
+        if not pending:
+            return
+        if pending["project_id"] != self.project_state.projectId:
+            self._translation_switch_pending = None
+            return
+        previous = next((item for item in jobs if item.get("id") == pending["job_id"]), None)
+        if previous is None or previous.get("state") not in {
+            "cancelled", "failed", "interrupted", "succeeded",
+        }:
+            return
+        self._translation_switch_pending = None
+        self._selected_translation_cache_id = ""
+        self._set_translation_busy(False)
+        self.startTranslation(*pending["arguments"])
+
     @Slot(str, str, bool, bool, str)
     @Slot(str, str, bool, bool, str, str)
     def toggleTranslation(
@@ -2022,8 +2561,17 @@ class ApplicationViewModel(QObject):
         if self._translation_job_state == "running":
             self.pauseTranslation()
             return
+        if self._translation_preferences_busy:
+            self._set_status("Đang lưu văn phong mới; chưa tiếp tục tác vụ dịch")
+            return
         if self._translation_job_state in {"paused", "queued"}:
-            self.resumeTranslation(headed=headed, guest=guest)
+            if (not credential_input.strip()
+                    and self.translationSelectionMatches(provider_id, model_id, base_url)):
+                self.resumeTranslation(headed=headed, guest=guest)
+            else:
+                self.startTranslation(
+                    provider_id, model_id, headed, guest, credential_input, base_url,
+                )
             return
         if self._translation_job_state in {
             "cancelled",
@@ -2036,8 +2584,8 @@ class ApplicationViewModel(QObject):
             if (
                 not credential_input.strip()
                 and bool(requested_model_id)
-                and self._translation_provider_id == requested_provider_id
-                and self._translation_model_id == requested_model_id
+                and self.translationSelectionMatches(requested_provider_id, requested_model_id,
+                                                     base_url)
             ):
                 self.resumeTranslation(headed=headed, guest=guest)
                 return
@@ -2067,6 +2615,30 @@ class ApplicationViewModel(QObject):
             base_url,
         )
 
+    @Slot(str, str, bool, bool, str, str, str, str)
+    def toggleTranslationWithStyle(
+        self, provider_id: str, model_id: str, headed: bool, guest: bool,
+        credential_input: str, base_url: str, preset: str, custom_rules: str,
+    ) -> None:
+        """Persist a changed draft before continuing with the user's latest selection."""
+        arguments = (provider_id, model_id, headed, guest, credential_input, base_url)
+        if self._translation_job_state == "running":
+            self.toggleTranslation(*arguments)
+            return
+        if self._translation_preferences_busy:
+            self._set_status("Văn phong đang được lưu; hãy chờ xác nhận")
+            return
+        if (preset, custom_rules) == (self.project_state.translationStylePreset,
+                                     self.project_state.translationCustomRules):
+            self.toggleTranslation(*arguments)
+            return
+        self._translation_style_control_pending = {
+            "project_id": self.project_state.projectId, "arguments": arguments,
+        }
+        self.setTranslationPreferences(preset, custom_rules)
+        if not self._translation_preferences_busy:
+            self._translation_style_control_pending = None
+
     def _begin_translation(
         self,
         provider_id: str,
@@ -2088,7 +2660,9 @@ class ApplicationViewModel(QObject):
         if provider_id == "gemini-web":
             options.update(self._gemini_web_options(headed=headed, guest=guest))
         elif provider_id in {"gemini-api", *OPENAI_COMPATIBLE_PROVIDER_IDS}:
-            references = credential_references or self._translation_api_references(provider_id)
+            references = credential_references or self._selected_translation_api_references(
+                provider_id
+            )
             if not references:
                 self._set_translation_busy(False)
                 self._set_status("Hãy thêm ít nhất một API key vào Windows Credential Manager")
@@ -2106,6 +2680,15 @@ class ApplicationViewModel(QObject):
             self.settings.setValue("translation/openaiCompatibleBaseUrl", base_url)
         self._translation_provider_id = provider_id
         self._translation_model_id = model_id
+        self._translation_base_url = base_url
+        self._translation_job_credential_references = list(options.get("credential_references", []))
+        self._translation_job_style_preset = self.project_state.translationStylePreset
+        self._translation_job_custom_rules = self.project_state.translationCustomRules
+        self._translation_job_id = ""
+        self._selected_translation_cache_id = ""
+        self._translation_cache_selection_explicit = False
+        self.translationCachesChanged.emit()
+        self.statusNotificationDismissRequested.emit()
         self._set_translation_job_state("start_requested")
         self._set_translation_busy(True)
         self._set_translation_qa(
@@ -2115,7 +2698,8 @@ class ApplicationViewModel(QObject):
                 "checked_cues": 0,
                 "cue_total": self.project_state.subtitle_cues.count,
                 "issues": [],
-            }
+            },
+            reconcile_with_project=False,
         )
         self.runtime.request(
             "create_translation_job",
@@ -2166,7 +2750,9 @@ class ApplicationViewModel(QObject):
         }:
             payload: dict[str, object] = {"job_id": self._translation_job_id}
             if self._translation_provider_id in {"gemini-api", *OPENAI_COMPATIBLE_PROVIDER_IDS}:
-                references = self._translation_api_references(self._translation_provider_id)
+                references = self._selected_translation_api_references(
+                    self._translation_provider_id
+                )
                 if not references:
                     self._set_status("Chưa có API key trong Windows Credential Manager")
                     return
@@ -2230,6 +2816,64 @@ class ApplicationViewModel(QObject):
     def saveGeminiApiCredentials(self, raw: str) -> None:
         self.saveTranslationApiCredentials("gemini-api", raw)
 
+    @Slot(str, str, str)
+    def saveTranslationApiCredential(self, provider_id: str, name: str, secret: str) -> None:
+        provider_id, name, secret = provider_id.strip().casefold(), name.strip(), secret.strip()
+        if provider_id not in {"gemini-api", *OPENAI_COMPATIBLE_PROVIDER_IDS}:
+            self._set_status("Nguồn dịch API không được hỗ trợ")
+            return
+        if not name or len(name) > 120 or any(c in name for c in "\r\n\0") or not secret:
+            self._set_status("Nhập tên key (tối đa 120 ký tự) và API key trước khi lưu")
+            return
+        self.runtime.request("store_credentials", {
+            "credentials": [{"reference": name, "secret": secret}],
+        }, context={"credential_provider_id": provider_id,
+                    "credential_references": [name], "start_translation": False})
+        self._set_status("Đang lưu API key vào Windows Credential Manager")
+
+    @Property("QStringList", notify=translationModelCatalogChanged)
+    def translationAvailableModels(self) -> list[str]:
+        return self._translation_catalog_models
+
+    @Property(bool, notify=translationModelCatalogChanged)
+    def translationModelCatalogBusy(self) -> bool:
+        return self._translation_catalog_busy
+
+    @Property(str, notify=translationModelCatalogChanged)
+    def translationModelCatalogStatus(self) -> str:
+        return self._translation_catalog_status
+
+    @Property(str, notify=translationModelCatalogChanged)
+    def translationModelCatalogProvider(self) -> str:
+        return self._translation_catalog_provider
+
+    @Slot()
+    def clearTranslationModelCatalog(self) -> None:
+        self._translation_catalog_generation += 1
+        self._translation_catalog_models = []
+        self._translation_catalog_provider = ""
+        self._translation_catalog_busy = False
+        self._translation_catalog_status = "Gợi ý model. Có thể chọn hoặc nhập tên thủ công."
+        self.translationModelCatalogChanged.emit()
+
+    @Slot(str, str, str)
+    def refreshTranslationModels(self, provider_id: str, reference: str, base_url: str) -> None:
+        if not self._backend_ready or not reference.strip():
+            self._translation_catalog_status = "Hãy lưu và chọn một API key trước khi tải model."
+            self.translationModelCatalogChanged.emit()
+            return
+        self._translation_catalog_generation += 1
+        self._translation_catalog_provider = provider_id.strip().casefold()
+        self._translation_catalog_models = []
+        self._translation_catalog_busy = True
+        self._translation_catalog_status = "Đang tải model từ API…"
+        self.translationModelCatalogChanged.emit()
+        self.runtime.request("list_translation_models", {
+            "provider_id": provider_id, "credential_reference": reference,
+            "base_url": base_url,
+        }, context={"catalog_generation": self._translation_catalog_generation,
+                    "catalog_provider": self._translation_catalog_provider})
+
     @Slot(str, str)
     def saveTranslationApiCredentials(self, provider_id: str, raw: str) -> None:
         provider_id = provider_id.strip().casefold()
@@ -2287,6 +2931,11 @@ class ApplicationViewModel(QObject):
         if not path.is_file() or path.suffix.casefold() != ".srt":
             self._set_status("File bản dịch ngoài phải là SRT tồn tại trên máy")
             return
+        if self._defer_until_subtitle_saves_flushed(
+            "import-translation", lambda: self.importTranslationPath(raw_path),
+            "Đang lưu dự án trước khi nhập bản dịch…", durable=True,
+        ):
+            return
         self.runtime.request(
             "import_translation_srt",
             {
@@ -2311,6 +2960,11 @@ class ApplicationViewModel(QObject):
         path = _local_path_from_ui(raw_path)
         if path.suffix.casefold() != ".srt":
             self._set_status("File xuất phụ đề phải có đuôi .srt")
+            return
+        if self._defer_until_subtitle_saves_flushed(
+            "export-srt", lambda: self.exportSubtitleSrt(language, raw_path),
+            "Đang lưu chỉnh sửa trước khi xuất SRT…", durable=True,
+        ):
             return
         self._set_subtitle_export_busy(True)
         self.runtime.request(
@@ -2339,6 +2993,8 @@ class ApplicationViewModel(QObject):
 
     @Slot(str)
     def previewCatalogVoice(self, voice_id: str) -> None:
+        if not self._features_available():
+            return
         entry = self.voice_catalog.find(voice_id.strip())
         path = Path(str(entry.get("preview_source", ""))).expanduser()
         if not entry or entry.get("preview_available") is not True or not path.is_file():
@@ -2362,6 +3018,8 @@ class ApplicationViewModel(QObject):
 
     @Slot(str)
     def installVoice(self, voice_id: str) -> None:
+        if not self._features_available():
+            return
         normalized = voice_id.strip()
         entry = self.voice_catalog.find(normalized)
         if not entry:
@@ -2692,6 +3350,11 @@ class ApplicationViewModel(QObject):
         """
 
         requested_id = str(cue_id or "").strip()
+        if self.project_state.title_cues.find(requested_id):
+            self.selectTimelineCue(requested_id, False)
+            self.navigate("timeline")
+            self._set_status("Chỉnh tên phim/kênh trong tab Text của Timeline")
+            return
         try:
             requested_index = int(cue_index)
         except (TypeError, ValueError):
@@ -2735,6 +3398,11 @@ class ApplicationViewModel(QObject):
         """Open an S1/S2/S3 cue in the subtitle editing workspace."""
 
         requested_id = str(cue_id or "").strip()
+        if self.project_state.title_cues.find(requested_id):
+            self.selectTimelineCue(requested_id, False)
+            self.navigate("timeline")
+            self._set_status("Chỉnh tên phim/kênh trong tab Text của Timeline")
+            return
         try:
             requested_index = int(cue_index)
         except (TypeError, ValueError):
@@ -2769,17 +3437,42 @@ class ApplicationViewModel(QObject):
 
     @Slot()
     def startVoicePreview(self) -> None:
+        if not self._features_available():
+            return
+        if self._defer_until_subtitle_saves_flushed(
+            "voice-preview",
+            self.startVoicePreview,
+            "Đang lưu phụ đề trước khi tạo giọng nghe thử…",
+            durable=True,
+        ):
+            return
         self.stopVoiceCatalogPreview()
         self._start_voice_job("preview")
 
     @Slot()
     def startVoiceGeneration(self) -> None:
+        if not self._features_available():
+            return
+        if self._defer_until_subtitle_saves_flushed(
+            "voice-production",
+            self.startVoiceGeneration,
+            "Đang lưu phụ đề trước khi tạo D1…",
+            durable=True,
+        ):
+            return
         self._start_voice_job("production")
 
     @Slot()
     def regenerateSelectedVoiceCue(self) -> None:
         if not self._selected_cue_id:
             self._set_status("Hãy chọn cue trong Biên tập phụ đề trước")
+            return
+        if self._defer_until_subtitle_saves_flushed(
+            "voice-selected",
+            self.regenerateSelectedVoiceCue,
+            "Đang lưu cue đã sửa trước khi tạo lại giọng…",
+            durable=True,
+        ):
             return
         self._start_voice_job("production", force_cue_ids=[self._selected_cue_id])
 
@@ -2969,6 +3662,13 @@ class ApplicationViewModel(QObject):
 
     @Slot()
     def startExport(self) -> None:
+        if not self._features_available():
+            return
+        if self._defer_until_subtitle_saves_flushed(
+            "export", self.startExport, "Đang lưu project trước khi khóa snapshot xuất video…",
+            durable=True,
+        ):
+            return
         if not self._backend_ready or not self.project_state.hasVideo:
             self._set_status("Hãy mở project có video trước khi xuất")
             return
@@ -3001,6 +3701,8 @@ class ApplicationViewModel(QObject):
                         "outline_width": self.exportSubtitleOutlineWidth,
                         "alignment": self.exportSubtitleAlignment,
                         "opacity_percent": self.exportSubtitleOpacityPercent,
+                        "background_enabled": self.exportSubtitleBackgroundEnabled,
+                        "background_mode": self.exportSubtitleBackgroundMode,
                     },
                     "video_filter": {
                         "preset_id": self.exportVideoFilterPreset,
@@ -3067,6 +3769,11 @@ class ApplicationViewModel(QObject):
         self.overlaySelectionRequested.emit("overlay-default-logo")
         self._send_effect_command("set_logo_asset", values={"path": path})
 
+    @Slot(str)
+    def selectProjectOverlay(self, overlay_id: str) -> None:
+        if self.project_state.overlay(overlay_id):
+            self.overlaySelectionRequested.emit(overlay_id)
+
     @Slot(str, bool)
     def setOverlayEnabled(self, overlay_id: str, enabled: bool) -> None:
         self._send_effect_command("update", overlay_id=overlay_id, values={"enabled": enabled})
@@ -3100,6 +3807,7 @@ class ApplicationViewModel(QObject):
             values={
                 "start_us": max(0, int(start_seconds * 1_000_000)),
                 "end_us": max(0, int(end_seconds * 1_000_000)),
+                "display_time": True,
             },
         )
 
@@ -3162,6 +3870,7 @@ class ApplicationViewModel(QObject):
         )
         pending = {
             "command": command,
+            "project_id": self.project_state.projectId,
             "overlay_id": overlay_id or "",
             "values": dict(values or {}),
             "geometry": is_geometry,
@@ -3178,9 +3887,14 @@ class ApplicationViewModel(QObject):
         self._effect_generations[generation_key] = generation
         pending["generation_key"] = generation_key
         pending["generation"] = generation
-        if self._timeline_busy:
+        if (self._timeline_busy or self._subtitle_command_context
+                or self._subtitle_save_in_flight or self._subtitle_save_queue):
             self._enqueue_effect_command(pending)
             self._set_status("Đã xếp thay đổi logo/blur; sẽ lưu ngay sau thao tác hiện tại")
+            self._defer_until_subtitle_saves_flushed(
+                "effect-commands", self._dispatch_pending_effect_command,
+                "Đã xếp thay đổi logo/blur; sẽ lưu ngay sau thao tác hiện tại",
+            )
             return
         params: dict[str, object] = {
             "project_id": self.project_state.projectId,
@@ -3211,6 +3925,8 @@ class ApplicationViewModel(QObject):
                 if pending.get("geometry") is not True:
                     break
                 if str(pending.get("overlay_id", "")) == overlay_id:
+                    if "rollback" in pending:
+                        command["rollback"] = pending["rollback"]
                     self._pending_effect_commands[index] = command
                     return
         self._pending_effect_commands.append(command)
@@ -3221,19 +3937,28 @@ class ApplicationViewModel(QObject):
         return self._pending_effect_commands.pop(0)
 
     def _dispatch_pending_effect_command(self, pending: dict[str, object] | None = None) -> None:
+        if (self._timeline_busy or self._subtitle_command_context
+                or self._subtitle_save_in_flight or self._subtitle_save_queue
+                or self._timeline_reconcile_pending):
+            if pending is not None:
+                self._enqueue_effect_command(pending)
+            return
         command = pending if pending is not None else self._take_pending_effect_command()
         if command is None:
+            return
+        if command.get("project_id", self.project_state.projectId) != self.project_state.projectId:
+            self._dispatch_pending_effect_command()
             return
         overlay_id = str(command.get("overlay_id", ""))
         params: dict[str, object] = {
             "project_id": self.project_state.projectId,
             "command": str(command.get("command", "update")),
-            "values": command.get("values")
-            if isinstance(command.get("values"), dict)
-            else {},
+            "values": command.get("values") if isinstance(command.get("values"), dict) else {},
         }
         if overlay_id:
             params["overlay_id"] = overlay_id
+        self.project_state.apply_local_effect_command(
+            params["command"], overlay_id, params["values"])
         self._set_timeline_busy(True)
         self.runtime.request(
             "effect_command",
@@ -3397,12 +4122,57 @@ class ApplicationViewModel(QObject):
     def selectCue(self, cue_id: str, start_us: float) -> None:
         if not self.project_state.subtitle_cues.find(cue_id):
             return
+        if self._selected_clip_id:
+            self._selected_clip_id = ""
+            self.selectedClipChanged.emit()
         if cue_id != self._selected_cue_id or self._selected_cue_ids != [cue_id]:
             self._selected_cue_id = cue_id
             self._selected_cue_ids = [cue_id]
             self.selectedCueChanged.emit()
         output_us = self.project_state.sourceToOutputUs(max(0.0, start_us))
         self.setPlayheadMs(output_us / 1_000)
+
+    @Slot(str, bool)
+    def selectTimelineCue(self, cue_id: str, additive: bool = False) -> None:
+        """Select a Timeline cue without moving the playhead."""
+
+        if not self.project_state.subtitle_cues.find(cue_id):
+            return
+        if self._selected_clip_id and self.selectedClipTrackKind not in {"subtitle", "text"}:
+            self._selected_clip_id = ""
+            self.selectedClipChanged.emit()
+        if not additive:
+            selected = [cue_id]
+        else:
+            selected = list(self._selected_cue_ids)
+            is_title = bool(self.project_state.title_cues.find(cue_id))
+            selected = [item for item in selected
+                        if bool(self.project_state.title_cues.find(item)) == is_title]
+            if cue_id in selected:
+                selected.remove(cue_id)
+            else:
+                selected.append(cue_id)
+        if selected == self._selected_cue_ids:
+            return
+        self._selected_cue_ids = selected
+        self._selected_cue_id = selected[-1] if selected else ""
+        self.selectedCueChanged.emit()
+
+    @Slot()
+    def clearTimelineCueSelection(self) -> None:
+        """Clear cue/clip selection after a plain click on empty Timeline space."""
+
+        cue_changed = bool(self._selected_cue_id or self._selected_cue_ids)
+        clip_changed = bool(self._selected_clip_id)
+        if not cue_changed and not clip_changed:
+            return
+        self._selected_cue_id = ""
+        self._selected_cue_ids = []
+        self._selected_clip_id = ""
+        if cue_changed:
+            self.selectedCueChanged.emit()
+        if clip_changed:
+            self.selectedClipChanged.emit()
 
     @Slot(str, float, int)
     def selectCueWithModifiers(
@@ -3444,7 +4214,50 @@ class ApplicationViewModel(QObject):
 
     @Slot(str, result=bool)
     def isCueSelected(self, cue_id: str) -> bool:
-        return cue_id in self._selected_cue_ids
+        if getattr(self, "_cue_selection_list", None) is not self._selected_cue_ids:
+            self._cue_selection_list = self._selected_cue_ids
+            self._cue_selection_set = set(self._selected_cue_ids)
+        return cue_id in self._cue_selection_set
+
+    @Slot("QVariantMap", int, int, result="QVariantMap")
+    def subtitleArtwork(self, cue: dict, width: int, height: int, *, measure_only=False) -> dict:
+        if not cue.get("cue_id") or not (cue.get("translated_text") or cue.get("source_text")):
+            return {}
+        from urllib.parse import quote
+
+        from ducai_studio.providers.subtitle_artwork import editor_payload, layout_json
+
+        style = self._subtitle_artwork_style()
+        payload = editor_payload(cue, max(2, width), max(2, height), style)
+        key = json.dumps(payload, sort_keys=True)
+        layout = layout_json(key, include_paths=not measure_only)
+        if measure_only:
+            return layout
+        return {
+            "source": "image://subtitle-artwork/" + quote(key, safe=""),
+            "text_rect": layout["text_rect"],
+            "concealment_rect": layout["concealment_rect"],
+            "font_size": layout["font_size"],
+            "placement_rect": layout["placement_rect"],
+            "selection_rect": layout["selection_rect"],
+        }
+
+    def _subtitle_artwork_style(self):
+        from ducai_studio.domain.effects import SubtitleStyle
+
+        return SubtitleStyle(
+            enabled=self.exportSubtitleEnabled,
+            font_family=self.exportFontFamily,
+            font_size=self.exportFontSize,
+            margin_bottom=self.exportSubtitleMarginBottom,
+            primary_color=self.exportSubtitlePrimaryColor,
+            outline_color=self.exportSubtitleOutlineColor,
+            outline_width=self.exportSubtitleOutlineWidth,
+            alignment=self.exportSubtitleAlignment,
+            opacity_percent=self.exportSubtitleOpacityPercent,
+            background_enabled=self.exportSubtitleBackgroundEnabled,
+            background_mode=self.exportSubtitleBackgroundMode,
+        )
 
     @Slot("QVariantList", bool)
     def selectSubtitleCueIds(self, cue_ids: list, additive: bool = False) -> None:
@@ -3456,6 +4269,10 @@ class ApplicationViewModel(QObject):
         values = list(dict.fromkeys(available))
         if additive:
             values = list(dict.fromkeys((*self._selected_cue_ids, *values)))
+        if values:
+            title_selection = bool(self.project_state.title_cues.find(values[-1]))
+            values = [item for item in values
+                      if bool(self.project_state.title_cues.find(item)) == title_selection]
         if values == self._selected_cue_ids:
             return
         self._selected_cue_ids = values
@@ -3464,6 +4281,9 @@ class ApplicationViewModel(QObject):
 
     @Slot()
     def selectAllSubtitleCues(self) -> None:
+        if self.project_state.title_cues.find(self._selected_cue_id):
+            self.selectSubtitleCueIds(self.project_state.titleCueIds(), False)
+            return
         values = [
             str(self.project_state.subtitle_cues.get(row).get("cue_id", ""))
             for row in range(self.project_state.subtitle_cues.count)
@@ -3569,6 +4389,26 @@ class ApplicationViewModel(QObject):
             background_opacity_percent,
         )
 
+    @Slot(str)
+    def setSelectedCueRole(self, role: str) -> None:
+        if role not in {"dialogue", "scene_text"}:
+            self._set_status("Loại cue phải là thoại S1 hoặc chữ trong cảnh S2")
+            return
+        cue_ids = list(self._selected_cue_ids)
+        if not cue_ids and self._selected_cue_id:
+            cue_ids = [self._selected_cue_id]
+        if not cue_ids:
+            self._set_status("Hãy chọn ít nhất một cue để chuyển loại")
+            return
+        if not self.selectedCueClassification["can_convert"]:
+            self._set_status("Chỉ chuyển cue phụ đề S; chữ tiêu đề trên track T được giữ riêng")
+            return
+        self._send_subtitle_command(
+            "set_cue_role", cue_id=cue_ids[-1],
+            values={"cue_ids": cue_ids, "role": role},
+            status_context={"converted_cue_count": len(cue_ids), "converted_cue_role": role},
+        )
+
     def _set_selected_subtitle_text_format(
         self,
         font_size: int,
@@ -3591,10 +4431,8 @@ class ApplicationViewModel(QObject):
         if not cue_ids:
             self._set_status("Hãy chọn ít nhất một cue chữ trước")
             return
-        normalized_size = max(1, min(100, int(font_size)))
-        normalized_orientation = (
-            "vertical" if orientation == "vertical" else "horizontal"
-        )
+        normalized_size = max(1, int(font_size))
+        normalized_orientation = "vertical" if orientation == "vertical" else "horizontal"
         normalized_color = str(background_color or "").strip().upper()
         normalized_text_color = str(text_color or "").strip().upper()
         normalized_style = (
@@ -3614,40 +4452,32 @@ class ApplicationViewModel(QObject):
             }
             else "standard"
         )
-        normalized_padding_x = max(0, min(100, int(background_padding_x)))
-        normalized_padding_y = max(0, min(100, int(background_padding_y)))
+        normalized_padding_x = max(0, int(background_padding_x))
+        normalized_padding_y = max(0, int(background_padding_y))
         normalized_background_style = (
-            background_style
-            if background_style in CUE_BACKGROUND_STYLES
-            else "solid"
+            background_style if background_style in CUE_BACKGROUND_STYLES else "solid"
         )
-        normalized_letter_spacing = max(0, min(100, int(letter_spacing_percent)))
+        normalized_letter_spacing = max(0, int(letter_spacing_percent))
         normalized_bold = bool(font_bold)
         normalized_italic = bool(font_italic)
         normalized_text_opacity = max(0, min(100, int(text_opacity_percent)))
-        normalized_background_opacity = max(
-            0, min(100, int(background_opacity_percent))
+        normalized_background_opacity = max(0, min(100, int(background_opacity_percent)))
+        optimistic_changes = self.project_state.subtitle_cues.optimistic_update_text_format_many(
+            cue_ids,
+            font_size=normalized_size,
+            orientation=normalized_orientation,
+            background_color=normalized_color,
+            text_color=normalized_text_color,
+            style_hint=normalized_style,
+            background_padding_x=normalized_padding_x,
+            background_padding_y=normalized_padding_y,
+            background_style=normalized_background_style,
+            letter_spacing_percent=normalized_letter_spacing,
+            font_bold=normalized_bold,
+            font_italic=normalized_italic,
+            text_opacity_percent=normalized_text_opacity,
+            background_opacity_percent=normalized_background_opacity,
         )
-        optimistic_changes: list[dict[str, object]] = []
-        for cue_id in cue_ids:
-            optimistic_changes.extend(
-                self.project_state.subtitle_cues.optimistic_update_text_format(
-                    cue_id,
-                    font_size=normalized_size,
-                    orientation=normalized_orientation,
-                    background_color=normalized_color,
-                    text_color=normalized_text_color,
-                    style_hint=normalized_style,
-                    background_padding_x=normalized_padding_x,
-                    background_padding_y=normalized_padding_y,
-                    background_style=normalized_background_style,
-                    letter_spacing_percent=normalized_letter_spacing,
-                    font_bold=normalized_bold,
-                    font_italic=normalized_italic,
-                    text_opacity_percent=normalized_text_opacity,
-                    background_opacity_percent=normalized_background_opacity,
-                )
-            )
         if optimistic_changes:
             self.selectedCueChanged.emit()
         self._send_subtitle_command(
@@ -3686,7 +4516,7 @@ class ApplicationViewModel(QObject):
             cue_id
             for cue_id in cue_ids
             if self.project_state.subtitle_cues.find(cue_id).get("cue_role")
-            == "scene_text"
+            in {"scene_text", "title_text"}
         ]
         if not scene_ids:
             self._set_status("Chế độ mờ dần chỉ áp dụng cho chữ trong cảnh")
@@ -3725,43 +4555,135 @@ class ApplicationViewModel(QObject):
         pixel_y = max(0, min(image.height() - 1, int(y)))
         return image.pixelColor(pixel_x, pixel_y).name(QColor.NameFormat.HexRgb).upper()
 
-    @Slot(float, float, float, float)
+    @Slot(float, float, float, float, result=bool)
+    @Slot(float, float, float, float, int, int, result=bool)
     def transformSelectedSubtitleGeometry(
         self,
         delta_x: float,
         delta_y: float,
         scale_x: float,
         scale_y: float,
-    ) -> None:
+        render_width: int = 1920,
+        render_height: int = 1080,
+    ) -> bool:
         cue_ids = list(self._selected_cue_ids)
         if not cue_ids:
             self._set_status("Hãy chọn cue chữ cần di chuyển trên Preview")
-            return
+            return False
         values = (delta_x, delta_y, scale_x, scale_y)
-        if not all(math.isfinite(value) for value in values):
-            return
-        self._send_subtitle_command(
-            "transform_cue_geometry",
-            cue_id=cue_ids[-1],
-            values={
-                "cue_ids": cue_ids,
-                "delta_x": float(delta_x),
-                "delta_y": float(delta_y),
-                "scale_x": float(scale_x),
-                "scale_y": float(scale_y),
-            },
-            status_context={"geometry_cue_count": len(cue_ids)},
-        )
+        if (not all(math.isfinite(value) for value in values)
+                or min(render_width, render_height, scale_x, scale_y) <= 0
+                or self.subtitleBusy or self.timelineBusy or not self.project_state.hasProject):
+            return False
+        self._subtitle_geometry_generation += 1
+        context = {"generation": self._subtitle_geometry_generation,
+                   "project_id": self.project_state.projectId,
+                   "revision": self.project_state.revision,
+                   "cue_ids": cue_ids, "delta_x": float(delta_x), "delta_y": float(delta_y),
+                   "scale_x": float(scale_x), "scale_y": float(scale_y)}
+        self._subtitle_geometry_context = context
+        cues = [cue for cue_id in cue_ids
+                if (cue := self.project_state.subtitle_cues.find(cue_id))
+                and not cue.get("panel_box") and cue.get("cue_role") != "scene_text"]
+        if len(cues) > 128:
+            from ducai_studio.providers.subtitle_artwork import _ensure_fonts
 
-    @Slot(float, int)
-    def moveSelectedSceneTexts(self, delta_us: float, lane_delta: int) -> None:
+            _ensure_fonts()  # Font registration belongs to the GUI thread.
+            context["measured_cues"] = cues
+            context["measured_style"] = self._subtitle_artwork_style()
+            self._set_subtitle_busy(True)
+            self._save_state = f"Đang lưu vị trí {len(cue_ids)} cue"
+            self.saveStateChanged.emit()
+            QThreadPool.globalInstance().start(_SubtitleGeometryMeasureTask(
+                cues, context["measured_style"], render_width, render_height,
+                context, self.subtitleGeometryMeasured.emit))
+            return True
+        seeds = {}
+        for cue in cues:
+            artwork = self.subtitleArtwork(cue, render_width, render_height, measure_only=True)
+            rect = artwork.get("placement_rect")
+            if rect:
+                seeds[cue["cue_id"]] = [rect[0] / render_width, rect[1] / render_height,
+                                 rect[2] / render_width, rect[3] / render_height]
+        return self._submit_subtitle_geometry(seeds, context)
+
+    @Slot(bool, object, object)
+    def _subtitle_geometry_measured(self, succeeded: bool, result: object, context: object):
+        if not isinstance(context, dict) or context != self._subtitle_geometry_context:
+            return
+        same_project = context["project_id"] == self.project_state.projectId
+        inputs_unchanged = same_project and (
+            context["revision"] == self.project_state.revision
+            or (context.get("measured_style") == self._subtitle_artwork_style()
+                and all(self._subtitle_geometry_cue_is_unchanged(cue)
+                        for cue in context.get("measured_cues", []))))
+        if not succeeded or not inputs_unchanged:
+            self._finish_subtitle_geometry(False)
+            self._set_status("Không thể lưu vị trí chữ: dự án đã thay đổi hoặc đo chữ thất bại. "
+                             "Hãy chọn và kéo lại; dữ liệu đã lưu vẫn được giữ.")
+            return
+        self._subtitle_busy = False  # Preserve the pending preview until its own command ACK.
+        self._submit_subtitle_geometry(result, context)
+
+    def _subtitle_geometry_cue_is_unchanged(self, cue: dict) -> bool:
+        current = self.project_state.subtitle_cues.find(cue["cue_id"])
+        # An ACK may advance only the durable revision of already-previewed
+        # text/style. That metadata does not change the measured placement.
+        current.pop("revision", None)
+        return current == {key: value for key, value in cue.items() if key != "revision"}
+
+    def _submit_subtitle_geometry(self, seeds: dict, context: dict) -> bool:
+        values = {key: value for key, value in context.items()
+                  if key not in {"project_id", "revision", "generation",
+                                 "measured_cues", "measured_style"}}
+        try:
+            accepted = bool(self._send_subtitle_command(
+                "transform_cue_geometry",
+                cue_id=context["cue_ids"][-1],
+                values={**values, "panel_seeds": seeds},
+                status_context={"geometry_cue_count": len(context["cue_ids"]),
+                                "subtitle_geometry_generation": context["generation"]},
+            ))
+        except Exception as exc:
+            self._set_status("Không thể gửi vị trí chữ để lưu: " + str(exc))
+            accepted = False
+        if not accepted:
+            self._finish_subtitle_geometry(False)
+        return accepted
+
+    def _finish_subtitle_geometry(self, succeeded: bool) -> None:
+        generation = int(self._subtitle_geometry_context.get("generation", 0))
+        self._subtitle_geometry_context = {}
+        self._set_subtitle_busy(False)
+        if generation:
+            self.subtitleGeometrySettled.emit(generation, succeeded)
+        if succeeded:
+            self._run_subtitle_flush_callbacks()
+        else:
+            self._save_state = "Chỉnh vị trí chữ thất bại"
+            self.saveStateChanged.emit()
+            self._subtitle_flush_callbacks.clear()
+
+    def _subtitle_geometry_response_is_current(self, context: object) -> bool:
+        if not isinstance(context, dict) or not context.get("subtitle_geometry_generation"):
+            return True
+        return (context.get("subtitle_geometry_generation")
+                == self._subtitle_geometry_context.get("generation")
+                and context.get("project_id") == self.project_state.projectId)
+
+    @Slot(float, int, result=int)
+    def moveSelectedSceneTexts(self, delta_us: float, lane_delta: int) -> int:
         cue_ids = list(self._selected_cue_ids)
         if not cue_ids:
             self._set_status("Hãy chọn cue phụ đề cần di chuyển")
-            return
+            return 0
         if not math.isfinite(delta_us):
-            return
-        applied_delta = int(round(delta_us))
+            return 0
+        minimum_delta, maximum_delta = self._selected_scene_timing_bounds("move")
+        applied_delta = max(
+            minimum_delta,
+            min(maximum_delta, int(round(delta_us))),
+        )
         optimistic_changes: list[dict[str, object]] = []
         for cue_id in cue_ids:
             timing = self.project_state.subtitle_cues.scene_text_base_timing(cue_id)
@@ -3786,17 +4708,91 @@ class ApplicationViewModel(QObject):
                     "applied_end_us": applied_end,
                 }
             )
-        self._send_subtitle_command(
+        return self._send_subtitle_command(
             "move_scene_texts",
             cue_id=cue_ids[-1],
             values={
                 "cue_ids": cue_ids,
                 "delta_us": applied_delta,
                 "lane_delta": int(lane_delta),
+                "display_time": True,
             },
             optimistic_changes=optimistic_changes,
             status_context={"moved_cue_count": len(cue_ids)},
         )
+
+    def _selected_scene_timing_bounds(self, edge: str) -> tuple[int, int]:
+        timings = [
+            timing
+            for cue_id in self._selected_cue_ids
+            if (timing := self.project_state.subtitle_cues.scene_text_base_timing(cue_id))
+            is not None
+        ]
+        if not timings:
+            return 0, 0
+        latest_end_us = max(end_us for _start_us, end_us in timings)
+        duration_us = int(self.project_state.durationUs)
+        # Lightweight unit/project snapshots may omit video tracks entirely.
+        # Do not invent an end clamp in that compatibility case; the server is
+        # still authoritative when a real project command is submitted.
+        if duration_us < latest_end_us:
+            duration_us = 9_007_199_254_740_991
+        if edge == "left":
+            return (
+                -min(start_us for start_us, _end_us in timings),
+                min(end_us - start_us - 100_000 for start_us, end_us in timings),
+            )
+        if edge == "right":
+            return (
+                max(100_000 - (end_us - start_us) for start_us, end_us in timings),
+                duration_us - max(end_us for _start_us, end_us in timings),
+            )
+        return (
+            -min(start_us for start_us, _end_us in timings),
+            duration_us - max(end_us for _start_us, end_us in timings),
+        )
+
+    @Slot(str, result="QVariantMap")
+    def selectedSceneTimingDeltaBounds(self, edge: str) -> dict[str, object]:
+        minimum, maximum = self._selected_scene_timing_bounds(edge)
+        lanes: list[int] = []
+        for cue_id in self._selected_cue_ids:
+            cue = self.project_state.subtitle_cues.find(cue_id)
+            raw_track_id = str(cue.get("subtitle_track_id", "S2"))
+            try:
+                lanes.append(max(1, int(raw_track_id.removeprefix("S"))))
+            except ValueError:
+                lanes.append(1 if cue.get("cue_role") == "dialogue" else 2)
+        return {
+            "minimum": float(minimum),
+            "maximum": float(maximum),
+            "minimumLaneDelta": float(1 - min(lanes)) if lanes else 0.0,
+            "fixedLane": bool(self.project_state.title_cues.find(self._selected_cue_id)),
+            "timings": {
+                cue_id: list(timing)
+                for cue_id in self._selected_cue_ids
+                if (timing := self.project_state.subtitle_cues.scene_text_base_timing(cue_id))
+                is not None
+            },
+        }
+
+    @Slot(str, float, float, "QVariantList", "QVariantMap")
+    def addTitleText(self, text: str, start_us: float, end_us: float,
+                     visual_box: list, options: dict) -> None:
+        if not self.project_state.hasVideo:
+            self._set_status("Hãy thêm video trước khi đặt tên phim/kênh")
+            return
+        start = max(0, int(round(start_us)))
+        end = min(int(self.project_state.durationUs), int(round(end_us)))
+        if not text.strip() or end - start < 100_000:
+            self._set_status("Text cần nội dung và thời lượng ít nhất 100 ms trong video")
+            return
+        values = {**dict(options), "title_mode": True, "text": text.strip(),
+                  "start_us": start, "end_us": end, "visual_box": list(visual_box),
+                  "display_time": True}
+        values.pop("cue_role", None)
+        self._send_subtitle_command("add_title_text", values=values, needs_selection=False,
+                                    status_context={"title_created": True})
 
     @Slot(str, float, result="QVariantMap")
     def manualSubtitleCueDefaults(self, cue_role: str, start_us: float) -> dict:
@@ -3829,15 +4825,11 @@ class ApplicationViewModel(QObject):
         )
         raw_box = template.get("panel_box") or template.get("visual_box")
         if not isinstance(raw_box, (list, tuple)) or len(raw_box) != 4:
-            raw_box = (
-                [0.10, 0.74, 0.80, 0.16]
-                if role == "dialogue"
-                else [0.35, 0.35, 0.30, 0.14]
-            )
+            raw_box = [0.10, 0.74, 0.80, 0.16] if role == "dialogue" else [0.35, 0.35, 0.30, 0.14]
         return {
             "cue_role": role,
             "visual_box": [float(value) for value in raw_box],
-            "font_size": int(template.get("text_font_size", 12)),
+            "font_size": 40 if role == "scene_text" else int(template.get("text_font_size", 12)),
             "orientation": str(template.get("orientation", "horizontal")),
             "background_color": (
                 SCENE_TEXT_DEFAULT_BACKGROUND_COLOR
@@ -3847,8 +4839,7 @@ class ApplicationViewModel(QObject):
             "text_color": str(
                 SCENE_TEXT_DEFAULT_TEXT_COLOR
                 if role == "scene_text"
-                else template.get("text_color", "")
-                or self.exportSubtitlePrimaryColor
+                else template.get("text_color", "") or self.exportSubtitlePrimaryColor
             ),
             "style_hint": (
                 SCENE_TEXT_DEFAULT_STYLE_HINT
@@ -3871,8 +4862,14 @@ class ApplicationViewModel(QObject):
                 if role == "scene_text"
                 else template.get("background_opacity_percent", 90)
             ),
-            "fade_enabled": bool(template.get("fade_enabled", False)),
-            "fade_duration_ms": int(template.get("fade_duration_ms", 300)),
+            "fade_enabled": (
+                SCENE_TEXT_DEFAULT_FADE_ENABLED
+                if role == "scene_text"
+                else bool(template.get("fade_enabled", False))
+            ),
+            "fade_duration_ms": int(
+                template.get("fade_duration_ms", SCENE_TEXT_DEFAULT_FADE_DURATION_MS)
+            ),
         }
 
     @Slot(str, float, float, "QVariantList", "QVariantMap")
@@ -3886,40 +4883,36 @@ class ApplicationViewModel(QObject):
     ) -> None:
         raw_box = list(visual_box) if isinstance(visual_box, list) else []
         if len(raw_box) != 4 or not all(
-            isinstance(value, (int, float)) and not isinstance(value, bool)
-            for value in raw_box
+            isinstance(value, (int, float)) and not isinstance(value, bool) for value in raw_box
         ):
             self._set_status("Vùng đặt chữ thủ công không hợp lệ")
             return
         raw_options = dict(options) if isinstance(options, dict) else {}
-        cue_role = (
-            "dialogue" if raw_options.get("cue_role") == "dialogue" else "scene_text"
-        )
+        cue_role = "dialogue" if raw_options.get("cue_role") == "dialogue" else "scene_text"
         values: dict[str, object] = {
             "text": text,
             "start_us": max(0, round(start_us)),
             "end_us": max(0, round(end_us)),
+            "display_time": True,
             "visual_box": [float(value) for value in raw_box],
             "cue_role": cue_role,
-            "font_size": max(1, min(100, int(raw_options.get("font_size", 12)))),
+            "font_size": max(1, int(raw_options.get("font_size", 12))),
             "orientation": "vertical"
             if raw_options.get("orientation") == "vertical"
             else "horizontal",
-            "background_color": str(
-                raw_options.get("background_color", "") or ""
-            ).strip().upper(),
+            "background_color": str(raw_options.get("background_color", "") or "").strip().upper(),
             "text_color": str(raw_options.get("text_color", "") or "").strip().upper(),
             "style_hint": str(raw_options.get("style_hint", "standard")),
             "track_id": str(raw_options.get("track_id", "")),
             "background_padding_x": max(
-                0, min(100, int(raw_options.get("background_padding_x", 20)))
+                0, int(raw_options.get("background_padding_x", 20))
             ),
             "background_padding_y": max(
-                0, min(100, int(raw_options.get("background_padding_y", 10)))
+                0, int(raw_options.get("background_padding_y", 10))
             ),
             "background_style": str(raw_options.get("background_style", "solid")),
             "letter_spacing_percent": max(
-                0, min(100, int(raw_options.get("letter_spacing_percent", 0)))
+                0, int(raw_options.get("letter_spacing_percent", 0))
             ),
             "font_bold": bool(raw_options.get("font_bold", False)),
             "font_italic": bool(raw_options.get("font_italic", False)),
@@ -3929,18 +4922,25 @@ class ApplicationViewModel(QObject):
             "background_opacity_percent": max(
                 0, min(100, int(raw_options.get("background_opacity_percent", 90)))
             ),
-            "fade_enabled": bool(raw_options.get("fade_enabled", False))
+            "fade_enabled": bool(
+                raw_options.get(
+                    "fade_enabled",
+                    SCENE_TEXT_DEFAULT_FADE_ENABLED if cue_role == "scene_text" else False,
+                )
+            )
             if cue_role == "scene_text"
             else False,
             "fade_duration_ms": max(
-                50, min(2_000, int(raw_options.get("fade_duration_ms", 300)))
+                50,
+                min(
+                    2_000,
+                    int(raw_options.get("fade_duration_ms", SCENE_TEXT_DEFAULT_FADE_DURATION_MS)),
+                ),
             ),
         }
         if self._subtitle_busy:
             if len(self._pending_manual_scene_text_commands) >= 32:
-                self._set_status(
-                    "Hàng chờ thêm chữ đã đầy; hãy chờ các thay đổi hiện tại lưu xong"
-                )
+                self._set_status("Hàng chờ thêm chữ đã đầy; hãy chờ các thay đổi hiện tại lưu xong")
                 return
             self._pending_manual_scene_text_commands.append(
                 {"project_id": self.project_state.projectId, "values": values}
@@ -4025,7 +5025,11 @@ class ApplicationViewModel(QObject):
         start_us = int(cue.get("start_us", 0))
         end_us = int(cue.get("end_us", 0))
         split_us = self._playhead_us
-        values = {"split_us": split_us} if start_us < split_us < end_us else {}
+        values = (
+            {"split_us": split_us, "display_time": True}
+            if start_us < split_us < end_us
+            else {"display_time": True}
+        )
         self._send_subtitle_command("split", cue_id=self._selected_cue_id, values=values)
 
     @Slot()
@@ -4039,7 +5043,10 @@ class ApplicationViewModel(QObject):
         self._send_subtitle_command(
             "shift",
             cue_id=self._selected_cue_id,
-            values={"delta_us": int(round(milliseconds * 1_000))},
+            values={
+                "delta_us": int(round(milliseconds * 1_000)),
+                "display_time": True,
+            },
         )
 
     @Slot(bool)
@@ -4099,11 +5106,57 @@ class ApplicationViewModel(QObject):
     @Slot(str)
     def deleteSubtitleCue(self, cue_id: str) -> None:
         cue = self.project_state.subtitle_cues.find(cue_id)
+        if not cue:
+            self._set_status("Cue này không còn trong dự án; hãy chọn lại cue cần xóa")
+            return
+        if self._defer_until_subtitle_saves_flushed(
+            "delete-cue", lambda: self.deleteSubtitleCue(cue_id),
+            "Đang lưu chỉnh sửa trước khi xóa cue…",
+        ):
+            return
         self._send_subtitle_command(
             "delete",
             cue_id=cue_id,
             status_context={"deleted_cue_index": cue.get("index", 0)},
         )
+
+    @Slot()
+    def deleteTimelineSelection(self) -> None:
+        """One deletion route for buttons, context menus and the Delete key."""
+        clip = self.project_state.clip_info(self._selected_clip_id)
+        if clip and self.selectedClipTrackKind == "video":
+            self._request_video_edit("delete_video_segment", clip_id=self._selected_clip_id)
+            return
+        ids = list(self._selected_cue_ids)
+        if not ids and clip and self.selectedClipTrackKind in {"subtitle", "text"}:
+            cue_id = str(clip.get("cue_id") or "")
+            if self.project_state.subtitle_cues.find(cue_id):
+                ids = [cue_id]
+        if ids:
+            self._delete_timeline_cues(tuple(ids))
+        elif clip:
+            self.deleteSelected(True)
+        else:
+            self._set_status("Hãy chọn cue hoặc đoạn video cần xóa trên Timeline")
+
+    def _delete_timeline_cues(self, ids: tuple[str, ...]) -> None:
+        if self._defer_until_subtitle_saves_flushed(
+            "delete-cues", lambda: self._delete_timeline_cues(ids),
+            "Đang lưu chỉnh sửa trước khi xóa cue…",
+        ):
+            return
+        if not all(self.project_state.subtitle_cues.find(cue_id) for cue_id in ids):
+            self._set_status("Cue đã thay đổi; hãy chọn lại trước khi xóa")
+            return
+        self._send_subtitle_command("delete_cues", values={"cue_ids": list(ids)},
+                                    needs_selection=False)
+
+    @Slot()
+    def deleteSelectedSubtitleCues(self) -> None:
+        if self._selected_cue_ids:
+            self._delete_timeline_cues(tuple(self._selected_cue_ids))
+        else:
+            self._set_status("Hãy chọn cue chữ trước khi xóa")
 
     @Slot(str)
     def acceptSceneTextCue(self, cue_id: str) -> None:
@@ -4120,9 +5173,10 @@ class ApplicationViewModel(QObject):
         cue = self.project_state.subtitle_cues.find(cue_id)
         if cue.get("cue_role") != "scene_text":
             return
-        if self.project_state.subtitle_cues.optimistic_update_scene_font_scale(
-            cue_id, scale
-        ) and cue_id == self._selected_cue_id:
+        if (
+            self.project_state.subtitle_cues.optimistic_update_scene_font_scale(cue_id, scale)
+            and cue_id == self._selected_cue_id
+        ):
             self.selectedCueChanged.emit()
 
     @Slot(str, float, float)
@@ -4181,7 +5235,8 @@ class ApplicationViewModel(QObject):
 
         if not math.isfinite(delta_us):
             return
-        delta = round(delta_us)
+        minimum_delta, maximum_delta = self._selected_scene_timing_bounds("move")
+        delta = max(minimum_delta, min(maximum_delta, round(delta_us)))
         selected = set(self._selected_cue_ids)
         if not selected:
             return
@@ -4191,6 +5246,72 @@ class ApplicationViewModel(QObject):
         )
         if self._selected_cue_id in changed_ids:
             self.selectedCueChanged.emit()
+
+    @Slot(str, float)
+    def previewSelectedSceneTextResize(self, edge: str, delta_us: float) -> None:
+        if edge not in {"left", "right"} or not math.isfinite(delta_us):
+            return
+        selected = set(self._selected_cue_ids)
+        if not selected:
+            return
+        minimum_delta, maximum_delta = self._selected_scene_timing_bounds(edge)
+        delta = max(minimum_delta, min(maximum_delta, round(delta_us)))
+        changed_ids = self.project_state.subtitle_cues.preview_scene_text_edge_delta(
+            selected,
+            edge,
+            delta,
+        )
+        if self._selected_cue_id in changed_ids:
+            self.selectedCueChanged.emit()
+
+    @Slot(str, float, result=int)
+    def resizeSelectedSceneTexts(self, edge: str, delta_us: float) -> int:
+        cue_ids = list(self._selected_cue_ids)
+        if not cue_ids:
+            self._set_status("Hãy chọn cue phụ đề cần chỉnh thời gian")
+            return 0
+        if edge not in {"left", "right"} or not math.isfinite(delta_us):
+            return 0
+        minimum_delta, maximum_delta = self._selected_scene_timing_bounds(edge)
+        applied_delta = max(
+            minimum_delta,
+            min(maximum_delta, int(round(delta_us))),
+        )
+        optimistic_changes: list[dict[str, object]] = []
+        for cue_id in cue_ids:
+            timing = self.project_state.subtitle_cues.scene_text_base_timing(cue_id)
+            if timing is None:
+                continue
+            previous_start, previous_end = timing
+            applied_start = previous_start + (applied_delta if edge == "left" else 0)
+            applied_end = previous_end + (applied_delta if edge == "right" else 0)
+            self.project_state.subtitle_cues.preview_scene_text_timing(
+                cue_id,
+                applied_start,
+                applied_end,
+            )
+            optimistic_changes.append(
+                {
+                    "kind": "scene_timing",
+                    "cue_id": cue_id,
+                    "previous_start_us": previous_start,
+                    "previous_end_us": previous_end,
+                    "applied_start_us": applied_start,
+                    "applied_end_us": applied_end,
+                }
+            )
+        return self._send_subtitle_command(
+            "resize_scene_texts",
+            cue_id=cue_ids[-1],
+            values={
+                "cue_ids": cue_ids,
+                "edge": edge,
+                "delta_us": applied_delta,
+                "display_time": True,
+            },
+            optimistic_changes=optimistic_changes,
+            status_context={"resized_cue_count": len(cue_ids)},
+        )
 
     @Slot(str, float, float, float, float)
     def setSceneTextTiming(
@@ -4222,7 +5343,7 @@ class ApplicationViewModel(QObject):
         self._send_subtitle_command(
             "set_scene_text_timing",
             cue_id=cue_id,
-            values={"start_us": start, "end_us": end},
+            values={"start_us": start, "end_us": end, "display_time": True},
             optimistic_changes=[
                 {
                     "kind": "scene_timing",
@@ -4241,15 +5362,28 @@ class ApplicationViewModel(QObject):
 
     @Slot()
     def undoSubtitle(self) -> None:
+        if self._defer_until_subtitle_saves_flushed(
+            "undo-subtitle", self.undoSubtitle, "Đang lưu thay đổi trước khi hoàn tác…"
+        ):
+            return
         self._send_subtitle_command("undo", needs_selection=False)
 
     @Slot()
     def redoSubtitle(self) -> None:
+        if self._defer_until_subtitle_saves_flushed(
+            "redo-subtitle", self.redoSubtitle, "Đang lưu thay đổi trước khi làm lại…"
+        ):
+            return
         self._send_subtitle_command("redo", needs_selection=False)
 
     @Slot()
     def rescanSelectedCue(self) -> None:
         if self._ocr_busy or not self._selected_cue_id or not self.project_state.hasVideo:
+            return
+        if self._defer_until_subtitle_saves_flushed(
+            "rescan-cue", self.rescanSelectedCue,
+            "Đang lưu chỉnh sửa trước khi quét lại cue…", durable=True,
+        ):
             return
         self._set_ocr_busy(True)
         self.runtime.request(
@@ -4266,6 +5400,15 @@ class ApplicationViewModel(QObject):
 
     @Slot(str)
     def navigate(self, workspace_id: str) -> None:
+        if workspace_id != "settings" and not self.license_model.active:
+            self._set_status("Chưa kích hoạt. Mở Cài đặt → Kích hoạt để sử dụng chức năng.")
+            workspace_id = "settings"
+        if workspace_id == "import":
+            self.showImportDialog()
+            return
+        if workspace_id in {"effects", "mixer"}:
+            self.openTimelineSettings()
+            return
         for item in NAVIGATION:
             if item.workspace_id == workspace_id:
                 if workspace_id == "import":
@@ -4283,6 +5426,11 @@ class ApplicationViewModel(QObject):
                 self._set_status(f"Đã mở {item.title}")
                 return
 
+    @Slot()
+    def openTimelineSettings(self) -> None:
+        self.navigate("timeline")
+        self.timelineSettingsRequested.emit()
+
     @Slot(str)
     def openProject(self, project_id: str) -> None:
         value = project_id.strip()
@@ -4291,6 +5439,13 @@ class ApplicationViewModel(QObject):
             return
         if not value:
             self._set_status("Dự án được chọn không hợp lệ")
+            return
+        if self._defer_until_subtitle_saves_flushed(
+            "open-project",
+            lambda: self.openProject(value),
+            "Đang lưu project hiện tại trước khi chuyển dự án…",
+            durable=True,
+        ):
             return
         self.runtime.request("get_project", {"project_id": value})
         self._set_status("Đang mở dự án")
@@ -4396,6 +5551,7 @@ class ApplicationViewModel(QObject):
         if selected is None:
             self._set_status("Cache không còn tương thích với phụ đề nguồn hiện tại")
             return
+        self._translation_cache_selection_explicit = True
         if value != self._selected_translation_cache_id:
             self._selected_translation_cache_id = value
             self.translationCachesChanged.emit()
@@ -4430,6 +5586,7 @@ class ApplicationViewModel(QObject):
         self._translation_job_id = job_id
         self._translation_provider_id = str(cache.get("provider_id", ""))
         self._translation_model_id = str(cache.get("model_id", ""))
+        self._bind_translation_configuration(cache.get("provider_config"))
         display_state = str(cache.get("display_state", cache.get("state", "")))
         self._set_translation_job_state(display_state)
         self._set_translation_busy(
@@ -4447,6 +5604,8 @@ class ApplicationViewModel(QObject):
 
     @Slot()
     def showImportDialog(self) -> None:
+        if not self._features_available():
+            return
         if not self._backend_ready:
             self._set_status("Job Manager chưa sẵn sàng để nhập media")
             return
@@ -4467,6 +5626,8 @@ class ApplicationViewModel(QObject):
 
     @Slot()
     def showNewProjectDialog(self) -> None:
+        if not self._features_available():
+            return
         if not self._backend_ready:
             self._set_status("Job Manager chưa sẵn sàng để tạo dự án")
             return
@@ -4483,6 +5644,11 @@ class ApplicationViewModel(QObject):
         if not path.is_file():
             self._set_status("File tạo dự án không tồn tại")
             return
+        if self._defer_until_subtitle_saves_flushed(
+            "new-project", lambda: self.createProjectFromPath(raw_path),
+            "Đang lưu dự án trước khi tạo dự án mới…", durable=True,
+        ):
+            return
         self._set_import_busy(True)
         self._save_state = "Đang kiểm tra media"
         self.saveStateChanged.emit()
@@ -4495,6 +5661,11 @@ class ApplicationViewModel(QObject):
         path = _local_path_from_ui(raw_path)
         if not path.is_file():
             self._set_status("File nhập không tồn tại")
+            return
+        if self._defer_until_subtitle_saves_flushed(
+            "import-media", lambda: self.importPath(raw_path),
+            "Đang lưu dự án trước khi nhập media…", durable=True,
+        ):
             return
         self._set_import_busy(True)
         self._save_state = "Đang kiểm tra media"
@@ -4564,6 +5735,11 @@ class ApplicationViewModel(QObject):
         self._begin_multi_import(paths)
 
     def _begin_multi_import(self, paths: list[Path]) -> None:
+        if self._defer_until_subtitle_saves_flushed(
+            "import-multi", lambda: self._begin_multi_import(paths),
+            "Đang lưu dự án trước khi nhập Multi video…", durable=True,
+        ):
+            return
         self._multi_import_paths = paths
         self._multi_import_project_ids = []
         self._set_import_busy(True)
@@ -4818,6 +5994,12 @@ class ApplicationViewModel(QObject):
 
     @Slot(str)
     def openMultiVideoDetail(self, project_id: str) -> None:
+        if self._defer_until_subtitle_saves_flushed(
+            "multi-detail", lambda: self.openMultiVideoDetail(project_id),
+            "Đang lưu chỉnh sửa trước khi mở video khác…",
+            durable=True,
+        ):
+            return
         if self._multi_detail_busy:
             self._set_status("Chỉ có thể mở chỉnh sửa chi tiết một video mỗi lần.")
             return
@@ -4984,6 +6166,11 @@ class ApplicationViewModel(QObject):
         if not self._backend_ready or self.multiSelectedCount <= 0:
             self._set_status("Hãy chọn ít nhất một video để chạy Multi video")
             return
+        if self._defer_until_subtitle_saves_flushed(
+            "start-multi", self.startMultiVideo,
+            "Đang lưu chỉnh sửa trước khi chạy Multi video…", durable=True,
+        ):
+            return
         try:
             settings = self._multi_settings_snapshot()
         except ValueError as exc:
@@ -5030,6 +6217,11 @@ class ApplicationViewModel(QObject):
             "paused",
             "interrupted",
         }:
+            return
+        if self._defer_until_subtitle_saves_flushed(
+            "resume-multi", self.resumeMultiVideo,
+            "Đang lưu chỉnh sửa trước khi tiếp tục Multi video…", durable=True,
+        ):
             return
         if not self._begin_multi_control("multi_resume"):
             return
@@ -5147,6 +6339,7 @@ class ApplicationViewModel(QObject):
                 # single-video OCR screen instead of silently falling back to
                 # a hard-coded 1.25 FPS.
                 "sample_interval_us": int(round(1_000_000 / self._ocr_sample_fps)),
+                "scene_text_enabled": self._ocr_scene_text_enabled,
                 "engine_python": (
                     str(whisper_runtime_python())
                     if self._ocr_extraction_method == "whisper_audio"
@@ -5337,14 +6530,26 @@ class ApplicationViewModel(QObject):
         self._selected_clip_id = value
         self._selected_track_id = ""
         self._selected_track_ids.clear()
+        if (value and self.selectedClipTrackKind not in {"subtitle", "text"}
+                and (self._selected_cue_id or self._selected_cue_ids)):
+            self._selected_cue_id = ""
+            self._selected_cue_ids = []
+            self.selectedCueChanged.emit()
         if clip_selection_changed:
             self.selectedClipChanged.emit()
         if track_selection_changed:
             self.selectedTrackChanged.emit()
 
+    @Slot(str, bool)
+    def selectTimelineClip(self, clip_id: str, additive: bool = False) -> None:
+        self.selectClip(clip_id)
+        clip = self.project_state.clip_info(clip_id)
+        if clip and self.selectedClipTrackKind in {"subtitle", "text"}:
+            self.selectTimelineCue(str(clip.get("cue_id") or ""), additive)
+
     @Slot(str)
     def selectTrack(self, track_id: str) -> None:
-        value = track_id if self.project_state.track_info(track_id) is not None else ""
+        value = track_id if self.project_state.track_is_persisted(track_id) else ""
         next_ids = {value} if value else set()
         track_selection_changed = (
             value != self._selected_track_id or self._selected_track_ids != next_ids
@@ -5368,7 +6573,7 @@ class ApplicationViewModel(QObject):
 
     @Slot(str)
     def toggleTrackSelection(self, track_id: str) -> None:
-        if self.project_state.track_info(track_id) is None:
+        if not self.project_state.track_is_persisted(track_id):
             return
         self._clear_clip_for_track_selection()
         if track_id in self._selected_track_ids:
@@ -5389,6 +6594,7 @@ class ApplicationViewModel(QObject):
             str(item.get("id"))
             for item in self.project_state._track_by_id.values()
             if isinstance(item, dict) and isinstance(item.get("id"), str)
+            and (item.get("kind") != "text" or item.get("clips"))
         }
         if ids != self._selected_track_ids:
             self._selected_track_ids = ids
@@ -5402,6 +6608,69 @@ class ApplicationViewModel(QObject):
             return
         self._playhead_us = value
         self.playheadChanged.emit()
+
+    @Slot()
+    def addTimelineMarker(self) -> None:
+        """Add one display-time bookmark at the current playhead."""
+
+        if self._timeline_busy or not self.project_state.hasProject:
+            return
+        duration = max(0, int(self.project_state.durationUs))
+        position = max(0, min(self._playhead_us, duration))
+        markers = set(int(value) for value in self.project_state.timelineMarkers)
+        if position in markers:
+            self._set_status("Đã có mark tại vị trí này")
+            return
+        markers.add(position)
+        self._send_timeline_command(
+            "set_markers",
+            value={"markers": sorted(markers)},
+            needs_selection=False,
+        )
+        self._set_status("Đang lưu mark Timeline")
+
+    @Slot()
+    def removeTimelineMarkerAtPlayhead(self) -> None:
+        """Remove the closest bookmark when it is close to the playhead."""
+
+        if self._timeline_busy or not self.project_state.hasProject:
+            return
+        markers = list(self.project_state.timelineMarkers)
+        if not markers:
+            self._set_status("Timeline chưa có mark")
+            return
+        closest = min(markers, key=lambda value: abs(value - self._playhead_us))
+        tolerance = max(500_000, self._timeline_seek_step_ms * 5_000)
+        if abs(closest - self._playhead_us) > tolerance:
+            self._set_status("Đưa playhead gần mark rồi thử xoá lại")
+            return
+        markers.remove(closest)
+        self._send_timeline_command(
+            "set_markers",
+            value={"markers": markers},
+            needs_selection=False,
+        )
+        self._set_status("Đang xoá mark Timeline")
+
+    @Slot(float)
+    def removeTimelineMarker(self, marker_us: float) -> None:
+        """Remove a specific marker from its non-blocking Timeline handle."""
+
+        if self._timeline_busy or not self.project_state.hasProject:
+            return
+        if not math.isfinite(marker_us):
+            return
+        target = int(round(marker_us))
+        markers = list(self.project_state.timelineMarkers)
+        if target not in markers:
+            return
+        markers.remove(target)
+        self._send_timeline_command(
+            "set_markers",
+            value={"markers": markers},
+            needs_selection=False,
+        )
+        self._set_status("Đang xoá mark Timeline")
 
     @Property(int, notify=previewMasterVolumeChanged)
     def previewMasterVolumePercent(self) -> int:
@@ -5420,6 +6689,104 @@ class ApplicationViewModel(QObject):
     def splitSelected(self, apply_linked: bool = True) -> None:
         self._send_timeline_command("split", apply_linked=apply_linked, use_playhead=True)
 
+    @Slot()
+    def splitVideoAtPlayhead(self) -> None:
+        self._request_video_edit("split_video", clip_id=(self._selected_clip_id
+                                 if self.selectedClipTrackKind == "video" else ""))
+
+    @Slot()
+    def copySelectedVideo(self) -> None:
+        if self.selectedClipTrackKind != "video" or self._timeline_busy:
+            return
+        self._copy_video(self.project_state.projectId, self._selected_clip_id)
+
+    def _copy_video(self, project_id: str, clip_id: str) -> None:
+        if self.project_state.projectId != project_id or not self.project_state.clip_info(clip_id):
+            self._set_status("Đoạn video cần sao chép đã thay đổi; hãy chọn lại")
+            return
+        if self._defer_until_subtitle_saves_flushed("video-copy",
+                                                  lambda: self._copy_video(project_id, clip_id),
+                                                  "Đang lưu trước khi sao chép video…"):
+            return
+        try:
+            self.runtime.request("copy_video_clip", {
+                "project_id": project_id, "clip_id": clip_id})
+        except Exception as exc:
+            self._set_status("Không thể sao chép video: " + str(exc))
+
+    @Slot()
+    def pasteVideoAtPlayhead(self) -> None:
+        if not self.canPasteVideo:
+            self._set_status("Hãy sao chép video trong dự án này trước khi dán")
+            return
+        self._request_video_edit("paste_video")
+
+    @Slot()
+    def duplicateSelectedVideo(self) -> None:
+        if self.selectedClipTrackKind == "video":
+            self._request_video_edit("duplicate_video", clip_id=self._selected_clip_id)
+
+    @Slot()
+    def toggleSelectedVideoMuted(self) -> None:
+        if self.selectedClipTrackKind == "video":
+            self._request_video_edit("clip_mute", clip_id=self._selected_clip_id,
+                                     value=not self.selectedClipMuted)
+
+    def _request_video_edit(self, command: str, *, clip_id: str = "", value=None,
+                            timeline_us: int | None = None, project_id: str | None = None) -> None:
+        if project_id is not None and project_id != self.project_state.projectId:
+            return
+        project_id = self.project_state.projectId
+        requested_us = self._playhead_us if timeline_us is None else timeline_us
+        if self._timeline_busy or not self.project_state.hasProject:
+            self._set_status("Hãy chờ thao tác Timeline hiện tại hoàn tất")
+            return
+        if self._defer_until_subtitle_saves_flushed(
+            "video-edit", lambda: self._request_video_edit(command, clip_id=clip_id, value=value,
+                                                           timeline_us=requested_us,
+                                                           project_id=project_id),
+            "Đang lưu phụ đề trước khi chỉnh đoạn video…",
+        ):
+            return
+        join_us = requested_us
+        if command == "delete_video_segment":
+            clip = self.project_state.clip_info(clip_id)
+            if not clip:
+                self._set_status("Đoạn video không còn trong dự án; hãy chọn lại")
+                return
+            join_us = int(clip["timeline_range"]["start_us"])
+        request_id = uuid4().hex
+        context = {
+            "timeline_cut": True, "project_id": self.project_state.projectId,
+            "request_id": request_id, "operation": command,
+            "join_us": join_us, "previous_playhead_us": self._playhead_us,
+        }
+        params = {
+            "project_id": self.project_state.projectId, "command": command,
+            "base_revision": self.project_state.revision, "request_id": request_id,
+            "timeline_us": requested_us,
+        }
+        if clip_id:
+            params["clip_id"] = clip_id
+        if value is not None:
+            params["value"] = value
+        self._active_timeline_cut_request_id = request_id
+        self._timeline_cut_context = context
+        self._set_timeline_busy(True)
+        self._timeline_cut_timeout_timer.start()
+        try:
+            self.runtime.request("timeline_command", params, context=context)
+        except Exception as exc:
+            self._finish_timeline_cut(False, context)
+            self._set_status("Không thể gửi thao tác video: " + str(exc))
+            return
+        self._set_status({"split_video": "Đang tách tại playhead…",
+                          "delete_video_segment": "Đang xóa đoạn video…",
+                          "paste_video": "Đang dán video tại playhead…",
+                          "duplicate_video": "Đang nhân bản video…",
+                          "clip_mute": "Đang đổi trạng thái âm thanh…"}.get(
+                              command, "Đang lưu video…"))
+
     @Slot(bool)
     def trimSelectedHead(self, apply_linked: bool = True) -> None:
         self._send_timeline_command("trim_head", apply_linked=apply_linked, use_playhead=True)
@@ -5428,8 +6795,153 @@ class ApplicationViewModel(QObject):
     def trimSelectedTail(self, apply_linked: bool = True) -> None:
         self._send_timeline_command("trim_tail", apply_linked=apply_linked, use_playhead=True)
 
+    @Slot(str, float, float)
+    def applyTimelineCut(self, operation: str, start_us: float, end_us: float) -> None:
+        if operation not in {"keep_from", "keep_until", "keep_range", "remove_range"}:
+            self._set_status("Thao tác cắt video không hợp lệ")
+            return
+        if not math.isfinite(start_us) or not math.isfinite(end_us):
+            self._set_status("Mốc A/B không hợp lệ")
+            return
+        start = int(round(start_us))
+        end = int(round(end_us))
+        duration = int(self.project_state.durationUs)
+        if (
+            self._timeline_busy
+            or not self.project_state.hasProject
+            or start < 0
+            or end <= start
+            or end > duration
+        ):
+            if not self._timeline_busy:
+                self._set_status("Mốc A/B phải nằm trong thời lượng video và A phải nhỏ hơn B")
+            return
+        if self._defer_until_subtitle_saves_flushed(
+            "timeline-cut",
+            lambda: self.applyTimelineCut(operation, start, end),
+            "Đang lưu phụ đề trước khi cắt video…",
+        ):
+            return
+        request_id = uuid4().hex
+        base_revision = self.project_state.revision
+        context: dict[str, object] = {
+            "timeline_cut": True,
+            "project_id": self.project_state.projectId,
+            "request_id": request_id,
+            "operation": operation,
+            "range_start_us": start,
+            "range_end_us": end,
+            "previous_playhead_us": self._playhead_us,
+        }
+        params = {
+            "project_id": self.project_state.projectId,
+            "command": "cut",
+            "operation": operation,
+            "range_start_us": start,
+            "range_end_us": end,
+            "base_revision": base_revision,
+            "request_id": request_id,
+        }
+        self._active_timeline_cut_request_id = request_id
+        self._timeline_cut_context = context
+        self._set_timeline_busy(True)
+        self._timeline_cut_timeout_timer.start()
+        try:
+            self.runtime.request("timeline_command", params, context=context)
+        except Exception:
+            self._finish_timeline_cut(False, context)
+            raise
+        self._set_status("Đang áp dụng vùng cắt A–B")
+
+    def _timeline_cut_context_is_current(self, context: object) -> bool:
+        return (
+            isinstance(context, dict)
+            and context.get("timeline_cut") is True
+            and bool(self._active_timeline_cut_request_id)
+            and str(context.get("request_id", "")) == self._active_timeline_cut_request_id
+        )
+
+    def _finish_timeline_cut(self, succeeded: bool, context: object) -> None:
+        details = context if isinstance(context, dict) else self._timeline_cut_context
+        if details.get("timeline_cut") is not True:
+            return
+        request_id = str(details.get("request_id", ""))
+        if request_id and request_id != self._active_timeline_cut_request_id:
+            return
+        operation = str(details.get("operation", ""))
+        join_us = int(details["join_us"]) if "join_us" in details else (
+            int(details.get("range_start_us", 0) or 0)
+            if operation == "remove_range"
+            else 0
+        )
+        if succeeded:
+            self.setPlayheadMs(join_us / 1_000)
+        else:
+            previous = int(details.get("previous_playhead_us", self._playhead_us) or 0)
+            self.setPlayheadMs(previous / 1_000)
+        self._active_timeline_cut_request_id = ""
+        self._timeline_cut_context = {}
+        self._timeline_cut_timeout_timer.stop()
+        self._set_timeline_busy(False)
+        self.timelineCutSettled.emit(succeeded, operation, float(join_us))
+
+    @Slot()
+    def _timeline_cut_timed_out(self) -> None:
+        if not self._active_timeline_cut_request_id:
+            return
+        context = dict(self._timeline_cut_context)
+        project_id = str(context.get("project_id", self.project_state.projectId))
+        self._finish_timeline_cut(False, context)
+        self._begin_timeline_reconcile(project_id)
+        self._save_state = "Chỉnh timeline thất bại"
+        self.saveStateChanged.emit()
+        self._set_status(
+            "Cắt video phản hồi quá lâu; màn hình đã giữ nguyên. "
+            "Hãy kiểm tra Job Manager rồi thử lại."
+        )
+
+    def _begin_timeline_reconcile(self, project_id: str) -> None:
+        if not project_id:
+            return
+        self._timeline_reconcile_generation += 1
+        self._timeline_reconcile_pending = True
+        self._timeline_reconcile_project_id = project_id
+        self._set_timeline_busy(True)
+        self._dispatch_timeline_reconcile()
+
+    def _dispatch_timeline_reconcile(self) -> None:
+        if not self._timeline_reconcile_pending or not self._backend_ready:
+            return
+        generation = self._timeline_reconcile_generation
+        project_id = self._timeline_reconcile_project_id
+        try:
+            self.runtime.request(
+                "get_project",
+                {"project_id": project_id},
+                context={
+                    "timeline_reconcile": True,
+                    "project_id": project_id,
+                    "generation": generation,
+                },
+            )
+        except Exception:
+            QTimer.singleShot(1_000, self._dispatch_timeline_reconcile)
+
+    def _timeline_reconcile_context_is_current(self, context: object) -> bool:
+        return (
+            isinstance(context, dict)
+            and context.get("timeline_reconcile") is True
+            and self._timeline_reconcile_pending
+            and str(context.get("project_id", "")) == self._timeline_reconcile_project_id
+            and int(context.get("generation", -1) or -1)
+            == self._timeline_reconcile_generation
+        )
+
     @Slot(bool)
     def deleteSelected(self, apply_linked: bool = True) -> None:
+        if self.selectedClipTrackKind in {"video", "subtitle", "text"}:
+            self.deleteTimelineSelection()
+            return
         self._send_timeline_command("delete", apply_linked=apply_linked)
 
     @Slot(float, bool)
@@ -5477,6 +6989,9 @@ class ApplicationViewModel(QObject):
         ):
             return
         self._set_timeline_busy(True)
+        if (self.project_state.voiceConformApplied
+                and self.selectedClipTrackKind in {"video", "original_audio"}):
+            start_us = self.project_state.outputToSourceUs(start_us)
         self.runtime.request(
             "timeline_command",
             {
@@ -5548,10 +7063,18 @@ class ApplicationViewModel(QObject):
 
     @Slot()
     def undoTimeline(self) -> None:
+        if self._defer_until_subtitle_saves_flushed(
+            "undo-timeline", self.undoTimeline, "Đang lưu phụ đề trước khi hoàn tác Timeline…"
+        ):
+            return
         self._send_timeline_command("undo", needs_selection=False)
 
     @Slot()
     def redoTimeline(self) -> None:
+        if self._defer_until_subtitle_saves_flushed(
+            "redo-timeline", self.redoTimeline, "Đang lưu phụ đề trước khi làm lại Timeline…"
+        ):
+            return
         self._send_timeline_command("redo", needs_selection=False)
 
     @Slot(str, int, result=int)
@@ -5979,6 +7502,8 @@ class ApplicationViewModel(QObject):
                 repr(raw_item.get("error_payload", {})),
             )
             current_markers[job_id] = marker
+            if job_id in self._superseded_job_ids:
+                continue
             if not self._jobs_snapshot_initialized or state not in terminal_states:
                 continue
             if self._terminal_job_notification_markers.get(job_id) == marker:
@@ -6018,6 +7543,45 @@ class ApplicationViewModel(QObject):
             return
         self._backend_ready = value
         self.backendReadyChanged.emit()
+        if not value and self._project_save_context:
+            self._project_save_failed({"message": "Mất kết nối trong khi lưu"},
+                                      dict(self._project_save_context))
+        if not value and self._subtitle_command_context:
+            context = dict(self._subtitle_command_context)
+            self._action_failed("subtitle_command", {
+                "message": "Mất kết nối khi sửa phụ đề; đang đọc lại bản đã lưu",
+            }, context)
+            self._begin_timeline_reconcile(str(context.get("project_id", "")))
+        if not value and (self._subtitle_save_in_flight or self._subtitle_save_queue):
+            project_id = str(self._subtitle_save_context.get(
+                "project_id", self.project_state.projectId))
+            self._action_failed("subtitle_command", {
+                "message": ("Mất kết nối khi lưu phụ đề; thao tác xóa chờ đã hủy, "
+                            "đang đọc lại bản đã lưu"),
+            }, self._subtitle_save_context or {
+                "project_id": project_id, "background_subtitle_save": True,
+            })
+            self._begin_timeline_reconcile(project_id)
+        if not value and self._scene_timing_context:
+            context = dict(self._scene_timing_context)
+            self._action_failed("subtitle_command", {
+                "message": "Mất kết nối khi lưu thời gian cue; đang đọc lại bản đã lưu",
+            }, context)
+            self._begin_timeline_reconcile(str(context.get("project_id", "")))
+        if not value and self._subtitle_geometry_context:
+            project_id = str(self._subtitle_geometry_context.get("project_id", ""))
+            self._finish_subtitle_geometry(False)
+            self._set_status("Mất kết nối khi lưu vị trí chữ; đang đọc lại bản đã lưu")
+            self._begin_timeline_reconcile(project_id)
+        if not value and self._active_timeline_cut_request_id:
+            context = dict(self._timeline_cut_context)
+            project_id = str(context.get("project_id", self.project_state.projectId))
+            self._finish_timeline_cut(False, context)
+            self._begin_timeline_reconcile(project_id)
+            self._save_state = "Chỉnh timeline thất bại"
+            self.saveStateChanged.emit()
+        if value and self._timeline_reconcile_pending:
+            self._dispatch_timeline_reconcile()
         if not value and self._multi_detail_busy:
             self._multi_detail_generation += 1
             self._finish_multi_detail()
@@ -6048,6 +7612,21 @@ class ApplicationViewModel(QObject):
         self._set_ocr_busy(bool(active_id))
         if not isinstance(raw_items, list):
             return
+        superseded_before = len(self._superseded_job_ids)
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            spec = item.get("spec")
+            if not isinstance(spec, dict) or spec.get("kind") != "tts":
+                continue
+            config = spec.get("provider_config")
+            if not isinstance(config, dict):
+                continue
+            replaced_job_id = str(config.get("replaces_job_id", "")).strip()
+            if replaced_job_id:
+                self._superseded_job_ids.add(replaced_job_id)
+        if len(self._superseded_job_ids) != superseded_before:
+            self.statusNotificationDismissRequested.emit()
         latest_ocr = next(
             (
                 item
@@ -6086,6 +7665,10 @@ class ApplicationViewModel(QObject):
         )
         if active_translation_id:
             self._translation_job_id = active_translation_id
+            if (not self._translation_cache_selection_explicit
+                    and self._selected_translation_cache_id != active_translation_id):
+                self._selected_translation_cache_id = active_translation_id
+                self.translationCachesChanged.emit()
         translation_start_pending = (
             not active_translation_id
             and self._translation_busy
@@ -6161,6 +7744,10 @@ class ApplicationViewModel(QObject):
                     latest_translation["spec"].get("provider_id", "")
                 )
                 self._translation_model_id = str(latest_translation["spec"].get("model_id", ""))
+                config = latest_translation["spec"].get("provider_config", {})
+                self._bind_translation_configuration(config)
+            else:
+                self._bind_translation_configuration({})
         translation_state = str(latest_translation.get("state", "")) if latest_translation else ""
         if (
             latest_translation
@@ -6514,6 +8101,7 @@ class ApplicationViewModel(QObject):
                     ),
                 )
         self._notify_terminal_job_changes(raw_items)
+        self._complete_translation_switch(raw_items)
 
     @Slot(object)
     def _replace_multi_videos(self, payload: object) -> None:
@@ -6695,6 +8283,99 @@ class ApplicationViewModel(QObject):
 
     @Slot(str, object, object)
     def _action_succeeded(self, action: str, result: object, context: object) -> None:
+        if action == "list_translation_models":
+            if (not isinstance(context, dict)
+                    or context.get("catalog_generation") != self._translation_catalog_generation):
+                return
+            self._translation_catalog_busy = False
+            data = result if isinstance(result, dict) else {}
+            self._translation_catalog_models = [str(m) for m in data.get("models", [])]
+            self._translation_catalog_status = str(data.get("error") or (
+                f"API trả {len(self._translation_catalog_models)} model"
+                + (" (danh sách một phần)" if data.get("partial") else "")
+                + ". Vẫn có thể nhập tên thủ công."
+            ))
+            self.translationModelCatalogChanged.emit()
+            return
+        if action == "save_project_edits":
+            self._project_save_finished(result, context)
+            return
+        if (action == "effect_command" and isinstance(context, dict)
+                and context.get("project_id")
+                and context["project_id"] != self.project_state.projectId):
+            return
+        if action == "subtitle_command" and not self._subtitle_command_response_is_current(context):
+            return
+        if action == "copy_video_clip":
+            if isinstance(result, dict) and result.get("copied") is True:
+                self._video_clipboard_project_id = str(result.get("project_id", ""))
+                self.videoClipboardChanged.emit()
+                self._set_status("Đã sao chép video và âm thanh liên kết")
+            return
+        if action == "subtitle_command" and not self._background_save_response_is_current(context):
+            return
+        if action == "subtitle_command" and not self._scene_timing_response_is_current(context):
+            return
+        if (action == "subtitle_command"
+                and not self._subtitle_geometry_response_is_current(context)):
+            return
+        if (
+            action == "subtitle_command" and isinstance(result, dict)
+            and isinstance(context, dict) and context.get("background_subtitle_save") is True
+            and result.get("_subtitle_patch") is True
+            and result.get("id") == self.project_state.projectId
+            and type(result.get("revision")) is int
+            and result["revision"] < self.project_state.content_revision
+        ):
+            # Decode can finish out of order. The newer durable head already
+            # includes this saved edit; do not roll it back as a stale patch.
+            self._finish_background_subtitle_save()
+            return
+        if (
+            action == "timeline_command"
+            and isinstance(context, dict)
+            and context.get("timeline_cut") is True
+            and self._timeline_cut_context_is_current(context)
+            and not isinstance(result, dict)
+        ):
+            self._action_failed(
+                action,
+                {
+                    "code": "timeline_patch_invalid",
+                    "message": "Job Manager trả về dữ liệu cắt video không hợp lệ",
+                },
+                context,
+            )
+            return
+        if (
+            action == "timeline_command"
+            and isinstance(result, dict)
+            and result.get("_timeline_patch") is True
+            and isinstance(context, dict)
+            and context.get("timeline_cut") is True
+            and self._timeline_cut_context_is_current(context)
+        ):
+            self.runtime.project_timeline_patch(
+                self.project_state.content_patch_snapshot(),
+                result,
+                context,
+            )
+            self._set_status("Đang cập nhật hiển thị sau khi cắt…")
+            return
+        if (action == "subtitle_command" and isinstance(result, dict)
+                and result.get("_subtitle_patch") is True
+                and "_prepared_subtitle_snapshot" not in result
+                and (not isinstance(context, dict) or not context.get("background_subtitle_save"))
+                and (not isinstance(context, dict) or not (
+                    context.get("scene_timing_generation")
+                    or context.get("subtitle_geometry_generation")))
+                and len(self.project_state._canonical_snapshot.get("source_cues", [])) >= 1000):
+            self.runtime.project_timeline_patch(
+                self.project_state.content_patch_snapshot(), result,
+                {**(context if isinstance(context, dict) else {}),
+                 "subtitle_patch_projection": True},
+            )
+            return
         if action in {
             "reserve_update_install",
             "release_update_install",
@@ -6702,15 +8383,8 @@ class ApplicationViewModel(QObject):
         }:
             self.updater_model.action_succeeded(action, result)
             return
-        if action == "set_translation_preferences" and not isinstance(result, dict):
-            self._action_failed(
-                action,
-                {
-                    "code": "translation_preferences_invalid",
-                    "message": "Job Manager trả về dữ liệu văn phong không hợp lệ",
-                },
-                context,
-            )
+        if action in {"set_translation_preferences", "save_translation_style"}:
+            self._translation_preferences_saved(action, result, context)
             return
         if action == "export_subtitle_srt":
             self._set_subtitle_export_busy(False)
@@ -7133,8 +8807,13 @@ class ApplicationViewModel(QObject):
             available = {str(item.get("job_id", "")) for item in caches}
             self._pending_history_deletion_ids.intersection_update(available)
             selected = self._selected_translation_cache_id
-            if selected not in available:
+            controls_own_preview = self._translation_controls_own_preview()
+            if controls_own_preview:
+                if not self._translation_cache_selection_explicit:
+                    selected = self._translation_job_id
+            elif selected not in available:
                 selected = str(caches[0].get("job_id", "")) if caches else ""
+                self._translation_cache_selection_explicit = False
             changed = (
                 caches != self._translation_caches
                 or selected != self._selected_translation_cache_id
@@ -7143,21 +8822,14 @@ class ApplicationViewModel(QObject):
             self._selected_translation_cache_id = selected
             if changed:
                 self.translationCachesChanged.emit()
-            if selected:
+            if selected and selected in available:
                 selected_cache = next(
                     (item for item in caches if str(item.get("job_id", "")) == selected),
                     None,
                 )
-                active_translation_id = self.subtitle_jobs.active_job_id(
-                    self.project_state.projectId, "translate"
-                )
-                # Do not let a delayed cache refresh overwrite a different
-                # translation that is already running.  When there is no
-                # active job, bind the selected ledger immediately; the
-                # preview response only supplies the cue text/QA details.
-                if isinstance(selected_cache, dict) and (
-                    not active_translation_id or active_translation_id == selected
-                ):
+                # Cache replies can predate creation/resume of the current
+                # worker. Only job polling owns its live lifecycle state.
+                if isinstance(selected_cache, dict) and not controls_own_preview:
                     self._bind_translation_cache_record(selected_cache)
                 self.runtime.request(
                     "get_translation_preview",
@@ -7174,6 +8846,8 @@ class ApplicationViewModel(QObject):
             if not project_id or project_id != self.project_state.projectId:
                 return
             job_id = str(result.get("job_id", ""))
+            if not self._translation_preview_matches_job(job_id):
+                return
             preview_context = context if isinstance(context, dict) else {}
             requested_job_id = str(preview_context.get("cache_job_id", ""))
             if requested_job_id and requested_job_id != self._selected_translation_cache_id:
@@ -7193,11 +8867,12 @@ class ApplicationViewModel(QObject):
                 self._translation_job_id = job_id
                 self._translation_provider_id = str(result.get("provider_id", ""))
                 self._translation_model_id = str(result.get("model_id", ""))
+                self._bind_translation_configuration(result.get("provider_config"))
                 display_state = str(result.get("display_state", result.get("state", "")))
                 self._set_translation_job_state(display_state)
                 self.translationBusyChanged.emit()
             if isinstance(result.get("qa"), dict):
-                self._set_translation_qa(result["qa"])
+                self._set_translation_qa(result["qa"], reconcile_with_project=False)
             values = result.get("values")
             if not isinstance(values, list):
                 return
@@ -7217,10 +8892,7 @@ class ApplicationViewModel(QObject):
             self._translation_event_requests.discard(job_id)
             if project_id != self.project_state.projectId:
                 return
-            if (
-                self._selected_translation_cache_id
-                and job_id != self._selected_translation_cache_id
-            ):
+            if not self._translation_preview_matches_job(job_id):
                 return
             events = result if isinstance(result, list) else []
             cursor = self._translation_event_sequences.get(job_id, 0)
@@ -7266,6 +8938,8 @@ class ApplicationViewModel(QObject):
             self._translation_qa_event_requests.discard(job_id)
             if project_id != self.project_state.projectId:
                 return
+            if not self._translation_preview_matches_job(job_id):
+                return
             events = result if isinstance(result, list) else []
             cursor = self._translation_qa_event_sequences.get(job_id, 0)
             for event in events:
@@ -7278,7 +8952,7 @@ class ApplicationViewModel(QObject):
                     continue
                 payload = event.get("payload")
                 if isinstance(payload, dict):
-                    self._set_translation_qa(payload)
+                    self._set_translation_qa(payload, reconcile_with_project=False)
             self._translation_qa_event_sequences[job_id] = cursor
             return
         if action == "list_credentials" and isinstance(result, dict):
@@ -7352,6 +9026,55 @@ class ApplicationViewModel(QObject):
             state = str(result.get("overall_status", "unknown"))
             self._set_status(f"Chẩn đoán runtime hoàn tất: {state}")
             return
+        if action in {
+            "optimize_project_database",
+            "get_database_optimization",
+            "cancel_database_optimization",
+        } and isinstance(result, dict):
+            self._database_maintenance = dict(result)
+            self.databaseMaintenanceChanged.emit()
+            state = str(result.get("state", ""))
+            if state in {"running", "cancelling"}:
+                if not self._database_maintenance_timer.isActive():
+                    self._database_maintenance_timer.start()
+                stage_labels = {
+                    "starting": "Đang chuẩn bị",
+                    "copying": "Đang sao chép an toàn",
+                    "compressing": "Đang nén revision",
+                    "vacuuming": "Đang thu gọn SQLite",
+                    "verifying": "Đang kiểm tra toàn vẹn",
+                    "swapping": "Đang đổi database",
+                }
+                stage = stage_labels.get(str(result.get("stage", "")), "Đang tối ưu")
+                current = int(result.get("current", 0) or 0)
+                total = int(result.get("total", 0) or 0)
+                detail = f" {current}/{total}" if total > 0 else ""
+                self._set_status(
+                    "Đang chờ checkpoint hủy an toàn…"
+                    if state == "cancelling"
+                    else f"{stage}{detail}"
+                )
+                return
+            self._database_maintenance_timer.stop()
+            if state == "cancelled":
+                self._set_status(
+                    str(result.get("message", "Đã hủy tối ưu; database hiện tại không đổi."))
+                )
+                return
+            if state == "failed":
+                self._set_status(
+                    "Tối ưu dữ liệu dự án thất bại: "
+                    + str(result.get("message", "lỗi không xác định"))
+                )
+                return
+            before = int(result.get("before_bytes", 0) or 0)
+            after = int(result.get("after_bytes", 0) or 0)
+            saved = max(0, before - after)
+            self._set_status(
+                "Đã tối ưu dữ liệu dự án và giữ bản sao an toàn; "
+                f"giảm {saved / (1024 * 1024):.1f} MB."
+            )
+            return
         if action == "inspect_legacy_project" and isinstance(result, dict):
             self._legacy_migration_report = result
             self.legacyMigrationChanged.emit()
@@ -7406,12 +9129,18 @@ class ApplicationViewModel(QObject):
                 self._set_status("Job Manager không trả về mã tác vụ dịch")
                 return
             self._translation_job_id = job_id
+            self._selected_translation_cache_id = job_id
+            self._translation_cache_selection_explicit = False
+            self.translationCachesChanged.emit()
             spec = result.get("spec")
             self._translation_provider_id = (
                 str(spec.get("provider_id", "")) if isinstance(spec, dict) else ""
             )
             self._translation_model_id = (
                 str(spec.get("model_id", "")) if isinstance(spec, dict) else ""
+            )
+            self._bind_translation_configuration(
+                spec.get("provider_config") if isinstance(spec, dict) else None
             )
             self.translationBusyChanged.emit()
             self._start_translation_worker(job_id)
@@ -7502,8 +9231,15 @@ class ApplicationViewModel(QObject):
                 self._start_tts_worker(job_id)
             return
         if action == "retry_job" and isinstance(context, dict) and context.get("resume_tts"):
-            job_id = context.get("job_id")
+            job_id = result.get("id") if isinstance(result, dict) else context.get("job_id")
             if isinstance(job_id, str):
+                replaced_job_id = str(result.get("replaced_job_id", ""))
+                if replaced_job_id:
+                    self._superseded_job_ids.add(replaced_job_id)
+                    self.statusNotificationDismissRequested.emit()
+                self._tts_job_id = job_id
+                self._set_tts_job_state("start_requested")
+                self.ttsBusyChanged.emit()
                 self._start_tts_worker(job_id)
             return
         if action == "retry_job" and isinstance(context, dict) and context.get("resume_export"):
@@ -7629,6 +9365,8 @@ class ApplicationViewModel(QObject):
             return
         if action in {"start_job", "pause_job", "resume_job", "cancel_job"}:
             self.runtime.request("list_jobs")
+            if action == "cancel_job" and isinstance(result, dict):
+                self._complete_translation_switch([result])
             return
         if action == "create_project" and isinstance(result, dict):
             self._apply_project(result)
@@ -7656,26 +9394,36 @@ class ApplicationViewModel(QObject):
             "timeline_command",
             "subtitle_command",
             "effect_command",
-            "set_translation_preferences",
         } and isinstance(result, dict):
             project_context = context if isinstance(context, dict) else {}
-            if action == "set_translation_preferences":
-                request_project_id = str(project_context.get("project_id", ""))
-                if request_project_id and request_project_id != self.project_state.projectId:
-                    self._set_translation_preferences_busy(False)
-                    return
-                if not request_project_id or str(result.get("id", "")) != request_project_id:
-                    self._action_failed(
-                        action,
-                        {
-                            "code": "translation_preferences_invalid",
-                            "message": (
-                                "Dữ liệu văn phong trả về không thuộc project hiện tại"
-                            ),
-                        },
-                        project_context,
-                    )
-                    return
+            timeline_reconcile = (
+                action == "get_project"
+                and project_context.get("timeline_reconcile") is True
+            )
+            if timeline_reconcile and not self._timeline_reconcile_context_is_current(
+                project_context
+            ):
+                return
+            if timeline_reconcile and str(result.get("id", "")) != str(
+                project_context.get("project_id", "")
+            ):
+                self._action_failed(
+                    action,
+                    {
+                        "code": "timeline_reconcile_invalid",
+                        "message": "Dữ liệu đồng bộ không thuộc project hiện tại",
+                    },
+                    project_context,
+                )
+                return
+            if (
+                action == "timeline_command"
+                and project_context.get("timeline_cut") is True
+                and not self._timeline_cut_context_is_current(project_context)
+            ):
+                # A timed-out or superseded cut must not overwrite the latest
+                # project revision or release the busy gate of a newer cut.
+                return
             is_multi_detail = (
                 action == "get_project" and project_context.get("multi_detail") is True
             )
@@ -7691,11 +9439,7 @@ class ApplicationViewModel(QObject):
                     "Không thể mở video: dữ liệu Timeline trả về không đúng project đã chọn."
                 )
                 return
-            if action == "timeline_command":
-                self._can_undo_timeline = result.get("_timeline_can_undo") is True
-                self._can_redo_timeline = result.get("_timeline_can_redo") is True
-                self.timelineHistoryChanged.emit()
-            elif action == "import_media":
+            if action == "import_media":
                 self._can_undo_timeline = False
                 self._can_redo_timeline = False
                 self.timelineHistoryChanged.emit()
@@ -7703,16 +9447,32 @@ class ApplicationViewModel(QObject):
                 self._can_undo_subtitle = result.get("_subtitle_can_undo") is True
                 self._can_redo_subtitle = result.get("_subtitle_can_redo") is True
                 self.subtitleHistoryChanged.emit()
-            elif action == "effect_command":
-                self._can_undo_timeline = False
-                self._can_redo_timeline = False
+                self._can_undo_timeline = result.get("_timeline_can_undo") is True
+                self._can_redo_timeline = result.get("_timeline_can_redo") is True
                 self.timelineHistoryChanged.emit()
+            elif action == "effect_command":
+                self._can_undo_timeline = result.get("_timeline_can_undo") is True
+                self._can_redo_timeline = result.get("_timeline_can_redo") is True
+                self.timelineHistoryChanged.emit()
+                self._can_undo_subtitle = result.get("_subtitle_can_undo") is True
+                self._can_redo_subtitle = result.get("_subtitle_can_redo") is True
+                self.subtitleHistoryChanged.emit()
             compact_subtitle_patch = (
                 action == "subtitle_command" and result.get("_subtitle_patch") is True
             )
+            compact_timeline_patch = (
+                action in {"timeline_command", "subtitle_command"}
+                and result.get("_timeline_patch") is True
+            )
             try:
                 if compact_subtitle_patch:
-                    self.project_state.apply_subtitle_patch(result)
+                    if "_prepared_subtitle_snapshot" in result:
+                        self.project_state.apply_prepared_subtitle_patch(
+                            result["_prepared_subtitle_snapshot"],
+                            result["_prepared_subtitle_projected"],
+                        )
+                    else:
+                        self.project_state.apply_subtitle_patch(result)
                     self._set_translation_qa(self._translation_qa)
                     self._selected_cue_ids = [
                         cue_id
@@ -7721,9 +9481,7 @@ class ApplicationViewModel(QObject):
                     ]
                     if not self.project_state.subtitle_cues.find(self._selected_cue_id):
                         self._selected_cue_id = (
-                            self._selected_cue_ids[-1]
-                            if self._selected_cue_ids
-                            else ""
+                            self._selected_cue_ids[-1] if self._selected_cue_ids else ""
                         )
                         self.selectedCueChanged.emit()
                     elif self._selected_cue_id:
@@ -7734,9 +9492,7 @@ class ApplicationViewModel(QObject):
                             for row in range(self.project_state.subtitle_cues.count)
                         ]
                         manual = [
-                            cue
-                            for cue in manual
-                            if cue.get("provenance") == "manual_scene_text"
+                            cue for cue in manual if cue.get("provenance") == "manual_scene_text"
                         ]
                         if manual:
                             created = max(
@@ -7747,6 +9503,13 @@ class ApplicationViewModel(QObject):
                                 str(created.get("cue_id", "")),
                                 float(created.get("start_us", 0) or 0),
                             )
+                elif compact_timeline_patch:
+                    self.project_state.apply_timeline_patch(result)
+                    self._refresh_edit_selection()
+                    if project_context.get("title_created"):
+                        created = result.get("title_cue_upserts", [])
+                        if created:
+                            self.selectTimelineCue(str(created[-1]["id"]), False)
                 elif action == "effect_command" and result.get("_effect_patch") is True:
                     generation_key = str(project_context.get("generation_key", ""))
                     generation = int(project_context.get("generation", 0) or 0)
@@ -7756,21 +9519,22 @@ class ApplicationViewModel(QObject):
                         self.project_state.apply_effect_patch(result)
                 else:
                     self._apply_project(result)
-                if action == "set_translation_preferences":
-                    self._set_translation_preferences_busy(False)
             except (TypeError, ValueError, KeyError, LookupError) as exc:
                 # A late or malformed subtitle response must never leave the
                 # editor locked.  Route it through the same rollback/error
                 # path as an explicit backend failure so the busy flag and
                 # optimistic text are restored deterministically.
-                if action in {"subtitle_command", "set_translation_preferences"}:
+                if action in {
+                    "subtitle_command",
+                    "timeline_command",
+                }:
                     self._action_failed(
                         action,
                         {
                             "code": (
                                 "subtitle_patch_invalid"
                                 if action == "subtitle_command"
-                                else "translation_preferences_invalid"
+                                else "timeline_patch_invalid"
                             ),
                             "message": str(exc),
                         },
@@ -7778,6 +9542,15 @@ class ApplicationViewModel(QObject):
                     )
                     return
                 raise
+            if action == "timeline_command":
+                self._can_undo_timeline = result.get("_timeline_can_undo") is True
+                self._can_redo_timeline = result.get("_timeline_can_redo") is True
+                self.timelineHistoryChanged.emit()
+                self._can_undo_subtitle = result.get("_subtitle_can_undo") is True
+                self._can_redo_subtitle = result.get("_subtitle_can_redo") is True
+                self.subtitleHistoryChanged.emit()
+            if action == "timeline_command" and project_context.get("timeline_cut") is True:
+                self._finish_timeline_cut(True, project_context)
             if action in {
                 "get_project",
                 "import_media",
@@ -7823,7 +9596,8 @@ class ApplicationViewModel(QObject):
                     },
                 )
             timing_repair_job_id = str(project_context.get("voice_timing_repair_job_id", ""))
-            if action == "get_project" and self.project_state.projectId:
+            if (action in {"get_project", "import_media"}
+                    and self.project_state.projectId and not timeline_reconcile):
                 if timing_repair_job_id:
                     self.navigate("translate")
                     if project_context.get("voice_timing_repair_succeeded") is True:
@@ -7837,10 +9611,39 @@ class ApplicationViewModel(QObject):
                     target_screen = str(project_context.get("multi_detail_target", "timeline"))
                     self.navigate("translate" if target_screen == "translate" else "timeline")
             self._set_import_busy(False)
-            self._set_timeline_busy(False)
-            self._set_subtitle_busy(False)
-            self._save_state = "Đã lưu"
-            self.saveStateChanged.emit()
+            if timeline_reconcile:
+                self._timeline_reconcile_pending = False
+                self._timeline_reconcile_project_id = ""
+            background_subtitle_save = (
+                action == "subtitle_command"
+                and project_context.get("background_subtitle_save") is True
+            )
+            if action != "subtitle_command":
+                self._set_timeline_busy(False)
+            if project_context.get("scene_timing_generation"):
+                self._finish_scene_timing_command(True)
+            elif project_context.get("subtitle_geometry_generation"):
+                self._finish_subtitle_geometry(True)
+            elif (not background_subtitle_save and not self._scene_timing_context
+                  and not self._subtitle_geometry_context
+                  and (action == "subtitle_command" or not self._subtitle_command_context)):
+                self._set_subtitle_busy(False)
+            if self._scene_timing_context:
+                # A text/style ACK may project a new head while a timing edit
+                # is still saving. Keep its preview until its own ACK arrives.
+                for change in self._scene_timing_context.get("optimistic_changes", []):
+                    self.project_state.subtitle_cues.preview_scene_text_timing(
+                        str(change["cue_id"]), int(change["applied_start_us"]),
+                        int(change["applied_end_us"]),
+                    )
+            if background_subtitle_save:
+                self._finish_background_subtitle_save()
+            else:
+                pending_count = len(self._subtitle_save_queue) + int(self._subtitle_save_in_flight)
+                self._save_state = (f"Đang lưu {pending_count} thay đổi" if pending_count
+                                    else "Đang lưu vị trí chữ" if self._subtitle_geometry_context
+                                    else "Đã lưu")
+                self.saveStateChanged.emit()
             status_by_action = {
                 "get_project": "Đã mở dự án",
                 "import_media": "Đã nhập media và đưa vào timeline",
@@ -7848,13 +9651,14 @@ class ApplicationViewModel(QObject):
                 "timeline_command": "Đã cập nhật timeline",
                 "subtitle_command": "Đã cập nhật phụ đề",
                 "effect_command": "Đã cập nhật timeline",
-                "set_translation_preferences": "Đã lưu văn phong dịch cho project",
             }
             if not timing_repair_job_id:
                 terminal_translation_job_id = str(
                     project_context.get("terminal_translation_job_id", "")
                 )
-                if action == "get_project" and terminal_translation_job_id:
+                if timeline_reconcile:
+                    self._set_status("Đã đồng bộ trạng thái timeline mới nhất")
+                elif action == "get_project" and terminal_translation_job_id:
                     self._set_status("Đã dịch xong và đã chuyển sang Timeline")
                 elif (
                     action == "get_project"
@@ -7869,7 +9673,9 @@ class ApplicationViewModel(QObject):
                     self._set_status("Đã tạo voice xong và đã cập nhật Timeline")
                 elif action == "subtitle_command":
                     subtitle_command = str(project_context.get("subtitle_command", ""))
-                    if subtitle_command == "find_replace":
+                    if background_subtitle_save:
+                        pass
+                    elif subtitle_command == "find_replace":
                         replacement_count = int(project_context.get("replacement_count", 0) or 0)
                         replacement_cue_count = int(
                             project_context.get("replacement_cue_count", 0) or 0
@@ -7893,19 +9699,26 @@ class ApplicationViewModel(QObject):
                             f"Đã lưu tỷ lệ chữ trong cảnh {scale_percent}%; có thể bấm Hoàn tác"
                         )
                     elif subtitle_command == "set_scene_text_timing":
-                        start_us = int(
-                            project_context.get("scene_timing_start_us", 0) or 0
-                        )
-                        end_us = int(
-                            project_context.get("scene_timing_end_us", 0) or 0
-                        )
+                        start_us = int(project_context.get("scene_timing_start_us", 0) or 0)
+                        end_us = int(project_context.get("scene_timing_end_us", 0) or 0)
                         self._set_status(
                             "Đã lưu thời gian chữ trong cảnh "
                             f"{start_us / 1_000_000:.3f}s–{end_us / 1_000_000:.3f}s; "
                             "có thể bấm Hoàn tác"
                         )
+                    elif subtitle_command == "set_cue_role":
+                        label = ("S1 · Thoại" if project_context.get("converted_cue_role")
+                                 == "dialogue" else "S2 · Chữ cảnh")
+                        count = int(project_context.get("converted_cue_count", 1))
+                        self._set_status(
+                            f"Đã chuyển {count} cue sang {label}; "
+                            "Ctrl+S để lưu, tạo lại giọng để áp dụng loại mới cho D1"
+                        )
                     else:
-                        self._set_status("Đã lưu thay đổi phụ đề")
+                        self._set_status(
+                            "Đã cập nhật bản đang chỉnh" if result.get("_project_dirty")
+                            else "Đã lưu thay đổi phụ đề"
+                        )
                 else:
                     self._set_status(status_by_action[action])
             if not is_multi_detail and action not in {"subtitle_command", "effect_command"}:
@@ -7944,7 +9757,67 @@ class ApplicationViewModel(QObject):
             elif action == "timeline_command":
                 self._dispatch_pending_effect_command()
             elif action == "subtitle_command":
+                if not background_subtitle_save:
+                    self._run_subtitle_flush_callbacks()
                 self._dispatch_pending_manual_scene_text()
+            self._observe_project_persistence(result)
+            self._run_subtitle_flush_callbacks()
+
+    @Slot(bool, object, object)
+    def _timeline_patch_projected(
+        self,
+        succeeded: bool,
+        result: object,
+        context: object,
+    ) -> None:
+        if isinstance(context, dict) and context.get("subtitle_patch_projection") is True:
+            if not succeeded or not isinstance(result, dict):
+                self._action_failed("subtitle_command", result, context)
+            else:
+                patch = {**result["patch"], "_prepared_subtitle_snapshot": result["canonical"],
+                         "_prepared_subtitle_projected": result["projected"]}
+                self._action_succeeded("subtitle_command", patch, context)
+            return
+        if not self._timeline_cut_context_is_current(context):
+            return
+        if not succeeded or not isinstance(result, dict):
+            error = result if isinstance(result, dict) else {"message": str(result)}
+            self._action_failed("timeline_command", error, context)
+            return
+        canonical = result.get("canonical")
+        projected = result.get("projected")
+        patch = result.get("patch")
+        if not isinstance(canonical, dict) or not isinstance(projected, dict):
+            self._action_failed(
+                "timeline_command",
+                {
+                    "code": "timeline_patch_invalid",
+                    "message": "Dữ liệu hiển thị sau khi cắt không hợp lệ",
+                },
+                context,
+            )
+            return
+        try:
+            self.project_state.apply_prepared_timeline_patch(canonical, projected)
+        except (TypeError, ValueError, KeyError, LookupError) as exc:
+            self._action_failed(
+                "timeline_command",
+                {"code": "timeline_patch_invalid", "message": str(exc)},
+                context,
+            )
+            return
+        patch = patch if isinstance(patch, dict) else {}
+        self._refresh_edit_selection()
+        self._can_undo_timeline = patch.get("_timeline_can_undo") is True
+        self._can_redo_timeline = patch.get("_timeline_can_redo") is True
+        self.timelineHistoryChanged.emit()
+        self._finish_timeline_cut(True, context)
+        self._save_state = "Đã lưu"
+        self.saveStateChanged.emit()
+        self._set_status("Đã cập nhật timeline")
+        self._dispatch_pending_effect_command()
+        self._observe_project_persistence(patch)
+        self._run_subtitle_flush_callbacks()
 
     @staticmethod
     def _format_action_error(error: object) -> str:
@@ -7959,6 +9832,51 @@ class ApplicationViewModel(QObject):
 
     @Slot(str, object, object)
     def _action_failed(self, action: str, error: object, context: object) -> None:
+        if action == "list_translation_models":
+            if (isinstance(context, dict)
+                    and context.get("catalog_generation") == self._translation_catalog_generation):
+                self._translation_catalog_busy = False
+                self._translation_catalog_status = (
+                    "Không tải được model. Hãy thử lại hoặc nhập tên thủ công."
+                )
+                self.translationModelCatalogChanged.emit()
+            return
+        if action == "save_project_edits":
+            self._project_save_failed(error, context)
+            return
+        if (action == "effect_command" and isinstance(context, dict)
+                and context.get("project_id")
+                and context["project_id"] != self.project_state.projectId):
+            return
+        if action == "subtitle_command" and not self._subtitle_command_response_is_current(context):
+            return
+        if action == "subtitle_command" and not self._background_save_response_is_current(context):
+            return
+        if action == "subtitle_command" and not self._scene_timing_response_is_current(context):
+            return
+        if (action == "subtitle_command"
+                and not self._subtitle_geometry_response_is_current(context)):
+            return
+        if (
+            action == "get_project"
+            and isinstance(context, dict)
+            and context.get("timeline_reconcile") is True
+        ):
+            if not self._timeline_reconcile_context_is_current(context):
+                return
+            self._set_timeline_busy(True)
+            self._set_status(
+                "Chưa thể đồng bộ trạng thái sau lần cắt; sẽ thử lại trước thao tác tiếp theo."
+            )
+            QTimer.singleShot(1_000, self._dispatch_timeline_reconcile)
+            return
+        if (
+            action == "timeline_command"
+            and isinstance(context, dict)
+            and context.get("timeline_cut") is True
+            and not self._timeline_cut_context_is_current(context)
+        ):
+            return
         if action in {
             "reserve_update_install",
             "release_update_install",
@@ -7973,11 +9891,10 @@ class ApplicationViewModel(QObject):
                 + self._format_action_error(error)
             )
             return
-        if action == "set_translation_preferences":
+        if action in {"set_translation_preferences", "save_translation_style"}:
+            self._translation_style_control_pending = None
             self._set_translation_preferences_busy(False)
-            self._set_status(
-                "Không thể lưu văn phong dịch: " + self._format_action_error(error)
-            )
+            self._set_status("Không thể lưu văn phong dịch: " + self._format_action_error(error))
             return
         if action == "subtitle_command":
             request_context = context if isinstance(context, dict) else {}
@@ -7990,13 +9907,25 @@ class ApplicationViewModel(QObject):
                     self.selectedCueChanged.emit()
             self._set_translation_qa(self._translation_qa)
             self._refresh_local_multi_translation_review()
-            self._set_subtitle_busy(False)
+            if request_context.get("scene_timing_generation"):
+                self._finish_scene_timing_command(False)
+            elif request_context.get("subtitle_geometry_generation"):
+                self._finish_subtitle_geometry(False)
+            elif request_context.get("background_subtitle_save") is not True:
+                self._set_subtitle_busy(False)
+                if request_context.get("subtitle_command_generation"):
+                    self._cancel_dependent_editor_changes()
+            if request_context.get("background_subtitle_save") is True:
+                self._finish_background_subtitle_save(False)
             self._save_state = "Chỉnh phụ đề thất bại"
             self.saveStateChanged.emit()
             self._set_status(
                 "Không thể lưu thay đổi phụ đề; nội dung trên màn hình đã được hoàn nguyên: "
                 + self._format_action_error(error)
             )
+            if (request_context.get("subtitle_patch_projection")
+                    or (isinstance(error, dict) and error.get("code") == "subtitle_patch_invalid")):
+                self._begin_timeline_reconcile(request_project_id)
             if self._backend_ready and self.multi_videos.item(self.project_state.projectId):
                 # Restore the card from the durable project after a failed
                 # optimistic edit; this is a lightweight status-only refresh.
@@ -8175,8 +10104,22 @@ class ApplicationViewModel(QObject):
             "runtime_diagnostics",
             "inspect_legacy_project",
             "import_legacy_project",
+            "optimize_project_database",
+            "get_database_optimization",
+            "cancel_database_optimization",
         }:
             message = self._format_action_error(error)
+            if action in {
+                "optimize_project_database",
+                "get_database_optimization",
+                "cancel_database_optimization",
+            }:
+                self._database_maintenance_timer.stop()
+                self._database_maintenance = {
+                    "state": "failed",
+                    "message": message,
+                }
+                self.databaseMaintenanceChanged.emit()
             self._set_status(f"{action} thất bại: {message}")
             return
         if action == "inspect_media_usage":
@@ -8211,6 +10154,7 @@ class ApplicationViewModel(QObject):
         }:
             if action == "create_translation_job":
                 self._set_translation_busy(False)
+                self._set_translation_job_state("failed")
             elif action == "create_tts_job":
                 self._set_tts_busy(False)
             elif action == "create_export_job":
@@ -8308,6 +10252,9 @@ class ApplicationViewModel(QObject):
             if action == "start_job" and job_kind == "translate":
                 self._set_translation_busy(False)
                 self._set_translation_job_state("failed")
+            elif action == "cancel_job" and job_kind == "translate":
+                self._translation_switch_pending = None
+                self.runtime.request("list_jobs")
             elif action == "retry_job" and job_kind == "translate":
                 # The immutable ledger is still selectable even when the
                 # retry command itself is rejected (for example because a
@@ -8351,8 +10298,16 @@ class ApplicationViewModel(QObject):
         }:
             return
         self._set_import_busy(False)
-        self._set_timeline_busy(False)
-        self._set_subtitle_busy(False)
+        if (
+            action == "timeline_command"
+            and isinstance(context, dict)
+            and context.get("timeline_cut") is True
+        ):
+            self._finish_timeline_cut(False, context)
+        else:
+            self._set_timeline_busy(False)
+        if not self._scene_timing_context and not self._subtitle_command_context:
+            self._set_subtitle_busy(False)
         if action == "timeline_command":
             self._dispatch_pending_effect_command()
         self._save_state = {
@@ -8365,17 +10320,48 @@ class ApplicationViewModel(QObject):
         message = self._format_action_error(error)
         self._set_status(f"Tác vụ không thành công: {message}")
 
+    def _refresh_edit_selection(self) -> None:
+        """Notify inspectors after a general patch, including mixed-history undo."""
+        if self.project_state.clip_info(self._selected_clip_id) is None:
+            self._selected_clip_id = ""
+        self.selectedClipChanged.emit()
+        self._selected_cue_ids = [
+            cue_id for cue_id in self._selected_cue_ids
+            if self.project_state.subtitle_cues.find(cue_id)
+        ]
+        if not self.project_state.subtitle_cues.find(self._selected_cue_id):
+            self._selected_cue_id = self._selected_cue_ids[-1] if self._selected_cue_ids else ""
+        self.selectedCueChanged.emit()
+        if self.project_state.track_info(self._selected_track_id) is None:
+            self._selected_track_id = ""
+        self._selected_track_ids.intersection_update(self.project_state._track_by_id)
+        self.selectedTrackChanged.emit()
+
     def _apply_project(self, snapshot: dict) -> None:
         previous_project_id = self.project_state.projectId
         incoming_project_id = snapshot.get("id", "")
         if previous_project_id and incoming_project_id != previous_project_id:
+            self._cancel_dependent_editor_changes()
+            self._set_subtitle_busy(False)
+            self._subtitle_save_timer.stop()
+            self._subtitle_command_watchdog.stop()
+            if self._scene_timing_context:
+                self._finish_scene_timing_command(False)
+            if self._subtitle_geometry_context:
+                self._finish_subtitle_geometry(False)
             self._pending_manual_scene_text_commands.clear()
         self.project_state.replace(
             snapshot,
             preserve_live_translations=bool(
                 previous_project_id and incoming_project_id == previous_project_id
             ),
+            take_ownership=True,
         )
+        self._observe_project_persistence({
+            **snapshot,
+            "_project_dirty": snapshot.get("_project_dirty", False),
+            "_saved_revision": snapshot.get("_saved_revision", self.project_state.revision),
+        })
         project_id = self.project_state.projectId
         conform_applied = self.project_state.voiceConformApplied
         conform_changed = conform_applied != self._voice_conform_applied
@@ -8397,6 +10383,7 @@ class ApplicationViewModel(QObject):
             cache_changed = bool(self._translation_caches or self._selected_translation_cache_id)
             self._translation_caches = []
             self._selected_translation_cache_id = ""
+            self._translation_cache_selection_explicit = False
             self._translation_cache_refresh_pending = False
             self._translation_cache_refresh_marker = ("", "", "", "")
             self._translation_qa_event_sequences.clear()
@@ -8434,11 +10421,7 @@ class ApplicationViewModel(QObject):
                 for cue_id in self._selected_cue_ids
                 if self.project_state.subtitle_cues.find(cue_id)
             ]
-            self._selected_cue_id = (
-                self._selected_cue_ids[-1]
-                if self._selected_cue_ids
-                else ""
-            )
+            self._selected_cue_id = self._selected_cue_ids[-1] if self._selected_cue_ids else ""
             self.selectedCueChanged.emit()
         elif self._selected_cue_id:
             if self._selected_cue_id not in self._selected_cue_ids:
@@ -8500,6 +10483,42 @@ class ApplicationViewModel(QObject):
         self._translation_busy = value
         self.translationBusyChanged.emit()
 
+    def _translation_preferences_saved(self, action: str, result: object, context: object) -> None:
+        project_id = context.get("project_id", "") if isinstance(context, dict) else ""
+        if project_id and project_id != self.project_state.projectId:
+            self._translation_style_control_pending = None
+            self._set_translation_preferences_busy(False)
+            return
+        try:
+            if not project_id or not isinstance(result, dict) or result.get("id") != project_id:
+                raise ValueError("Dữ liệu văn phong trả về không thuộc project hiện tại")
+            self.project_state.apply_translation_preferences(result)
+        except (TypeError, ValueError, KeyError) as exc:
+            self._action_failed(action, {"code": "translation_preferences_invalid",
+                                        "message": str(exc)}, context)
+            return
+        self._set_translation_preferences_busy(False)
+        saved_revision = result.get("_saved_revision", result["revision"])
+        if type(saved_revision) is int and saved_revision >= 0:
+            # Record the durable watermark even while a cue ACK is pending;
+            # its older metadata must not make a flushed head appear unsaved.
+            self._last_saved_revision = max(self._last_saved_revision, saved_revision)
+        # This ACK owns only preferences. Do not retire another operation's
+        # busy gate or overwrite pending edits with an older clean-save state.
+        if (result["revision"] >= self.project_state.revision
+                and not self._subtitle_save_queue and not self._subtitle_save_in_flight
+                and not self._subtitle_geometry_context and not self._scene_timing_context):
+            self._observe_project_persistence({
+                **result, "_project_dirty": result.get("_project_dirty", False),
+                "_saved_revision": result.get("_saved_revision", result["revision"]),
+            })
+        self._set_status("Đã lưu văn phong mới cho project" if action == "save_translation_style"
+                         else "Đã lưu văn phong dịch cho project")
+        pending = self._translation_style_control_pending
+        self._translation_style_control_pending = None
+        if pending and pending["project_id"] == self.project_state.projectId:
+            self.toggleTranslation(*pending["arguments"])
+
     def _set_translation_preferences_busy(self, value: bool) -> None:
         if value == self._translation_preferences_busy:
             return
@@ -8512,7 +10531,9 @@ class ApplicationViewModel(QObject):
         self._translation_job_state = value
         self.translationBusyChanged.emit()
 
-    def _set_translation_qa(self, snapshot: object) -> None:
+    def _set_translation_qa(
+        self, snapshot: object, *, reconcile_with_project: bool = True,
+    ) -> None:
         if not isinstance(snapshot, dict):
             return
         status = str(snapshot.get("status", "NONE")).upper()
@@ -8534,7 +10555,11 @@ class ApplicationViewModel(QObject):
                 if isinstance(issue, dict)
             ],
         }
-        normalized = self._reconcile_translation_qa_with_current_cues(normalized)
+        # A job's QA counts belong to its immutable ledger. Visible project rows
+        # may still contain another model/style's translations until new deltas
+        # arrive; they must not inflate counts or add unrelated QA issues.
+        if reconcile_with_project:
+            normalized = self._reconcile_translation_qa_with_current_cues(normalized)
         if normalized == self._translation_qa:
             return
         self._translation_qa = normalized
@@ -8768,6 +10793,11 @@ class ApplicationViewModel(QObject):
         self.exportBusyChanged.emit()
 
     def _set_subtitle_busy(self, value: bool) -> None:
+        if not value and self._subtitle_command_context:
+            self._subtitle_command_context = {}
+            self._subtitle_command_watchdog.stop()
+            if self._subtitle_save_queue:
+                self._subtitle_save_timer.start()
         if value == self._subtitle_busy:
             return
         self._subtitle_busy = value
@@ -8790,7 +10820,7 @@ class ApplicationViewModel(QObject):
         needs_selection: bool = True,
         optimistic_changes: list[dict[str, object]] | None = None,
         status_context: dict[str, object] | None = None,
-    ) -> None:
+    ) -> int:
         changes = optimistic_changes or []
 
         def rollback_optimistic() -> None:
@@ -8800,23 +10830,50 @@ class ApplicationViewModel(QObject):
             self._set_translation_qa(self._translation_qa)
             self._refresh_local_multi_translation_review()
 
-        if self._subtitle_busy or not self.project_state.hasProject:
+        if self._timeline_busy:
             rollback_optimistic()
-            return
+            self._set_status("Hãy chờ thao tác Timeline hiện tại hoàn tất trước khi sửa phụ đề")
+            return 0
+        background_save = command in {
+            "update_text",
+            "set_text_format",
+            "set_scene_text_fade",
+        }
+        specialized_gesture = (command in {"move_scene_texts", "resize_scene_texts"}
+                               or (status_context or {}).get("subtitle_geometry_generation"))
+        if (not background_save and not specialized_gesture
+                and (self._subtitle_save_in_flight or self._subtitle_save_queue)):
+            self._defer_until_subtitle_saves_flushed(
+                "subtitle-command-" + command,
+                lambda: self._send_subtitle_command(
+                    command, cue_id=cue_id, language=language, values=values,
+                    needs_selection=needs_selection, optimistic_changes=changes,
+                    status_context=status_context,
+                ),
+                "Đang lưu chỉnh sửa trước khi sửa phụ đề…",
+            )
+            return 1
+        if (self._subtitle_busy and not background_save) or not self.project_state.hasProject:
+            rollback_optimistic()
+            self._set_status("Hãy chờ thay đổi phụ đề hiện tại được lưu trước khi chỉnh tiếp")
+            return 0
         if needs_selection and command != "add" and not cue_id:
             rollback_optimistic()
             self._set_status("Hãy chọn cue trước")
-            return
+            return 0
+        command_values = dict(values or {})
+        target_ids = command_values.get("cue_ids", [cue_id] if cue_id else [])
+        if target_ids and all(self.project_state.title_cues.find(str(item)) for item in target_ids):
+            command_values["title_mode"] = True
         params: dict[str, object] = {
             "project_id": self.project_state.projectId,
             "command": command,
             "language": language,
-            "values": values or {},
+            "values": command_values,
             "compact": True,
         }
         if cue_id:
             params["cue_id"] = cue_id
-        self._set_subtitle_busy(True)
         if changes:
             # The editor already owns the optimistic Vietnamese text. Mirror
             # its CJK count onto the Multi card before the disk/IPC round trip;
@@ -8828,15 +10885,350 @@ class ApplicationViewModel(QObject):
             "optimistic_changes": changes,
             **(status_context or {}),
         }
+        if background_save:
+            context["background_subtitle_save"] = True
+            self._queue_background_subtitle_save(params, context)
+            return 1
+        timing_command = command in {"move_scene_texts", "resize_scene_texts"}
+        generation = 1
+        if timing_command:
+            self._scene_timing_generation += 1
+            generation = self._scene_timing_generation
+            context["scene_timing_generation"] = generation
+            self._scene_timing_context = context
+        self._subtitle_command_generation += 1
+        context["subtitle_command_generation"] = self._subtitle_command_generation
+        self._subtitle_command_context = context
+        self._subtitle_command_watchdog.start()
+        self._set_subtitle_busy(True)
         try:
             self.runtime.request("subtitle_command", params, context=context)
-        except Exception:
-            rollback_optimistic()
-            self._set_subtitle_busy(False)
-            raise
+        except Exception as exc:
+            self._action_failed("subtitle_command", {"message": str(exc)}, context)
+            self._begin_timeline_reconcile(str(context.get("project_id", "")))
+            return 0
         self._set_status(
             "Đã cập nhật trên màn hình; đang lưu project…" if changes else "Đang cập nhật phụ đề"
         )
+        self._save_state = "Đang lưu thay đổi phụ đề"
+        self.saveStateChanged.emit()
+        return generation
+
+    def _subtitle_command_response_is_current(self, context: object) -> bool:
+        if not isinstance(context, dict) or not context.get("subtitle_command_generation"):
+            return True
+        return bool(self._subtitle_command_context
+                    and context.get("subtitle_command_generation")
+                    == self._subtitle_command_context.get("subtitle_command_generation")
+                    and context.get("project_id") == self.project_state.projectId)
+
+    @Slot()
+    def _subtitle_command_timed_out(self) -> None:
+        if not self._subtitle_command_context:
+            return
+        context = dict(self._subtitle_command_context)
+        self._action_failed("subtitle_command", {
+            "code": "save_ack_timeout",
+            "message": "Chưa nhận xác nhận sau 120 giây; đang đọc lại dự án đã lưu",
+        }, context)
+        self._begin_timeline_reconcile(str(context.get("project_id", "")))
+
+    def _scene_timing_response_is_current(self, context: object) -> bool:
+        if not isinstance(context, dict) or not context.get("scene_timing_generation"):
+            return True
+        return bool(
+            self._scene_timing_context
+            and context.get("scene_timing_generation")
+            == self._scene_timing_context.get("scene_timing_generation")
+            and context.get("project_id") == self.project_state.projectId
+        )
+
+    def _finish_scene_timing_command(self, succeeded: bool) -> None:
+        generation = int(self._scene_timing_context.get("scene_timing_generation", 0))
+        self._scene_timing_context = {}
+        self._set_subtitle_busy(False)
+        if generation:
+            self.sceneTimingSettled.emit(generation, succeeded)
+        if succeeded:
+            self._run_subtitle_flush_callbacks()
+        else:
+            self._subtitle_flush_callbacks.clear()
+
+    def _queue_background_subtitle_save(
+        self, params: dict[str, object], context: dict[str, object]
+    ) -> None:
+        values = params.get("values")
+        cue_ids = (
+            tuple(str(value) for value in values.get("cue_ids", []) if isinstance(value, str))
+            if isinstance(values, dict)
+            else ()
+        )
+        key = (
+            str(params.get("command", "")),
+            str(params.get("cue_id", "")),
+            str(params.get("language", "")),
+            cue_ids,
+        )
+        queued = {
+            "key": key,
+            "params": dict(params),
+            "context": dict(context),
+        }
+        for index, item in enumerate(self._subtitle_save_queue):
+            if item.get("key") != key:
+                continue
+            previous_context = item.get("context")
+            if isinstance(previous_context, dict):
+                queued["context"]["optimistic_changes"] = previous_context.get(
+                    "optimistic_changes", []
+                )
+            self._subtitle_save_queue[index] = queued
+            break
+        else:
+            self._subtitle_save_queue.append(queued)
+        pending_count = len(self._subtitle_save_queue) + int(self._subtitle_save_in_flight)
+        self._save_state = f"Đang đồng bộ {pending_count} thay đổi · Chưa lưu"
+        self.saveStateChanged.emit()
+        self._subtitle_save_timer.start()
+
+    def _defer_until_subtitle_saves_flushed(
+        self,
+        key: str,
+        callback: Callable[[], None],
+        status: str,
+        *,
+        durable: bool = False,
+    ) -> bool:
+        after_sync = (lambda: self._save_before_action(key, callback)) if durable else callback
+        if (not self._subtitle_save_in_flight and not self._subtitle_save_queue
+                and not self._scene_timing_context and not self._subtitle_geometry_context
+                and not self._subtitle_command_context and not self._timeline_busy
+                and not self._pending_effect_commands and not self._timeline_reconcile_pending):
+            if durable and (self._project_dirty or self._project_save_context):
+                after_sync()
+                return True
+            return False
+        self._subtitle_flush_callbacks[key] = after_sync
+        self._subtitle_save_timer.stop()
+        self._dispatch_background_subtitle_save()
+        self._dispatch_pending_effect_command()
+        self._set_status(status)
+        return True
+
+    @Property(bool, notify=saveStateChanged)
+    def projectDirty(self) -> bool:
+        return self._project_dirty
+
+    @Property(bool, notify=saveStateChanged)
+    def projectSaveBusy(self) -> bool:
+        return bool(self._project_save_context)
+
+    def _observe_project_persistence(self, result: object) -> None:
+        if not isinstance(result, dict) or type(result.get("_project_dirty")) is not bool:
+            return
+        project_id = str(result.get("id", ""))
+        if not project_id or project_id != self.project_state.projectId:
+            return
+        if self._draft_project_id != project_id:
+            self._draft_project_id = project_id
+            self._last_saved_revision = 0
+        saved_revision = int(result.get("_saved_revision", 0))
+        self._last_saved_revision = max(self._last_saved_revision, saved_revision)
+        self._project_dirty = self.project_state.revision > self._last_saved_revision
+        if self._project_dirty:
+            if not self._project_save_context and not self._project_autosave_timer.isActive():
+                self._project_autosave_timer.start()
+            self._save_state = "Chưa lưu · Ctrl+S · Tự lưu sau 5 phút nếu còn thay đổi"
+            if result.get("_project_dirty"):
+                self._set_status("Đã cập nhật bản đang chỉnh · Ctrl+S để lưu")
+        else:
+            self._project_autosave_timer.stop()
+            self._save_state = "Đã lưu"
+        self.saveStateChanged.emit()
+
+    @Slot()
+    def _request_project_autosave(self) -> None:
+        if (self.project_state.hasProject and self._project_dirty
+                and not self._project_save_context):
+            self.projectAutosaveRequested.emit()
+
+    @Slot()
+    def saveProject(self) -> None:
+        if not self.project_state.hasProject:
+            return
+        if self._defer_until_subtitle_saves_flushed("manual-save", self.saveProject,
+                                                   "Đang đồng bộ chỉnh sửa trước khi lưu…"):
+            return
+        if not self._project_dirty and not self._project_save_context:
+            self._project_autosave_timer.stop()
+            return
+        self._start_project_save()
+
+    def _save_before_action(self, key: str, callback: Callable[[], None]) -> None:
+        if not self._project_dirty and not self._project_save_context:
+            callback()
+            return
+        self._project_after_save_callbacks[key] = callback
+        self._start_project_save()
+
+    def _start_project_save(self) -> None:
+        if self._project_save_context:
+            return
+        self._project_autosave_timer.stop()
+        self._project_save_generation += 1
+        context = {"project_id": self.project_state.projectId,
+                   "save_generation": self._project_save_generation}
+        self._project_save_context = context
+        self._project_save_watchdog.start()
+        self._save_state = "Đang lưu dự án…"
+        self.saveStateChanged.emit()
+        try:
+            self.runtime.request("save_project_edits", {"project_id": context["project_id"]},
+                                 context=context)
+        except Exception as exc:
+            self._project_save_failed({"message": str(exc)}, context)
+
+    def _project_save_finished(self, result: object, context: object) -> None:
+        if not self._project_save_context or context != self._project_save_context:
+            return
+        if (not isinstance(result, dict) or result.get("id") != self.project_state.projectId
+                or type(result.get("_saved_revision")) is not int):
+            self._project_save_failed({"message": "Xác nhận lưu không hợp lệ"}, context)
+            return
+        self._project_save_context = {}
+        self._project_save_watchdog.stop()
+        self._observe_project_persistence(result)
+        callbacks = tuple(self._project_after_save_callbacks.values())
+        self._project_after_save_callbacks.clear()
+        for callback in callbacks:
+            # Edits may have arrived while the previous snapshot was saving.
+            # A dependent switch/job must save that newer draft too.
+            QTimer.singleShot(0, lambda cb=callback: self._defer_after_project_save(cb))
+        self._set_status("Đã lưu dự án" if not self._project_dirty else
+                         "Đã lưu bản trước; còn chỉnh sửa mới chưa lưu")
+
+    def _defer_after_project_save(self, callback: Callable[[], None]) -> None:
+        if not self._defer_until_subtitle_saves_flushed(
+            f"after-save:{id(callback)}", callback,
+            "Đang đồng bộ chỉnh sửa mới trước khi tiếp tục…", durable=True,
+        ):
+            callback()
+
+    def _project_save_failed(self, error: object, context: object) -> None:
+        if not self._project_save_context or context != self._project_save_context:
+            return
+        self._project_save_context = {}
+        self._project_save_watchdog.stop()
+        self._project_after_save_callbacks.clear()
+        self._save_state = "Chưa lưu · Lưu thất bại, Ctrl+S để thử lại"
+        if self._project_dirty and not self._project_autosave_timer.isActive():
+            self._project_autosave_timer.start()
+        self.saveStateChanged.emit()
+        self._set_status("Lưu chưa hoàn tất; giữ nguyên bản đang chỉnh. "
+                         + self._format_action_error(error))
+
+    @Slot()
+    def _project_save_timed_out(self) -> None:
+        self._project_save_failed({"message": "Chưa nhận xác nhận lưu sau 30 giây"},
+                                  dict(self._project_save_context))
+
+    @Slot()
+    def _dispatch_background_subtitle_save(self) -> None:
+        if (self._subtitle_save_in_flight or not self._subtitle_save_queue
+                or self._subtitle_command_context or self._timeline_reconcile_pending):
+            return
+        pending = self._subtitle_save_queue.pop(0)
+        params = pending.get("params")
+        context = pending.get("context")
+        if not isinstance(params, dict) or not isinstance(context, dict):
+            self._dispatch_background_subtitle_save()
+            return
+        self._subtitle_save_in_flight = True
+        self._subtitle_save_generation += 1
+        context = {**context, "background_save_generation": self._subtitle_save_generation}
+        self._subtitle_save_context = context
+        self._subtitle_save_watchdog.start()
+        try:
+            self.runtime.request("subtitle_command", params, context=context)
+        except Exception as exc:
+            self._action_failed("subtitle_command", {"message": str(exc)}, context)
+            self._begin_timeline_reconcile(str(context.get("project_id", "")))
+
+    def _background_save_response_is_current(self, context: object) -> bool:
+        if not isinstance(context, dict) or not context.get("background_save_generation"):
+            return True
+        return context.get("background_save_generation") == self._subtitle_save_context.get(
+            "background_save_generation") and (
+                context.get("project_id") == self.project_state.projectId)
+
+    @Slot()
+    def _background_subtitle_save_timed_out(self) -> None:
+        if not self._subtitle_save_in_flight:
+            return
+        context = dict(self._subtitle_save_context)
+        self._action_failed("subtitle_command", {
+            "code": "save_ack_timeout",
+            "message": ("Chưa nhận xác nhận lưu sau 120 giây; đã hủy thao tác xóa chờ "
+                        "và đang đọc lại dự án"),
+        }, context)
+        self._begin_timeline_reconcile(str(context.get("project_id", "")))
+
+    def _finish_background_subtitle_save(self, succeeded: bool = True) -> None:
+        self._subtitle_save_in_flight = False
+        self._subtitle_save_context = {}
+        self._subtitle_save_watchdog.stop()
+        if not succeeded:
+            for pending in self._subtitle_save_queue:
+                context = pending.get("context")
+                if isinstance(context, dict):
+                    self.project_state.subtitle_cues.rollback_text_changes(
+                        context.get("optimistic_changes", [])
+                    )
+            self._subtitle_save_queue.clear()
+            self._subtitle_flush_callbacks.clear()
+            self.saveStateChanged.emit()
+            return
+        if self._subtitle_save_queue:
+            if self._subtitle_flush_callbacks:
+                QTimer.singleShot(0, self._dispatch_background_subtitle_save)
+            else:
+                self._subtitle_save_timer.start()
+            self._save_state = f"Đang đồng bộ {len(self._subtitle_save_queue)} thay đổi · Chưa lưu"
+        else:
+            self._save_state = (
+                "Đang lưu thay đổi phụ đề"
+                if self._scene_timing_context or self._subtitle_geometry_context else (
+                    "Chưa lưu · Ctrl+S · Tự lưu mỗi 5 phút" if self._project_dirty else "Đã lưu"
+                )
+            )
+            self._run_subtitle_flush_callbacks()
+        self.saveStateChanged.emit()
+
+    def _run_subtitle_flush_callbacks(self) -> None:
+        if (self._scene_timing_context or self._subtitle_geometry_context
+                or self._subtitle_command_context
+                or self._subtitle_save_in_flight
+                or self._subtitle_save_queue or self._timeline_busy
+                or self._pending_effect_commands or self._timeline_reconcile_pending):
+            return
+        callbacks = tuple(self._subtitle_flush_callbacks.values())
+        self._subtitle_flush_callbacks.clear()
+        for callback in callbacks:
+            QTimer.singleShot(0, callback)
+
+    def _cancel_dependent_editor_changes(self) -> None:
+        """Do not replay uncertain dependent edits later or in another project."""
+        self._subtitle_flush_callbacks.clear()
+        if self._subtitle_save_queue or self._subtitle_save_in_flight:
+            self._finish_background_subtitle_save(False)
+        geometry_ids = set()
+        for pending in reversed(self._pending_effect_commands):
+            self.project_state.rollback_local_effect(pending.get("rollback", {}))
+            if pending.get("geometry") and pending.get("overlay_id"):
+                geometry_ids.add(str(pending["overlay_id"]))
+        self._pending_effect_commands.clear()
+        for overlay_id in geometry_ids:
+            self.overlayGeometrySettled.emit(overlay_id, False)
 
     def _start_ocr_worker(self, job_id: str) -> None:
         self.runtime.request(
@@ -8910,7 +11302,7 @@ class ApplicationViewModel(QObject):
         self,
         command: str,
         *,
-        value: str | int | float | None = None,
+        value: str | int | float | dict | None = None,
         apply_linked: bool = True,
         use_playhead: bool = False,
         needs_selection: bool = True,

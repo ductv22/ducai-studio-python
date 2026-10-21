@@ -24,6 +24,11 @@ Item {
         Math.min(1, Math.log(projectDurationUs / viewportDurationUs) / Math.log(maximumZoom))
     )
     property real pendingZoomLevel: 0
+    property bool followPlayhead: appModel.uiIntValue("timelineFollowPlayhead", 1) === 1
+    property bool spacePanHeld: false
+    property bool timelinePanActive: false
+    property real timelinePanOriginX: 0
+    property real timelinePanOriginStartUs: 0
     property real pendingVoiceSyncSpeed: 1.25
     property bool clipResizeActive: false
     property bool clipResizePending: false
@@ -42,8 +47,13 @@ Item {
     property bool clipResizeSnapActive: false
     property bool clipResizeSpeedLimited: false
     property string clipResizeLimitText: ""
+    property int openContextMenus: 0
     property bool sceneTimingActive: false
     property bool sceneTimingPending: false
+    property int sceneTimingGeneration: 0
+    property var sceneTimingBases: ({})
+    property bool sceneTimingSnapStartEligible: false
+    property bool sceneTimingSnapEndEligible: false
     property string sceneTimingClipId: ""
     property string sceneTimingCueId: ""
     property string sceneTimingMode: ""
@@ -56,7 +66,11 @@ Item {
     property int sceneTimingTrackIndex: -1
     property string sceneTimingTrackId: ""
     property real sceneTimingPreviewDeltaUs: 0
+    property real sceneTimingMinimumDeltaUs: 0
+    property real sceneTimingMaximumDeltaUs: 0
+    property int sceneTimingMinimumLaneDelta: 0
     property int sceneTimingLaneDelta: 0
+    property bool sceneTimingFixedLane: false
     property bool sceneTimingSnapActive: false
     property string sceneTimingSnapEdge: ""
     property real sceneTimingSnapTargetUs: -1
@@ -74,6 +88,7 @@ Item {
     property real clipMovePreviewDeltaUs: 0
     property int clipMoveTrackIndex: -1
     property bool clipMoveSnapActive: false
+    property real fittedProjectDurationUs: 0
     activeFocusOnTab: true
     focus: true
     Accessible.name: "Timeline"
@@ -88,12 +103,75 @@ Item {
         onCueSubmitted: root.regionEditorMode = ""
     }
 
+    Timer {
+        id: trackViewportTimer
+        interval: 40
+        repeat: false
+        onTriggered: root.applyTrackViewport()
+    }
+
+    Timer {
+        id: timelineViewportTimer
+        // Geometry follows the pointer immediately in QML.  Coalescing the
+        // Python model synchronization to roughly one frame prevents a burst
+        // of wheel/drag events from rebuilding hundreds of clip delegates.
+        interval: 24
+        repeat: false
+        onTriggered: root.syncTimelineViewportModels()
+    }
+
     // Let focused text fields consume editing shortcuts (Ctrl+A, Ctrl+C, ...)
     // before the timeline-level selection handler sees them.  Without this,
     // Ctrl+A in the speed/volume inspector selected every track and cleared the
     // clip inspector, making per-cue editing appear unavailable.
     Keys.priority: Keys.AfterItem
     Keys.onPressed: function(event) {
+        if (timelinePreview.textEditorHasFocus()) return
+        if ((event.modifiers & Qt.ControlModifier) && !event.isAutoRepeat
+                && (root.appModel.selectedClipTrackKind === "video" || event.key === Qt.Key_V)) {
+            if (event.key === Qt.Key_C) root.appModel.copySelectedVideo()
+            else if (event.key === Qt.Key_V) {
+                timelinePreview.pause()
+                root.appModel.pasteVideoAtPlayhead()
+            } else if (event.key === Qt.Key_D) {
+                timelinePreview.pause()
+                root.appModel.duplicateSelectedVideo()
+            } else return
+            event.accepted = true
+            return
+        }
+        if ((event.modifiers & Qt.ControlModifier)
+                && (event.key === Qt.Key_Z || event.key === Qt.Key_Y)) {
+            if (event.key === Qt.Key_Z) root.appModel.undoTimeline()
+            else root.appModel.redoTimeline()
+            event.accepted = true
+            return
+        }
+        if (event.key === Qt.Key_Delete && event.modifiers === Qt.NoModifier) {
+            timelinePreview.pause()
+            root.appModel.deleteTimelineSelection()
+            event.accepted = true
+            return
+        }
+        if (event.key === Qt.Key_X && event.modifiers === Qt.NoModifier
+                && !event.isAutoRepeat) {
+            timelinePreview.pause()
+            root.appModel.splitVideoAtPlayhead()
+            event.accepted = true
+            return
+        }
+        if (event.key === Qt.Key_M && !event.isAutoRepeat) {
+            if (event.modifiers & Qt.ShiftModifier)
+                root.appModel.removeTimelineMarkerAtPlayhead()
+            else
+                root.appModel.addTimelineMarker()
+            event.accepted = true
+            return
+        }
+        if (event.key === Qt.Key_Space && !event.isAutoRepeat) {
+            root.spacePanHeld = true
+            return
+        }
         if (event.key === Qt.Key_Escape
                 && (root.clipResizeActive || root.sceneTimingActive || root.clipMoveActive)) {
             if (root.clipResizeActive) root.cancelClipResize()
@@ -112,20 +190,39 @@ Item {
             return
         }
     }
+    Keys.onReleased: function(event) {
+        if (event.key === Qt.Key_Space && !event.isAutoRepeat)
+            root.spacePanHeld = false
+    }
 
     function clipUsesResizePreview(clipId) {
         return clipResizeClipId === clipId
             && (clipResizeActive || clipResizePending)
     }
 
+    readonly property var cueSelectionLookup: {
+        const ids = root.appModel.selectedCueIds
+        const lookup = Object.create(null)
+        for (let i = 0; i < ids.length; ++i) lookup[ids[i]] = true
+        return lookup
+    }
+
     function cueSelected(cueId) {
-        return root.appModel.selectedCueIds.indexOf(String(cueId || "")) >= 0
+        return root.cueSelectionLookup[String(cueId || "")] === true
     }
 
     function clipUsesSceneTimingPreview(clipId, cueId) {
         if (!(sceneTimingActive || sceneTimingPending)) return false
-        if (sceneTimingMode === "move") return cueSelected(cueId)
-        return sceneTimingClipId === clipId
+        return Boolean(sceneTimingBases[String(cueId || "")])
+    }
+
+    function sceneTimingBase(cueId, edge, fallbackUs) {
+        const timing = sceneTimingBases[String(cueId || "")]
+        return timing ? Number(timing[edge === "start" ? 0 : 1]) : fallbackUs
+    }
+
+    function sceneTimingSnapThresholdUs() {
+        return Math.min(500_000, 8 * root.viewportDurationUs / Math.max(1, clipLayer.width))
     }
 
     function clipUsesMovePreview(clipId, linkGroupId) {
@@ -169,7 +266,8 @@ Item {
             if (state === "matched") return Theme.successTint
         }
         if (selected) return Theme.selectionFill
-        if (trackKind === "original_audio" || trackKind === "voice") return Theme.audio
+        if (trackKind === "original_audio" || trackKind === "voice"
+                || trackKind === "background_music") return Qt.darker(Theme.audio, 3.0)
         return Theme.video
     }
 
@@ -312,12 +410,13 @@ Item {
 
     function beginSceneTiming(clipId, cueId, mode, startUs, endUs, trackIndex,
                               trackId, pointerX, pointerY) {
-        if (!cueId || root.sceneTimingPending || root.appModel.subtitleBusy) return
+        if (!cueId || root.sceneTimingPending || root.appModel.subtitleBusy
+                || root.appModel.timelineBusy) return
         root.forceActiveFocus()
         root.appModel.selectClip(clipId)
         if (!root.cueSelected(cueId))
-            root.appModel.selectCue(String(cueId), Number(startUs))
-        root.selectInspectorTab("clip")
+            root.appModel.selectTimelineCue(String(cueId), false)
+        root.selectInspectorTab("text")
         root.sceneTimingClipId = String(clipId)
         root.sceneTimingCueId = String(cueId)
         root.sceneTimingMode = String(mode)
@@ -330,35 +429,45 @@ Item {
         root.sceneTimingTrackIndex = Number(trackIndex)
         root.sceneTimingTrackId = String(trackId || "")
         root.sceneTimingPreviewDeltaUs = 0
+        const timingBounds = root.appModel.selectedSceneTimingDeltaBounds(mode)
+        root.sceneTimingBases = timingBounds.timings || ({})
+        root.sceneTimingMinimumDeltaUs = Number(timingBounds.minimum || 0)
+        root.sceneTimingMaximumDeltaUs = Number(timingBounds.maximum || 0)
+        root.sceneTimingMinimumLaneDelta = Number(timingBounds.minimumLaneDelta || 0)
+        root.sceneTimingFixedLane = Boolean(timingBounds.fixedLane)
         root.sceneTimingLaneDelta = 0
         root.sceneTimingSnapActive = false
         root.sceneTimingSnapEdge = ""
         root.sceneTimingSnapTargetUs = -1
+        const snapThreshold = root.sceneTimingSnapThresholdUs()
+        // An edge already near the playhead must be free to move away; only
+        // an approaching edge is attracted during this gesture.
+        root.sceneTimingSnapStartEligible = Math.abs(
+            Number(startUs) - root.appModel.playheadUs) > snapThreshold
+        root.sceneTimingSnapEndEligible = Math.abs(
+            Number(endUs) - root.appModel.playheadUs) > snapThreshold
         root.sceneTimingActive = true
     }
 
     function updateSceneTiming(pointerX, pointerY) {
         if (!root.sceneTimingActive) return
         const pointerUs = root.clipLayerTimeAt(pointerX)
-        const minimumDurationUs = 100_000
-        const eightPixelsUs = 8 * root.viewportDurationUs
-            / Math.max(1, clipLayer.width)
-        const snapThresholdUs = Math.min(
-            500_000, Math.max(80_000, eightPixelsUs)
-        )
+        const snapThresholdUs = root.sceneTimingSnapThresholdUs()
         const playheadUs = Number(root.appModel.playheadUs)
         root.sceneTimingSnapActive = false
         root.sceneTimingSnapEdge = ""
         root.sceneTimingSnapTargetUs = -1
         if (root.sceneTimingMode === "move") {
             const rawDelta = pointerUs - root.sceneTimingPointerOriginUs
-            const minimumDelta = -root.sceneTimingOriginalStartUs
-            const maximumDelta = root.projectDurationUs - root.sceneTimingOriginalEndUs
+            const minimumDelta = root.sceneTimingMinimumDeltaUs
+            const maximumDelta = root.sceneTimingMaximumDeltaUs
             let delta = Math.max(minimumDelta, Math.min(maximumDelta, rawDelta))
             const rawStartUs = root.sceneTimingOriginalStartUs + delta
             const rawEndUs = root.sceneTimingOriginalEndUs + delta
-            const startDistance = Math.abs(rawStartUs - playheadUs)
-            const endDistance = Math.abs(rawEndUs - playheadUs)
+            const startDistance = root.sceneTimingSnapStartEligible
+                ? Math.abs(rawStartUs - playheadUs) : Infinity
+            const endDistance = root.sceneTimingSnapEndEligible
+                ? Math.abs(rawEndUs - playheadUs) : Infinity
             if (Math.min(startDistance, endDistance) <= snapThresholdUs) {
                 const snapStart = startDistance <= endDistance
                 const desiredDelta = playheadUs - (snapStart
@@ -374,57 +483,71 @@ Item {
             root.sceneTimingPreviewDeltaUs = delta
             root.sceneTimingPreviewStartUs = root.sceneTimingOriginalStartUs + delta
             root.sceneTimingPreviewEndUs = root.sceneTimingOriginalEndUs + delta
-            const currentLane = Number(root.sceneTimingTrackId.slice(1)) || 2
             const rawLaneDelta = Math.round(
                 (Number(pointerY) - root.sceneTimingPointerOriginY) / 62
             )
-            root.sceneTimingLaneDelta = Math.max(1 - currentLane, rawLaneDelta)
-        } else if (root.sceneTimingMode === "left") {
-            let startUs = Math.max(
-                0,
-                Math.min(root.sceneTimingOriginalEndUs - minimumDurationUs, pointerUs)
+            root.sceneTimingLaneDelta = root.sceneTimingFixedLane ? 0 : Math.max(
+                root.sceneTimingMinimumLaneDelta, rawLaneDelta
             )
-            if (Math.abs(startUs - playheadUs) <= snapThresholdUs) {
-                startUs = Math.max(
-                    0,
+        } else if (root.sceneTimingMode === "left") {
+            let delta = Math.max(
+                root.sceneTimingMinimumDeltaUs,
+                Math.min(
+                    root.sceneTimingMaximumDeltaUs,
+                    pointerUs - root.sceneTimingPointerOriginUs
+                )
+            )
+            let startUs = root.sceneTimingOriginalStartUs + delta
+            if (root.sceneTimingSnapStartEligible
+                    && Math.abs(startUs - playheadUs) <= snapThresholdUs) {
+                delta = Math.max(
+                    root.sceneTimingMinimumDeltaUs,
                     Math.min(
-                        root.sceneTimingOriginalEndUs - minimumDurationUs,
-                        playheadUs
+                        root.sceneTimingMaximumDeltaUs,
+                        playheadUs - root.sceneTimingOriginalStartUs
                     )
                 )
+                startUs = root.sceneTimingOriginalStartUs + delta
                 root.sceneTimingSnapActive = true
                 root.sceneTimingSnapEdge = "start"
                 root.sceneTimingSnapTargetUs = playheadUs
             }
             root.sceneTimingPreviewStartUs = startUs
             root.sceneTimingPreviewEndUs = root.sceneTimingOriginalEndUs
+            root.sceneTimingPreviewDeltaUs = delta
         } else {
             root.sceneTimingPreviewStartUs = root.sceneTimingOriginalStartUs
-            let endUs = Math.min(
-                root.projectDurationUs,
-                Math.max(root.sceneTimingOriginalStartUs + minimumDurationUs, pointerUs)
+            let delta = Math.max(
+                root.sceneTimingMinimumDeltaUs,
+                Math.min(
+                    root.sceneTimingMaximumDeltaUs,
+                    pointerUs - root.sceneTimingPointerOriginUs
+                )
             )
-            if (Math.abs(endUs - playheadUs) <= snapThresholdUs) {
-                endUs = Math.min(
-                    root.projectDurationUs,
-                    Math.max(
-                        root.sceneTimingOriginalStartUs + minimumDurationUs,
-                        playheadUs
+            let endUs = root.sceneTimingOriginalEndUs + delta
+            if (root.sceneTimingSnapEndEligible
+                    && Math.abs(endUs - playheadUs) <= snapThresholdUs) {
+                delta = Math.max(
+                    root.sceneTimingMinimumDeltaUs,
+                    Math.min(
+                        root.sceneTimingMaximumDeltaUs,
+                        playheadUs - root.sceneTimingOriginalEndUs
                     )
                 )
+                endUs = root.sceneTimingOriginalEndUs + delta
                 root.sceneTimingSnapActive = true
                 root.sceneTimingSnapEdge = "end"
                 root.sceneTimingSnapTargetUs = playheadUs
             }
             root.sceneTimingPreviewEndUs = endUs
+            root.sceneTimingPreviewDeltaUs = delta
         }
         if (root.sceneTimingMode === "move")
             root.appModel.previewSelectedSceneTextMove(root.sceneTimingPreviewDeltaUs)
         else
-            root.appModel.previewSceneTextTiming(
-                root.sceneTimingCueId,
-                root.sceneTimingPreviewStartUs,
-                root.sceneTimingPreviewEndUs
+            root.appModel.previewSelectedSceneTextResize(
+                root.sceneTimingMode,
+                root.sceneTimingPreviewDeltaUs
             )
     }
 
@@ -443,18 +566,25 @@ Item {
         }
         root.sceneTimingPending = true
         if (root.sceneTimingMode === "move")
-            root.appModel.moveSelectedSceneTexts(
+            root.sceneTimingGeneration = root.appModel.moveSelectedSceneTexts(
                 root.sceneTimingPreviewDeltaUs,
                 root.sceneTimingLaneDelta
             )
         else
-            root.appModel.setSceneTextTiming(
-                root.sceneTimingCueId,
-                root.sceneTimingPreviewStartUs,
-                root.sceneTimingPreviewEndUs,
-                root.sceneTimingOriginalStartUs,
-                root.sceneTimingOriginalEndUs
+            root.sceneTimingGeneration = root.appModel.resizeSelectedSceneTexts(
+                root.sceneTimingMode,
+                root.sceneTimingPreviewDeltaUs
             )
+        if (!root.sceneTimingGeneration)
+            root.cancelPendingSceneTiming()
+    }
+
+    function cancelPendingSceneTiming() {
+        if (root.sceneTimingMode === "move")
+            root.appModel.previewSelectedSceneTextMove(0)
+        else
+            root.appModel.previewSelectedSceneTextResize(root.sceneTimingMode, 0)
+        root.resetSceneTiming()
     }
 
     function cancelSceneTiming() {
@@ -462,23 +592,24 @@ Item {
         if (root.sceneTimingMode === "move")
             root.appModel.previewSelectedSceneTextMove(0)
         else
-            root.appModel.previewSceneTextTiming(
-                root.sceneTimingCueId,
-                root.sceneTimingOriginalStartUs,
-                root.sceneTimingOriginalEndUs
-            )
+            root.appModel.previewSelectedSceneTextResize(root.sceneTimingMode, 0)
         root.resetSceneTiming()
     }
 
     function resetSceneTiming() {
         root.sceneTimingActive = false
         root.sceneTimingPending = false
+        root.sceneTimingGeneration = 0
+        root.sceneTimingBases = ({})
         root.sceneTimingClipId = ""
         root.sceneTimingCueId = ""
         root.sceneTimingMode = ""
         root.sceneTimingTrackIndex = -1
         root.sceneTimingTrackId = ""
         root.sceneTimingPreviewDeltaUs = 0
+        root.sceneTimingMinimumDeltaUs = 0
+        root.sceneTimingMaximumDeltaUs = 0
+        root.sceneTimingMinimumLaneDelta = 0
         root.sceneTimingLaneDelta = 0
         root.sceneTimingSnapActive = false
         root.sceneTimingSnapEdge = ""
@@ -555,8 +686,17 @@ Item {
         const maximumStart = Math.max(0, projectDurationUs - duration)
         viewportStartUs = Math.max(0, Math.min(maximumStart, startUs))
         viewportEndUs = viewportStartUs + duration
+        if (!timelineViewportTimer.running) timelineViewportTimer.start()
+    }
+
+    function syncTimelineViewportModels() {
+        // Do not recycle the delegate currently holding a drag/resize grab.
+        if (sceneTimingActive || clipMoveActive || clipResizeActive || openContextMenus > 0) {
+            if (!timelineViewportTimer.running) timelineViewportTimer.start()
+            return
+        }
         const prefetchUs = Math.min(
-            10_000_000, Math.max(250_000, duration * 0.25)
+            10_000_000, Math.max(250_000, viewportDurationUs * 0.25)
         )
         appModel.currentProject.clipModel.setViewport(
             viewportStartUs,
@@ -570,12 +710,68 @@ Item {
         )
     }
 
+    function scheduleTrackViewportUpdate() {
+        if (!trackViewportTimer.running) trackViewportTimer.start()
+    }
+
+    function applyTrackViewport() {
+        if (sceneTimingActive || clipMoveActive || clipResizeActive || openContextMenus > 0) {
+            if (!trackViewportTimer.running) trackViewportTimer.start()
+            return
+        }
+        if (!trackList || trackList.height <= 0) return
+        const firstTrack = Math.max(0, Math.floor(trackList.contentY / 62))
+        const lastTrack = Math.max(
+            firstTrack,
+            Math.ceil((trackList.contentY + trackList.height) / 62) - 1
+        )
+        appModel.currentProject.clipModel.setTrackViewport(
+            firstTrack,
+            lastTrack,
+            1
+        )
+    }
+
     function showProjectStart() {
         applyViewport(0, Math.min(projectDurationUs, 60_000_000))
     }
 
     function fitProject() {
         applyViewport(0, projectDurationUs)
+    }
+
+    function fitSelection() {
+        const cue = appModel.selectedCue || ({})
+        const startUs = Number(cue.start_us ?? -1)
+        const endUs = Number(cue.end_us ?? -1)
+        if (startUs < 0 || endUs <= startUs) {
+            zoomBy(0.7)
+            return
+        }
+        const padding = Math.max(250_000, (endUs - startUs) * 0.35)
+        applyViewport(startUs - padding, endUs - startUs + padding * 2)
+    }
+
+    function panBy(deltaUs) {
+        applyViewport(viewportStartUs + deltaUs, viewportDurationUs)
+    }
+
+    function keepPlayheadVisible() {
+        if (!followPlayhead || !timelinePreview.playing || clipResizeActive
+                || sceneTimingActive || clipMoveActive) return
+        const playhead = Number(appModel.playheadUs)
+        const leftGuard = viewportStartUs + viewportDurationUs * 0.04
+        const rightGuard = viewportEndUs - viewportDurationUs * 0.04
+        if (playhead >= rightGuard)
+            applyViewport(playhead - viewportDurationUs * 0.12, viewportDurationUs)
+        else if (playhead < leftGuard)
+            applyViewport(playhead - viewportDurationUs * 0.88, viewportDurationUs)
+    }
+
+    function setFollowPlayhead(enabled) {
+        followPlayhead = enabled
+        appModel.setUiIntValue("timelineFollowPlayhead", enabled ? 1 : 0)
+        if (enabled) keepPlayheadVisible()
     }
 
     function zoomAt(factor, anchorRatio) {
@@ -640,33 +836,53 @@ Item {
 
     Component.onCompleted: {
         fittedProjectId = appModel.currentProject.projectId
+        fittedProjectDurationUs = appModel.currentProject.durationUs
         fitProject()
         refreshClipFields()
+    }
+
+    VideoClipMenu {
+        id: videoMenu
+        appModel: root.appModel
+        onPauseRequested: timelinePreview.pause()
+        onAboutToShow: ++root.openContextMenus
+        onClosed: root.openContextMenus = Math.max(0, root.openContextMenus - 1)
     }
 
     Connections {
         target: root.appModel.currentProject
         function onChanged() {
-            if (root.fittedProjectId !== root.appModel.currentProject.projectId) {
+            const duration = Math.max(0, root.appModel.currentProject.durationUs)
+            // Import creates the empty project before its media/track ACK.
+            // Initialize once when that same project first receives a duration.
+            if (root.fittedProjectId !== root.appModel.currentProject.projectId
+                    || (root.fittedProjectDurationUs <= 0 && duration > 0)) {
                 root.fittedProjectId = root.appModel.currentProject.projectId
+                root.fittedProjectDurationUs = duration
                 root.fitProject()
                 return
             }
+            root.fittedProjectDurationUs = duration
             root.applyViewport(root.viewportStartUs, root.viewportDurationUs)
         }
     }
 
     Connections {
         target: root.appModel
+        function onTimelineSettingsRequested() { root.selectInspectorTab("settings") }
         function onSelectedClipChanged() { root.refreshClipFields() }
+        function onSelectedCueChanged() {
+            if (root.appModel.selectedCueCount > 0) root.selectInspectorTab("text")
+        }
+        function onPlayheadChanged() { root.keepPlayheadVisible() }
         function onTimelineBusyChanged() {
             if (root.clipResizePending && !root.appModel.timelineBusy)
                 root.resetClipResize()
             if (root.clipMovePending && !root.appModel.timelineBusy)
                 root.resetClipMove()
         }
-        function onSubtitleBusyChanged() {
-            if (root.sceneTimingPending && !root.appModel.subtitleBusy)
+        function onSceneTimingSettled(generation, succeeded) {
+            if (root.sceneTimingPending && generation === root.sceneTimingGeneration)
                 root.resetSceneTiming()
         }
     }
@@ -744,12 +960,10 @@ Item {
                 SplitView.preferredHeight: verticalTimelineSplit.height
                     * root.appModel.uiRealValue("timelinePreviewRatio", 0.55)
                 SplitView.minimumHeight: 200
-                // Reserve enough room below for the persistent typography
-                // toolbar and a usable multi-track viewport at the supported
-                // 720 px window height.  The 10 px splitter handle is included
-                // in the 420 px reservation.
+                // Typography lives in the side inspector. Reserve track space
+                // without forcing the overview outside the SplitView hit area.
                 SplitView.maximumHeight: Math.max(
-                    200, verticalTimelineSplit.height - 420
+                    200, verticalTimelineSplit.height - 270
                 )
                 color: Theme.canvas
                 onHeightChanged: persistPreviewRatio.restart()
@@ -757,6 +971,12 @@ Item {
                     id: timelinePreview
                     anchors.fill: parent
                     appModel: root.appModel
+                    showProjectOverlays: true
+                    editableProjectOverlays: root.inspectorTab === "settings" || root.inspectorTab === "project"
+                    videoContextMenuEnabled: true
+                    onVideoContextMenuRequested: function(x, y) {
+                        videoMenu.openAt(timelinePreview, x, y)
+                    }
                     ocrRegionEditorMode: root.regionEditorMode
                     onColorPicked: function(target, color) {
                         subtitleTextToolbar.applyPickedColor(target, color)
@@ -772,16 +992,15 @@ Item {
             Item {
                 SplitView.fillWidth: true
                 SplitView.fillHeight: true
-                // Keep at least one complete track row visible below the
-                // persistent grouped typography toolbar at 720p.
-                SplitView.minimumHeight: 410
+                SplitView.minimumHeight: 260
 
                 ColumnLayout {
                     anchors.fill: parent
                     spacing: Theme.space8
 
-            RowLayout {
+            Flow {
                 Layout.fillWidth: true
+                Layout.preferredHeight: implicitHeight
                 spacing: Theme.space8
                 DsButton {
                     text: "T"
@@ -794,12 +1013,35 @@ Item {
                     Accessible.name: "Thêm chữ vào video tại playhead"
                 }
                 DsButton {
-                    text: "Tách"
+                    text: "＋ Mark"
                     compact: true
-                    tooltipText: "Tách clip đang chọn tại vị trí playhead."
-                    enabled: root.appModel.hasSelectedClip && !root.appModel.timelineBusy
-                    disabledReason: "Cần chọn clip và đặt playhead bên trong clip."
-                    onClicked: root.appModel.splitSelected(true)
+                    primary: false
+                    tooltipText: "Đánh dấu vị trí playhead (phím M)."
+                    enabled: root.appModel.currentProject.hasProject
+                        && !root.appModel.timelineBusy
+                    onClicked: root.appModel.addTimelineMarker()
+                    Accessible.name: "Thêm mark tại playhead"
+                }
+                DsButton {
+                    text: "Xoá mark"
+                    compact: true
+                    danger: true
+                    tooltipText: "Xoá mark gần playhead (Shift+M)."
+                    enabled: root.appModel.currentProject.hasProject
+                        && !root.appModel.timelineBusy
+                    onClicked: root.appModel.removeTimelineMarkerAtPlayhead()
+                    Accessible.name: "Xoá mark gần playhead"
+                }
+                DsIconButton {
+                    objectName: "timelineScissorsButton"
+                    iconName: "scissors"
+                    tooltipText: "Tách video tại playhead (X). Tách hai đầu rồi chọn đoạn và nhấn Delete để xóa."
+                    enabled: root.appModel.currentProject.hasVideo && !root.appModel.timelineBusy
+                    onClicked: {
+                        timelinePreview.pause()
+                        root.appModel.splitVideoAtPlayhead()
+                    }
+                    Accessible.name: "Tách video tại playhead, phím X"
                 }
                 DsButton {
                     text: "Khớp D1"
@@ -825,7 +1067,13 @@ Item {
                     disabledReason: "Chưa có thao tác để làm lại."
                     onClicked: root.appModel.redoTimeline()
                 }
-                Item { Layout.fillWidth: true }
+                DsButton {
+                    objectName: "timelineSettingsButton"
+                    text: "Thiết lập"
+                    compact: true
+                    tooltipText: "Thiết lập xuất, phụ đề, logo, blur, filter và âm thanh."
+                    onClicked: root.selectInspectorTab("settings")
+                }
                 DsButton {
                     text: "Đầu"
                     compact: true
@@ -833,6 +1081,38 @@ Item {
                     enabled: root.appModel.currentProject.hasProject
                     disabledReason: "Timeline chưa có nội dung."
                     onClicked: root.showProjectStart()
+                }
+                DsIconButton {
+                    iconName: "zoom-out"
+                    tooltipText: "Thu nhỏ Timeline"
+                    enabled: root.appModel.currentProject.hasProject
+                    onClicked: root.zoomBy(1.35)
+                }
+                DsIconButton {
+                    iconName: "zoom-in"
+                    tooltipText: "Phóng to Timeline tại playhead"
+                    enabled: root.appModel.currentProject.hasProject
+                    onClicked: root.zoomBy(0.74)
+                }
+                DsIconButton {
+                    iconName: "focus"
+                    tooltipText: "Vừa cue hoặc vùng đang chọn"
+                    enabled: root.appModel.currentProject.hasProject
+                    onClicked: root.fitSelection()
+                }
+                DsIconButton {
+                    iconName: "maximize"
+                    tooltipText: "Vừa toàn bộ dự án"
+                    enabled: root.appModel.currentProject.hasProject
+                    onClicked: root.fitProject()
+                }
+                DsIconButton {
+                    iconName: "locate"
+                    tooltipText: root.followPlayhead
+                        ? "Tắt tự bám playhead" : "Bật tự bám playhead"
+                    active: root.followPlayhead
+                    enabled: root.appModel.currentProject.hasProject
+                    onClicked: root.setFollowPlayhead(!root.followPlayhead)
                 }
                 Text {
                     text: Math.round(root.projectDurationUs / root.viewportDurationUs * 100) + "%"
@@ -842,8 +1122,7 @@ Item {
                 }
                 Slider {
                     id: zoomSlider
-                    Layout.preferredWidth: 120
-                    Layout.minimumWidth: 88
+                    width: 120
                     from: 0
                     to: 1
                     value: root.zoomLevel
@@ -854,22 +1133,18 @@ Item {
                     }
                     Accessible.name: "Mức kéo dãn timeline"
                 }
-                DsButton {
-                    text: "Toàn bộ"
-                    compact: true
-                    tooltipText: "Hiển thị toàn bộ thời lượng dự án trong Timeline."
-                    enabled: root.appModel.currentProject.hasProject
-                    disabledReason: "Timeline chưa có nội dung."
-                    onClicked: root.fitProject()
+                Text {
+                    text: "Bước"
+                    color: Theme.textMuted
+                    font.pixelSize: 10
                 }
-            }
-
-            SubtitleTextToolbar {
-                id: subtitleTextToolbar
-                Layout.fillWidth: true
-                appModel: root.appModel
-                onColorPickRequested: function(target) {
-                    timelinePreview.colorPickerTarget = target
+                DsSpinBox {
+                    width: 104
+                    from: 1
+                    to: 1000
+                    value: root.appModel.timelineSeekStepMs
+                    accessibleName: "Bước tua chính xác từ 1 đến 1000 mili giây"
+                    onValueModified: root.appModel.setTimelineSeekStepMs(value)
                 }
             }
 
@@ -936,7 +1211,10 @@ Item {
                             onContentYChanged: {
                                 if (!modelResetInProgress)
                                     contentYBeforeModelReset = contentY
+                                root.scheduleTrackViewportUpdate()
                             }
+                            onHeightChanged: root.scheduleTrackViewportUpdate()
+                            Component.onCompleted: root.scheduleTrackViewportUpdate()
                             Connections {
                                 target: trackList.model
                                 function onModelAboutToBeReset() {
@@ -957,6 +1235,7 @@ Item {
                                             )
                                         )
                                         trackList.modelResetInProgress = false
+                                        root.scheduleTrackViewportUpdate()
                                     })
                                 }
                             }
@@ -991,12 +1270,26 @@ Item {
                                             font.weight: Font.DemiBold
                                         }
                                         Text {
+                                            visible: trackRow.model.kind !== "text"
                                             text: trackRow.model.trackId
                                                 + (trackRow.model.muted ? "  ·  Tắt tiếng" : "")
                                                 + (trackRow.model.locked ? "  ·  Đã khóa" : "")
                                             color: Theme.textMuted
                                             font.family: Theme.timecodeFamily
                                             font.pixelSize: 10
+                                        }
+                                        DsButton {
+                                            objectName: "addTimelineTitleButton"
+                                            visible: trackRow.model.kind === "text"
+                                            text: "T + Thêm text"
+                                            compact: true
+                                            enabled: root.appModel.currentProject.hasVideo
+                                                && !trackRow.model.locked
+                                            tooltipText: "Thêm tên phim/kênh trên track Text riêng, không lồng tiếng."
+                                            onClicked: {
+                                                timelinePreview.pause()
+                                                manualCueDialog.openForTitle(root.appModel.playheadUs)
+                                            }
                                         }
                                     }
                                     Rectangle {
@@ -1016,12 +1309,18 @@ Item {
                                     width: 188
                                     acceptedButtons: Qt.LeftButton | Qt.RightButton
                                     onClicked: function(mouse) {
+                                        if (trackRow.model.kind === "text" && mouse.button === Qt.LeftButton) {
+                                            if (trackRow.model.locked) return
+                                            timelinePreview.pause()
+                                            manualCueDialog.openForTitle(root.appModel.playheadUs)
+                                            return
+                                        }
                                         if (mouse.modifiers & Qt.ControlModifier)
                                             root.appModel.toggleTrackSelection(trackRow.model.trackId)
                                         else
                                             root.appModel.selectTrack(trackRow.model.trackId)
                                         root.selectInspectorTab("track")
-                                        if (mouse.button === Qt.RightButton) {
+                                        if (mouse.button === Qt.RightButton && root.appModel.hasSelectedTrack) {
                                             trackMenu.openAt(trackRow, mouse.x, mouse.y)
                                         }
                                     }
@@ -1071,6 +1370,7 @@ Item {
                                         spacing: 0
                                         DsContextButton {
                                             Layout.fillWidth: true
+                                            visible: trackRow.model.kind !== "text"
                                             text: trackRow.model.muted
                                                 ? "Bật tiếng track" : "Tắt tiếng track"
                                             onClicked: {
@@ -1116,6 +1416,7 @@ Item {
                                     id: deleteTrackDialog
                                     title: "Xoá timeline?"
                                     modal: true
+                                    width: 352
                                     standardButtons: Dialog.Cancel | Dialog.Ok
                                     anchors.centerIn: Overlay.overlay
                                     contentItem: Text {
@@ -1139,28 +1440,76 @@ Item {
                             anchors.leftMargin: 188
                             anchors.rightMargin: Theme.space12
 
+                            WheelHandler {
+                                target: null
+                                acceptedModifiers: Qt.ControlModifier
+                                onWheel: function(event) {
+                                    root.zoomAt(
+                                        event.angleDelta.y >= 0 ? 0.8 : 1.25,
+                                        Math.max(0, Math.min(
+                                            1, event.x / Math.max(1, clipLayer.width)
+                                        ))
+                                    )
+                                    event.accepted = true
+                                }
+                            }
+
+                            WheelHandler {
+                                target: null
+                                acceptedModifiers: Qt.ShiftModifier
+                                onWheel: function(event) {
+                                    root.panBy(
+                                        (event.angleDelta.y >= 0 ? -1 : 1)
+                                            * root.viewportDurationUs * 0.12
+                                    )
+                                    event.accepted = true
+                                }
+                            }
+
                             MouseArea {
                                 id: subtitleMarqueeArea
+                                objectName: "timelineMarqueeArea"
                                 anchors.fill: parent
                                 z: 0
-                                acceptedButtons: Qt.LeftButton
+                                acceptedButtons: Qt.LeftButton | Qt.MiddleButton
                                 preventStealing: true
                                 property bool additive: false
                                 onPressed: function(mouse) {
                                     root.forceActiveFocus()
+                                    if (mouse.button === Qt.MiddleButton || root.spacePanHeld) {
+                                        root.timelinePanActive = true
+                                        root.timelinePanOriginX = mouse.x
+                                        root.timelinePanOriginStartUs = root.viewportStartUs
+                                        return
+                                    }
                                     root.marqueeActive = false
                                     root.marqueeStart = Qt.point(mouse.x, mouse.y)
                                     root.marqueeEnd = root.marqueeStart
                                     additive = Boolean(mouse.modifiers & Qt.ControlModifier)
+                                    if (!additive)
+                                        root.appModel.clearTimelineCueSelection()
                                 }
                                 onPositionChanged: function(mouse) {
                                     if (!pressed) return
+                                    if (root.timelinePanActive) {
+                                        const deltaUs = (root.timelinePanOriginX - mouse.x)
+                                            / Math.max(1, width) * root.viewportDurationUs
+                                        root.applyViewport(
+                                            root.timelinePanOriginStartUs + deltaUs,
+                                            root.viewportDurationUs
+                                        )
+                                        return
+                                    }
                                     root.marqueeEnd = Qt.point(mouse.x, mouse.y)
                                     if (Math.abs(root.marqueeEnd.x - root.marqueeStart.x) >= 4
                                             || Math.abs(root.marqueeEnd.y - root.marqueeStart.y) >= 4)
                                         root.marqueeActive = true
                                 }
                                 onReleased: function(mouse) {
+                                    if (root.timelinePanActive) {
+                                        root.timelinePanActive = false
+                                        return
+                                    }
                                     if (!root.marqueeActive) {
                                         root.seekTimelineAt(mouse.x)
                                         return
@@ -1181,7 +1530,30 @@ Item {
                                     root.appModel.selectSubtitleCueIds(ids, additive)
                                     root.marqueeActive = false
                                 }
-                                onCanceled: root.marqueeActive = false
+                                onCanceled: {
+                                    root.marqueeActive = false
+                                    root.timelinePanActive = false
+                                }
+                                onWheel: function(wheel) {
+                                    const direction = wheel.angleDelta.y >= 0 ? 1 : -1
+                                    if (wheel.modifiers & Qt.ControlModifier) {
+                                        root.zoomAt(
+                                            direction > 0 ? 0.8 : 1.25,
+                                            Math.max(0, Math.min(1, wheel.x / Math.max(1, width)))
+                                        )
+                                    } else if (wheel.modifiers & Qt.ShiftModifier) {
+                                        root.panBy(-direction * root.viewportDurationUs * 0.12)
+                                    } else {
+                                        const maximumY = Math.max(
+                                            0, trackList.contentHeight - trackList.height
+                                        )
+                                        trackList.contentY = Math.max(
+                                            0,
+                                            Math.min(maximumY, trackList.contentY - wheel.angleDelta.y)
+                                        )
+                                    }
+                                    wheel.accepted = true
+                                }
                             }
 
                             Rectangle {
@@ -1197,6 +1569,62 @@ Item {
                             }
 
                             Repeater {
+                                id: timelineMarkerRepeater
+                                z: 3
+                                model: root.appModel.currentProject.timelineMarkers
+                                delegate: Item {
+                                    required property var modelData
+                                    readonly property real markerUs: Number(modelData)
+                                    readonly property bool inViewport:
+                                        markerUs >= root.viewportStartUs
+                                        && markerUs <= root.viewportEndUs
+                                    visible: inViewport
+                                    x: (markerUs - root.viewportStartUs)
+                                        / root.viewportDurationUs * clipLayer.width - 1
+                                    y: 0
+                                    width: 2
+                                    height: clipLayer.height
+                                    Rectangle {
+                                        anchors.fill: parent
+                                        color: Theme.primary
+                                        opacity: 0.82
+                                    }
+                                    Rectangle {
+                                        x: -5
+                                        y: 0
+                                        width: 12
+                                        height: 16
+                                        radius: 3
+                                        color: Theme.primary
+                                        border.color: Theme.canvas
+                                        border.width: 1
+                                        Text {
+                                            anchors.centerIn: parent
+                                            text: "M"
+                                            color: Theme.canvas
+                                            font.bold: true
+                                            font.pixelSize: 9
+                                        }
+                                    }
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        anchors.leftMargin: -5
+                                        anchors.rightMargin: -5
+                                        acceptedButtons: Qt.LeftButton | Qt.RightButton
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: function(mouse) {
+                                            if (mouse.button === Qt.RightButton)
+                                                root.appModel.removeTimelineMarker(markerUs)
+                                            else
+                                                root.appModel.setPlayheadMs(markerUs / 1000)
+                                        }
+                                        ToolTip.visible: containsMouse
+                                        ToolTip.text: "Mark " + (markerUs / 1000000).toFixed(3) + " s"
+                                    }
+                                }
+                            }
+
+                            Repeater {
                                 z: 2
                                 model: root.appModel.currentProject.clipModel
                                 delegate: Rectangle {
@@ -1206,7 +1634,10 @@ Item {
                                     // Repeater, so its z value is not inherited.
                                     // Keep clip gestures above the blank seek/
                                     // marquee MouseArea at every scroll offset.
-                                    z: 2
+                                    // Overlapping labels share the one Text line.
+                                    // A selected label must remain reachable above
+                                    // a longer title spanning the whole video.
+                                    z: model.trackKind === "text" && root.cueSelected(model.cueId) ? 4 : 2
                                     readonly property real laneWidth: clipLayer.width
                                     readonly property bool usesResizePreview: root.clipUsesResizePreview(
                                         model.clipId
@@ -1219,10 +1650,10 @@ Item {
                                         model.clipId, model.linkGroupId
                                     )
                                     readonly property bool isSceneTextClip:
-                                        model.trackKind === "subtitle"
+                                        (model.trackKind === "subtitle" || model.trackKind === "text")
                                         && Boolean(model.cueId)
                                     readonly property bool isSubtitleClip:
-                                        model.trackKind === "subtitle"
+                                        (model.trackKind === "subtitle" || model.trackKind === "text")
                                         && Boolean(model.cueId)
                                     readonly property bool isMovableMediaClip:
                                         (model.trackKind === "video"
@@ -1230,16 +1661,20 @@ Item {
                                         && !model.trackLocked
                                     readonly property real effectiveStart: usesSceneTimingPreview
                                         ? (root.sceneTimingMode === "move"
-                                            ? model.startUs + root.sceneTimingPreviewDeltaUs
-                                            : root.sceneTimingPreviewStartUs)
+                                            || root.sceneTimingMode === "left"
+                                            ? root.sceneTimingBase(model.cueId, "start", model.startUs)
+                                                + root.sceneTimingPreviewDeltaUs
+                                            : root.sceneTimingBase(model.cueId, "start", model.startUs))
                                         : (usesMovePreview
                                             ? model.startUs + root.clipMovePreviewDeltaUs
                                             : (usesResizePreview
                                                 ? root.clipResizePreviewStartUs : model.startUs))
                                     readonly property real effectiveEnd: usesSceneTimingPreview
                                         ? (root.sceneTimingMode === "move"
-                                            ? model.endUs + root.sceneTimingPreviewDeltaUs
-                                            : root.sceneTimingPreviewEndUs)
+                                            || root.sceneTimingMode === "right"
+                                            ? root.sceneTimingBase(model.cueId, "end", model.endUs)
+                                                + root.sceneTimingPreviewDeltaUs
+                                            : root.sceneTimingBase(model.cueId, "end", model.endUs))
                                         : (usesMovePreview
                                             ? model.endUs + root.clipMovePreviewDeltaUs
                                             : (usesResizePreview
@@ -1281,7 +1716,7 @@ Item {
                                         (clippedEnd - clippedStart)
                                             / root.viewportDurationUs * laneWidth
                                     )
-                                    height: 34
+                                    height: model.trackKind === "video" ? 46 : 34
                                     radius: Theme.radiusSmall
                                     // A dense D1 timeline can make a cue narrower
                                     // than the label's horizontal padding. Clip the
@@ -1291,37 +1726,57 @@ Item {
                                     clip: true
                                     color: model.isAggregate
                                         ? Theme.surfaceRaised
+                                        : (model.overlapWarning && clipItem.isSubtitleClip
+                                            ? Theme.errorTint
                                         : root.clipFillColor(
                                             effectiveTimingState,
                                             model.trackKind,
                                             root.cueSelected(model.cueId)
                                                 || root.appModel.selectedClipId === model.clipId
-                                        )
+                                        ))
                                     border.width: !model.isAggregate
-                                        && effectiveTimingState === "overflow"
+                                        && model.overlapWarning && clipItem.isSubtitleClip
                                         ? 3
                                         : (!model.isAggregate
-                                            && (effectiveTimingState === "underflow"
-                                                || effectiveTimingState === "position_mismatch"
-                                                || effectiveTimingState === "matched"
-                                                || root.cueSelected(model.cueId)
-                                                || root.appModel.selectedClipId === model.clipId)
-                                            ? 2 : 1)
+                                            && effectiveTimingState === "overflow"
+                                            ? 3
+                                            : (!model.isAggregate
+                                                && (effectiveTimingState === "underflow"
+                                                    || effectiveTimingState === "position_mismatch"
+                                                    || effectiveTimingState === "matched"
+                                                    || root.cueSelected(model.cueId)
+                                                    || root.appModel.selectedClipId === model.clipId)
+                                                ? 2 : 1))
                                     border.color: model.isAggregate
                                         ? Theme.borderStrong
+                                        : (model.overlapWarning && clipItem.isSubtitleClip
+                                            ? Theme.errorBorder
                                         : root.clipBorderColor(
                                             effectiveTimingState,
                                             model.trackKind,
                                             root.cueSelected(model.cueId)
                                                 || root.appModel.selectedClipId === model.clipId
-                                        )
+                                        ))
                                     Accessible.name: model.isAggregate
                                         ? model.trackName + ", " + model.aggregateCount
                                             + " cue tổng quan; phóng to để xem chữ"
                                         : model.trackName + ", clip " + model.clipId
                                     Accessible.role: Accessible.ListItem
 
+                                    TimelineMediaStrip {
+                                        anchors.fill: parent
+                                        anchors.margins: 2
+                                        visible: !clipItem.model.isAggregate && !clipItem.isSubtitleClip
+                                        projectModel: root.appModel.currentProject
+                                        clipId: clipItem.model.clipId
+                                        startUs: clipItem.clippedStart
+                                        endUs: clipItem.clippedEnd
+                                        loadingEnabled: visible && !root.timelinePanActive
+                                            && !root.clipMoveActive && !root.clipResizeActive
+                                        opacity: 0.9
+                                    }
                                     Text {
+                                        z: 1
                                         anchors.centerIn: parent
                                         visible: clipItem.model.isAggregate || parent.width >= 28
                                         width: Math.max(0, parent.width - Theme.space12)
@@ -1334,10 +1789,12 @@ Item {
                                                 + "  "
                                                 + Number(clipItem.model.speedPercent / 100).toFixed(2)
                                                 + "×  |  "
-                                                + Math.round(clipItem.model.volume * 100) + "%"))
+                                                + (clipItem.model.muted ? "Tắt tiếng" : Math.round(clipItem.model.volume * 100) + "%")))
                                         color: Theme.textPrimary
                                         font.family: Theme.fontFamily
                                         font.pixelSize: 10
+                                        style: clipItem.isSubtitleClip ? Text.Normal : Text.Outline
+                                        styleColor: Theme.canvas
                                         horizontalAlignment: Text.AlignHCenter
                                         elide: Text.ElideRight
                                     }
@@ -1357,18 +1814,44 @@ Item {
                                             font.pixelSize: 11
                                         }
                                     }
+                                    Rectangle {
+                                        visible: clipItem.model.overlapWarning
+                                            && clipItem.isSubtitleClip
+                                            && !clipItem.model.isAggregate
+                                        anchors.left: parent.left
+                                        anchors.top: parent.top
+                                        width: 18
+                                        height: 18
+                                        radius: 9
+                                        color: Theme.error
+                                        Text {
+                                            anchors.centerIn: parent
+                                            text: "!"
+                                            color: Theme.canvas
+                                            font.bold: true
+                                            font.pixelSize: 11
+                                        }
+                                    }
 
                                     HoverHandler { id: clipHover }
                                     ToolTip.visible: clipHover.hovered && !clipItem.model.isAggregate
                                     ToolTip.text: clipItem.model.cueText
-                                        ? ("Cue #" + clipItem.model.cueIndex + " · "
+                                        ? ((clipItem.model.overlapWarning && clipItem.isSubtitleClip
+                                            ? "⚠ Cue chồng nhau trên 2/3 thời lượng; hãy kiểm tra.\n"
+                                            : "")
+                                            + (clipItem.model.trackKind === "text"
+                                            ? ("Text #" + clipItem.model.cueIndex + " · "
+                                                + clipItem.model.cueText + " · "
+                                                + (clipItem.effectiveStart / 1000000).toFixed(3)
+                                                + "–" + (clipItem.effectiveEnd / 1000000).toFixed(3) + " s")
+                                            : ("Cue #" + clipItem.model.cueIndex + " · "
                                             + clipItem.model.cueText
                                             + " · " + root.timingStateText(
                                                 clipItem.effectiveTimingState,
                                                 clipItem.effectiveDurationDeltaUs,
                                                 clipItem.effectiveStart - clipItem.model.slotStartUs,
                                                 clipItem.effectiveRequiredSpeed
-                                            ))
+                                            ))))
                                         : ""
 
                                     MouseArea {
@@ -1393,9 +1876,8 @@ Item {
                                                 return
                                             if (clipItem.isSubtitleClip
                                                     && !root.cueSelected(clipItem.model.cueId)) {
-                                                root.appModel.selectCueWithAdditive(
+                                                root.appModel.selectTimelineCue(
                                                     String(clipItem.model.cueId),
-                                                    Number(clipItem.model.startUs),
                                                     Boolean(
                                                         mouse.modifiers
                                                             & Qt.ControlModifier
@@ -1448,9 +1930,11 @@ Item {
                                         }
                                         onReleased: function(mouse) {
                                             if (!dragStarted || mouse.button !== Qt.LeftButton) return
-                                            if (clipItem.isSceneTextClip)
+                                            if (clipItem.isSceneTextClip) {
+                                                const point = mapToItem(clipLayer, mouse.x, mouse.y)
+                                                root.updateSceneTiming(point.x, point.y)
                                                 root.finishSceneTiming()
-                                            else
+                                            } else
                                                 root.finishClipMove()
                                         }
                                         onCanceled: {
@@ -1465,27 +1949,22 @@ Item {
                                                 dragStarted = false
                                                 return
                                             }
-                                            root.appModel.selectClip(clipItem.model.clipId)
-                                            if (clipItem.isSubtitleClip
-                                                    && !selectionHandledOnPress) {
-                                                root.appModel.selectCueWithAdditive(
-                                                    String(clipItem.model.cueId),
-                                                    Number(clipItem.model.startUs),
-                                                    Boolean(
-                                                        mouse.modifiers
-                                                            & Qt.ControlModifier
-                                                    )
+                                            root.forceActiveFocus()
+                                            if (selectionHandledOnPress
+                                                    || (mouse.button === Qt.RightButton
+                                                        && root.cueSelected(clipItem.model.cueId)))
+                                                root.appModel.selectClip(clipItem.model.clipId)
+                                            else
+                                                root.appModel.selectTimelineClip(
+                                                    clipItem.model.clipId,
+                                                    Boolean(mouse.modifiers & Qt.ControlModifier)
                                                 )
-                                            }
-                                            root.selectInspectorTab("clip")
-                                            if (mouse.button === Qt.LeftButton) {
-                                                const point = mapToItem(
-                                                    clipLayer, mouse.x, mouse.y
-                                                )
-                                                root.seekTimelineAt(point.x)
-                                            }
+                                            root.selectInspectorTab(clipItem.model.cueId ? "text" : "clip")
                                             if (mouse.button === Qt.RightButton) {
-                                                clipMenu.openAt(clipItem, mouse.x, mouse.y)
+                                                if (clipItem.model.trackKind === "video")
+                                                    videoMenu.openAt(clipItem, mouse.x, mouse.y)
+                                                else
+                                                    clipMenuLoader.openAt(clipItem, mouse.x, mouse.y)
                                             }
                                         }
                                         onDoubleClicked: {
@@ -1551,10 +2030,12 @@ Item {
                                             else
                                                 root.updateClipResize(point.x)
                                         }
-                                        onReleased: {
-                                            if (clipItem.isSceneTextClip)
+                                        onReleased: function(mouse) {
+                                            if (clipItem.isSceneTextClip) {
+                                                const point = mapToItem(clipLayer, mouse.x, mouse.y)
+                                                root.updateSceneTiming(point.x, point.y)
                                                 root.finishSceneTiming()
-                                            else
+                                            } else
                                                 root.finishClipResize()
                                         }
                                         onCanceled: {
@@ -1611,10 +2092,12 @@ Item {
                                             else
                                                 root.updateClipResize(point.x)
                                         }
-                                        onReleased: {
-                                            if (clipItem.isSceneTextClip)
+                                        onReleased: function(mouse) {
+                                            if (clipItem.isSceneTextClip) {
+                                                const point = mapToItem(clipLayer, mouse.x, mouse.y)
+                                                root.updateSceneTiming(point.x, point.y)
                                                 root.finishSceneTiming()
-                                            else
+                                            } else
                                                 root.finishClipResize()
                                         }
                                         onCanceled: {
@@ -1625,8 +2108,17 @@ Item {
                                         }
                                     }
 
-                                    Popup {
+                                    Loader {
+                                        id: clipMenuLoader
+                                        active: false
+                                        function openAt(sourceItem, localX, localY) {
+                                            active = true
+                                            item.openAt(sourceItem, localX, localY)
+                                        }
+                                        sourceComponent: Popup {
                                         id: clipMenu
+                                        onAboutToShow: ++root.openContextMenus
+                                        onClosed: root.openContextMenus = Math.max(0, root.openContextMenus - 1)
 
                                         function openAt(sourceItem, localX, localY) {
                                             const popupPoint = sourceItem.mapToItem(
@@ -1671,7 +2163,8 @@ Item {
                                             DsContextButton {
                                                 Layout.fillWidth: true
                                                 visible: clipItem.isSubtitleClip
-                                                text: "Mở trong Biên tập phụ đề"
+                                                text: clipItem.model.trackKind === "text"
+                                                    ? "Sửa Text" : "Mở trong Biên tập phụ đề"
                                                 onClicked: {
                                                     clipMenu.close()
                                                     root.appModel.openSubtitleCueInEditor(
@@ -1699,17 +2192,18 @@ Item {
                                             }
                                             DsContextButton {
                                                 Layout.fillWidth: true
-                                                visible: !clipItem.isSubtitleClip
+                                                visible: !clipItem.isSubtitleClip && clipItem.model.trackKind !== "video"
                                                 text: "Tách video và audio tại playhead"
                                                 onClicked: {
                                                     clipMenu.close()
-                                                    root.appModel.splitSelected(true)
+                                                    timelinePreview.pause()
+                                                    root.appModel.splitVideoAtPlayhead()
                                                 }
                                             }
                                             DsContextButton {
                                                 Layout.fillWidth: true
-                                                visible: !clipItem.isSubtitleClip
-                                                text: "Cắt phần trước, cả linked clip"
+                                                visible: !clipItem.isSubtitleClip && clipItem.model.trackKind !== "video"
+                                                text: "Bỏ đầu clip đến playhead, cả clip liên kết"
                                                 onClicked: {
                                                     clipMenu.close()
                                                     root.appModel.trimSelectedHead(true)
@@ -1717,8 +2211,8 @@ Item {
                                             }
                                             DsContextButton {
                                                 Layout.fillWidth: true
-                                                visible: !clipItem.isSubtitleClip
-                                                text: "Cắt phần sau, cả linked clip"
+                                                visible: !clipItem.isSubtitleClip && clipItem.model.trackKind !== "video"
+                                                text: "Bỏ đuôi clip từ playhead, cả clip liên kết"
                                                 onClicked: {
                                                     clipMenu.close()
                                                     root.appModel.trimSelectedTail(true)
@@ -1726,12 +2220,12 @@ Item {
                                             }
                                             MenuSeparator {
                                                 Layout.fillWidth: true
-                                                visible: !clipItem.isSubtitleClip
+                                                visible: !clipItem.isSubtitleClip && clipItem.model.trackKind !== "video"
                                             }
                                             DsContextButton {
                                                 Layout.fillWidth: true
-                                                visible: !clipItem.isSubtitleClip
-                                                text: "Cắt phần trước, chỉ clip này"
+                                                visible: !clipItem.isSubtitleClip && clipItem.model.trackKind !== "video"
+                                                text: "Bỏ đầu clip đến playhead, chỉ clip này"
                                                 onClicked: {
                                                     clipMenu.close()
                                                     root.appModel.trimSelectedHead(false)
@@ -1739,8 +2233,8 @@ Item {
                                             }
                                             DsContextButton {
                                                 Layout.fillWidth: true
-                                                visible: !clipItem.isSubtitleClip
-                                                text: "Cắt phần sau, chỉ clip này"
+                                                visible: !clipItem.isSubtitleClip && clipItem.model.trackKind !== "video"
+                                                text: "Bỏ đuôi clip từ playhead, chỉ clip này"
                                                 onClicked: {
                                                     clipMenu.close()
                                                     root.appModel.trimSelectedTail(false)
@@ -1748,11 +2242,11 @@ Item {
                                             }
                                             MenuSeparator {
                                                 Layout.fillWidth: true
-                                                visible: !clipItem.isSubtitleClip
+                                                visible: !clipItem.isSubtitleClip && clipItem.model.trackKind !== "video"
                                             }
                                             DsContextButton {
                                                 Layout.fillWidth: true
-                                                visible: !clipItem.isSubtitleClip
+                                                visible: !clipItem.isSubtitleClip && clipItem.model.trackKind !== "video"
                                                 text: "Tốc độ 85% cho clip liên kết"
                                                 onClicked: {
                                                     clipMenu.close()
@@ -1761,7 +2255,7 @@ Item {
                                             }
                                             DsContextButton {
                                                 Layout.fillWidth: true
-                                                visible: !clipItem.isSubtitleClip
+                                                visible: !clipItem.isSubtitleClip && clipItem.model.trackKind !== "video"
                                                 text: "Tốc độ 100% cho clip liên kết"
                                                 onClicked: {
                                                     clipMenu.close()
@@ -1770,7 +2264,7 @@ Item {
                                             }
                                             DsContextButton {
                                                 Layout.fillWidth: true
-                                                visible: !clipItem.isSubtitleClip
+                                                visible: !clipItem.isSubtitleClip && clipItem.model.trackKind !== "video"
                                                 text: "Tắt tiếng clip này"
                                                 onClicked: {
                                                     clipMenu.close()
@@ -1779,7 +2273,7 @@ Item {
                                             }
                                             DsContextButton {
                                                 Layout.fillWidth: true
-                                                visible: !clipItem.isSubtitleClip
+                                                visible: !clipItem.isSubtitleClip && clipItem.model.trackKind !== "video"
                                                 text: "Đặt lại âm lượng 100%"
                                                 onClicked: {
                                                     clipMenu.close()
@@ -1788,15 +2282,17 @@ Item {
                                             }
                                             DsContextButton {
                                                 Layout.fillWidth: true
-                                                visible: !clipItem.isSubtitleClip
+                                                visible: !clipItem.isSubtitleClip && clipItem.model.trackKind !== "video"
                                                 danger: true
                                                 text: "Xóa clip liên kết"
                                                 onClicked: {
                                                     clipMenu.close()
-                                                    root.appModel.deleteSelected(true)
+                                                    timelinePreview.pause()
+                                                    root.appModel.deleteTimelineSelection()
                                                 }
                                             }
                                         }
+                                    }
                                     }
                                 }
                             }
@@ -2154,7 +2650,7 @@ Item {
 
                     Rectangle {
                         Layout.fillWidth: true
-                        Layout.preferredHeight: 32
+                        Layout.preferredHeight: 38
                         color: Theme.surfaceRaised
                         RowLayout {
                             anchors.fill: parent
@@ -2167,41 +2663,161 @@ Item {
                                 font.family: Theme.fontFamily
                                 font.pixelSize: 10
                             }
-                            Slider {
+                            Rectangle {
                                 id: horizontalViewport
+                                objectName: "timelineOverview"
                                 Layout.fillWidth: true
-                                from: 0
-                                to: Math.max(0, root.projectDurationUs - root.viewportDurationUs)
-                                value: root.viewportStartUs
-                                enabled: to > 0
-                                onMoved: root.applyViewport(value, root.viewportDurationUs)
+                                Layout.preferredHeight: 18
+                                radius: 9
+                                color: Theme.borderStrong
+                                border.width: 1
+                                border.color: Theme.borderSubtle
                                 Accessible.name: "Cuộn timeline theo chiều ngang"
-                                background: Rectangle {
-                                    x: horizontalViewport.leftPadding
-                                    y: horizontalViewport.topPadding
-                                        + horizontalViewport.availableHeight / 2 - height / 2
-                                    width: horizontalViewport.availableWidth
-                                    height: 4
-                                    radius: 2
-                                    color: Theme.borderStrong
-                                    Rectangle {
-                                        width: horizontalViewport.visualPosition * parent.width
-                                        height: parent.height
-                                        radius: parent.radius
-                                        color: Theme.primary
+
+                                MouseArea {
+                                    anchors.fill: parent
+                                    acceptedButtons: Qt.LeftButton
+                                    onClicked: function(mouse) {
+                                        const centerUs = mouse.x / Math.max(1, width)
+                                            * root.projectDurationUs
+                                        root.applyViewport(
+                                            centerUs - root.viewportDurationUs / 2,
+                                            root.viewportDurationUs
+                                        )
                                     }
                                 }
-                                handle: Rectangle {
-                                    x: horizontalViewport.leftPadding
-                                        + horizontalViewport.visualPosition
-                                            * (horizontalViewport.availableWidth - width)
-                                    y: horizontalViewport.topPadding
-                                        + horizontalViewport.availableHeight / 2 - height / 2
-                                    width: 14
-                                    height: 14
+
+                                Rectangle {
+                                    id: overviewWindow
+                                    objectName: "timelineOverviewWindow"
+                                    x: root.viewportStartUs / root.projectDurationUs
+                                        * horizontalViewport.width
+                                    y: 2
+                                    width: Math.max(
+                                        24,
+                                        root.viewportDurationUs / root.projectDurationUs
+                                            * horizontalViewport.width
+                                    )
+                                    height: parent.height - 4
                                     radius: 7
-                                    color: horizontalViewport.pressed
-                                        ? Theme.primaryPressed : Theme.primaryHover
+                                    color: Theme.primary
+                                    opacity: 0.78
+                                    border.width: 1
+                                    border.color: Theme.primaryHover
+
+                                    MouseArea {
+                                        id: overviewBodyDrag
+                                        objectName: "timelineOverviewDrag"
+                                        anchors.fill: parent
+                                        acceptedButtons: Qt.LeftButton
+                                        cursorShape: Qt.SizeHorCursor
+                                        property real pressX: 0
+                                        property real pressStartUs: 0
+                                        onPressed: function(mouse) {
+                                            pressX = mapToItem(horizontalViewport, mouse.x, 0).x
+                                            pressStartUs = root.viewportStartUs
+                                        }
+                                        onPositionChanged: function(mouse) {
+                                            if (!pressed) return
+                                            root.applyViewport(
+                                                pressStartUs
+                                                    + (mapToItem(horizontalViewport, mouse.x, 0).x - pressX)
+                                                        / Math.max(1, horizontalViewport.width)
+                                                        * root.projectDurationUs,
+                                                root.viewportDurationUs
+                                            )
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        anchors.left: parent.left
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        width: 3
+                                        height: parent.height - 4
+                                        radius: 2
+                                        color: Theme.canvas
+                                        z: 3
+                                    }
+                                    MouseArea {
+                                        anchors.left: parent.left
+                                        anchors.leftMargin: -6
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        width: 14
+                                        height: parent.height + 8
+                                        z: 4
+                                        cursorShape: Qt.SizeHorCursor
+                                        property real pressX: 0
+                                        property real pressStartUs: 0
+                                        property real fixedEndUs: 0
+                                        onPressed: function(mouse) {
+                                            pressX = mapToItem(horizontalViewport, mouse.x, 0).x
+                                            pressStartUs = root.viewportStartUs
+                                            fixedEndUs = root.viewportEndUs
+                                        }
+                                        onPositionChanged: function(mouse) {
+                                            if (!pressed) return
+                                            const currentX = mapToItem(
+                                                horizontalViewport, mouse.x, 0
+                                            ).x
+                                            const proposed = pressStartUs
+                                                + (currentX - pressX)
+                                                    / Math.max(1, horizontalViewport.width)
+                                                    * root.projectDurationUs
+                                            const nextStart = Math.max(
+                                                0,
+                                                Math.min(
+                                                    fixedEndUs - root.minimumViewportUs,
+                                                    proposed
+                                                )
+                                            )
+                                            root.applyViewport(nextStart, fixedEndUs - nextStart)
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        anchors.right: parent.right
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        width: 3
+                                        height: parent.height - 4
+                                        radius: 2
+                                        color: Theme.canvas
+                                        z: 3
+                                    }
+                                    MouseArea {
+                                        anchors.right: parent.right
+                                        anchors.rightMargin: -6
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        width: 14
+                                        height: parent.height + 8
+                                        z: 4
+                                        cursorShape: Qt.SizeHorCursor
+                                        property real pressX: 0
+                                        property real fixedStartUs: 0
+                                        property real pressEndUs: 0
+                                        onPressed: function(mouse) {
+                                            pressX = mapToItem(horizontalViewport, mouse.x, 0).x
+                                            fixedStartUs = root.viewportStartUs
+                                            pressEndUs = root.viewportEndUs
+                                        }
+                                        onPositionChanged: function(mouse) {
+                                            if (!pressed) return
+                                            const currentX = mapToItem(
+                                                horizontalViewport, mouse.x, 0
+                                            ).x
+                                            const proposed = pressEndUs
+                                                + (currentX - pressX)
+                                                    / Math.max(1, horizontalViewport.width)
+                                                    * root.projectDurationUs
+                                            const nextEnd = Math.min(
+                                                root.projectDurationUs,
+                                                Math.max(
+                                                    fixedStartUs + root.minimumViewportUs,
+                                                    proposed
+                                                )
+                                            )
+                                            root.applyViewport(fixedStartUs, nextEnd - fixedStartUs)
+                                        }
+                                    }
                                 }
                             }
                             Text {
@@ -2230,8 +2846,11 @@ Item {
                 anchors.fill: parent
                 anchors.margins: Theme.space12
                 spacing: Theme.space8
-                RowLayout {
+                GridLayout {
                     Layout.fillWidth: true
+                    columns: 3
+                    rowSpacing: Theme.space4
+                    columnSpacing: Theme.space4
                     DsTabButton {
                         Layout.fillWidth: true
                         Layout.minimumWidth: 0
@@ -2267,10 +2886,19 @@ Item {
                     DsTabButton {
                         Layout.fillWidth: true
                         Layout.minimumWidth: 0
-                        text: "Dự án"
-                        tooltipText: "Thông tin và thao tác cấp dự án."
-                        checked: root.inspectorTab === "project"
-                        onClicked: root.selectInspectorTab("project")
+                        text: "Thiết lập"
+                        tooltipText: "Thiết lập xuất, hiệu ứng và âm thanh của dự án."
+                        checked: root.inspectorTab === "settings" || root.inspectorTab === "project"
+                        onClicked: root.selectInspectorTab("settings")
+                    }
+                    DsTabButton {
+                        objectName: "timelineTextInspectorTab"
+                        Layout.fillWidth: true
+                        Layout.minimumWidth: 0
+                        text: "Text"
+                        tooltipText: "Nội dung, chữ, nền và hiệu ứng của cue."
+                        checked: root.inspectorTab === "text"
+                        onClicked: root.selectInspectorTab("text")
                     }
                 }
                 StackLayout {
@@ -2281,7 +2909,8 @@ Item {
                     currentIndex: root.inspectorTab === "track"
                         ? 1 : (root.inspectorTab === "subtitles"
                             ? 2 : (root.inspectorTab === "voice-sync"
-                                ? 3 : (root.inspectorTab === "project" ? 4 : 0)))
+                                ? 3 : (root.inspectorTab === "settings" || root.inspectorTab === "project"
+                                    ? 4 : (root.inspectorTab === "text" ? 5 : 0))))
                     Item {
                         EmptyState {
                             anchors.fill: parent
@@ -2473,6 +3102,7 @@ Item {
                             }
                             Text {
                                 Layout.fillWidth: true
+                                visible: root.appModel.currentProject.track(root.appModel.selectedTrackId).kind !== "text"
                                 text: root.appModel.selectedTrackMuted
                                     ? "Track đang tắt tiếng" : "Track đang phát âm thanh"
                                 color: Theme.textSecondary
@@ -2481,6 +3111,7 @@ Item {
                             }
                             DsButton {
                                 Layout.fillWidth: true
+                                visible: root.appModel.currentProject.track(root.appModel.selectedTrackId).kind !== "text"
                                 text: root.appModel.selectedTrackMuted
                                     ? "Bật tiếng track" : "Tắt tiếng track"
                                 enabled: !root.appModel.timelineBusy
@@ -2867,7 +3498,17 @@ Item {
                             }
                         }
                     }
-                    EmptyState { title: "Chưa mở dự án"; description: "Timebase và proxy sẽ lấy từ project hiện tại." }
+                    ExportSettingsPanel { appModel: root.appModel }
+                    SubtitleTextToolbar {
+                        id: subtitleTextToolbar
+                        appModel: root.appModel
+                        inspectorMode: true
+                        allowManualPlacement: true
+                        onManualPlacementRequested: timelinePreview.beginManualSceneText()
+                        onColorPickRequested: function(target) {
+                            timelinePreview.colorPickerTarget = target
+                        }
+                    }
                 }
             }
         }

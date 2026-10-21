@@ -8,6 +8,7 @@ import sys
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from time import monotonic
 from uuid import uuid4
 
 
@@ -46,7 +47,7 @@ class PreviewTileRequest:
     def cache_key(self) -> str:
         raw = "|".join(
             (
-                "v1",
+                "v2" if self.kind is TileKind.WAVEFORM else "v1",
                 self.media_fingerprint,
                 self.kind.value,
                 str(self.start_us),
@@ -117,32 +118,49 @@ class FfmpegPreviewTileProvider:
         staged = staging_root / f"{request.cache_key}-{uuid4().hex}.png"
         try:
             command = self._command(request, staged)
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                timeout=self.timeout,
-                check=False,
-                creationflags=(
-                    subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-                ),
-            )
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"FFmpeg preview tile failed with exit code {result.returncode}"
+            deadline = monotonic() + self.timeout
+            for attempt in range(2):
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, self.timeout)
+                result = subprocess.run(
+                    command, capture_output=True, timeout=remaining, check=False,
+                    creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
                 )
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        f"FFmpeg preview tile failed with exit code {result.returncode}"
+                    )
+                if (staged.is_file() and staged.stat().st_size > 0
+                        or attempt or request.kind is not TileKind.THUMBNAIL
+                        or not request.start_us):
+                    break
+                # Seeking between the final frame PTS and EOF can succeed
+                # without a frame. Only then try the last frame before the
+                # requested time, reversing a one-second window at tile size.
+                # Long-GOP sources may require additional decoder seek preroll.
+                command = self._command(request, staged, previous_frame=True)
             return cache.commit(request, staged), False
         finally:
             staged.unlink(missing_ok=True)
 
-    def _command(self, request: PreviewTileRequest, output: Path) -> list[str]:
+    def _command(
+        self, request: PreviewTileRequest, output: Path, *, previous_frame: bool = False,
+    ) -> list[str]:
         start = f"{request.start_us / 1_000_000:.6f}"
         if request.kind is TileKind.THUMBNAIL:
+            earlier = max(0, request.start_us - 1_000_000)
+            if previous_frame:
+                start = f"{earlier / 1_000_000:.6f}"
             return [
                 self.ffmpeg_path,
                 "-v",
                 "error",
+                "-threads", "1",
                 "-ss",
                 start,
+                *(["-t", f"{(request.start_us - earlier) / 1_000_000:.6f}"]
+                  if previous_frame else []),
                 "-i",
                 str(request.media_path),
                 "-frames:v",
@@ -150,7 +168,7 @@ class FfmpegPreviewTileProvider:
                 "-vf",
                 (
                     f"scale={request.width}:{request.height}:"
-                    "force_original_aspect_ratio=decrease"
+                    "force_original_aspect_ratio=decrease" + (",reverse" if previous_frame else "")
                 ),
                 "-y",
                 str(output),
@@ -160,6 +178,7 @@ class FfmpegPreviewTileProvider:
             self.ffmpeg_path,
             "-v",
             "error",
+            "-threads", "1",
             "-ss",
             start,
             "-t",
@@ -167,7 +186,10 @@ class FfmpegPreviewTileProvider:
             "-i",
             str(request.media_path),
             "-filter_complex",
-            f"showwavespic=s={request.width}x{request.height}:colors=#8B5CF6",
+            # Rectify before reducing sample rate so high-frequency speech
+            # retains its envelope. Memory is bounded even for long overviews.
+            "aformat=channel_layouts=mono,aeval=abs(val(0)),aresample=2000,"
+            f"showwavespic=s={request.width}x{request.height}:colors=#27BFA3:scale=sqrt",
             "-frames:v",
             "1",
             "-y",

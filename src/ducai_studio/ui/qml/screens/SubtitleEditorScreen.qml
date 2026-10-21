@@ -28,6 +28,7 @@ Item {
     property string contextCueRole: "dialogue"
     property string contextCueReviewState: "accepted"
     property string regionEditorMode: ""
+    property string translationPreferencesSyncKey: ""
     readonly property var translationProviderIds: [
         "gemini-web", "gemini-api", "gemini-cli", "deepseek-api",
         "tokenhub-api", "qwen-api", "glm-api", "openai-compatible"
@@ -75,6 +76,21 @@ Item {
     function selectedTranslationProviderIsCustom() {
         return selectedTranslationProviderId() === "openai-compatible"
     }
+    function selectedTranslationModelId() {
+        return selectedTranslationProviderId() === "gemini-web"
+            ? "selected-on-web" : translationModel.chosenModel.trim()
+    }
+    readonly property bool translationChoiceMatchesJob:
+        appModel.translationJobState.length > 0 && appModel.translationSelectionMatches(
+            selectedTranslationProviderId(), selectedTranslationModelId(), customBaseUrl.text,
+            root.selectedTranslationProviderIsApi() ? savedCredentialBox.currentText : ""
+        )
+    readonly property bool translationChoiceChanged:
+        ["paused", "queued", "cancelled", "failed", "interrupted", "review"]
+            .indexOf(appModel.translationJobState) >= 0 && !translationChoiceMatchesJob
+    readonly property bool translationStyleEditable:
+        ["running", "start_requested", "pause_requested", "resume_requested", "cancel_requested"]
+            .indexOf(appModel.translationJobState) < 0
 
     Component.onCompleted: {
         var savedProvider = appModel.uiStringValue("translation/provider", "gemini-web")
@@ -84,6 +100,17 @@ Item {
         root.syncTranslationPreferences()
     }
     function syncTranslationPreferences() {
+        var syncKey = JSON.stringify({
+            projectId: appModel.currentProject.projectId,
+            preset: appModel.currentProject.translationStylePreset,
+            rules: appModel.currentProject.translationCustomRules,
+            styles: appModel.currentProject.translationStylePresets,
+            activeName: appModel.currentProject.translationActiveStyleName
+        })
+        // Cue saves also emit changed; they must not reset draft style inputs.
+        if (syncKey === translationPreferencesSyncKey)
+            return
+        translationPreferencesSyncKey = syncKey
         var styleIndex = translationStyleIds.indexOf(
             appModel.currentProject.translationStylePreset
         )
@@ -92,6 +119,37 @@ Item {
             translationStyleBox.currentIndex = styleIndex
         if (!translationRules.activeFocus)
             translationRules.text = appModel.currentProject.translationCustomRules
+        var savedStyles = appModel.currentProject.translationStylePresets || []
+        var matchingIndex = -1
+        for (var index = 0; index < savedStyles.length; index++) {
+            var saved = savedStyles[index]
+            if (saved.name === appModel.currentProject.translationActiveStyleName) {
+                matchingIndex = index
+                break
+            }
+        }
+        if (savedTranslationStyleBox.currentIndex !== matchingIndex)
+            savedTranslationStyleBox.currentIndex = matchingIndex
+        if (!translationStyleName.activeFocus) {
+            translationStyleName.text = matchingIndex >= 0
+                ? String(savedStyles[matchingIndex].name || "") : ""
+        }
+    }
+    function loadSavedTranslationStyle(index) {
+        var savedStyles = appModel.currentProject.translationStylePresets || []
+        if (index < 0 || index >= savedStyles.length)
+            return
+        var saved = savedStyles[index]
+        var styleIndex = translationStyleIds.indexOf(String(saved.preset || "auto"))
+        if (styleIndex < 0) styleIndex = 0
+        translationStyleBox.currentIndex = styleIndex
+        translationStyleName.text = String(saved.name || "")
+        translationRules.text = String(saved.custom_rules || "")
+        root.appModel.setTranslationPreferences(
+            root.translationStyleIds[styleIndex] || "auto",
+            translationRules.text,
+            String(saved.name || "")
+        )
     }
     readonly property string workspaceMode: appModel.currentWorkspace
     readonly property string workspaceTitle: workspaceMode === "transcribe"
@@ -413,7 +471,7 @@ Item {
 
             Panel {
                 Layout.fillWidth: true
-                Layout.preferredHeight: 164
+                Layout.preferredHeight: 196
                 visible: root.workspaceMode === "transcribe"
                 ColumnLayout {
                     anchors.fill: parent
@@ -606,6 +664,17 @@ Item {
                             onClicked: root.appModel.cancelOcr()
                         }
                     }
+                    CheckBox {
+                        objectName: "sceneOcrToggle"
+                        visible: !root.whisperExtraction
+                        text: "OCR chữ trong cảnh (S2…)"
+                        checked: root.appModel.ocrSceneTextEnabled
+                        enabled: !root.appModel.ocrBusy
+                        Accessible.name: text
+                        onToggled: root.appModel.setOcrSceneTextEnabled(checked)
+                        ToolTip.visible: hovered
+                        ToolTip.text: "Tắt để lần trích xuất mới chỉ quét thoại. Không xóa chữ cảnh đã có; Multi dùng cùng lựa chọn."
+                    }
                     RowLayout {
                         Layout.fillWidth: true
                         spacing: Theme.space8
@@ -685,7 +754,7 @@ Item {
             Panel {
                 Layout.fillWidth: true
                 Layout.preferredHeight: root.selectedTranslationProviderIsCustom()
-                    ? 286 : (root.selectedTranslationProviderIsApi() ? 250 : 222)
+                    ? 342 : (root.selectedTranslationProviderIsApi() ? 306 : 246)
                 visible: root.workspaceMode === "translate"
                 ColumnLayout {
                     anchors.fill: parent
@@ -696,32 +765,83 @@ Item {
                         spacing: Theme.space8
                         ComboBox {
                             id: providerBox
+                            objectName: "translationProviderChooser"
                             Layout.preferredWidth: 164
                             model: root.translationProviderLabels
                             Accessible.name: "Nguồn dịch và model API"
                             onCurrentIndexChanged: {
+                                root.appModel.clearTranslationModelCatalog()
                                 var defaults = root.translationProviderModels[currentIndex] || []
-                                if (defaults.length > 0)
-                                    translationModel.text = defaults[0]
-                                else
-                                    translationModel.text = root.translationProviderDefaults[currentIndex] || ""
+                                var fallback = defaults.length > 0 ? defaults[0]
+                                    : root.translationProviderDefaults[currentIndex] || ""
+                                translationModel.setModelText(root.appModel.uiStringValue(
+                                    "translation/model/" + root.selectedTranslationProviderId(), fallback
+                                ))
                                 customBaseUrl.text = root.appModel.uiStringValue(
                                     "translationBaseUrl", "https://api.openai.com/v1"
                                 )
                                 apiCredentialInput.text = ""
+                                Qt.callLater(savedCredentialBox.restoreSelection)
                             }
+                            onActivated: root.appModel.setUiStringValue(
+                                "translation/provider", root.selectedTranslationProviderId()
+                            )
                         }
-                        DsTextField {
+                        ComboBox {
                             id: translationModel
-                            Layout.preferredWidth: 168
-                            visible: providerBox.currentIndex !== 0
-                            text: root.appModel.uiStringValue(
+                            objectName: "translationModelChooser"
+                            property alias text: translationModel.editText
+                            property string chosenModel: root.appModel.uiStringValue(
                                 "translationModel", "selected-on-web"
                             )
-                            placeholderText: providerBox.currentIndex === 0
-                                ? "Model trên Web" : "Tên model (có thể gõ tay)"
-                            onEditingFinished: root.appModel.setUiStringValue(
-                                "translationModel", text
+                            function setModelText(value) {
+                                chosenModel = value
+                                editText = value
+                            }
+                            function rememberModel() {
+                                chosenModel = editText
+                                root.appModel.setUiStringValue("translationModel", editText)
+                                root.appModel.setUiStringValue(
+                                    "translation/model/" + root.selectedTranslationProviderId(), editText
+                                )
+                            }
+                            Layout.preferredWidth: 216
+                            visible: providerBox.currentIndex !== 0
+                            editable: true
+                            currentIndex: -1
+                            editText: chosenModel
+                            model: root.appModel.translationModelCatalogProvider
+                                    === root.selectedTranslationProviderId()
+                                && root.appModel.translationAvailableModels.length > 0
+                                ? root.appModel.translationAvailableModels
+                                : root.translationProviderModels[providerBox.currentIndex] || []
+                            Accessible.name: "Chọn model hoặc nhập tên model thủ công"
+                            onModelChanged: Qt.callLater(function() { editText = chosenModel })
+                            onActivated: rememberModel()
+                            onAccepted: rememberModel()
+                            Connections {
+                                target: translationModel.contentItem
+                                // Only user typing changes the remembered input.
+                                // ComboBox also rewrites editText when its model
+                                // arrives; that must not replace a manual name.
+                                function onTextEdited() {
+                                    const input = translationModel.contentItem as TextInput
+                                    if (input)
+                                        translationModel.chosenModel = input.text
+                                }
+                            }
+                            onActiveFocusChanged: { if (!activeFocus) rememberModel() }
+                        }
+                        DsButton {
+                            text: root.appModel.translationModelCatalogBusy ? "Đang tải…" : "Tải model"
+                            compact: true
+                            visible: root.selectedTranslationProviderIsApi()
+                            enabled: !root.appModel.translationModelCatalogBusy
+                                && savedCredentialBox.currentText.length > 0
+                            disabledReason: "Lưu và chọn một API key trước."
+                            onClicked: root.appModel.refreshTranslationModels(
+                                root.selectedTranslationProviderId(), savedCredentialBox.currentText,
+                                customBaseUrl.text
                             )
                         }
                         DsTextField {
@@ -747,6 +867,15 @@ Item {
                             onClicked: translationImportDialog.open()
                         }
                     }
+                    Text {
+                        Layout.fillWidth: true
+                        visible: providerBox.currentIndex !== 0
+                        text: root.appModel.translationModelCatalogStatus
+                        color: Theme.textMuted
+                        font.family: Theme.fontFamily
+                        font.pixelSize: 11
+                        elide: Text.ElideRight
+                    }
                     RowLayout {
                         Layout.fillWidth: true
                         spacing: Theme.space8
@@ -758,6 +887,7 @@ Item {
                         }
                         ComboBox {
                             id: translationStyleBox
+                            objectName: "translationBuiltinStyle"
                             Layout.preferredWidth: 174
                             model: root.translationStyleLabels
                             Accessible.name: "Văn phong dịch của project"
@@ -771,6 +901,7 @@ Item {
 
                             TextArea {
                                 id: translationRules
+                                objectName: "translationStyleRules"
                                 width: translationRulesScroll.availableWidth
                                 height: Math.max(
                                     translationRulesScroll.availableHeight,
@@ -810,10 +941,12 @@ Item {
                             font.pixelSize: 9
                         }
                         DsButton {
-                            text: "Lưu văn phong"
+                            objectName: "applyTranslationStyle"
+                            text: "Áp dụng"
+                            tooltipText: "Dùng các quy tắc hiện tại cho dự án, không tạo bản mới."
                             compact: true
                             enabled: root.appModel.currentProject.hasProject
-                                && !root.appModel.translationBusy
+                                && root.translationStyleEditable
                                 && !root.appModel.translationPreferencesBusy
                             operationState: root.appModel.translationPreferencesBusy
                                 ? "running" : "idle"
@@ -830,28 +963,137 @@ Item {
                     }
                     RowLayout {
                         Layout.fillWidth: true
-                        visible: root.selectedTranslationProviderIsApi()
                         spacing: Theme.space8
-                        DsTextField {
-                            id: apiCredentialInput
-                            Layout.fillWidth: true
-                            placeholderText: "Dán nhiều key: ten-1=API_KEY ; ten-2=API_KEY"
-                            echoMode: TextInput.Password
-                        }
-                        DsButton {
-                            text: "Lưu danh sách"
-                            enabled: apiCredentialInput.text.trim().length > 0
-                            disabledReason: "Dán ít nhất một API key."
-                            onClicked: root.appModel.saveTranslationApiCredentials(
-                                root.selectedTranslationProviderId(), apiCredentialInput.text
-                            )
+                        Text {
+                            text: "Bản đã lưu"
+                            color: Theme.textSecondary
+                            font.family: Theme.fontFamily
+                            font.pixelSize: 10
                         }
                         ComboBox {
+                            id: savedTranslationStyleBox
+                            objectName: "savedTranslationStyle"
+                            Layout.preferredWidth: 190
+                            model: root.appModel.currentProject.translationStylePresets || []
+                            textRole: "name"
+                            currentIndex: -1
+                            enabled: count > 0 && root.translationStyleEditable
+                                && !root.appModel.translationPreferencesBusy
+                            Accessible.name: "Các văn phong đã lưu"
+                            ToolTip.visible: hovered
+                            ToolTip.delay: 500
+                            ToolTip.text: "Chọn để nạp và áp dụng văn phong đã lưu cho dự án."
+                            onActivated: (index) => root.loadSavedTranslationStyle(index)
+                        }
+                        Text {
+                            text: "Tên bản mới"
+                            color: Theme.textSecondary
+                            font.family: Theme.fontFamily
+                            font.pixelSize: 10
+                        }
+                        DsTextField {
+                            id: translationStyleName
+                            objectName: "translationStyleName"
+                            Layout.fillWidth: true
+                            placeholderText: "Tên bản văn phong mới"
+                            maximumLength: 80
+                            Accessible.name: "Tên bản văn phong"
+                        }
+                        DsButton {
+                            objectName: "saveTranslationStyle"
+                            text: "Lưu văn phong"
+                            primary: true
+                            tooltipText: "Lưu quy tắc và văn phong hiện tại thành một bản có tên riêng."
+                            compact: true
+                            enabled: root.appModel.currentProject.hasProject
+                                && root.translationStyleEditable
+                                && !root.appModel.translationPreferencesBusy
+                                && translationStyleName.text.trim().length > 0
+                            operationState: root.appModel.translationPreferencesBusy
+                                ? "running" : "idle"
+                            runningText: "Đang lưu…"
+                            disabledReason: translationStyleName.text.trim().length === 0
+                                ? "Hãy nhập tên bản văn phong."
+                                : (root.appModel.translationPreferencesBusy
+                                    ? "Văn phong đang được lưu."
+                                    : "Hãy mở project và chờ tác vụ dịch dừng.")
+                            onClicked: root.appModel.saveTranslationStyle(
+                                translationStyleName.text,
+                                root.translationStyleIds[translationStyleBox.currentIndex]
+                                    || "auto",
+                                translationRules.text
+                            )
+                        }
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        visible: root.selectedTranslationProviderIsApi()
+                        spacing: Theme.space8
+                        Text {
+                            text: "Tên key"
+                            color: Theme.textSecondary
+                            font.family: Theme.fontFamily
+                            font.pixelSize: 11
+                        }
+                        DsTextField {
+                            id: apiCredentialName
+                            objectName: "translationKeyName"
+                            Layout.preferredWidth: 132
+                            placeholderText: "Ví dụ: Key chính"
+                            Accessible.name: "Tên API key (không phải secret)"
+                        }
+                        Text {
+                            text: "API key"
+                            color: Theme.textSecondary
+                            font.family: Theme.fontFamily
+                            font.pixelSize: 11
+                        }
+                        DsTextField {
+                            id: apiCredentialInput
+                            objectName: "translationKeySecret"
+                            Layout.fillWidth: true
+                            placeholderText: "Dán API key"
+                            echoMode: TextInput.Password
+                            Accessible.name: "API key được che ký tự"
+                        }
+                        DsButton {
+                            text: "Lưu key"
+                            enabled: apiCredentialInput.text.trim().length > 0
+                                && apiCredentialName.text.trim().length > 0
+                            disabledReason: "Nhập tên và API key vào hai ô riêng."
+                            onClicked: root.appModel.saveTranslationApiCredential(
+                                root.selectedTranslationProviderId(), apiCredentialName.text,
+                                apiCredentialInput.text
+                            )
+                        }
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        visible: root.selectedTranslationProviderIsApi()
+                        spacing: Theme.space8
+                        ComboBox {
                             id: savedCredentialBox
+                            objectName: "translationSavedKeyChooser"
+                            function restoreSelection() {
+                                const preferred = root.appModel.uiStringValue(
+                                    "translation/selectedCredential/" + root.selectedTranslationProviderId(),
+                                    ""
+                                )
+                                const references = root.selectedTranslationCredentialReferences || []
+                                const preferredIndex = references.indexOf(preferred)
+                                currentIndex = preferredIndex >= 0 ? preferredIndex
+                                    : (references.length > 0 ? 0 : -1)
+                            }
                             Layout.preferredWidth: 150
                             model: root.selectedTranslationCredentialReferences
                             Accessible.name: "Danh sách API key đã lưu theo tên"
                             displayText: count > 0 ? currentText : "Chưa có key"
+                            Component.onCompleted: restoreSelection()
+                            onModelChanged: Qt.callLater(restoreSelection)
+                            onActivated: root.appModel.setUiStringValue(
+                                "translation/selectedCredential/" + root.selectedTranslationProviderId(),
+                                currentText
+                            )
                         }
                         DsButton {
                             text: "Xóa key"
@@ -887,19 +1129,42 @@ Item {
                         }
                         ComboBox {
                             id: translationCacheBox
+                            objectName: "translationCacheChooser"
                             Layout.fillWidth: true
                             model: root.appModel.translationCaches
                             textRole: "label"
                             valueRole: "job_id"
                             Accessible.name: "Chọn cache dịch tương thích với video hiện tại"
-                            displayText: count > 0 ? currentText : "Chưa có cache tương thích"
-                            enabled: count > 0
+                            displayText: {
+                                // ComboBox may select its first row when the model
+                                // resets, before the selected job exists in that list.
+                                var caches = root.appModel.translationCaches
+                                var selected = root.appModel.selectedTranslationCacheId
+                                for (var index = 0; index < caches.length; ++index) {
+                                    if (caches[index].job_id === selected) {
+                                        var cache = caches[index]
+                                        var qa = root.appModel.translationQa || {}
+                                        if (selected === root.appModel.translationJobId
+                                                && qa.cue_total > 0
+                                                && cache.provider_id && cache.model_id) {
+                                            return (qa.completed_cues || 0) + "/" + qa.cue_total
+                                                + " cue · " + root.translationJobStateLabel(
+                                                    root.appModel.translationJobState)
+                                                + " · " + cache.provider_id + " / " + cache.model_id
+                                        }
+                                        return caches[index].label
+                                    }
+                                }
+                                return root.appModel.translationBusy
+                                    ? "Cache của lượt dịch hiện tại" : "Chưa có cache tương thích"
+                            }
+                            enabled: count > 0 && !root.appModel.translationBusy
                             currentIndex: {
                                 for (var index = 0; index < count; ++index) {
                                     if (valueAt(index) === root.appModel.selectedTranslationCacheId)
                                         return index
                                 }
-                                return count > 0 ? 0 : -1
+                                return -1
                             }
                             onActivated: root.appModel.selectTranslationCache(
                                 valueAt(currentIndex)
@@ -921,7 +1186,9 @@ Item {
                         DsButton {
                             Layout.preferredWidth: 190
                             primary: !warning
-                            text: root.appModel.translationJobState === "cancelled"
+                            objectName: "translationPrimaryControl"
+                            text: root.translationChoiceChanged ? "Dịch với lựa chọn mới"
+                                : root.appModel.translationJobState === "cancelled"
                                 || root.appModel.translationJobState === "failed"
                                 || root.appModel.translationJobState === "interrupted"
                                 || root.appModel.translationJobState === "review"
@@ -930,7 +1197,7 @@ Item {
                                     ? "Tiếp tục dịch"
                                     : (root.appModel.currentProject.hasTranslatedSubtitles
                                         ? "Dịch lại · ghi đè bản Việt" : "Bắt đầu dịch"))
-                            operationState: ["succeeded", ""]
+                            operationState: root.translationChoiceChanged ? "idle" : ["succeeded", ""]
                                 .indexOf(root.appModel.translationJobState) >= 0
                                 ? "idle" : root.appModel.translationJobState
                             warning: ["running", "pause_requested", "failed", "review",
@@ -951,6 +1218,7 @@ Item {
                                     "cancelled"].indexOf(root.appModel.translationJobState) >= 0
                                     ? "Đang tiếp tục dịch từ cache" : "Đang bắt đầu dịch")
                             enabled: root.appModel.currentProject.subtitleCueModel.count > 0
+                                && !root.appModel.translationPreferencesBusy
                                 && ["start_requested", "pause_requested", "resume_requested",
                                     "cancel_requested"]
                                     .indexOf(root.appModel.translationJobState) < 0
@@ -960,15 +1228,17 @@ Item {
                             disabledReason: root.appModel.currentProject.subtitleCueModel.count <= 0
                                 ? "Chưa có cue nguồn."
                                 : "Dịch đang chuyển trạng thái; hãy chờ xác nhận."
-                            onClicked: root.appModel.toggleTranslation(
+                            onClicked: root.appModel.toggleTranslationWithStyle(
                                 root.selectedTranslationProviderId(),
-                                translationModel.text,
+                                root.selectedTranslationModelId(),
                                 root.headedWebEnabled,
                                 root.guestWebEnabled,
                                 root.selectedTranslationProviderIsApi()
                                     ? apiCredentialInput.text : "",
                                 root.selectedTranslationProviderIsCustom()
-                                    ? customBaseUrl.text : ""
+                                    ? customBaseUrl.text : "",
+                                root.translationStyleIds[translationStyleBox.currentIndex] || "auto",
+                                translationRules.text
                             )
                         }
                         DsButton {
@@ -1103,20 +1373,6 @@ Item {
                         ? "Đang xuất một file SRT."
                         : "Chưa có phụ đề tiếng Việt để xuất."
                     onClicked: translatedSrtExportDialog.open()
-                }
-            }
-
-            SubtitleTextToolbar {
-                id: subtitleTextToolbar
-                Layout.fillWidth: true
-                visible: root.workspaceMode === "translate" || root.workspaceMode === "subtitles"
-                appModel: root.appModel
-                allowManualPlacement: true
-                onManualPlacementRequested: manualCueDialog.openForPlayhead(
-                    root.appModel.playheadUs
-                )
-                onColorPickRequested: function(target) {
-                    subtitlePreview.colorPickerTarget = target
                 }
             }
 
@@ -1567,9 +1823,6 @@ Item {
                         anchors.margins: Theme.space8
                         appModel: root.appModel
                         ocrRegionEditorMode: root.regionEditorMode
-                        onColorPicked: function(target, color) {
-                            subtitleTextToolbar.applyPickedColor(target, color)
-                        }
                         onRegionDrawn: function(mode, x, y, width, height) {
                             if (mode === "dialogue") {
                                 root.appModel.setOcrRegions(

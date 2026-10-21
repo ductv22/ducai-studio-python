@@ -17,8 +17,14 @@ class SubtitleStyle:
     outline_width: int = 3
     alignment: int = 2
     opacity_percent: int = 100
+    background_enabled: bool = True
+    background_mode: str = "legacy"
 
     def __post_init__(self) -> None:
+        if type(self.background_enabled) is not bool:
+            raise TypeError("Subtitle background enabled state must be boolean")
+        if self.background_mode not in {"legacy", "black", "blur"}:
+            raise ValueError("Subtitle background mode is invalid")
         if not self.font_family.strip():
             raise ValueError("Subtitle font family is required")
         if not 12 <= self.font_size <= 120:
@@ -154,6 +160,8 @@ class RenderSubtitle:
     font_italic: bool = False
     text_opacity_percent: int = 100
     background_opacity_percent: int = 90
+    background_padding_x: int = 20
+    background_padding_y: int = 10
 
     def __post_init__(self) -> None:
         if not self.cue_id or self.index <= 0 or self.end_us <= self.start_us:
@@ -164,9 +172,17 @@ class RenderSubtitle:
             raise ValueError("Subtitle font size is invalid")
         if self.orientation not in {"horizontal", "vertical"}:
             raise ValueError("Subtitle orientation is invalid")
+        if any(
+            type(value) is not int or value < 0
+            for value in (
+                self.background_padding_x,
+                self.background_padding_y,
+            )
+        ):
+            raise ValueError("Subtitle background padding is invalid")
         if (
             type(self.letter_spacing_percent) is not int
-            or not 0 <= self.letter_spacing_percent <= 100
+            or self.letter_spacing_percent < 0
         ):
             raise ValueError("Subtitle letter spacing is invalid")
         if type(self.font_bold) is not bool or type(self.font_italic) is not bool:
@@ -212,12 +228,19 @@ class RenderSubtitleBlur:
     opacity: float = 1.0
     region_source: str = "estimated"
     concealment_mode: str = "blur"
+    tracking_mode: str = "source_subtitle"
+    padding_x: float = 0.012
+    padding_y: float = 0.008
 
     def __post_init__(self) -> None:
         if not self.cue_id or self.index <= 0 or self.end_us <= self.start_us:
             raise ValueError("Subtitle blur identity and time range are invalid")
         if self.region_source not in {"ocr", "estimated"}:
             raise ValueError("Subtitle blur region source is invalid")
+        if self.tracking_mode not in {"source_subtitle", "translated_text", "ocr_watermark"}:
+            raise ValueError("Subtitle blur tracking mode is invalid")
+        if not 0 <= self.padding_x <= 0.5 or not 0 <= self.padding_y <= 0.5:
+            raise ValueError("Subtitle blur padding is invalid")
         if type(self.blur_radius) is not int or not 1 <= self.blur_radius <= 100:
             raise ValueError("Subtitle blur radius is invalid")
         if not 0.0 <= self.opacity <= 1.0:
@@ -264,6 +287,7 @@ class RenderSceneText:
     background_opacity_percent: int = 90
     fade_enabled: bool = False
     fade_duration_ms: int = 300
+    source_blur_enabled: bool = True
 
     def __post_init__(self) -> None:
         if not self.cue_id or self.index <= 0 or self.end_us <= self.start_us:
@@ -300,7 +324,7 @@ class RenderSceneText:
             "calligraphy_hurricane",
         }:
             raise ValueError("Scene text style hint is invalid")
-        if not self.font_family.strip() or not 1 <= self.font_size <= 16_384:
+        if not self.font_family.strip() or type(self.font_size) is not int or self.font_size < 1:
             raise ValueError("Scene text font is invalid")
         if self.background_color:
             if len(self.background_color) != 7 or not self.background_color.startswith("#"):
@@ -319,15 +343,15 @@ class RenderSceneText:
         if (
             type(self.background_padding_x) is not int
             or type(self.background_padding_y) is not int
-            or not 0 <= self.background_padding_x <= 100
-            or not 0 <= self.background_padding_y <= 100
+            or self.background_padding_x < 0
+            or self.background_padding_y < 0
         ):
             raise ValueError("Scene text background padding is invalid")
         if self.background_style not in CUE_BACKGROUND_STYLES:
             raise ValueError("Scene text background style is invalid")
         if (
             type(self.letter_spacing_percent) is not int
-            or not 0 <= self.letter_spacing_percent <= 100
+            or self.letter_spacing_percent < 0
         ):
             raise ValueError("Scene text letter spacing is invalid")
         if type(self.font_bold) is not bool or type(self.font_italic) is not bool:
@@ -343,6 +367,8 @@ class RenderSceneText:
             raise TypeError("Scene text fade flag is invalid")
         if type(self.fade_duration_ms) is not int or not 50 <= self.fade_duration_ms <= 2_000:
             raise ValueError("Scene text fade duration is invalid")
+        if type(self.source_blur_enabled) is not bool:
+            raise TypeError("Scene text source blur flag is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -379,13 +405,19 @@ class ExportSnapshot:
     conform_segments: tuple[RenderConformSegment, ...] = ()
     subtitle_blurs: tuple[RenderSubtitleBlur, ...] = ()
     scene_texts: tuple[RenderSceneText, ...] = ()
+    # Timeline edits/layers resolve to chronological visible video segments. ``video``
+    # remains the compatibility field for old snapshots and the legacy
+    # one-clip/conform renderer; when populated, this tuple is the complete
+    # video timeline in playback order (including the first clip).
+    video_segments: tuple[RenderClip, ...] = ()
+    title_texts: tuple[RenderSceneText, ...] = ()
 
     @property
     def duration_us(self) -> int:
         return self.timeline_end_us - self.timeline_start_us
 
     def __post_init__(self) -> None:
-        if self.schema_version not in {1, 2, 3, 4}:
+        if self.schema_version not in {1, 2, 3, 4, 5}:
             raise ValueError("Unsupported export snapshot schema")
         if not self.project_id or self.project_revision <= 0:
             raise ValueError("Export snapshot project identity is invalid")
@@ -393,7 +425,21 @@ class ExportSnapshot:
             raise ValueError("Export snapshot duration is invalid")
         if self.source_width <= 0 or self.source_height <= 0:
             raise ValueError("Export source resolution is invalid")
-        if not self.conform_segments and (
+        if self.video_segments:
+            if self.conform_segments:
+                raise ValueError("Voice conform export requires one legacy video clip")
+            if self.video_segments[0] != self.video:
+                raise ValueError("Export compatibility video must be the first video segment")
+            previous_end = self.timeline_start_us
+            for segment in self.video_segments:
+                if segment.track_kind != "video":
+                    raise ValueError("Export video segments must belong to a video track")
+                if segment.timeline_start_us != previous_end:
+                    raise ValueError("Export video segments must be chronological and gap-free")
+                previous_end = segment.timeline_end_us
+            if previous_end != self.timeline_end_us:
+                raise ValueError("Export video segments do not cover the snapshot")
+        elif not self.conform_segments and (
             self.video.timeline_start_us > self.timeline_start_us
             or self.video.timeline_end_us < self.timeline_end_us
         ):

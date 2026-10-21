@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Protocol
 
@@ -15,13 +15,17 @@ from ducai_studio.domain.effects import (
     RenderSubtitleBlur,
 )
 from ducai_studio.domain.project import (
+    Overlay,
     OverlayKind,
     ProjectSnapshot,
     SubtitleCue,
+    TimelineClip,
     TrackKind,
     dialogue_cues,
     scene_text_cues,
 )
+from ducai_studio.domain.timebase import SpeedRatio, TimeRange
+from ducai_studio.domain.video_layers import resolved_video_rows
 
 SCENE_TEXT_FONT_FAMILIES = {
     "calligraphy": "Playwrite VN",
@@ -49,34 +53,73 @@ def build_export_snapshot(
     settings: ExportSettings,
     media_probe: MediaProbe,
 ) -> ExportSnapshot:
+    if getattr(project, "timeline_edit", None) is not None:
+        # Timeline edits are stored as immutable operations over the physical
+        # project. Export consumes the same rippled projection as Preview and
+        # never mutates or rewrites source media.
+        from ducai_studio.domain.timeline_edit import project_for_timeline
+
+        project = project_for_timeline(project)
     media = {item.id: item for item in project.media}
-    video_clips = [
-        (track, clip)
+    video_tracks = [
+        track
         for track in project.tracks
-        if track.kind is TrackKind.VIDEO and track.visible
-        for clip in track.clips
+        if track.kind is TrackKind.VIDEO and track.visible and track.clips
     ]
-    if len(video_clips) != 1:
-        raise ValueError(
-            "The first export release supports exactly one covering video clip; "
-            "multi-clip timelines are not silently flattened"
+    if not video_tracks:
+        raise ValueError("Export requires a visible video track")
+    tracks_by_id = {track.id: track for track in project.tracks}
+    clips_by_id = {clip.id: clip for track in video_tracks for clip in track.clips}
+    video_clips = [
+        replace(
+            clips_by_id[row["id"]],
+            timeline_range=TimeRange(**row["timeline_range"]),
+            source_range=TimeRange(**row["source_range"]),
+            speed=SpeedRatio(**row["speed"]),
         )
-    video_track, video_clip = video_clips[0]
-    if video_clip.media_id is None or video_clip.source_range is None:
-        raise ValueError("Export video clip has no source media range")
-    video_asset = media.get(video_clip.media_id)
-    if video_asset is None:
-        raise ValueError("Export video clip references missing media")
-    video_path = Path(video_asset.path).expanduser().resolve(strict=True)
-    probe = media_probe.probe(video_path)
-    if not probe.has_video or probe.width is None or probe.height is None:
-        raise ValueError("Export source is not a decodable video")
-    start_us = video_clip.timeline_range.start_us
-    end_us = video_clip.timeline_range.end_us
-    video = _render_clip(video_track.kind, video_track.muted, video_clip, video_path)
+        for row in resolved_video_rows(project)
+    ]
+    if not video_clips:
+        raise ValueError("Export requires a decodable video clip")
+    previous_end = video_clips[0].timeline_range.start_us
+    rendered_video: list[RenderClip] = []
+    probes = []
+    probe_by_path = {}
+    for video_clip in video_clips:
+        if video_clip.timeline_range.start_us != previous_end:
+            relation = "gap" if video_clip.timeline_range.start_us > previous_end else "overlap"
+            raise ValueError(f"Export video timeline contains a {relation}")
+        if video_clip.media_id is None or video_clip.source_range is None:
+            raise ValueError("Export video clip has no source media range")
+        video_asset = media.get(video_clip.media_id)
+        if video_asset is None:
+            raise ValueError("Export video clip references missing media")
+        video_path = Path(video_asset.path).expanduser().resolve(strict=True)
+        probe = probe_by_path.get(video_path)
+        if probe is None:
+            probe = media_probe.probe(video_path)
+            probe_by_path[video_path] = probe
+        if not probe.has_video or probe.width is None or probe.height is None:
+            raise ValueError("Export source is not a decodable video")
+        probes.append(probe)
+        rendered_video.append(
+            _render_clip(
+                TrackKind.VIDEO, tracks_by_id[video_clip.track_id].muted, video_clip, video_path
+            )
+        )
+        previous_end = video_clip.timeline_range.end_us
+    video_clip = video_clips[0]
+    probe = probes[0]
+    start_us = video_clips[0].timeline_range.start_us
+    end_us = video_clips[-1].timeline_range.end_us
+    content_start_us = start_us
+    content_end_us = end_us
+    video = rendered_video[0]
     conform_plan = project.voice_conform.plan if project.voice_conform is not None else None
     conform_segments: tuple[RenderConformSegment, ...] = ()
     if conform_plan is not None:
+        if len(video_clips) != 1:
+            raise ValueError("Voice conform export requires exactly one video clip")
         if (
             video_clip.source_range.start_us != 0
             or video_clip.source_range.end_us != conform_plan.source_duration_us
@@ -110,6 +153,17 @@ def build_export_snapshot(
         )
 
     audio: list[RenderClip] = []
+    video_link_groups = {
+        clip.link_group_id
+        for track in project.tracks
+        if track.kind is TrackKind.VIDEO
+        for clip in track.clips
+        if clip.link_group_id
+    }
+    winning_video_by_link: dict[str, list[TimelineClip]] = {}
+    for item in video_clips:
+        if item.link_group_id:
+            winning_video_by_link.setdefault(item.link_group_id, []).append(item)
     for track in project.tracks:
         if track.kind not in {
             TrackKind.ORIGINAL_AUDIO,
@@ -120,54 +174,90 @@ def build_export_snapshot(
         for clip in track.clips:
             if clip.media_id is None or clip.source_range is None:
                 continue
-            if (
-                clip.timeline_range.end_us <= start_us
-                or clip.timeline_range.start_us >= end_us
-            ):
+            if clip.timeline_range.end_us <= start_us or clip.timeline_range.start_us >= end_us:
                 continue
             asset = media.get(clip.media_id)
             if asset is None:
                 raise ValueError(f"Export audio clip references missing media: {clip.id}")
             path = Path(asset.path).expanduser().resolve(strict=True)
-            rendered = _render_clip(track.kind, track.muted, clip, path)
-            if conform_plan is not None and track.kind is TrackKind.ORIGINAL_AUDIO:
-                rendered = RenderClip(
-                    rendered.clip_id,
-                    rendered.track_id,
-                    rendered.track_kind,
-                    rendered.path,
-                    conform_plan.source_to_output_us(rendered.timeline_start_us),
-                    conform_plan.source_to_output_us(rendered.timeline_end_us),
-                    rendered.source_start_us,
-                    rendered.source_end_us,
-                    rendered.speed_numerator,
-                    rendered.speed_denominator,
-                    rendered.volume,
-                    rendered.muted,
-                )
-            audio.append(rendered)
+            # Linked source audio follows the same winning video intervals as
+            # Preview. Occluded V1 audio must not play underneath a pasted V2.
+            intervals = [(clip.timeline_range, False)]
+            if track.kind is TrackKind.ORIGINAL_AUDIO and clip.link_group_id:
+                linked_videos = winning_video_by_link.get(clip.link_group_id, ())
+                if clip.link_group_id in video_link_groups:
+                    intervals = [
+                        (
+                            TimeRange(
+                                max(clip.timeline_range.start_us, item.timeline_range.start_us),
+                                min(clip.timeline_range.end_us, item.timeline_range.end_us),
+                            ),
+                            item.muted or tracks_by_id[item.track_id].muted,
+                        )
+                        for item in linked_videos
+                        if max(clip.timeline_range.start_us, item.timeline_range.start_us)
+                        < min(clip.timeline_range.end_us, item.timeline_range.end_us)
+                    ]
+            for interval, video_muted in intervals:
+                piece = _clip_interval(clip, interval)
+                rendered = _render_clip(track.kind, track.muted or video_muted, piece, path)
+                if conform_plan is not None and track.kind is TrackKind.ORIGINAL_AUDIO:
+                    rendered = replace(
+                        rendered,
+                        timeline_start_us=conform_plan.source_to_output_us(
+                            rendered.timeline_start_us
+                        ),
+                        timeline_end_us=conform_plan.source_to_output_us(rendered.timeline_end_us),
+                    )
+                audio.append(rendered)
 
     overlays: list[RenderOverlay] = []
     subtitle_blurs: list[RenderSubtitleBlur] = []
-    for overlay in project.overlays:
+    effective_overlays = list(project.overlays)
+    style = settings.subtitle_style
+    if style.background_enabled and style.background_mode == "blur":
+        automatic = next(
+            (item for item in effective_overlays if item.id == "overlay-default-blur"), None
+        )
+        if automatic is None:
+            automatic = Overlay(
+                "overlay-default-blur",
+                OverlayKind.BLUR,
+                TimeRange(content_start_us, content_end_us),
+                0.1,
+                0.85,
+                0.8,
+                0.1,
+                tracking_mode="source_subtitle",
+                blur_radius=22,
+            )
+            effective_overlays.append(automatic)
+        effective_overlays = [
+            replace(item, enabled=True, tracking_mode="source_subtitle")
+            if item.id == automatic.id
+            else item
+            for item in effective_overlays
+        ]
+    for overlay in effective_overlays:
+        if overlay.id == "overlay-default-blur" and (
+            not style.background_enabled or style.background_mode == "black"
+        ):
+            continue
         if (
             not overlay.enabled
             or overlay.range.end_us <= start_us
             or overlay.range.start_us >= end_us
         ):
             continue
-        if (
-            overlay.kind is OverlayKind.BLUR
-            and overlay.tracking_mode == "source_subtitle"
-        ):
-            for cue in project.source_cues:
+        if overlay.kind is OverlayKind.BLUR and overlay.tracking_mode == "source_subtitle":
+            for cue in dialogue_cues(project.translated_cues or project.source_cues):
                 cue_start = max(
-                    video_clip.timeline_range.start_us,
+                    content_start_us,
                     overlay.range.start_us,
                     cue.range.start_us,
                 )
                 cue_end = min(
-                    video_clip.timeline_range.end_us,
+                    content_end_us,
                     overlay.range.end_us,
                     cue.range.end_us,
                 )
@@ -196,19 +286,19 @@ def build_export_snapshot(
                         overlay.opacity,
                         region_source,
                         overlay.concealment_mode,
+                        "translated_text",
+                        overlay.padding_x,
+                        overlay.padding_y,
                     )
                 )
             continue
-        if (
-            overlay.kind is OverlayKind.BLUR
-            and overlay.tracking_mode == "ocr_watermark"
-        ):
+        if overlay.kind is OverlayKind.BLUR and overlay.tracking_mode == "ocr_watermark":
             overlay_start = max(
-                video_clip.timeline_range.start_us,
+                content_start_us,
                 overlay.range.start_us,
             )
             overlay_end = min(
-                video_clip.timeline_range.end_us,
+                content_end_us,
                 overlay.range.end_us,
             )
             if conform_plan is not None:
@@ -239,8 +329,8 @@ def build_export_snapshot(
             asset_path = str(Path(asset.path).expanduser().resolve(strict=True))
         if overlay.kind.value == "logo" and not asset_path:
             raise ValueError("Enabled logo overlay has no image asset")
-        overlay_start = max(video_clip.timeline_range.start_us, overlay.range.start_us)
-        overlay_end = min(video_clip.timeline_range.end_us, overlay.range.end_us)
+        overlay_start = max(content_start_us, overlay.range.start_us)
+        overlay_end = min(content_end_us, overlay.range.end_us)
         if conform_plan is not None:
             overlay_start = conform_plan.source_to_output_us(overlay_start)
             overlay_end = conform_plan.source_to_output_us(overlay_end)
@@ -261,12 +351,12 @@ def build_export_snapshot(
         )
 
     raw_cues = project.translated_cues if project.translated_cues else project.source_cues
-    if settings.subtitle_style.enabled and not raw_cues:
+    if settings.subtitle_style.enabled and not raw_cues and not project.title_cues:
         raise ValueError("Subtitle burn-in is enabled but the project has no subtitles")
     subtitles = []
     scene_texts: list[RenderSceneText] = []
-    source_start_us = video_clip.timeline_range.start_us
-    source_end_us = video_clip.timeline_range.end_us
+    source_start_us = video_clips[0].timeline_range.start_us
+    source_end_us = video_clips[-1].timeline_range.end_us
     for cue in dialogue_cues(raw_cues):
         if cue.range.end_us <= source_start_us or cue.range.start_us >= source_end_us:
             continue
@@ -296,9 +386,10 @@ def build_export_snapshot(
                 cue.font_italic,
                 cue.text_opacity_percent,
                 cue.background_opacity_percent,
+                cue.background_padding_x,
+                cue.background_padding_y,
             )
         )
-    source_scene_by_id = {cue.id: cue for cue in scene_text_cues(project.source_cues)}
     render_width = int(settings.output_width or probe.width)
     render_height = int(settings.output_height or probe.height)
     render_width -= render_width % 2
@@ -306,16 +397,10 @@ def build_export_snapshot(
     for cue in scene_text_cues(raw_cues):
         if cue.range.end_us <= source_start_us or cue.range.start_us >= source_end_us:
             continue
-        source_geometry = source_scene_by_id.get(cue.id)
-        geometry = (
-            source_geometry
-            if source_geometry is not None and source_geometry.visual_box is not None
-            else cue
-        )
         scene_texts.append(
             _render_scene_text(
                 cue,
-                geometry=geometry,
+                geometry=cue,
                 render_width=render_width,
                 render_height=render_height,
                 clip_start_us=source_start_us,
@@ -323,8 +408,20 @@ def build_export_snapshot(
                 conform_plan=conform_plan,
             )
         )
+    title_track_visible = all(track.visible for track in project.tracks
+                              if track.kind is TrackKind.TEXT)
+    title_texts = tuple(
+        _render_scene_text(
+            cue, geometry=cue, render_width=render_width, render_height=render_height,
+            clip_start_us=source_start_us, clip_end_us=source_end_us, conform_plan=conform_plan,
+        )
+        for cue in project.title_cues
+        if title_track_visible and cue.range.end_us > source_start_us
+        and cue.range.start_us < source_end_us
+    )
     return ExportSnapshot(
-        4 if scene_texts else (3 if subtitle_blurs else (2 if conform_segments else 1)),
+        5 if title_texts else (4 if scene_texts else (3 if subtitle_blurs else
+                                                   (2 if conform_segments else 1))),
         project.id,
         project.revision,
         start_us,
@@ -339,11 +436,33 @@ def build_export_snapshot(
         conform_segments,
         tuple(subtitle_blurs),
         tuple(scene_texts),
+        tuple(rendered_video) if len(rendered_video) > 1 else (),
+        title_texts,
     )
 
 
 def export_snapshot_json(snapshot: ExportSnapshot) -> dict:
     return asdict(snapshot)
+
+
+def _clip_interval(clip, interval: TimeRange):
+    if interval == clip.timeline_range:
+        return clip
+    from fractions import Fraction
+
+    source_start = clip.source_range.start_us + clip.speed.timeline_to_source_us(
+        interval.start_us - clip.timeline_range.start_us
+    )
+    source_end = clip.source_range.start_us + clip.speed.timeline_to_source_us(
+        interval.end_us - clip.timeline_range.start_us
+    )
+    speed = Fraction(source_end - source_start, interval.duration_us)
+    return replace(
+        clip,
+        timeline_range=interval,
+        source_range=TimeRange(source_start, source_end),
+        speed=SpeedRatio(speed.numerator, speed.denominator),
+    )
 
 
 def _render_clip(kind, muted, clip, path: Path) -> RenderClip:
@@ -360,7 +479,7 @@ def _render_clip(kind, muted, clip, path: Path) -> RenderClip:
         clip.speed.numerator,
         clip.speed.denominator,
         clip.volume,
-        muted,
+        muted or clip.muted,
     )
 
 
@@ -400,9 +519,7 @@ def _render_scene_text(
     conform_plan,
 ) -> RenderSceneText:
     if geometry.visual_box is None:
-        raise ValueError(
-            f"Chữ trong cảnh cue {cue.index} chưa có vùng OCR để che và đặt bản dịch."
-        )
+        raise ValueError(f"Chữ trong cảnh cue {cue.index} chưa có vùng OCR để che và đặt bản dịch.")
     glyph_x, glyph_y, glyph_width, glyph_height = geometry.visual_box
     if geometry.panel_box is not None:
         panel_x, panel_y, panel_width, panel_height = geometry.panel_box
@@ -453,7 +570,7 @@ def _render_scene_text(
         geometry.visual_box_source or "ocr",
         geometry.review_state,
         30 if geometry.review_state == "accepted" else 24,
-        geometry.text_color,
+        geometry.text_color or "#FFFFFF",
         geometry.background_padding_x,
         geometry.background_padding_y,
         geometry.background_style,
@@ -464,6 +581,7 @@ def _render_scene_text(
         geometry.background_opacity_percent,
         geometry.fade_enabled,
         geometry.fade_duration_ms,
+        False,
     )
 
 
@@ -490,46 +608,41 @@ def _scene_text_font_size(
 ) -> int:
     lines = [line for line in text.splitlines() if line] or [text]
     longest = max(1, max(len(line) for line in lines))
-    # Qt Quick and libass resolve the bundled Playwrite variable font with very
-    # different metrics.  These libass ratios come from raster probes of the
-    # packaged font; QML uses its own Qt-specific ratios.  Keeping engine-aware
-    # fit metrics produces comparable visible bounds instead of making the ASS
-    # export roughly 2.5x smaller than Preview.  The panel clip remains the
-    # final no-overflow safety net.
+    # Use the preview's reference pixel size. Export paints the same glyph
+    # outlines rather than asking libass to reinterpret the font metrics.
     if style_hint.startswith("calligraphy"):
-        width_ratio = 0.90
-        line_height_ratio = 0.95
+        width_ratio = 1.96
+        line_height_ratio = 2.55
     else:
         width_ratio = 1.28
         line_height_ratio = 1.32
     if orientation == "vertical":
         panel_by_width = panel_width_px * 0.88 / max(1.0, longest * width_ratio)
-        panel_by_height = panel_height_px * 0.88 / max(
-            1.25, len(lines) * line_height_ratio
-        )
+        panel_by_height = panel_height_px * 0.88 / max(1.25, len(lines) * line_height_ratio)
         source_size = min(
             glyph_width_px * 0.92,
             glyph_height_px / max(1.0, len(lines) * 1.08),
         )
     else:
         panel_by_width = panel_width_px * 0.88 / max(1.0, longest * width_ratio)
-        panel_by_height = panel_height_px * 0.88 / max(
-            1.0, len(lines) * line_height_ratio
-        )
+        panel_by_height = panel_height_px * 0.88 / max(1.0, len(lines) * line_height_ratio)
         source_size = glyph_height_px * 0.92
     panel_fit = min(panel_by_width, panel_by_height)
     automatic_size = min(source_size, panel_fit)
-    # The current editor exposes a Word-like 1–100 size. ``12`` preserves the
+    # The editor exposes a positive Word-like size. ``12`` preserves the
     # automatic OCR fit, while larger/smaller values scale it monotonically.
     # Legacy 0.5–2.0 scene scale remains multiplied in.
-    scaled_size = automatic_size * max(1 / 24, min(50 / 3, float(font_scale)))
+    scaled_size = automatic_size * max(1 / 24, float(font_scale))
     # The panel is a placement handle, not a hidden font-size clamp. The video
     # frame remains the final paint boundary, so moving or shrinking the handle
     # never silently reduces an explicitly selected Word-like font size.
-    safe_render_max = max(
-        panel_width_px,
-        panel_height_px,
-        glyph_width_px,
-        glyph_height_px,
-    ) * 8
+    safe_render_max = (
+        max(
+            panel_width_px,
+            panel_height_px,
+            glyph_width_px,
+            glyph_height_px,
+        )
+        * 8
+    )
     return max(1, int(min(scaled_size, safe_render_max)))

@@ -12,37 +12,49 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import replace
+from contextlib import suppress
+from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 from uuid import uuid4
 
 from ducai_studio.application.ocr_pipeline import (
+    OCR_AGGREGATION_VERSION,
     apply_quality_rescue,
     coalesce_rescue_windows,
     cross_pass_consensus_candidates,
     group_visual_evidence,
     measure_hard_sub_coverage,
     merge_band_candidates,
+    reconcile_dialogue_evidence,
     reinforce_candidate_ranges,
     scene_text_cues_from_evidence,
+    scene_text_rescue_regions,
     targeted_rescue_windows,
 )
 from ducai_studio.application.subtitle_finalizer import (
     FinalizationStatus,
+    collapse_proven_ocr_candidates,
     finalize_ocr_candidates,
     publish_final_srt,
     render_srt,
 )
 from ducai_studio.domain.project import SubtitleCue
-from ducai_studio.domain.subtitles import NormalizedBox, RescueWindow, SubtitleEvidence
+from ducai_studio.domain.subtitles import (
+    NormalizedBox,
+    RescueWindow,
+    SceneTextProbe,
+    SubtitleEvidence,
+)
 from ducai_studio.domain.timebase import TimeRange
 from ducai_studio.external_runtime import (
     isolated_python_environment,
     isolated_python_working_directory,
 )
 from ducai_studio.infrastructure.portable_runtime import paddle_cache_home_for_runtime
+from ducai_studio.infrastructure.process_tree import ProcessTreeGuard
+from ducai_studio.infrastructure.runtime_program import runtime_program_path
 from ducai_studio.providers.ocr import DEFAULT_SUBTITLE_BANDS
 from ducai_studio.workers.protocol import PROTOCOL_VERSION, WorkerMessage
 
@@ -51,12 +63,99 @@ class EngineError(RuntimeError):
     pass
 
 
+_OCR_FALLBACK_DETAILS = {
+    "ocr_cuda_driver_incompatible": "driver NVIDIA chưa phù hợp runtime CUDA",
+    "ocr_cuda_kernel_unsupported": "runtime CUDA không hỗ trợ GPU này",
+    "ocr_cuda_blackwell_runtime_incompatible": "RTX 50 cần runtime Paddle CUDA 12.9 trở lên",
+    "ocr_cuda_launch_failed": "kernel CUDA gặp lỗi; kiểm tra driver/runtime",
+    "ocr_cuda_out_of_memory": "GPU không còn đủ VRAM",
+    "ocr_cuda_library_missing": "thiếu hoặc không nạp được thư viện CUDA/cuDNN",
+    "ocr_cuda_cpu_only": "runtime Paddle đang là bản CPU",
+    "ocr_cuda_device_unavailable": "Paddle không tìm thấy GPU CUDA đã chọn",
+}
+
+_OCR_EXECUTION_DETAILS = {
+    **_OCR_FALLBACK_DETAILS,
+    "ocr_predictor_timeout": "tiến trình nhận chữ quá thời gian chờ",
+    "ocr_predictor_exited": "tiến trình nhận chữ bị ngắt",
+    "BrokenPipeError": "mất kết nối tiến trình nhận chữ",
+    "ConnectionResetError": "mất kết nối tiến trình nhận chữ",
+    "ConnectionAbortedError": "mất kết nối tiến trình nhận chữ",
+    "insufficient_free_memory": "không đủ RAM/VRAM trống cho 3 tiến trình",
+    "memory_probe_unavailable": "không xác minh được RAM/VRAM trống",
+    "gpu_oom": "GPU không còn đủ VRAM",
+    "model_startup_failed": "không nạp được bộ nhận chữ",
+    "model_missing": "thiếu model nhận chữ",
+    "ocr_predictor_invalid_handshake": "phản hồi khởi tạo không hợp lệ",
+    "ocr_predictor_invalid_readings": "phản hồi nhận chữ không hợp lệ",
+    "ocr_predictor_result_count_mismatch": "số kết quả nhận chữ không hợp lệ",
+    "RuntimeError": "bộ nhận chữ gặp lỗi",
+    "ValueError": "phản hồi nhận chữ không hợp lệ",
+}
+
+
 class WorkerStopped(RuntimeError):
     pass
 
 
 class WhisperRestart(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class ScanPlanSegment:
+    index: int
+    media_id: str
+    media_path: str
+    source_start_us: int
+    source_end_us: int
+    timeline_start_us: int
+    timeline_end_us: int
+    base_start_us: int
+    base_end_us: int
+
+    @property
+    def timeline_duration_us(self) -> int:
+        return self.timeline_end_us - self.timeline_start_us
+
+    def contains_timeline(self, timestamp_us: int) -> bool:
+        return self.timeline_start_us <= timestamp_us < self.timeline_end_us
+
+    def timeline_to_source(self, timestamp_us: int) -> int:
+        return self._project_timestamp(
+            timestamp_us,
+            target_start_us=self.source_start_us,
+            target_end_us=self.source_end_us,
+        )
+
+    def timeline_to_base(self, timestamp_us: int) -> int:
+        return self._project_timestamp(
+            timestamp_us,
+            target_start_us=self.base_start_us,
+            target_end_us=self.base_end_us,
+        )
+
+    def source_to_timeline(self, timestamp_us: int) -> int:
+        source_duration_us = self.source_end_us - self.source_start_us
+        offset_us = max(0, min(source_duration_us - 1, timestamp_us - self.source_start_us))
+        projected = self.timeline_start_us + (
+            offset_us * self.timeline_duration_us // source_duration_us
+        )
+        return min(self.timeline_end_us - 1, projected)
+
+    def _project_timestamp(
+        self,
+        timestamp_us: int,
+        *,
+        target_start_us: int,
+        target_end_us: int,
+    ) -> int:
+        if not self.contains_timeline(timestamp_us):
+            raise ValueError("scan_plan_timestamp_out_of_range")
+        target_duration_us = target_end_us - target_start_us
+        offset_us = timestamp_us - self.timeline_start_us
+        projected = target_start_us + (offset_us * target_duration_us // self.timeline_duration_us)
+        return min(target_end_us - 1, projected)
 
 
 def _sampling_intervals(configured_interval_us: int) -> tuple[int, int]:
@@ -68,6 +167,7 @@ class EngineHostClient:
         self.python_path = python_path
         self.host_path = host_path
         self.process: subprocess.Popen[str] | None = None
+        self._process_tree: ProcessTreeGuard | None = None
         self._stderr: deque[str] = deque(maxlen=20)
         self._stderr_thread: threading.Thread | None = None
 
@@ -83,19 +183,36 @@ class EngineHostClient:
         portable_cache = paddle_cache_home_for_runtime(self.python_path)
         if portable_cache is not None:
             environment.setdefault("PADDLE_PDX_CACHE_HOME", str(portable_cache))
-        self.process = subprocess.Popen(
-            [str(self.python_path), "-u", str(self.host_path)],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            creationflags=creation_flags,
-            env=environment,
-            cwd=isolated_python_working_directory(self.python_path),
+        environment["DUCAI_WORKER_PROGRAM"] = str(self.python_path)
+        environment["DUCAI_WORKER_ARGUMENTS_JSON"] = json.dumps(
+            ["-u", str(self.host_path)], ensure_ascii=False,
         )
+        self._process_tree = ProcessTreeGuard()
+        try:
+            self.process = subprocess.Popen(
+                [str(runtime_program_path()), "-m", "ducai_studio.workers.preowned_launcher"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=creation_flags,
+                env=environment,
+                cwd=isolated_python_working_directory(self.python_path),
+            )
+            # Assign before the first request can launch any model children.
+            self._process_tree.assign_pid(self.process.pid)
+            if self.process.stdin is None:
+                raise EngineError("ocr_engine_pipe_failed")
+            # TextIOWrapper translates LF to CRLF on Windows, but the launch
+            # gate is deliberately byte-exact and must not read ahead.
+            if os.write(self.process.stdin.fileno(), b"DUCAI_LAUNCH\n") != 13:
+                raise EngineError("ocr_engine_pipe_failed")
+        except BaseException:
+            self.close()
+            raise
         self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
         self._stderr_thread.start()
 
@@ -150,29 +267,37 @@ class EngineHostClient:
     def close(self) -> None:
         process = self.process
         self.process = None
-        if process is None:
-            return
-        if process.poll() is None and process.stdin is not None and process.stdout is not None:
-            try:
-                request_id = str(uuid4())
-                process.stdin.write(
-                    json.dumps(
-                        {
-                            "protocol_version": 1,
-                            "id": request_id,
-                            "action": "shutdown",
-                            "payload": {},
-                        }
-                    )
-                    + "\n"
-                )
-                process.stdin.flush()
+        tree, self._process_tree = self._process_tree, None
+        try:
+            if process is not None and process.poll() is None:
+                try:
+                    if process.stdin is not None:
+                        process.stdin.write(json.dumps({
+                            "protocol_version": 1, "id": str(uuid4()),
+                            "action": "shutdown", "payload": {},
+                        }) + "\n")
+                        process.stdin.flush()
+                    process.wait(timeout=5)
+                except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+                    # The guard below stops the host, venv launcher and every
+                    # predictor even when the host cannot acknowledge shutdown.
+                    if os.name != "nt":
+                        process.kill()
+        finally:
+            if tree is not None:
+                tree.close()
+            if process is not None:
+                if process.poll() is None:
+                    process.kill()
                 process.wait(timeout=5)
-            except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
-                process.kill()
-        if process.poll() is None:
-            process.kill()
-        process.wait(timeout=5)
+                for stream in (process.stdin, process.stdout, process.stderr):
+                    if stream is not None:
+                        # A killed pipe may fail its final flush.
+                        with suppress(OSError):
+                            stream.close()
+            if self._stderr_thread is not None:
+                self._stderr_thread.join(timeout=2)
+                self._stderr_thread = None
 
 
 class WhisperEngineClient:
@@ -346,9 +471,23 @@ class OcrWorker:
         self.cursor_us = 0
         self._change_events: list[int] = []
         self._scene_change_events: list[int] = []
+        self._scan_plan_segments: tuple[ScanPlanSegment, ...] = ()
+        self._scan_plan_duration_us = 0
+        self._scan_plan_fingerprint = ""
+        self._engine_mode = ""
+        self._engine_media_path = ""
+        self._ocr_execution: dict[str, Any] = {}
+        self._ocr_fallback_reason = ""
+        self._engine_video_duration_us: int | None = None
+        self._decoder_video_durations: dict[str, int] = {}
+        self._decoder_tail_request_counts: dict[str, int] = {}
+        self._change_tracking_segment_index: int | None = None
         self._whisper_force_cpu = False
         self._whisper_runtime: dict[str, Any] = {}
         self._whisper_segment_total = 0
+        self._finalization_detail = ""
+        self._finalization_last_progress = 0.0
+        self._finalization_started = 0.0
         self._reader = threading.Thread(target=self._read_commands, daemon=True)
 
     def send(
@@ -358,6 +497,35 @@ class OcrWorker:
         *,
         event_id: str | None = None,
     ) -> WorkerMessage:
+        if kind == "progress" and payload.get("phase") in {
+            "fast", "adaptive_ocr", "quality", "scene_quality",
+        } and (self._ocr_execution or self._engine_mode == "compatibility"):
+            execution = self._ocr_execution
+            if self._engine_mode == "compatibility":
+                # Rapid's CPU provider is known even when an older host omits
+                # telemetry. Never leave the configured GPU label on a CPU run.
+                execution = {"execution_device": "cpu", "execution_workers": 1}
+            payload = {**execution, **payload}
+            if self._ocr_fallback_reason:
+                payload["ocr_fallback_reason"] = self._ocr_fallback_reason
+            if not payload.get("phase_detail"):
+                device = execution["execution_device"]
+                workers = execution["execution_workers"]
+                if self._engine_mode == "compatibility":
+                    detail = "CPU · OCR tương thích"
+                    if self._ocr_fallback_reason:
+                        detail += " · Paddle lỗi: " + _OCR_FALLBACK_DETAILS.get(
+                            self._ocr_fallback_reason, self._ocr_fallback_reason,
+                        )
+                else:
+                    detail = ("GPU" if device.startswith("gpu") else device.upper())
+                    detail += f" · {workers} tiến trình nhận chữ"
+                    reason = execution.get("execution_fallback_reason")
+                    if reason:
+                        detail += " · " + _OCR_EXECUTION_DETAILS[reason]
+                    elif execution.get("execution_recovery_attempts") and workers == 3:
+                        detail += " · đã khôi phục chạy song song"
+                payload["phase_detail"] = detail
         message = WorkerMessage(
             PROTOCOL_VERSION,
             self.job_id,
@@ -432,7 +600,84 @@ class OcrWorker:
             raise ValueError("ocr_provider_config_missing")
         self.spec = spec
         self.config = config
+        self._configure_scan_plan()
         self._restore_checkpoint(start_payload.get("checkpoint"))
+
+    def _configure_scan_plan(self) -> None:
+        self._scan_plan_segments = ()
+        self._scan_plan_duration_us = 0
+        self._scan_plan_fingerprint = ""
+        raw_plan = self.config.get("scan_plan")
+        if raw_plan is None:
+            return
+        if not isinstance(raw_plan, dict) or raw_plan.get("schema_version") != 1:
+            raise ValueError("invalid_ocr_scan_plan")
+        duration_us = raw_plan.get("duration_us")
+        raw_segments = raw_plan.get("segments")
+        if (
+            type(duration_us) is not int
+            or duration_us <= 0
+            or not isinstance(raw_segments, list)
+            or not raw_segments
+        ):
+            raise ValueError("invalid_ocr_scan_plan")
+        segments: list[ScanPlanSegment] = []
+        previous_timeline_end_us = 0
+        for index, raw in enumerate(raw_segments):
+            if not isinstance(raw, dict):
+                raise ValueError("invalid_ocr_scan_plan")
+            media_id = raw.get("media_id")
+            media_path = raw.get("media_path")
+            timing_keys = (
+                "source_start_us",
+                "source_end_us",
+                "timeline_start_us",
+                "timeline_end_us",
+                "base_start_us",
+                "base_end_us",
+            )
+            if (
+                not isinstance(media_id, str)
+                or not media_id
+                or not isinstance(media_path, str)
+                or not media_path
+                or any(type(raw.get(key)) is not int for key in timing_keys)
+            ):
+                raise ValueError("invalid_ocr_scan_plan")
+            segment = ScanPlanSegment(
+                index=index,
+                media_id=media_id,
+                media_path=media_path,
+                source_start_us=int(raw["source_start_us"]),
+                source_end_us=int(raw["source_end_us"]),
+                timeline_start_us=int(raw["timeline_start_us"]),
+                timeline_end_us=int(raw["timeline_end_us"]),
+                base_start_us=int(raw["base_start_us"]),
+                base_end_us=int(raw["base_end_us"]),
+            )
+            if (
+                segment.source_start_us < 0
+                or segment.source_end_us <= segment.source_start_us
+                or segment.timeline_start_us < previous_timeline_end_us
+                or segment.timeline_end_us <= segment.timeline_start_us
+                or segment.timeline_end_us > duration_us
+                or segment.base_start_us < 0
+                or segment.base_end_us <= segment.base_start_us
+            ):
+                raise ValueError("invalid_ocr_scan_plan")
+            segments.append(segment)
+            previous_timeline_end_us = segment.timeline_end_us
+        if previous_timeline_end_us != duration_us:
+            raise ValueError("invalid_ocr_scan_plan")
+        self._scan_plan_segments = tuple(segments)
+        self._scan_plan_duration_us = duration_us
+        canonical = json.dumps(
+            raw_plan,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        self._scan_plan_fingerprint = sha256(canonical).hexdigest()
 
     def _restore_checkpoint(self, checkpoint: object) -> None:
         if self.config.get("extraction_method") == "whisper_audio":
@@ -445,6 +690,33 @@ class OcrWorker:
         artifact = checkpoint.get("artifact")
         if not isinstance(payload, dict) or not isinstance(artifact, dict):
             return
+        if self.config.get("ocr_aggregation_version") == OCR_AGGREGATION_VERSION and payload.get(
+            "ocr_aggregation_version"
+        ) != OCR_AGGREGATION_VERSION:
+            self.evidence_path.unlink(missing_ok=True)
+            return
+        if (
+            self._scan_plan_segments
+            and payload.get("scan_plan_fingerprint") != self._scan_plan_fingerprint
+        ):
+            self.evidence_path.unlink(missing_ok=True)
+            return
+        settings_fingerprint = str(self.spec.get("settings_fingerprint", ""))
+        if (
+            self._scan_plan_segments
+            and settings_fingerprint
+            and payload.get("settings_fingerprint") != settings_fingerprint
+        ):
+            self.evidence_path.unlink(missing_ok=True)
+            return
+        input_fingerprint = str(self.spec.get("input_fingerprint", ""))
+        if (
+            self._scan_plan_segments
+            and input_fingerprint
+            and payload.get("input_fingerprint") != input_fingerprint
+        ):
+            self.evidence_path.unlink(missing_ok=True)
+            return
         uri = artifact.get("uri")
         if not isinstance(uri, str):
             return
@@ -453,9 +725,7 @@ class OcrWorker:
         self.stage = str(payload.get("stage", "fast"))
         raw_cursor = payload.get("cursor_us", checkpoint.get("cursor_us", 0))
         self.cursor_us = int(raw_cursor) if type(raw_cursor) is int else 0
-        self._change_events = self._checkpoint_event_values(
-            payload.get("change_events_us")
-        )
+        self._change_events = self._checkpoint_event_values(payload.get("change_events_us"))
         self._scene_change_events = self._checkpoint_event_values(
             payload.get("scene_change_events_us")
         )
@@ -463,15 +733,15 @@ class OcrWorker:
             interval = self._integer_config("sample_interval_us", 800_000, 400_000)
             rewind = max(0, self.cursor_us - interval * 2)
             self._filter_working_evidence(
-                lambda row: not (
-                    row.get("provider_id") in {"paddle-fast", "rapid-compatibility"}
-                    and int(row.get("timestamp_us", 0)) >= rewind
+                lambda row: (
+                    not (
+                        row.get("provider_id") in {"paddle-fast", "rapid-compatibility"}
+                        and int(row.get("timestamp_us", 0)) >= rewind
+                    )
                 )
             )
             self.cursor_us = rewind
-            self._change_events = [
-                value for value in self._change_events if value < rewind
-            ]
+            self._change_events = [value for value in self._change_events if value < rewind]
             self._scene_change_events = [
                 value for value in self._scene_change_events if value < rewind
             ]
@@ -480,25 +750,28 @@ class OcrWorker:
             quality_interval = max(400_000, fast_interval // 2)
             rewind = max(0, self.cursor_us - quality_interval * 2)
             self._filter_working_evidence(
-                lambda row: not (
-                    row.get("provider_id")
-                    in {"paddle-quality", "rapid-quality-fallback"}
-                    and int(row.get("timestamp_us", 0)) >= rewind
+                lambda row: (
+                    not (
+                        row.get("provider_id") in {"paddle-quality", "rapid-quality-fallback"}
+                        and int(row.get("timestamp_us", 0)) >= rewind
+                    )
                 )
             )
+            self.cursor_us = rewind
+        elif self.stage == "scene_quality" and self.cursor_us > 0:
+            rewind = max(0, self.cursor_us - 800_000)
+            self._filter_working_evidence(lambda row: not (
+                (row.get("evidence_kind") == "scene" or row.get("record_kind") == "scene_probe")
+                and "quality" in str(row.get("provider_id", ""))
+                and int(row.get("timestamp_us", 0)) >= rewind
+            ))
             self.cursor_us = rewind
 
     @staticmethod
     def _checkpoint_event_values(value: object) -> list[int]:
         if not isinstance(value, list):
             return []
-        return sorted(
-            {
-                item
-                for item in value
-                if type(item) is int and item >= 0
-            }
-        )
+        return sorted({item for item in value if type(item) is int and item >= 0})
 
     def _restore_whisper_checkpoint(self, checkpoint: object) -> None:
         self.stage = "whisper"
@@ -528,9 +801,10 @@ class OcrWorker:
         if not self.evidence_path.is_file():
             return
         temporary = self.evidence_path.with_suffix(".rewrite")
-        with self.evidence_path.open("r", encoding="utf-8") as source, temporary.open(
-            "w", encoding="utf-8", newline="\n"
-        ) as destination:
+        with (
+            self.evidence_path.open("r", encoding="utf-8") as source,
+            temporary.open("w", encoding="utf-8", newline="\n") as destination,
+        ):
             for line in source:
                 try:
                     row = json.loads(line)
@@ -561,6 +835,7 @@ class OcrWorker:
                 "x2": band.x2,
                 "y2": band.y2,
                 "scale": band.scale,
+                "reading_mode": band.reading_mode,
             }
             for band in DEFAULT_SUBTITLE_BANDS
         ]
@@ -577,8 +852,7 @@ class OcrWorker:
                 not isinstance(item, (list, tuple))
                 or len(item) != 4
                 or any(
-                    isinstance(value, bool) or not isinstance(value, (int, float))
-                    for value in item
+                    isinstance(value, bool) or not isinstance(value, (int, float)) for value in item
                 )
             ):
                 raise ValueError(f"invalid_{key}")
@@ -611,48 +885,345 @@ class OcrWorker:
             key="ocr_dialogue_region",
         )
         payload: dict[str, Any] = {"exclusion_regions": exclusions}
-        if dialogue and any(str(item.get("name", "")) == "scene" for item in bands):
+        scene_names = [str(item["name"]) for item in bands
+                       if str(item.get("reading_mode", item["name"])) == "scene"]
+        if dialogue and scene_names:
             # Scene text (S2+) is deliberately scanned outside the dialogue
             # band. User exclusions still apply globally and therefore win.
-            payload["exclusion_regions_by_band"] = {"scene": dialogue}
+            payload["exclusion_regions_by_band"] = {name: dialogue for name in scene_names}
         return payload
 
-    def _open_engine(self, mode: str) -> None:
+    def _open_engine(self, mode: str, *, media_path: str | None = None) -> None:
         if self.engine is not None:
             self.engine.close()
         python_path = (
-            Path(str(self.config.get("engine_python", sys.executable)))
+            Path(str(self.config.get("engine_python", sys.executable))).expanduser().resolve()
+        )
+        runtime_host = os.environ.get("DUCAI_OCR_ENGINE_HOST_PATH", "").strip()
+        host_path = (
+            Path(
+                runtime_host
+                or str(
+                    self.config.get(
+                        "engine_host_path",
+                        Path(__file__).parents[1] / "engine_hosts" / "ocr_engine_host.py",
+                    )
+                )
+            )
             .expanduser()
             .resolve()
         )
-        runtime_host = os.environ.get("DUCAI_OCR_ENGINE_HOST_PATH", "").strip()
-        host_path = Path(
-            runtime_host
-            or str(
-                self.config.get(
-                    "engine_host_path",
-                    Path(__file__).parents[1] / "engine_hosts" / "ocr_engine_host.py",
-                )
-            )
-        ).expanduser().resolve()
         runtime_host_hash = os.environ.get("DUCAI_OCR_ENGINE_HOST_SHA256", "").strip()
         if runtime_host_hash and sha256(host_path.read_bytes()).hexdigest() != runtime_host_hash:
             raise RuntimeError("ocr_engine_host_runtime_changed")
         self.engine = EngineHostClient(python_path, host_path)
-        self.engine.request(
+        selected_media_path = media_path or (
+            self._scan_plan_segments[0].media_path
+            if self._scan_plan_segments
+            else str(self.config["media_path"])
+        )
+        metadata = self.engine.request(
             "open",
             {
                 "mode": mode,
-                "media_path": str(self.config["media_path"]),
+                "media_path": selected_media_path,
                 "device": str(self.config.get("device", "gpu:0")),
                 "batch_size": self._integer_config("engine_batch_size", 12, 1),
             },
         )
+        self._engine_mode = mode
+        self._engine_media_path = selected_media_path
+        self._remember_ocr_execution(metadata)
+        self._remember_video_duration(metadata)
+        self._change_tracking_segment_index = None
+
+    def _switch_engine_media(self, mode: str, media_path: str) -> None:
+        if self.engine is None or self._engine_mode != mode:
+            self._open_engine(mode, media_path=media_path)
+            return
+        if self._engine_media_path == media_path:
+            return
+        metadata = self.engine.request(
+            "open",
+            {
+                "mode": mode,
+                "media_path": media_path,
+                "device": str(self.config.get("device", "gpu:0")),
+                "batch_size": self._integer_config("engine_batch_size", 12, 1),
+            },
+        )
+        self._engine_media_path = media_path
+        self._remember_ocr_execution(metadata)
+        self._remember_video_duration(metadata)
+        self._change_tracking_segment_index = None
+
+    def _remember_ocr_execution(self, metadata: dict[str, Any]) -> None:
+        device = metadata.get("execution_device")
+        workers = metadata.get("worker_count", 1)
+        self._ocr_execution = {}
+        if not isinstance(device, str) or not device or len(device) > 32:
+            return  # Legacy hosts do not prove an execution device.
+        if type(workers) is not int or workers not in (1, 3):
+            return
+        self._ocr_execution = {"execution_device": device, "execution_workers": workers}
+        for key in ("execution_fallback_reason", "execution_recovery_reason"):
+            reason = metadata.get(key)
+            if isinstance(reason, str) and reason in _OCR_EXECUTION_DETAILS:
+                self._ocr_execution[key] = reason
+        attempts = metadata.get("execution_recovery_attempts")
+        if type(attempts) is int and 0 <= attempts <= 1:
+            self._ocr_execution["execution_recovery_attempts"] = attempts
+
+    def _remember_video_duration(self, metadata: dict[str, Any]) -> None:
+        self._engine_video_duration_us = None
+        self._decoder_video_durations.pop(self._engine_media_path, None)
+        count = metadata.get("frame_count")
+        # Older/custom hosts may not report a finite decoded frame count.
+        if type(count) is not int or count <= 0:
+            return
+        duration = metadata.get("duration_us")
+        fps = metadata.get("fps")
+        if (type(duration) is not int or duration <= 0
+                or isinstance(fps, bool) or not isinstance(fps, (int, float))
+                or not math.isfinite(fps) or fps <= 0
+                or duration != round(count * 1_000_000 / fps)):
+            raise EngineError("ocr_engine_invalid_video_metadata")
+        self._engine_video_duration_us = duration
+        self._decoder_video_durations[self._engine_media_path] = duration
+
+    def _request_readable_frames(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.engine is None:
+            raise EngineError("ocr_engine_unavailable")
+        duration = self._engine_video_duration_us
+        if duration is None:
+            return self.engine.request("recognize", payload)
+        timestamps = payload.get("timestamps_us")
+        if not isinstance(timestamps, list) or not timestamps:
+            return self.engine.request("recognize", payload)
+        skipped: set[int] = set()
+
+        def readable(values: list) -> list:
+            kept = []
+            for value in values:
+                if type(value) is int and value > duration:
+                    skipped.add(value)
+                else:
+                    kept.append(value)
+            return kept
+
+        bounded = {**payload, "timestamps_us": readable(timestamps)}
+        band_times = payload.get("band_timestamps_us")
+        if isinstance(band_times, dict):
+            bounded["band_timestamps_us"] = {
+                name: readable(values) if isinstance(values, list) else values
+                for name, values in band_times.items()
+            }
+        change_times = payload.get("change_timestamps_us")
+        if isinstance(change_times, list):
+            bounded["change_timestamps_us"] = readable(change_times)
+            if change_times and not bounded["change_timestamps_us"]:
+                # The host validates a nonempty probe schedule even when change
+                # detection is disabled. Keep OCR samples, not discarded probes.
+                bounded.pop("change_timestamps_us")
+                bounded["detect_changes"] = False
+        if skipped:
+            media = self._engine_media_path
+            self._decoder_tail_request_counts[media] = (
+                self._decoder_tail_request_counts.get(media, 0) + len(skipped)
+            )
+        if not bounded["timestamps_us"]:
+            probes = bounded.get("change_timestamps_us", [])
+            if payload.get("detect_changes") is True and probes:
+                # Keep valid change probes, without promoting them to OCR samples.
+                bounded["timestamps_us"] = probes
+                bounded["band_timestamps_us"] = {
+                    band["name"]: [] for band in payload.get("bands", [])
+                }
+                if "evidence_kinds_by_band" not in bounded:
+                    bounded["evidence_kinds_by_band"] = {
+                        band["name"]: payload.get("evidence_kind", "global")
+                        for band in payload.get("bands", [])
+                    }
+            else:
+                return {"evidence": [], "watermark_detections": [], "scene_probes": [],
+                        "event_timestamps_us": [], "scene_event_timestamps_us": [],
+                        "frame_count": 0, "processed_until_us": timestamps[-1]}
+        result = self.engine.request("recognize", bounded)
+        if skipped:
+            result = {**result, "processed_until_us": timestamps[-1]}
+        return result
+
+    def _segment_for_timeline(self, timestamp_us: int) -> ScanPlanSegment | None:
+        return next(
+            (
+                segment
+                for segment in self._scan_plan_segments
+                if segment.contains_timeline(timestamp_us)
+            ),
+            None,
+        )
+
+    def _timeline_timestamps(
+        self,
+        start_us: int,
+        end_us: int,
+        interval_us: int,
+    ) -> list[int]:
+        if not self._scan_plan_segments:
+            return list(range(start_us, end_us, interval_us))
+        values: set[int] = set()
+        for segment in self._scan_plan_segments:
+            lower = max(start_us, segment.timeline_start_us)
+            upper = min(end_us, segment.timeline_end_us)
+            if lower >= upper:
+                continue
+            relative_lower_us = lower - segment.timeline_start_us
+            step = max(0, (relative_lower_us + interval_us - 1) // interval_us)
+            first = segment.timeline_start_us + step * interval_us
+            values.update(range(first, upper, interval_us))
+        return sorted(values)
+
+    def _recognize(
+        self,
+        payload: dict[str, Any],
+        *,
+        mode: str,
+    ) -> dict[str, Any]:
+        if not self._scan_plan_segments:
+            if self.engine is None:
+                raise EngineError("ocr_engine_unavailable")
+            result = self._request_readable_frames(payload)
+            if "execution_device" in result:
+                self._remember_ocr_execution(result)
+            return result
+        raw_timestamps = payload.get("timestamps_us")
+        if not isinstance(raw_timestamps, list):
+            raise EngineError("ocr_scan_plan_timestamps_invalid")
+        grouped: dict[int, list[int]] = {}
+        for timestamp_us in raw_timestamps:
+            segment = self._segment_for_timeline(timestamp_us)
+            if segment is not None:
+                grouped.setdefault(segment.index, []).append(timestamp_us)
+        combined: dict[str, Any] = {
+            "evidence": [],
+            "watermark_detections": [],
+            "scene_probes": [],
+            "event_timestamps_us": [],
+            "scene_event_timestamps_us": [],
+            "frame_count": 0,
+        }
+        for segment_index in sorted(grouped):
+            segment = self._scan_plan_segments[segment_index]
+            virtual_timestamps = sorted(set(grouped[segment_index]))
+            actual_by_virtual = {
+                value: segment.timeline_to_source(value) for value in virtual_timestamps
+            }
+            virtual_by_actual = {actual: virtual for virtual, actual in actual_by_virtual.items()}
+            actual_timestamps = sorted(virtual_by_actual)
+            if not actual_timestamps:
+                continue
+            segment_payload = {**payload, "timestamps_us": actual_timestamps}
+            raw_band_timestamps = payload.get("band_timestamps_us")
+            if isinstance(raw_band_timestamps, dict):
+                segment_payload["band_timestamps_us"] = {
+                    name: sorted(
+                        {actual_by_virtual[value] for value in values if value in actual_by_virtual}
+                    )
+                    for name, values in raw_band_timestamps.items()
+                    if isinstance(values, list)
+                }
+            raw_change_timestamps = payload.get("change_timestamps_us")
+            if isinstance(raw_change_timestamps, list):
+                change_pairs = {
+                    segment.timeline_to_source(value): value
+                    for value in raw_change_timestamps
+                    if segment.contains_timeline(value)
+                }
+                if change_pairs:
+                    segment_payload["change_timestamps_us"] = sorted(change_pairs)
+                    virtual_by_actual.update(change_pairs)
+                else:
+                    segment_payload["change_timestamps_us"] = actual_timestamps
+            if payload.get("detect_changes") is True:
+                segment_payload["reset_change_tracking"] = (
+                    self._change_tracking_segment_index != segment.index
+                )
+            self._switch_engine_media(mode, segment.media_path)
+            if self.engine is None:
+                raise EngineError("ocr_engine_unavailable")
+            result = self._request_readable_frames(segment_payload)
+            if "execution_device" in result:
+                self._remember_ocr_execution(result)
+            if payload.get("detect_changes") is True:
+                self._change_tracking_segment_index = segment.index
+            for key in ("evidence", "watermark_detections", "scene_probes"):
+                rows = result.get(key, [])
+                if not isinstance(rows, list):
+                    raise EngineError("ocr_engine_invalid_result")
+                combined[key].extend(
+                    self._map_evidence_row(
+                        row,
+                        segment=segment,
+                        virtual_by_actual=virtual_by_actual,
+                    )
+                    for row in rows
+                )
+            for key in ("event_timestamps_us", "scene_event_timestamps_us"):
+                values = result.get(key, [])
+                if not isinstance(values, list):
+                    raise EngineError("ocr_engine_invalid_result")
+                combined[key].extend(
+                    virtual_by_actual.get(value, segment.source_to_timeline(value))
+                    for value in values
+                    if type(value) is int
+                    and segment.source_start_us <= value < segment.source_end_us
+                )
+            combined["frame_count"] += result.get("frame_count", len(actual_timestamps))
+            combined["processed_until_us"] = virtual_timestamps[-1]
+        for key in ("event_timestamps_us", "scene_event_timestamps_us"):
+            combined[key] = sorted(set(combined[key]))
+        return combined
+
+    @staticmethod
+    def _map_evidence_row(
+        raw: object,
+        *,
+        segment: ScanPlanSegment,
+        virtual_by_actual: dict[int, int],
+    ) -> dict[str, Any]:
+        if not isinstance(raw, dict):
+            raise EngineError("ocr_engine_invalid_result")
+        source_timestamp_us = raw.get("timestamp_us")
+        if type(source_timestamp_us) is not int or not (
+            segment.source_start_us <= source_timestamp_us < segment.source_end_us
+        ):
+            raise EngineError("ocr_engine_timestamp_outside_scan_segment")
+        timeline_timestamp_us = virtual_by_actual.get(
+            source_timestamp_us,
+            segment.source_to_timeline(source_timestamp_us),
+        )
+        identity = sha256(
+            f"{raw.get('id', '')}|{segment.index}|{timeline_timestamp_us}".encode()
+        ).hexdigest()[:24]
+        source_frame_id = str(raw.get("frame_id", ""))
+        return {
+            **raw,
+            "id": f"ocr-timeline-{identity}",
+            "frame_id": f"timeline-{timeline_timestamp_us:012d}-segment-{segment.index}",
+            "timestamp_us": timeline_timestamp_us,
+            "source_timestamp_us": source_timestamp_us,
+            "base_timestamp_us": segment.timeline_to_base(timeline_timestamp_us),
+            "source_evidence_id": str(raw.get("id", "")),
+            "source_frame_id": source_frame_id,
+            "scan_segment_index": segment.index,
+            "media_id": segment.media_id,
+            "media_path": segment.media_path,
+        }
 
     def _execute(self) -> int:
         if self.config.get("extraction_method") == "whisper_audio":
             return self._execute_whisper()
-        duration_us = self._integer_config("duration_us", 0, 1)
+        duration_us = self._scan_plan_duration_us or self._integer_config("duration_us", 0, 1)
         interval_us = self._integer_config("sample_interval_us", 800_000, 400_000)
         fast_interval_us, quality_interval_us = _sampling_intervals(interval_us)
         batch_frames = self._integer_config("window_frame_count", 12, 2)
@@ -666,17 +1237,18 @@ class OcrWorker:
                 bands,
                 configured_windows,
             )
-            if scene_timestamps:
+            if scene_timestamps and self.config.get("scene_text_enabled", True):
                 self._scan_scene_text(scene_timestamps, batch_frames)
             self.stage = "quality"
             self.cursor_us = 0
             self._checkpoint()
-        fast_candidates, rescue_windows = self._fast_candidates(
-            duration_us, fast_interval_us
+        fast_candidates, rescue_windows = self._finalization_step(
+            "Tổng hợp bằng chứng thoại Fast",
+            lambda: self._fast_candidates(duration_us, fast_interval_us),
         )
         if configured_windows:
             rescue_windows = configured_windows
-        if rescue_windows:
+        if rescue_windows and self.stage == "quality":
             self._scan_quality(
                 duration_us,
                 quality_interval_us,
@@ -685,36 +1257,55 @@ class OcrWorker:
                 rescue_windows,
             )
         self._checkpoint()
-        final_candidates = self._final_candidates(
-            fast_candidates,
-            rescue_windows,
-            duration_us,
-            quality_interval_us,
+        final_candidates = self._finalization_step(
+            "Đối chiếu kết quả Fast và Quality",
+            lambda: self._final_candidates(fast_candidates, rescue_windows,
+                                           duration_us, quality_interval_us),
         )
         rescan_cue_id = self.config.get("rescan_cue_id")
         if isinstance(rescan_cue_id, str):
             return self._finish_targeted_rescan(final_candidates)
-        evidence = self._load_evidence()
-        result = finalize_ocr_candidates(
+        if self.stage == "quality":
+            self.stage = "scene_quality"
+            self.cursor_us = 0
+            self._checkpoint()
+        if self.stage == "scene_quality" and self.config.get("scene_text_enabled", True):
+            self._scan_scene_quality(duration_us, batch_frames)
+        self.stage = "finalize"
+        evidence = self._finalization_step("Đọc và đối chiếu bằng chứng OCR", self._load_evidence)
+        result = self._finalization_step("Hoàn thiện cue thoại", lambda: finalize_ocr_candidates(
             final_candidates,
             video_duration_us=duration_us,
             evidence=evidence,
-        )
-        scene_cues = scene_text_cues_from_evidence(
+            suppressed_evidence={
+                item.evidence_id: item.winner_evidence_id
+                for item in getattr(self, "_suppressed_readings", ())
+            },
+        ))
+        scene_cues = self._finalization_step("Ghép chữ trong cảnh", lambda: self._scene_cues(
             evidence,
-            video_duration_us=duration_us,
+            duration_us=duration_us,
             first_index=len(result.cues) + 1,
             dialogue_cues=result.cues,
-        )
+        ))
         if scene_cues:
             result = replace(result, cues=(*result.cues, *scene_cues))
-        coverage = measure_hard_sub_coverage(
+        coverage_evidence, coverage_cues, coverage_duration = self._coverage_timeline(
             evidence,
             result.cues,
+            duration_us,
+        )
+        coverage = self._finalization_step(
+            "Kiểm tra độ phủ phụ đề", lambda: measure_hard_sub_coverage(
+            coverage_evidence,
+            coverage_cues,
             minimum_coverage=0.95,
             ignored_overlay_tokens=result.overlay_tokens,
-            video_duration_us=duration_us,
+            video_duration_us=coverage_duration,
+            progress=self._finalization_progress,
+            ),
         )
+        self._finalization_step("Chuẩn bị ghi SRT và báo cáo QA", lambda: None)
         blockers = list(result.blockers)
         if not coverage.subtitle_positive_timestamps:
             blockers.append("ocr_coverage_evidence_missing")
@@ -782,19 +1373,23 @@ class OcrWorker:
                 },
             )
             return 3
-        output_path = Path(
-            str(
-                self.config.get(
-                    "staging_output_path",
+        output_path = (
+            Path(
+                str(
                     self.config.get(
-                        "output_path",
-                        Path(str(self.config["media_path"])).with_suffix("").with_name(
-                            Path(str(self.config["media_path"])).stem + "_ZH_FINAL.srt"
+                        "staging_output_path",
+                        self.config.get(
+                            "output_path",
+                            Path(str(self.config["media_path"]))
+                            .with_suffix("")
+                            .with_name(Path(str(self.config["media_path"])).stem + "_ZH_FINAL.srt"),
                         ),
-                    ),
+                    )
                 )
             )
-        ).expanduser().resolve()
+            .expanduser()
+            .resolve()
+        )
         publish_final_srt(output_path, result)
         qa_path = output_path.with_name(output_path.stem + "_QA.json")
         _atomic_write_json(
@@ -837,6 +1432,7 @@ class OcrWorker:
         output_stat = output_path.stat()
         return {
             "schema_version": 3,
+            "ocr_aggregation_version": OCR_AGGREGATION_VERSION,
             "kind": "ocr_hard_sub_coverage",
             "status": status,
             "job_id": self.job_id,
@@ -844,15 +1440,26 @@ class OcrWorker:
             "settings_fingerprint": self.spec.get("settings_fingerprint", ""),
             "coverage_threshold": coverage["minimum_coverage"],
             "coverage_ratio": coverage["coverage_ratio"],
-            "subtitle_positive_timestamps": coverage[
-                "subtitle_positive_timestamps"
-            ],
+            "subtitle_positive_timestamps": coverage["subtitle_positive_timestamps"],
             "covered_timestamps": coverage["covered_timestamps"],
             "continuity_gap_limit_us": coverage["continuity_gap_limit_us"],
             "maximum_positive_gap_us": coverage["maximum_positive_gap_us"],
             "timeline_continuity_passes": coverage["timeline_continuity_passes"],
             "unmatched_samples": coverage["unmatched_samples"],
             "cue_count": cue_count,
+            "decoder_video_duration_us": dict(self._decoder_video_durations),
+            "decoder_tail_request_counts": dict(self._decoder_tail_request_counts),
+            "suppressed_readings": [
+                asdict(item) for item in getattr(self, "_suppressed_readings", ())
+            ],
+            "proof_only_collapse": True,
+            "deferred_reading_ids": [
+                item.evidence_id for item in getattr(self, "_deferred_readings", ())
+            ],
+            "retained_deferred_reading_ids": sorted(
+                {key for cue in cues for key in cue.evidence_ids}
+                & {item.evidence_id for item in getattr(self, "_deferred_readings", ())}
+            ),
             "blockers": blockers,
             "warnings": warnings,
             "cue_regions": [
@@ -866,9 +1473,12 @@ class OcrWorker:
                     "role": cue.role,
                     "orientation": cue.orientation,
                     "style_hint": cue.style_hint,
+                    "text_font_size": cue.text_font_size,
                     "panel_box": list(cue.panel_box) if cue.panel_box is not None else None,
                     "background_color": cue.background_color,
                     "review_state": cue.review_state,
+                    "confidence": cue.confidence,
+                    "evidence_ids": list(cue.evidence_ids),
                 }
                 for cue in cues
             ],
@@ -891,11 +1501,7 @@ class OcrWorker:
         self.stage = "whisper"
         configured_device = str(self.config.get("device", "auto")).strip().casefold()
         while self.cursor_us < duration_us:
-            device = (
-                "cpu"
-                if self._whisper_force_cpu or configured_device == "cpu"
-                else "cuda"
-            )
+            device = "cpu" if self._whisper_force_cpu or configured_device == "cpu" else "cuda"
             compute_type = "int8" if device == "cpu" else "float16"
             self._whisper_runtime = {"device": device, "compute_type": compute_type}
             self.send(
@@ -971,19 +1577,21 @@ class OcrWorker:
                     self.engine.close()
                     self.engine = None
 
-        cues, warnings = _whisper_cues(
-            self._load_whisper_segments(), video_duration_us=duration_us
-        )
+        cues, warnings = _whisper_cues(self._load_whisper_segments(), video_duration_us=duration_us)
         if not cues:
             raise RuntimeError("whisper_no_speech_detected")
-        output_path = Path(
-            str(
-                self.config.get(
-                    "staging_output_path",
-                    self.config.get("output_path", ""),
+        output_path = (
+            Path(
+                str(
+                    self.config.get(
+                        "staging_output_path",
+                        self.config.get("output_path", ""),
+                    )
                 )
             )
-        ).expanduser().resolve()
+            .expanduser()
+            .resolve()
+        )
         if not output_path.name.endswith("_ZH_FINAL.srt"):
             raise ValueError("whisper_output_path_invalid")
         _atomic_write_text(
@@ -1042,17 +1650,19 @@ class OcrWorker:
             self.engine.close()
         python_path = Path(str(self.config.get("engine_python", sys.executable))).resolve()
         runtime_host = os.environ.get("DUCAI_OCR_ENGINE_HOST_PATH", "").strip()
-        host_path = Path(
-            runtime_host
-            or str(
-                self.config.get(
-                    "engine_host_path",
-                    Path(__file__).parents[1]
-                    / "engine_hosts"
-                    / "whisper_engine_host.py",
+        host_path = (
+            Path(
+                runtime_host
+                or str(
+                    self.config.get(
+                        "engine_host_path",
+                        Path(__file__).parents[1] / "engine_hosts" / "whisper_engine_host.py",
+                    )
                 )
             )
-        ).expanduser().resolve()
+            .expanduser()
+            .resolve()
+        )
         runtime_hash = os.environ.get("DUCAI_OCR_ENGINE_HOST_SHA256", "").strip()
         if runtime_hash and sha256(host_path.read_bytes()).hexdigest() != runtime_hash:
             raise RuntimeError("whisper_engine_host_runtime_changed")
@@ -1060,22 +1670,15 @@ class OcrWorker:
 
     def _ensure_whisper_audio(self, duration_us: int) -> None:
         while not (
-            self.whisper_audio_path.is_file()
-            and self.whisper_audio_path.stat().st_size >= 4_096
+            self.whisper_audio_path.is_file() and self.whisper_audio_path.stat().st_size >= 4_096
         ):
             if not self._extract_whisper_audio_once(duration_us):
                 return
 
     def _extract_whisper_audio_once(self, duration_us: int) -> bool:
-        media_path = Path(str(self.config.get("media_path", ""))).expanduser().resolve(
-            strict=True
-        )
-        ffprobe = Path(str(self.config.get("ffprobe_path", ""))).expanduser().resolve(
-            strict=True
-        )
-        ffmpeg = Path(str(self.config.get("ffmpeg_path", ""))).expanduser().resolve(
-            strict=True
-        )
+        media_path = Path(str(self.config.get("media_path", ""))).expanduser().resolve(strict=True)
+        ffprobe = Path(str(self.config.get("ffprobe_path", ""))).expanduser().resolve(strict=True)
+        ffmpeg = Path(str(self.config.get("ffmpeg_path", ""))).expanduser().resolve(strict=True)
         stream = _probe_dialogue_stream(ffprobe, media_path)
         channels = int(stream.get("channels") or 2)
         mix = (
@@ -1357,8 +1960,9 @@ class OcrWorker:
         mode = "fast"
         try:
             self._open_engine(mode)
-        except EngineError:
+        except EngineError as error:
             mode = "compatibility"
+            self._ocr_fallback_reason = str(error)[:80]
             self.send(
                 "progress",
                 {"phase": "rapid_fallback", "current": 0, "total": 0},
@@ -1369,7 +1973,7 @@ class OcrWorker:
                 {
                     value
                     for window in configured_windows
-                    for value in range(
+                    for value in self._timeline_timestamps(
                         max(self.cursor_us, window.range.start_us),
                         window.range.end_us,
                         interval_us,
@@ -1377,23 +1981,23 @@ class OcrWorker:
                 }
             )
         else:
-            timestamps = list(range(self.cursor_us, duration_us, interval_us))
+            timestamps = self._timeline_timestamps(self.cursor_us, duration_us, interval_us)
         started = time.monotonic()
         completed = 0
-        historical_burst, historical_scene = self._adaptive_timestamps_from_events(
-            self._change_events,
-            duration_us,
-            scene_events=self._scene_change_events,
-        ) if not configured_windows else ((), ())
-        processed_burst_timestamps = {
-            value for value in historical_burst if value < self.cursor_us
-        }
-        processed_scene_timestamps = {
-            value for value in historical_scene if value < self.cursor_us
-        }
+        historical_burst, historical_scene = (
+            self._adaptive_timestamps(
+                self._change_events,
+                duration_us,
+                scene_events=self._scene_change_events,
+            )
+            if not configured_windows
+            else ((), ())
+        )
+        processed_burst_timestamps = {value for value in historical_burst if value < self.cursor_us}
+        processed_scene_timestamps = {value for value in historical_scene if value < self.cursor_us}
         change_probe_interval_us = 200_000
         change_probe_timestamps = (
-            list(range(self.cursor_us, duration_us, change_probe_interval_us))
+            self._timeline_timestamps(self.cursor_us, duration_us, change_probe_interval_us)
             if not configured_windows
             else []
         )
@@ -1405,11 +2009,22 @@ class OcrWorker:
             if self._handle_controls(stage="fast", cursor_us=self.cursor_us):
                 raise WorkerStopped
             change_probe_end_us = min(duration_us, batch[-1] + interval_us)
+            if self._scan_plan_segments:
+                final_batch_segment = self._segment_for_timeline(batch[-1])
+                if final_batch_segment is None:
+                    raise EngineError("ocr_scan_plan_timestamp_out_of_range")
+                # Do not consume probes from the next retained segment before a
+                # main OCR timestamp represents that segment in this request.
+                # Otherwise _recognize cannot issue a probe-only host request
+                # without also sending an unintended frame to the recognizer.
+                change_probe_end_us = min(
+                    change_probe_end_us,
+                    final_batch_segment.timeline_end_us,
+                )
             next_change_probe_offset = change_probe_offset
             while (
                 next_change_probe_offset < len(change_probe_timestamps)
-                and change_probe_timestamps[next_change_probe_offset]
-                < change_probe_end_us
+                and change_probe_timestamps[next_change_probe_offset] < change_probe_end_us
             ):
                 next_change_probe_offset += 1
             batch_change_timestamps = change_probe_timestamps[
@@ -1417,23 +2032,25 @@ class OcrWorker:
             ]
             change_probe_offset = next_change_probe_offset
             try:
-                result = self.engine.request(
-                    "recognize",
+                result = self._recognize(
                     {
                         "timestamps_us": batch,
                         "bands": bands,
                         "evidence_kind": "global",
                         "detect_changes": not configured_windows,
+                        "detect_scene_changes": self.config.get("scene_text_enabled", True),
                         "change_threshold": 0.115,
                         "scene_change_threshold": 0.10,
                         "change_timestamps_us": batch_change_timestamps or batch,
                         **self._recognize_region_payload(bands),
                     },
+                    mode=mode,
                 )
-            except EngineError:
+            except EngineError as error:
                 if mode == "compatibility":
                     raise
                 mode = "compatibility"
+                self._ocr_fallback_reason = str(error)[:80]
                 self.send(
                     "progress",
                     {
@@ -1443,18 +2060,19 @@ class OcrWorker:
                     },
                 )
                 self._open_engine(mode)
-                result = self.engine.request(
-                    "recognize",
+                result = self._recognize(
                     {
                         "timestamps_us": batch,
                         "bands": bands,
                         "evidence_kind": "global",
                         "detect_changes": not configured_windows,
+                        "detect_scene_changes": self.config.get("scene_text_enabled", True),
                         "change_threshold": 0.115,
                         "scene_change_threshold": 0.10,
                         "change_timestamps_us": batch_change_timestamps or batch,
                         **self._recognize_region_payload(bands),
                     },
+                    mode=mode,
                 )
             self._append_evidence(result.get("evidence", []))
             self._append_evidence(result.get("watermark_detections", []))
@@ -1469,26 +2087,26 @@ class OcrWorker:
                 type(value) is int for value in raw_scene_events
             ):
                 raise EngineError("ocr_scene_change_probe_invalid")
-            self._scene_change_events = sorted(
-                {*self._scene_change_events, *raw_scene_events}
+            self._scene_change_events = sorted({*self._scene_change_events, *raw_scene_events})
+            burst_timestamps, scene_timestamps = (
+                self._adaptive_timestamps(
+                    self._change_events,
+                    duration_us,
+                    scene_events=self._scene_change_events,
+                )
+                if not configured_windows
+                else ((), ())
             )
-            burst_timestamps, scene_timestamps = self._adaptive_timestamps_from_events(
-                self._change_events,
-                duration_us,
-                scene_events=self._scene_change_events,
-            ) if not configured_windows else ((), ())
             adaptive_horizon_us = min(duration_us, change_probe_end_us + 240_000)
             pending_burst = tuple(
                 value
                 for value in burst_timestamps
-                if value <= adaptive_horizon_us
-                and value not in processed_burst_timestamps
+                if value <= adaptive_horizon_us and value not in processed_burst_timestamps
             )
             pending_scene = tuple(
                 value
                 for value in scene_timestamps
-                if value <= adaptive_horizon_us
-                and value not in processed_scene_timestamps
+                if value <= adaptive_horizon_us and value not in processed_scene_timestamps
             )
             if pending_burst or pending_scene:
                 self._scan_adaptive(
@@ -1506,6 +2124,44 @@ class OcrWorker:
                 self._checkpoint()
         return ()
 
+    def _adaptive_timestamps(
+        self,
+        raw_events: list[int],
+        duration_us: int,
+        *,
+        scene_events: list[int] | None = None,
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        if not self._scan_plan_segments:
+            burst, scene = self._adaptive_timestamps_from_events(
+                raw_events,
+                duration_us,
+                scene_events=scene_events,
+            )
+            return burst, scene if self.config.get("scene_text_enabled", True) else ()
+        burst: set[int] = set()
+        scene: set[int] = set()
+        all_scene_events = scene_events or []
+        for segment in self._scan_plan_segments:
+            local_events = [
+                value - segment.timeline_start_us
+                for value in raw_events
+                if segment.contains_timeline(value)
+            ]
+            local_scene_events = [
+                value - segment.timeline_start_us
+                for value in all_scene_events
+                if segment.contains_timeline(value)
+            ]
+            local_burst, local_scene = self._adaptive_timestamps_from_events(
+                local_events,
+                segment.timeline_duration_us,
+                scene_events=local_scene_events,
+            )
+            burst.update(segment.timeline_start_us + value for value in local_burst)
+            scene.update(segment.timeline_start_us + value for value in local_scene)
+        return (tuple(sorted(burst)),
+                tuple(sorted(scene)) if self.config.get("scene_text_enabled", True) else ())
+
     @staticmethod
     def _adaptive_timestamps_from_events(
         raw_events: list[int],
@@ -1513,10 +2169,10 @@ class OcrWorker:
         *,
         scene_events: list[int] | None = None,
     ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        def bounded_events(values: list[int]) -> list[int]:
+        def bounded_events(values: list[int], slots: int) -> list[int]:
             # Fixed slots select the first chronological transition in each
             # slot. This is stable while a scan is still growing, remains
-            # capped at thirteen events per 30 seconds and is O(n), not a
+            # capped per 30 seconds and is O(n), not a
             # full event-list scan for every time window.
             bounded: list[int] = []
             occupied: set[tuple[int, int]] = set()
@@ -1525,7 +2181,7 @@ class OcrWorker:
                     continue
                 window = value // window_us
                 offset = value - window * window_us
-                slot = min(12, offset * 13 // window_us)
+                slot = min(slots - 1, offset * slots // window_us)
                 key = (window, slot)
                 if key in occupied:
                     continue
@@ -1534,16 +2190,18 @@ class OcrWorker:
             return bounded
 
         window_us = 30_000_000
-        events = bounded_events(raw_events)
+        # Keep dialogue sampling unchanged; labels need a later stable frame
+        # after their fade/animation, and closer anchors for static backgrounds.
+        events = bounded_events(raw_events, 48)
         scene_source = list(dict.fromkeys((*raw_events, *(scene_events or ()))))
-        bounded_scene_events = bounded_events(scene_source)
+        bounded_scene_events = bounded_events(scene_source, 24)
         burst = sorted(
             {
                 timestamp + offset
                 for timestamp in events
                 # A one-character subtitle can exist for only ~0.5 s. Sample
                 # densely around the detected transition, but only in this
-                # local burst so normal full-video OCR cost does not increase.
+                # bounded local burst instead of scanning the whole film densely.
                 for offset in (-100_000, 0, 100_000, 200_000, 300_000, 400_000)
                 if 0 <= timestamp + offset < duration_us
             }
@@ -1551,10 +2209,10 @@ class OcrWorker:
         scene_values = {
             timestamp + offset
             for timestamp in bounded_scene_events
-            for offset in (0, 240_000)
+            for offset in (0, 240_000, 600_000)
             if 0 <= timestamp + offset < duration_us
         }
-        scene_values.update(range(0, duration_us, 10_000_000))
+        scene_values.update(range(0, duration_us, 3_000_000))
         scene = sorted(scene_values)
         return tuple(burst), tuple(scene)
 
@@ -1567,6 +2225,8 @@ class OcrWorker:
     ) -> None:
         """OCR one local, chronological adaptive window without full rescans."""
 
+        if not self.config.get("scene_text_enabled", True):
+            scene_timestamps = ()
         timestamps = sorted({*burst_timestamps, *scene_timestamps})
         if not timestamps:
             return
@@ -1586,26 +2246,26 @@ class OcrWorker:
                 raise WorkerStopped
             burst_batch = [value for value in batch if value in burst_timestamps]
             scene_batch = [value for value in batch if value in scene_timestamps]
-            band_timestamps = {
-                name: burst_batch
-                for name in band_names
-            }
-            band_timestamps["scene"] = scene_batch
-            result = self.engine.request(
-                "recognize",
+            active_bands = [*bands, scene_band] if scene_batch else bands
+            band_timestamps = {name: burst_batch for name in band_names}
+            if scene_batch:
+                band_timestamps["scene"] = scene_batch
+            result = self._recognize(
                 {
                     "timestamps_us": batch,
-                    "bands": [*bands, scene_band],
+                    "bands": active_bands,
                     "band_timestamps_us": band_timestamps,
                     "evidence_kinds_by_band": {
                         **{name: "burst" for name in band_names},
-                        "scene": "scene",
+                        **({"scene": "scene"} if scene_batch else {}),
                     },
-                    **self._recognize_region_payload([*bands, scene_band]),
+                    **self._recognize_region_payload(active_bands),
                 },
+                mode=self._engine_mode,
             )
             self._append_evidence(result.get("evidence", []))
             self._append_evidence(result.get("watermark_detections", []))
+            self._append_evidence(result.get("scene_probes", []))
             self._send_progress(
                 "adaptive_ocr",
                 min(offset + len(batch), len(timestamps)),
@@ -1618,25 +2278,26 @@ class OcrWorker:
         timestamps: tuple[int, ...],
         batch_frames: int,
     ) -> None:
-        scene_band = [
-            {"name": "scene", "x1": 0.0, "y1": 0.0, "x2": 1.0, "y2": 1.0, "scale": 1.0}
-        ]
+        if not self.config.get("scene_text_enabled", True):
+            return
+        scene_band = [{"name": "scene", "x1": 0.0, "y1": 0.0, "x2": 1.0, "y2": 1.0, "scale": 1.0}]
         started = time.monotonic()
         for offset in range(0, len(timestamps), batch_frames):
             batch = list(timestamps[offset : offset + batch_frames])
             if self._handle_controls(stage="fast", cursor_us=self.cursor_us):
                 raise WorkerStopped
-            result = self.engine.request(
-                "recognize",
+            result = self._recognize(
                 {
                     "timestamps_us": batch,
                     "bands": scene_band,
                     "evidence_kind": "scene",
                     **self._recognize_region_payload(scene_band),
                 },
+                mode=self._engine_mode,
             )
             self._append_evidence(result.get("evidence", []))
             self._append_evidence(result.get("watermark_detections", []))
+            self._append_evidence(result.get("scene_probes", []))
             self.cursor_us = batch[-1]
             self._send_progress(
                 "scene_text",
@@ -1644,6 +2305,75 @@ class OcrWorker:
                 len(timestamps),
                 started,
             )
+
+    def _scan_scene_quality(self, duration_us: int, batch_frames: int) -> None:
+        if not self.config.get("scene_text_enabled", True):
+            return
+        seeds = tuple(item for item in self._scene_evidence(self._load_evidence())
+                      if "quality" not in item.provider_id)
+        regions = scene_text_rescue_regions(seeds, video_duration_us=duration_us)
+        jobs = []
+        bands = {}
+        for index, region in enumerate(regions):
+            start, end = region.range.start_us, region.range.end_us
+            if self._scan_plan_segments:
+                segment = next((s for s in self._scan_plan_segments
+                                if region.source_scope == f"{s.media_id}:{s.index}"), None)
+                if segment is None:
+                    continue
+                start = max(start, segment.timeline_start_us)
+                end = min(end, segment.timeline_end_us)
+            b = region.box
+            target = region.target_box
+            name = f"scene-roi-{index}"
+            bands[name] = {"name": name, "reading_mode": "scene", "x1": b.x, "y1": b.y,
+                           "x2": b.x + b.width, "y2": b.y + b.height, "scale": 2.0,
+                           "target_box": [target.x, target.y, target.width, target.height]}
+            jobs.extend((t, name) for t in range(start, end, 400_000) if t >= self.cursor_us)
+        jobs.sort()
+        if not jobs:
+            return
+        mode = "quality"
+        if self.engine is None or self._engine_mode != mode:
+            try:
+                self._open_engine(mode)
+            except EngineError:
+                mode = "compatibility"
+                self._open_engine(mode)
+        started = time.monotonic()
+        for offset in range(0, len(jobs), batch_frames):
+            batch = jobs[offset:offset + batch_frames]
+            if self._handle_controls(stage="scene_quality", cursor_us=self.cursor_us):
+                raise WorkerStopped
+            names = list(dict.fromkeys(name for _, name in batch))
+            crops = [bands[name] for name in names]
+            payload = {
+                "timestamps_us": sorted({t for t, _ in batch}), "bands": crops,
+                "band_timestamps_us": {name: sorted({t for t, n in batch if n == name})
+                                       for name in names},
+                "evidence_kinds_by_band": {name: "scene" for name in names},
+                **self._recognize_region_payload(crops),
+            }
+            try:
+                result = self._recognize(payload, mode=mode)
+            except EngineError:
+                if mode == "compatibility":
+                    raise
+                mode = "compatibility"
+                self._open_engine(mode)
+                result = self._recognize(payload, mode=mode)
+            for key in ("evidence", "watermark_detections", "scene_probes"):
+                rows = result.get(key, [])
+                if mode == "compatibility":
+                    rows = [{**row, "provider_id": "rapid-quality-fallback"} for row in rows]
+                self._append_evidence(rows)
+            self.cursor_us = batch[-1][0]
+            self._send_progress(
+                "scene_quality", min(offset + len(batch), len(jobs)), len(jobs), started,
+            )
+            if offset // batch_frames % 5 == 4:
+                self._checkpoint()
+        self._checkpoint()
 
     def _scan_quality(
         self,
@@ -1657,7 +2387,7 @@ class OcrWorker:
             {
                 value
                 for window in windows
-                for value in range(
+                for value in self._timeline_timestamps(
                     max(0, window.range.start_us),
                     min(duration_us, window.range.end_us),
                     interval_us,
@@ -1681,13 +2411,13 @@ class OcrWorker:
                 raise WorkerStopped
             compatibility_fallback = compatibility_mode
             try:
-                result = self.engine.request(
-                    "recognize",
+                result = self._recognize(
                     {
                         "timestamps_us": batch,
                         "bands": bands,
                         **self._recognize_region_payload(bands),
                     },
+                    mode="compatibility" if compatibility_mode else "quality",
                 )
             except EngineError:
                 if compatibility_mode:
@@ -1695,13 +2425,13 @@ class OcrWorker:
                 self._open_engine("compatibility")
                 compatibility_fallback = True
                 compatibility_mode = True
-                result = self.engine.request(
-                    "recognize",
+                result = self._recognize(
                     {
                         "timestamps_us": batch,
                         "bands": bands,
                         **self._recognize_region_payload(bands),
                     },
+                    mode="compatibility",
                 )
             rows = result.get("evidence", [])
             watermark_rows = result.get("watermark_detections", [])
@@ -1731,6 +2461,27 @@ class OcrWorker:
             if (offset // batch_frames + 1) % 5 == 0:
                 self._checkpoint()
 
+    def _coverage_timeline(self, evidence, cues, duration_us):
+        """Do not count intentional legacy gaps as missing OCR footage."""
+        if not self._scan_plan_segments:
+            return evidence, cues, duration_us
+        retained_evidence = []
+        retained_cues = []
+        cursor = 0
+        for segment in self._scan_plan_segments:
+            shift = cursor - segment.timeline_start_us
+            retained_evidence.extend(
+                replace(item, timestamp_us=item.timestamp_us + shift)
+                for item in self._segment_evidence(evidence, segment)
+            )
+            for cue in cues:
+                start = max(cue.range.start_us, segment.timeline_start_us)
+                end = min(cue.range.end_us, segment.timeline_end_us)
+                if end > start:
+                    retained_cues.append(replace(cue, range=TimeRange(start + shift, end + shift)))
+            cursor += segment.timeline_duration_us
+        return tuple(retained_evidence), tuple(retained_cues), cursor
+
     def _send_progress(self, phase: str, current: int, total: int, started: float) -> None:
         elapsed_ms = max(1, int((time.monotonic() - started) * 1000))
         rate = current / (elapsed_ms / 1000)
@@ -1747,6 +2498,33 @@ class OcrWorker:
                 "cursor_us": self.cursor_us,
             },
         )
+
+    def _finalization_step(self, detail: str, callback: Callable):
+        self._finalization_detail = detail
+        self._finalization_started = time.monotonic()
+        self._finalization_last_progress = 0.0
+        try:
+            self._finalization_progress(0, 0)
+            return callback()
+        finally:
+            self._finalization_detail = ""
+
+    def _finalization_progress(self, current: int, total: int) -> None:
+        if not getattr(self, "_finalization_detail", ""):
+            return
+        now = time.monotonic()
+        if now - self._finalization_last_progress < .5 and current != total:
+            return
+        self._finalization_last_progress = now
+        self.send("progress", {
+            "phase": "finalize", "current": 0, "total": 0,
+            "phase_current": current, "phase_total": total,
+            "phase_detail": self._finalization_detail,
+            "elapsed_ms": int((now - self._finalization_started) * 1000),
+            "eta_ms": None, "cursor_us": self.cursor_us,
+        })
+        if self._handle_controls(stage=self.stage, cursor_us=self.cursor_us):
+            raise WorkerStopped()
 
     def _handle_controls(self, *, stage: str, cursor_us: int) -> bool:
         while True:
@@ -1808,7 +2586,10 @@ class OcrWorker:
             for row in raw_rows:
                 if not isinstance(row, dict):
                     raise ValueError("ocr_evidence_must_be_object")
-                _evidence_from_row(row)
+                if row.get("record_kind") == "scene_probe":
+                    _scene_probe_from_row(row)
+                else:
+                    _evidence_from_row(row)
                 stream.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
@@ -1817,21 +2598,40 @@ class OcrWorker:
         if not self.evidence_path.is_file():
             return ()
         values: dict[str, SubtitleEvidence] = {}
+        byte_total = self.evidence_path.stat().st_size
+        completed_bytes = 0
         with self.evidence_path.open("r", encoding="utf-8") as stream:
-            for line in stream:
+            for index, line in enumerate(stream):
+                completed_bytes += len(line.encode("utf-8"))
+                if index % 1024 == 0:
+                    self._finalization_progress(completed_bytes, byte_total)
                 try:
                     raw = json.loads(line)
-                    if isinstance(raw, dict) and raw.get("ignored_overlay") is True:
+                    if isinstance(raw, dict) and (
+                        raw.get("ignored_overlay") is True
+                        or raw.get("record_kind") == "scene_probe"
+                    ):
                         continue
                     item = _evidence_from_row(raw)
                 except (json.JSONDecodeError, TypeError, ValueError):
                     continue
                 values[item.id] = item
-        return tuple(
-            sorted(
-                values.values(), key=lambda item: (item.timestamp_us, item.band, item.id)
-            )
+        ordered = tuple(
+            sorted(values.values(), key=lambda item: (item.timestamp_us, item.band, item.id))
         )
+        crops = {
+            str(band["name"]): NormalizedBox(
+                float(band["x1"]),
+                float(band["y1"]),
+                float(band["x2"]) - float(band["x1"]),
+                float(band["y2"]) - float(band["y1"]),
+            )
+            for band in self._bands_payload()
+        }
+        reconciled = reconcile_dialogue_evidence(ordered, crops)
+        self._suppressed_readings = (*reconciled.suppressions, *reconciled.deferred_suppressions)
+        self._deferred_readings = reconciled.deferred_suppressions
+        return reconciled.evidence
 
     def _load_watermark_evidence(self) -> tuple[SubtitleEvidence, ...]:
         if not self.evidence_path.is_file():
@@ -1848,78 +2648,212 @@ class OcrWorker:
                     continue
                 values[item.id] = item
         return tuple(
-            sorted(
-                values.values(), key=lambda item: (item.timestamp_us, item.band, item.id)
-            )
+            sorted(values.values(), key=lambda item: (item.timestamp_us, item.band, item.id))
         )
 
-    def _watermark_regions(self) -> list[dict[str, object]]:
-        detections = [
-            item for item in self._load_watermark_evidence() if item.box is not None
-        ]
-        clusters: list[list[SubtitleEvidence]] = []
-        for item in detections:
-            box = item.box
-            assert box is not None
-            center = (box.x + box.width / 2, box.y + box.height / 2)
-            target = next(
-                (
-                    cluster
-                    for cluster in clusters
-                    if cluster[-1].box is not None
-                    and abs(
-                        center[0]
-                        - (cluster[-1].box.x + cluster[-1].box.width / 2)
-                    )
-                    <= 0.15
-                    and abs(
-                        center[1]
-                        - (cluster[-1].box.y + cluster[-1].box.height / 2)
-                    )
-                    <= 0.10
+    def _segment_evidence(
+        self,
+        evidence: tuple[SubtitleEvidence, ...],
+        segment: ScanPlanSegment,
+    ) -> tuple[SubtitleEvidence, ...]:
+        return tuple(item for item in evidence if segment.contains_timeline(item.timestamp_us))
+
+    @staticmethod
+    def _clamp_candidates_to_segment(candidates, segment: ScanPlanSegment):
+        return tuple(
+            replace(
+                item,
+                range=TimeRange(
+                    max(segment.timeline_start_us, item.range.start_us),
+                    min(segment.timeline_end_us, item.range.end_us),
                 ),
-                None,
             )
-            if target is None:
-                clusters.append([item])
-            else:
-                target.append(item)
-        duration_us = self._integer_config("duration_us", 0, 1)
-        result: list[dict[str, object]] = []
-        for cluster in clusters:
-            global_cluster = [
-                item for item in cluster if item.evidence_kind == "global"
+            for item in candidates
+            if max(segment.timeline_start_us, item.range.start_us)
+            < min(segment.timeline_end_us, item.range.end_us)
+        )
+
+    def _scene_cues(
+        self,
+        evidence: tuple[SubtitleEvidence, ...],
+        *,
+        duration_us: int,
+        first_index: int,
+        dialogue_cues: tuple[SubtitleCue, ...],
+    ) -> tuple[SubtitleCue, ...]:
+        if not self.config.get("scene_text_enabled", True):
+            return ()
+        evidence = self._scene_evidence(evidence)
+        probes = self._load_scene_probes()
+        if not self._scan_plan_segments:
+            return scene_text_cues_from_evidence(
+                evidence,
+                video_duration_us=duration_us,
+                first_index=first_index,
+                dialogue_cues=dialogue_cues,
+                probes=probes,
+                progress=self._finalization_progress,
+            )
+        result: list[SubtitleCue] = []
+        for segment in self._scan_plan_segments:
+            segment_dialogue = tuple(
+                cue
+                for cue in dialogue_cues
+                if cue.range.start_us < segment.timeline_end_us
+                and segment.timeline_start_us < cue.range.end_us
+            )
+            cues = scene_text_cues_from_evidence(
+                self._segment_evidence(evidence, segment),
+                video_duration_us=duration_us,
+                first_index=first_index + len(result),
+                dialogue_cues=segment_dialogue,
+                probes=tuple(p for p in probes if segment.contains_timeline(p.timestamp_us)),
+                progress=self._finalization_progress,
+            )
+            result.extend(
+                replace(
+                    cue,
+                    range=TimeRange(
+                        max(segment.timeline_start_us, cue.range.start_us),
+                        min(segment.timeline_end_us, cue.range.end_us),
+                    ),
+                )
+                for cue in cues
+                if max(segment.timeline_start_us, cue.range.start_us)
+                < min(segment.timeline_end_us, cue.range.end_us)
+            )
+        return tuple(result)
+
+    def _scene_evidence(
+        self, evidence: tuple[SubtitleEvidence, ...],
+    ) -> tuple[SubtitleEvidence, ...]:
+        anchors = self._load_watermark_evidence()
+        stable = {}
+        for anchor in anchors:
+            b = anchor.box
+            if b is None or not ((b.x < .15 or b.x + b.width > .85)
+                                 and (b.y < .16 or b.y + b.height > .84)):
+                continue
+            key = (anchor.source_scope, round(b.x * 10), round(b.y * 10))
+            stable.setdefault(key, []).append(anchor)
+        confirmed = [rows for rows in stable.values()
+                     if len({r.frame_id for r in rows}) >= 3
+                     and max(r.timestamp_us for r in rows) - min(r.timestamp_us for r in rows)
+                     >= 2_000_000]
+        result = []
+        for item in evidence:
+            if item.evidence_kind != "scene" or item.box is None:
+                result.append(item)
+                continue
+            b = item.box
+            overlap = False
+            for rows in confirmed:
+                if rows[0].source_scope != item.source_scope:
+                    continue
+                if not (rows[0].timestamp_us - 3_000_000 <= item.timestamp_us
+                        <= rows[-1].timestamp_us + 3_000_000):
+                    continue
+                for anchor in rows:
+                    a = anchor.box
+                    assert a is not None
+                    intersection = max(
+                        0.0, min(a.x + a.width, b.x + b.width) - max(a.x, b.x),
+                    ) * max(
+                        0.0, min(a.y + a.height, b.y + b.height) - max(a.y, b.y))
+                    if intersection >= b.width * b.height * .50:
+                        overlap = True
+                        break
+                if overlap:
+                    break
+            if not overlap:
+                result.append(item)
+        return tuple(result)
+
+    def _load_scene_probes(self) -> tuple[SceneTextProbe, ...]:
+        if not self.evidence_path.is_file():
+            return ()
+        values = {}
+        with self.evidence_path.open(encoding="utf-8") as stream:
+            for line in stream:
+                try:
+                    row = json.loads(line)
+                    if isinstance(row, dict) and row.get("record_kind") == "scene_probe":
+                        probe = _scene_probe_from_row(row)
+                        values[(probe.timestamp_us, probe.box, probe.source_scope)] = probe
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                    continue
+        return tuple(values.values())
+
+    def _watermark_regions(self) -> list[dict[str, object]]:
+        detections = [item for item in self._load_watermark_evidence() if item.box is not None]
+        duration_us = self._scan_plan_duration_us or self._integer_config("duration_us", 0, 1)
+        groups = (
+            [
+                (
+                    segment.timeline_start_us,
+                    segment.timeline_end_us,
+                    [item for item in detections if segment.contains_timeline(item.timestamp_us)],
+                )
+                for segment in self._scan_plan_segments
             ]
-            frame_ids = {item.frame_id for item in global_cluster}
-            timestamps = sorted({item.timestamp_us for item in global_cluster})
-            if len(frame_ids) < 3 or len(timestamps) < 3:
-                continue
-            minimum_span_us = min(5_000_000, max(600_000, duration_us // 10))
-            if timestamps[-1] - timestamps[0] < minimum_span_us:
-                continue
-            boxes = [item.box for item in global_cluster if item.box is not None]
-            if not boxes or not all(
-                box.x <= 0.12
-                or box.x + box.width >= 0.88
-                or box.y <= 0.16
-                or box.y + box.height >= 0.84
-                for box in boxes
-            ):
-                continue
-            left = max(0.0, min(box.x for box in boxes) - 0.008)
-            top = max(0.0, min(box.y for box in boxes) - 0.006)
-            right = min(1.0, max(box.x + box.width for box in boxes) + 0.008)
-            bottom = min(1.0, max(box.y + box.height for box in boxes) + 0.006)
-            result.append(
-                {
-                    "id": f"ocr-watermark-{len(result) + 1}",
-                    "start_us": 0,
-                    "end_us": duration_us,
-                    "box": [left, top, right - left, bottom - top],
-                    "sample_count": len(frame_ids),
-                    "source": "ocr_bilibili_anchor",
-                }
-            )
+            if self._scan_plan_segments
+            else [(0, duration_us, detections)]
+        )
+        result: list[dict[str, object]] = []
+        for group_start_us, group_end_us, group_detections in groups:
+            clusters: list[list[SubtitleEvidence]] = []
+            for item in group_detections:
+                box = item.box
+                assert box is not None
+                center = (box.x + box.width / 2, box.y + box.height / 2)
+                target = next(
+                    (
+                        cluster
+                        for cluster in clusters
+                        if cluster[-1].box is not None
+                        and abs(center[0] - (cluster[-1].box.x + cluster[-1].box.width / 2)) <= 0.15
+                        and abs(center[1] - (cluster[-1].box.y + cluster[-1].box.height / 2))
+                        <= 0.10
+                    ),
+                    None,
+                )
+                if target is None:
+                    clusters.append([item])
+                else:
+                    target.append(item)
+            for cluster in clusters:
+                global_cluster = [item for item in cluster if item.evidence_kind == "global"]
+                frame_ids = {item.frame_id for item in global_cluster}
+                timestamps = sorted({item.timestamp_us for item in global_cluster})
+                if len(frame_ids) < 3 or len(timestamps) < 3:
+                    continue
+                group_duration_us = group_end_us - group_start_us
+                minimum_span_us = min(5_000_000, max(600_000, group_duration_us // 10))
+                if timestamps[-1] - timestamps[0] < minimum_span_us:
+                    continue
+                boxes = [item.box for item in global_cluster if item.box is not None]
+                if not boxes or not all(
+                    box.x <= 0.12
+                    or box.x + box.width >= 0.88
+                    or box.y <= 0.16
+                    or box.y + box.height >= 0.84
+                    for box in boxes
+                ):
+                    continue
+                left = max(0.0, min(box.x for box in boxes) - 0.008)
+                top = max(0.0, min(box.y for box in boxes) - 0.006)
+                right = min(1.0, max(box.x + box.width for box in boxes) + 0.008)
+                bottom = min(1.0, max(box.y + box.height for box in boxes) + 0.006)
+                result.append(
+                    {
+                        "id": f"ocr-watermark-{len(result) + 1}",
+                        "start_us": group_start_us,
+                        "end_us": group_end_us,
+                        "box": [left, top, right - left, bottom - top],
+                        "sample_count": len(frame_ids),
+                        "source": "ocr_bilibili_anchor",
+                    }
+                )
         return result
 
     def _fast_candidates(self, duration_us: int, interval_us: int):
@@ -1928,6 +2862,61 @@ class OcrWorker:
             for item in self._load_evidence()
             if item.provider_id not in {"paddle-quality", "rapid-quality-fallback"}
         )
+        if getattr(self, "_scan_plan_segments", ()):
+            candidates = []
+            rescue_windows: list[RescueWindow] = []
+            for segment in self._scan_plan_segments:
+                segment_evidence = self._segment_evidence(evidence, segment)
+                by_band = {
+                    band.name: group_visual_evidence(
+                        segment_evidence,
+                        band=band.name,
+                        duration_us=duration_us,
+                        sample_interval_us=interval_us,
+                    )
+                    for band in DEFAULT_SUBTITLE_BANDS
+                }
+                ids = iter(range(1, 1_000_000))
+                merged = self._clamp_candidates_to_segment(
+                    merge_band_candidates(
+                        by_band.get("upper", ()),
+                        by_band.get("lower", ()),
+                        evidence=segment_evidence,
+                        progress=self._finalization_progress,
+                        id_factory=lambda segment_index=segment.index, id_values=ids: (
+                            f"fast-segment-{segment_index}-merged-{next(id_values)}"
+                        ),
+                    ),
+                    segment,
+                )
+                candidates.extend(merged)
+                local_candidates = tuple(
+                    replace(
+                        item,
+                        range=TimeRange(
+                            item.range.start_us - segment.timeline_start_us,
+                            item.range.end_us - segment.timeline_start_us,
+                        ),
+                    )
+                    for item in merged
+                )
+                local_windows = coalesce_rescue_windows(
+                    targeted_rescue_windows(
+                        local_candidates,
+                        duration_us=segment.timeline_duration_us,
+                    )
+                )
+                rescue_windows.extend(
+                    RescueWindow(
+                        TimeRange(
+                            item.range.start_us + segment.timeline_start_us,
+                            item.range.end_us + segment.timeline_start_us,
+                        ),
+                        item.reasons,
+                    )
+                    for item in local_windows
+                )
+            return tuple(candidates), tuple(rescue_windows)
         by_band = {
             band.name: group_visual_evidence(
                 evidence,
@@ -1941,6 +2930,8 @@ class OcrWorker:
         merged = merge_band_candidates(
             by_band.get("upper", ()),
             by_band.get("lower", ()),
+            evidence=evidence,
+            progress=self._finalization_progress,
             id_factory=lambda: f"fast-merged-{next(ids)}",
         )
         return merged, coalesce_rescue_windows(
@@ -1955,6 +2946,72 @@ class OcrWorker:
         interval_us: int,
     ):
         all_evidence = self._load_evidence()
+        if getattr(self, "_scan_plan_segments", ()):
+            result = []
+            for segment in self._scan_plan_segments:
+                segment_fast = tuple(
+                    item
+                    for item in fast_candidates
+                    if item.range.start_us < segment.timeline_end_us
+                    and segment.timeline_start_us < item.range.end_us
+                )
+                segment_windows = tuple(
+                    item
+                    for item in rescue_windows
+                    if item.range.start_us < segment.timeline_end_us
+                    and segment.timeline_start_us < item.range.end_us
+                )
+                segment_evidence = self._segment_evidence(all_evidence, segment)
+                quality_evidence = tuple(
+                    item
+                    for item in segment_evidence
+                    if item.provider_id in {"paddle-quality", "rapid-quality-fallback"}
+                )
+                by_band = {
+                    band.name: group_visual_evidence(
+                        quality_evidence,
+                        band=band.name,
+                        duration_us=duration_us,
+                        sample_interval_us=interval_us,
+                    )
+                    for band in DEFAULT_SUBTITLE_BANDS
+                }
+                ids = iter(range(1, 1_000_000))
+                quality = self._clamp_candidates_to_segment(
+                    merge_band_candidates(
+                        by_band.get("upper", ()),
+                        by_band.get("lower", ()),
+                        evidence=quality_evidence,
+                        progress=self._finalization_progress,
+                        id_factory=lambda segment_index=segment.index, id_values=ids: (
+                            f"quality-segment-{segment_index}-merged-{next(id_values)}"
+                        ),
+                    ),
+                    segment,
+                )
+                cross_pass = self._clamp_candidates_to_segment(
+                    cross_pass_consensus_candidates(
+                        segment_evidence,
+                        video_duration_us=duration_us,
+                        evidence_half_interval_us=max(1, interval_us // 2),
+                        maximum_gap_us=max(400_000, interval_us),
+                    ),
+                    segment,
+                )
+                rescued = apply_quality_rescue(
+                    segment_fast,
+                    (*quality, *cross_pass),
+                    segment_windows,
+                )
+                reinforced = reinforce_candidate_ranges(
+                    rescued,
+                    quality_evidence,
+                    video_duration_us=duration_us,
+                    evidence_half_interval_us=interval_us // 2,
+                    maximum_distance_us=interval_us,
+                )
+                result.extend(self._clamp_candidates_to_segment(reinforced, segment))
+            return tuple(sorted(result, key=lambda item: (item.range.start_us, item.range.end_us)))
         evidence = tuple(
             item
             for item in all_evidence
@@ -1973,6 +3030,8 @@ class OcrWorker:
         quality = merge_band_candidates(
             by_band.get("upper", ()),
             by_band.get("lower", ()),
+            evidence=evidence,
+            progress=self._finalization_progress,
             id_factory=lambda: f"quality-merged-{next(ids)}",
         )
         cross_pass = cross_pass_consensus_candidates(
@@ -2026,6 +3085,14 @@ class OcrWorker:
             for item in candidates
             if item.range.start_us < end_us and start_us < item.range.end_us
         ]
+        evidence = self._load_evidence()
+        matching = collapse_proven_ocr_candidates(
+            tuple(matching), evidence=evidence,
+            suppressed_evidence={
+                item.evidence_id: item.winner_evidence_id
+                for item in getattr(self, "_suppressed_readings", ())
+            },
+        )
         if not matching:
             self.send("failed", {"code": "ocr_rescan_no_consensus"})
             return 3
@@ -2070,7 +3137,7 @@ class OcrWorker:
                 self.evidence_path.write_text("", encoding="utf-8")
             source = self.job_staging / f"checkpoint-{uuid4().hex}.ndjson.partial"
             shutil.copyfile(self.evidence_path, source)
-        digest = sha256(source.read_bytes()).hexdigest()
+        digest = _file_sha256(source)
         payload = {
             "stage_key": "ocr",
             "checkpoint_key": checkpoint_key,
@@ -2079,11 +3146,17 @@ class OcrWorker:
             "payload": {
                 "stage": self.stage,
                 "cursor_us": self.cursor_us,
-                "band_cursors_us": {
-                    band.name: self.cursor_us for band in DEFAULT_SUBTITLE_BANDS
-                },
+                "band_cursors_us": {band.name: self.cursor_us for band in DEFAULT_SUBTITLE_BANDS},
                 "change_events_us": self._change_events,
                 "scene_change_events_us": self._scene_change_events,
+                "input_fingerprint": self.spec.get("input_fingerprint", ""),
+                "settings_fingerprint": self.spec.get("settings_fingerprint", ""),
+                "ocr_aggregation_version": OCR_AGGREGATION_VERSION,
+                **(
+                    {"scan_plan_fingerprint": self._scan_plan_fingerprint}
+                    if self._scan_plan_fingerprint
+                    else {}
+                ),
                 **(extra_payload or {}),
             },
             "artifact_path": str(source),
@@ -2122,9 +3195,7 @@ def _probe_dialogue_stream(ffprobe: Path, media_path: Path) -> dict[str, Any]:
         raise RuntimeError("whisper_media_probe_invalid") from exc
     streams = payload.get("streams", []) if isinstance(payload, dict) else []
     audio = [
-        item
-        for item in streams
-        if isinstance(item, dict) and item.get("codec_type") == "audio"
+        item for item in streams if isinstance(item, dict) and item.get("codec_type") == "audio"
     ]
     if not audio:
         raise RuntimeError("whisper_audio_track_missing")
@@ -2148,12 +3219,7 @@ def _ffmpeg_progress_us(line: str) -> int | None:
             hours, minutes, seconds = value.split(":")
             return max(
                 0,
-                int(
-                    round(
-                        (int(hours) * 3_600 + int(minutes) * 60 + float(seconds))
-                        * 1_000_000
-                    )
-                ),
+                int(round((int(hours) * 3_600 + int(minutes) * 60 + float(seconds)) * 1_000_000)),
             )
     except (TypeError, ValueError):
         return None
@@ -2201,9 +3267,7 @@ def _whisper_cues(
         if rows:
             previous = rows[-1]
             previous_compact = "".join(
-                character
-                for character in str(previous["text"]).casefold()
-                if character.isalnum()
+                character for character in str(previous["text"]).casefold() if character.isalnum()
             )
             gap_us = start_us - int(previous["end_us"])
             if compact and compact == previous_compact and -100_000 <= gap_us <= 850_000:
@@ -2252,6 +3316,16 @@ def _whisper_cues(
     return cues, list(dict.fromkeys(warnings))
 
 
+def _scene_probe_from_row(raw: dict[str, Any]) -> SceneTextProbe:
+    return SceneTextProbe(
+        raw["timestamp_us"], NormalizedBox(*raw["region"]),
+        str(raw.get("source_scope", "")) or (
+            f"{raw.get('media_id', '')}:{raw.get('scan_segment_index', '')}"
+            if "media_id" in raw or "scan_segment_index" in raw else ""
+        ),
+    )
+
+
 def _evidence_from_row(raw: object) -> SubtitleEvidence:
     if not isinstance(raw, dict):
         raise TypeError("OCR evidence row must be an object")
@@ -2279,6 +3353,12 @@ def _evidence_from_row(raw: object) -> SubtitleEvidence:
         panel_box=panel_box,
         background_color=str(raw.get("background_color", "")),
         scene_confidence=float(raw.get("scene_confidence", 0.0)),
+        source_scope=str(raw.get("source_scope", ""))
+        or (
+            f"{raw.get('media_id', '')}:{raw.get('scan_segment_index', '')}"
+            if "media_id" in raw or "scan_segment_index" in raw
+            else ""
+        ),
     )
 
 
@@ -2313,11 +3393,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
+    from ducai_studio.infrastructure.licensing_state import worker_activation_exit_code
+
+    denied = worker_activation_exit_code()
+    if denied:
+        return denied
     return OcrWorker(arguments.job_id).run()
 
 
-if __name__ == "__main__":
-    exit_code = main()
+def exit_ocr_worker(exit_code: int) -> NoReturn:
+    """Flush after host cleanup without finalizing the blocked command reader."""
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(exit_code)
+
+
+if __name__ == "__main__":
+    exit_ocr_worker(main())

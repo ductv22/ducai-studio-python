@@ -71,16 +71,32 @@ def _dispatch_frozen_module(argv: list[str]) -> int | None:
     if len(argv) < 2 or argv[0] != "-m":
         return None
     module, arguments = argv[1], argv[2:]
+    if module.startswith("ducai_studio.workers."):
+        from ducai_studio.infrastructure.licensing_state import worker_activation_exit_code
+
+        denied = worker_activation_exit_code()
+        if denied:
+            return denied
     if module == "ducai_studio.job_manager":
         from ducai_studio.job_manager.__main__ import main as target
 
         return target(arguments)
-    if module == "ducai_studio.workers.ocr_worker":
-        from ducai_studio.workers.ocr_worker import main as target
+    if module == "ducai_studio.infrastructure.runtime_diagnostics":
+        from ducai_studio.infrastructure.runtime_diagnostics import main as target
 
         return target(arguments)
+    if module == "ducai_studio.workers.ocr_worker":
+        from ducai_studio.workers.ocr_worker import exit_ocr_worker
+        from ducai_studio.workers.ocr_worker import main as target
+
+        exit_ocr_worker(target(arguments))
     if module == "ducai_studio.workers.preowned_launcher":
         from ducai_studio.workers.preowned_launcher import main as target
+
+        sys.argv = [sys.argv[0], *arguments]
+        return target()
+    if module == "ducai_studio.workers.tts_postprocess":
+        from ducai_studio.workers.tts_postprocess import main as target
 
         sys.argv = [sys.argv[0], *arguments]
         return target()

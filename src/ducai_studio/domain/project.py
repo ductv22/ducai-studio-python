@@ -11,7 +11,7 @@ from .voice_conform import VoiceConformPlan
 TRANSLATION_STYLE_PRESETS = frozenset(
     {"auto", "xianxia", "wuxia", "palace", "modern", "neutral"}
 )
-CUE_ROLES = frozenset({"dialogue", "scene_text"})
+CUE_ROLES = frozenset({"dialogue", "scene_text", "title_text"})
 CUE_ORIENTATIONS = frozenset({"horizontal", "vertical"})
 CUE_BACKGROUND_STYLES = frozenset(
     {"solid", "ink_splash", "ink_wash", "ink_cloud", "brush_stroke"}
@@ -32,10 +32,13 @@ CUE_STYLE_HINTS = frozenset(
 )
 CUE_REVIEW_STATES = frozenset({"accepted", "review"})
 SCENE_TEXT_DEFAULT_STYLE_HINT = "calligraphy_brush"
+SCENE_TEXT_DEFAULT_FONT_SIZE = 40
 SCENE_TEXT_DEFAULT_BACKGROUND_STYLE = "ink_splash"
 SCENE_TEXT_DEFAULT_TEXT_COLOR = "#FFFFFF"
 SCENE_TEXT_DEFAULT_BACKGROUND_COLOR = "#000000"
 SCENE_TEXT_DEFAULT_BACKGROUND_OPACITY_PERCENT = 100
+SCENE_TEXT_DEFAULT_FADE_ENABLED = True
+SCENE_TEXT_DEFAULT_FADE_DURATION_MS = 300
 
 
 def _validate_normalized_box(
@@ -56,6 +59,22 @@ def _validate_normalized_box(
         raise ValueError(f"{label} must stay inside the frame")
 
 
+def grow_dialogue_panel_for_font(box, previous_size: int, next_size: int):
+    """Keep an edited dialogue's anchor while allowing a larger requested font.
+
+    A measured placement created by dragging is not a permanent font-size cap.
+    Decreasing the font needs no panel change; measured backgrounds still shrink.
+    """
+    if box is None or next_size <= previous_size:
+        return box
+    x, y, width, height = box
+    scale = next_size / max(1, previous_size)
+    new_width, new_height = min(1., width * scale), min(1., height * scale)
+    return (max(0., min(1. - new_width, x + (width - new_width) / 2)),
+            max(0., min(1. - new_height, y + (height - new_height) / 2)),
+            new_width, new_height)
+
+
 class MediaKind(StrEnum):
     VIDEO = "video"
     AUDIO = "audio"
@@ -69,6 +88,7 @@ class TrackKind(StrEnum):
     VOICE = "voice"
     BACKGROUND_MUSIC = "background_music"
     SUBTITLE = "subtitle"
+    TEXT = "text"
     LOGO = "logo"
     BLUR = "blur"
 
@@ -169,7 +189,7 @@ class SubtitleCue:
         elif self.visual_box_source:
             raise ValueError("Cue visual box source requires geometry")
         if self.role not in CUE_ROLES:
-            raise ValueError("Cue role must be dialogue or scene_text")
+            raise ValueError("Cue role must be dialogue, scene_text or title_text")
         if self.orientation not in CUE_ORIENTATIONS:
             raise ValueError("Cue orientation must be horizontal or vertical")
         if self.style_hint not in CUE_STYLE_HINTS:
@@ -185,26 +205,26 @@ class SubtitleCue:
             or not 0.5 <= self.scene_font_scale <= 2.0
         ):
             raise ValueError("Kích thước chữ S2 phải nằm trong khoảng 50% đến 200%")
-        if type(self.text_font_size) is not int or not 1 <= self.text_font_size <= 100:
-            raise ValueError("Kích thước chữ phải nằm trong khoảng 1 đến 100")
+        if type(self.text_font_size) is not int or self.text_font_size < 1:
+            raise ValueError("Kích thước chữ phải là số nguyên dương")
         if self.subtitle_track_id and (
-            not self.subtitle_track_id.startswith("S")
+            not self.subtitle_track_id.startswith("T" if self.role == "title_text" else "S")
             or not self.subtitle_track_id[1:].isdigit()
             or int(self.subtitle_track_id[1:]) <= 0
         ):
-            raise ValueError("Subtitle track id must use S1, S2, S3…")
+            raise ValueError("Text track id must use T1…; subtitle track id must use S1…")
         if (
             type(self.background_padding_x) is not int
             or type(self.background_padding_y) is not int
-            or not 0 <= self.background_padding_x <= 100
-            or not 0 <= self.background_padding_y <= 100
+            or self.background_padding_x < 0
+            or self.background_padding_y < 0
         ):
-            raise ValueError("Background padding must be between 0 and 100")
+            raise ValueError("Background padding must be a nonnegative integer")
         if (
             type(self.letter_spacing_percent) is not int
-            or not 0 <= self.letter_spacing_percent <= 100
+            or self.letter_spacing_percent < 0
         ):
-            raise ValueError("Letter spacing must be between 0 and 100")
+            raise ValueError("Letter spacing must be a nonnegative integer")
         if type(self.font_bold) is not bool or type(self.font_italic) is not bool:
             raise TypeError("Cue bold and italic flags must be boolean")
         if (
@@ -355,10 +375,13 @@ class TimelineClip:
     timing_unresolved: bool = False
     content_warning: bool = False
     issue_code: str = ""
+    muted: bool = False
 
     def __post_init__(self) -> None:
         if not self.id.strip() or not self.track_id.strip():
             raise ValueError("Clip id and track id are required")
+        if type(self.muted) is not bool:
+            raise TypeError("Clip muted state must be boolean")
         if not 0.0 <= self.volume <= 2.0:
             raise ValueError("Clip volume must be between 0 and 2")
         if self.payload_revision <= 0:
@@ -445,15 +468,59 @@ class Overlay:
 
 
 @dataclass(frozen=True, slots=True)
+class TranslationStylePreset:
+    """A user-named translation style saved inside a project."""
+
+    name: str
+    preset: str = "auto"
+    custom_rules: str = ""
+
+    def __post_init__(self) -> None:
+        normalized_name = self.name.strip()
+        if not normalized_name:
+            raise ValueError("Translation style name is required")
+        if len(normalized_name) > 80:
+            raise ValueError("Translation style name cannot exceed 80 characters")
+        if any(ord(character) < 32 for character in normalized_name):
+            raise ValueError("Translation style name contains control characters")
+        if self.preset not in TRANSLATION_STYLE_PRESETS:
+            raise ValueError("Translation style preset is invalid")
+        if len(self.custom_rules) > 4_000:
+            raise ValueError("Translation custom rules cannot exceed 4000 characters")
+        object.__setattr__(self, "name", normalized_name)
+
+    @property
+    def normalized_name(self) -> str:
+        return self.name.strip()
+
+
+@dataclass(frozen=True, slots=True)
 class TranslationPreferences:
     preset: str = "auto"
     custom_rules: str = ""
+    saved_styles: tuple[TranslationStylePreset, ...] = ()
+    active_style_name: str = ""
 
     def __post_init__(self) -> None:
         if self.preset not in TRANSLATION_STYLE_PRESETS:
             raise ValueError("Translation style preset is invalid")
         if len(self.custom_rules) > 4_000:
             raise ValueError("Translation custom rules cannot exceed 4000 characters")
+        names = [style.normalized_name.casefold() for style in self.saved_styles]
+        if len(names) != len(set(names)):
+            raise ValueError("Translation style names must be unique")
+        if len(self.saved_styles) > 100:
+            raise ValueError("A project cannot contain more than 100 saved translation styles")
+        if self.active_style_name:
+            active = next(
+                (style for style in self.saved_styles if style.name == self.active_style_name),
+                None,
+            )
+            if active is None or (active.preset, active.custom_rules) != (
+                self.preset,
+                self.custom_rules,
+            ):
+                raise ValueError("Active translation style must match a saved style")
 
 
 @dataclass(frozen=True, slots=True)
@@ -470,6 +537,23 @@ class VoiceConformState:
             raise ValueError("Voice conform base and output media must differ")
         if not self.parent_tts_job_id.strip():
             raise ValueError("Voice conform parent TTS job id is required")
+
+
+@dataclass(frozen=True, slots=True)
+class TimelineEditState:
+    retained_ranges: tuple[TimeRange, ...]
+    schema_version: int = 1
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1 or not self.retained_ranges:
+            raise ValueError("Phạm vi cắt video không hợp lệ")
+        previous_end = -1
+        for interval in self.retained_ranges:
+            if interval.duration_us <= 0:
+                raise ValueError("Đoạn video giữ lại không được rỗng")
+            if interval.start_us < previous_end:
+                raise ValueError("Các đoạn video giữ lại phải đúng thứ tự, không chồng nhau")
+            previous_end = interval.end_us
 
 
 @dataclass(frozen=True, slots=True)
@@ -491,6 +575,14 @@ class ProjectSnapshot:
     # S1, text outside it feeds S2, and exclusions win over both.
     ocr_dialogue_region: tuple[float, float, float, float] | None = None
     ocr_exclusion_regions: tuple[tuple[float, float, float, float], ...] = ()
+    timeline_edit: TimelineEditState | None = None
+    # User-authored timeline bookmarks are display-time positions in
+    # microseconds.  They are deliberately separate from media/cue data so
+    # adding or removing a mark never changes OCR, translation or TTS inputs.
+    timeline_markers: tuple[TimeUs, ...] = ()
+    # Editor-authored labels are not OCR/translation/TTS input. Keeping this
+    # collection separate preserves channel/film titles across stage reruns.
+    title_cues: tuple[SubtitleCue, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.id.strip() or not self.name.strip():
@@ -503,6 +595,10 @@ class ProjectSnapshot:
         )
         for index, region in enumerate(self.ocr_exclusion_regions, start=1):
             _validate_normalized_box(region, label=f"OCR exclusion region {index}")
+        if any(type(value) is not int or value < 0 for value in self.timeline_markers):
+            raise ValueError("Timeline markers must be non-negative integer timestamps")
+        if tuple(sorted(set(self.timeline_markers))) != self.timeline_markers:
+            raise ValueError("Timeline markers must be sorted and unique")
         media_ids = [item.id for item in self.media]
         track_ids = [item.id for item in self.tracks]
         if len(media_ids) != len(set(media_ids)) or len(track_ids) != len(set(track_ids)):
@@ -512,6 +608,15 @@ class ProjectSnapshot:
         if len(clip_ids) != len(set(clip_ids)):
             raise ValueError("Project clip ids must be unique")
         known_media = set(media_ids)
+        title_ids = [cue.id for cue in self.title_cues]
+        if len(title_ids) != len(set(title_ids)):
+            raise ValueError("Title text ids must be unique")
+        if set(title_ids) & {cue.id for cue in (*self.source_cues, *self.translated_cues)}:
+            raise ValueError("Title text identity must be separate from subtitles")
+        if any(cue.role != "title_text" for cue in self.title_cues):
+            raise ValueError("Title collection requires title_text cues")
+        if any(cue.role == "title_text" for cue in (*self.source_cues, *self.translated_cues)):
+            raise ValueError("Titles cannot be included in subtitle job inputs")
         for overlay in self.overlays:
             if overlay.asset_id is not None and overlay.asset_id not in known_media:
                 raise ValueError(f"Overlay references unknown media: {overlay.asset_id}")

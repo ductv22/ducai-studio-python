@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from uuid import uuid4
 
 from ducai_studio.domain.project import (
@@ -23,6 +23,14 @@ from ducai_studio.domain.timeline import (
     with_speed,
     with_volume,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class VideoClipBundle:
+    project_id: str
+    start_us: int
+    end_us: int
+    tracks: tuple[TimelineTrack, ...]
 
 
 class TimelineEditor:
@@ -147,10 +155,40 @@ class TimelineEditor:
     ) -> ProjectSnapshot:
         targets = self._targets(clip_id, apply_linked=apply_linked)
         replacements = {
-            clip.id: (trim_head(clip, timeline_us, unlink=not apply_linked),)
-            for clip in targets
+            clip.id: (trim_head(clip, timeline_us, unlink=not apply_linked),) for clip in targets
         }
         return self._commit(self._replace_clips(replacements))
+
+    def cut(self, operation: str, start_us: int, end_us: int) -> ProjectSnapshot:
+        from ducai_studio.domain.timeline_edit import cut_state, retained_cues
+
+        if any(track.locked for track in self.snapshot.tracks):
+            raise TimelineEditError("Hãy mở khóa các track trước khi cắt đồng bộ video")
+        state = cut_state(self.snapshot, operation, start_us, end_us)
+        candidate = replace(self.snapshot, timeline_edit=state)
+        retained_source = retained_cues(candidate, candidate.source_cues)
+        source = tuple(replace(cue, index=index) for index, cue in enumerate(retained_source, 1))
+        by_id = {cue.id: cue.index for cue in source}
+        by_previous_index = {
+            old.index: new.index for old, new in zip(retained_source, source, strict=True)
+        }
+        translated = tuple(
+            replace(cue, index=by_id.get(cue.id) or by_previous_index.get(cue.index, index))
+            for index, cue in enumerate(retained_cues(candidate, candidate.translated_cues), 1)
+        )
+        return self._commit(replace(candidate, source_cues=source, translated_cues=translated))
+
+    def set_markers(self, markers: object) -> ProjectSnapshot:
+        """Set sorted display-time bookmarks as one undoable Timeline edit."""
+
+        if not isinstance(markers, (list, tuple)):
+            raise TimelineEditError("Danh sách mark Timeline không hợp lệ")
+        if any(type(value) is not int or value < 0 for value in markers):
+            raise TimelineEditError("Mark Timeline phải là mốc mili giây không âm")
+        normalized = sorted(set(markers))
+        if normalized == list(self.snapshot.timeline_markers):
+            return self.snapshot
+        return self._commit(replace(self.snapshot, timeline_markers=tuple(normalized)))
 
     def trim_tail(
         self,
@@ -161,8 +199,7 @@ class TimelineEditor:
     ) -> ProjectSnapshot:
         targets = self._targets(clip_id, apply_linked=apply_linked)
         replacements = {
-            clip.id: (trim_tail(clip, timeline_us, unlink=not apply_linked),)
-            for clip in targets
+            clip.id: (trim_tail(clip, timeline_us, unlink=not apply_linked),) for clip in targets
         }
         return self._commit(self._replace_clips(replacements))
 
@@ -215,9 +252,7 @@ class TimelineEditor:
             if clip.track_id == "D1":
                 speed_value = speed.numerator / speed.denominator
                 if speed_value < 0.5 - 1e-9 or speed_value > 3.0 + 1e-9:
-                    raise TimelineEditError(
-                        "Tốc độ clip D1 phải nằm trong khoảng 0,50×–3,00×"
-                    )
+                    raise TimelineEditError("Tốc độ clip D1 phải nằm trong khoảng 0,50×–3,00×")
         replacements: dict[str, tuple[TimelineClip, ...]] = {}
         for clip in targets:
             changed = with_speed(clip, speed)
@@ -250,31 +285,21 @@ class TimelineEditor:
             # Magnetic SRT snap keeps hand-edits frame-accurate while still
             # allowing free resizing outside the 80 ms attraction window.
             if clip.timing_slot is not None:
-                if (
-                    abs(start - clip.timing_slot.start_us)
-                    <= VOICE_TIMING_SNAP_TOLERANCE_US
-                ):
+                if abs(start - clip.timing_slot.start_us) <= VOICE_TIMING_SNAP_TOLERANCE_US:
                     start = clip.timing_slot.start_us
-                if (
-                    abs(end - clip.timing_slot.end_us)
-                    <= VOICE_TIMING_SNAP_TOLERANCE_US
-                ):
+                if abs(end - clip.timing_slot.end_us) <= VOICE_TIMING_SNAP_TOLERANCE_US:
                     end = clip.timing_slot.end_us
             if apply_linked and clip is not targets[0]:
                 offset = targets[0].timeline_range.start_us - start
                 start = clip.timeline_range.start_us - offset
                 end = start + (timeline_end_us - timeline_start_us)
-            replacements[clip.id] = (
-                resize_clip(clip, TimeRange(start, end)),
-            )
+            replacements[clip.id] = (resize_clip(clip, TimeRange(start, end)),)
         return self._commit(self._replace_clips(replacements))
 
     def auto_fit_voice_timing(self) -> ProjectSnapshot:
         """Fit only D1 clips marked timing-unresolved to their SRT slots."""
 
-        voice_track = next(
-            (track for track in self.snapshot.tracks if track.id == "D1"), None
-        )
+        voice_track = next((track for track in self.snapshot.tracks if track.id == "D1"), None)
         if voice_track is None:
             raise TimelineEditError("D1 voice track does not exist")
         replacements: dict[str, tuple[TimelineClip, ...]] = {}
@@ -304,9 +329,7 @@ class TimelineEditor:
     def set_volume(self, clip_id: str, volume: float) -> ProjectSnapshot:
         clip = self._find_clip(clip_id)
         self._assert_editable((clip,))
-        return self._commit(
-            self._replace_clips({clip.id: (with_volume(clip, volume),)})
-        )
+        return self._commit(self._replace_clips({clip.id: (with_volume(clip, volume),)}))
 
     def delete_tracks(self, track_ids: tuple[str, ...]) -> ProjectSnapshot:
         ids = {value.strip() for value in track_ids if value.strip()}
@@ -316,7 +339,10 @@ class TimelineEditor:
         if unknown:
             raise LookupError("Unknown timeline track: " + ", ".join(sorted(unknown)))
         remaining = tuple(track for track in self.snapshot.tracks if track.id not in ids)
-        return self._commit(replace(self.snapshot, tracks=remaining))
+        removed_text = any(track.kind is TrackKind.TEXT and track.id in ids
+                           for track in self.snapshot.tracks)
+        return self._commit(replace(self.snapshot, tracks=remaining,
+                                    title_cues=() if removed_text else self.snapshot.title_cues))
 
     def set_track_muted(self, track_id: str, muted: bool) -> ProjectSnapshot:
         if type(muted) is not bool:
@@ -354,8 +380,215 @@ class TimelineEditor:
 
     def delete(self, clip_id: str, *, apply_linked: bool = True) -> ProjectSnapshot:
         targets = self._targets(clip_id, apply_linked=apply_linked)
+        return self._commit(self._replace_clips({clip.id: () for clip in targets}))
+
+    def copy_video(self, clip_id: str, *, include_fragments: bool = False) -> VideoClipBundle:
+        selected = self._find_clip(clip_id)
+        if self._find_track(selected.track_id).kind is not TrackKind.VIDEO:
+            raise TimelineEditError("Hãy chọn đoạn video để sao chép")
+        # Captured immutable values survive later edits/deletion of the original.
+        videos = tuple(
+            clip
+            for track in self.snapshot.tracks
+            for clip in track.clips
+            if clip.id == clip_id
+            or (
+                include_fragments
+                and track.id == selected.track_id
+                and clip.id.startswith(clip_id + "::cut::")
+            )
+        )
+        groups = {clip.link_group_id for clip in videos if clip.link_group_id}
+        clips = tuple(
+            clip
+            for track in self.snapshot.tracks
+            for clip in track.clips
+            if clip in videos or clip.link_group_id in groups
+        )
+        ids = {clip.id for clip in clips}
+        tracks = tuple(
+            replace(track, clips=tuple(clip for clip in track.clips if clip.id in ids))
+            for track in self.snapshot.tracks
+            if any(clip.id in ids for clip in track.clips)
+        )
+        return VideoClipBundle(
+            self.snapshot.id,
+            min(c.timeline_range.start_us for c in videos),
+            max(c.timeline_range.end_us for c in videos),
+            tracks,
+        )
+
+    def paste_video(
+        self, bundle: VideoClipBundle, start_us: int, *, new_layer: bool = True
+    ) -> ProjectSnapshot:
+        if bundle.project_id != self.snapshot.id:
+            raise TimelineEditError("Hãy sao chép video trong dự án hiện tại trước khi dán")
+        if type(start_us) is not int or start_us < 0:
+            raise TimelineEditError("Mốc dán video không hợp lệ")
+        delta = start_us - bundle.start_us
+        groups = {
+            clip.link_group_id: self._new_id("link")
+            for track in bundle.tracks
+            for clip in track.clips
+            if clip.link_group_id
+        }
+        tracks = list(self.snapshot.tracks)
+        next_video = (
+            max(
+                (
+                    int(track.id[1:])
+                    for track in tracks
+                    if track.kind is TrackKind.VIDEO and track.id[1:].isdigit()
+                ),
+                default=1,
+            )
+            + 1
+        )
+        for source_track in bundle.tracks:
+            if new_layer:
+                track_id = (
+                    f"V{next_video}"
+                    if source_track.kind is TrackKind.VIDEO
+                    else self._new_id("A-video")
+                )
+            else:
+                track_id = source_track.id
+                self._find_track(track_id)
+            copied = tuple(
+                replace(
+                    clip,
+                    id=self._new_id("clip"),
+                    track_id=track_id,
+                    timeline_range=TimeRange(
+                        clip.timeline_range.start_us + delta, clip.timeline_range.end_us + delta
+                    ),
+                    link_group_id=groups.get(clip.link_group_id),
+                    payload_revision=1,
+                )
+                for clip in source_track.clips
+            )
+            if new_layer:
+                tracks.append(
+                    replace(
+                        source_track,
+                        id=track_id,
+                        name=track_id
+                        if source_track.kind is TrackKind.VIDEO
+                        else f"Âm thanh {next_video}",
+                        clips=copied,
+                        locked=False,
+                    )
+                )
+            else:
+                tracks = [
+                    replace(
+                        track,
+                        clips=tuple(
+                            sorted(
+                                (*track.clips, *copied),
+                                key=lambda c: (c.timeline_range.start_us, c.id),
+                            )
+                        ),
+                    )
+                    if track.id == track_id
+                    else track
+                    for track in tracks
+                ]
+        return self._commit(replace(self.snapshot, tracks=tuple(tracks)))
+
+    def duplicate_video(self, clip_id: str, *, include_fragments: bool = False) -> ProjectSnapshot:
+        bundle = self.copy_video(clip_id, include_fragments=include_fragments)
+        if any(track.locked for track in self.snapshot.tracks):
+            raise TimelineEditError("Hãy mở khóa các track trước khi nhân bản và nối video")
+        insertion, duration = bundle.end_us, bundle.end_us - bundle.start_us
+
+        def shift_range(interval):
+            if interval is None or interval.end_us <= insertion:
+                return interval
+            return TimeRange(
+                interval.start_us + (duration if interval.start_us >= insertion else 0),
+                interval.end_us + duration,
+            )
+
+        tracks = []
+        for track in self.snapshot.tracks:
+            clips = []
+            for clip in track.clips:
+                interval = clip.timeline_range
+                if interval.start_us < insertion < interval.end_us and clip.source_range:
+                    left, right = split_clip(
+                        clip,
+                        insertion,
+                        left_id=clip.id,
+                        right_id=self._new_id("clip"),
+                        left_link_group_id=clip.link_group_id,
+                        right_link_group_id=(clip.link_group_id + "::after::" + str(insertion))
+                        if clip.link_group_id
+                        else None,
+                    )
+                    clips.extend(
+                        (
+                            replace(left, timing_slot=shift_range(left.timing_slot)),
+                            replace(
+                                right,
+                                timeline_range=TimeRange(
+                                    insertion + duration, interval.end_us + duration
+                                ),
+                                timing_slot=shift_range(right.timing_slot),
+                            ),
+                        )
+                    )
+                else:
+                    clips.append(
+                        replace(
+                            clip,
+                            timeline_range=shift_range(interval),
+                            timing_slot=shift_range(clip.timing_slot),
+                        )
+                    )
+            tracks.append(replace(track, clips=tuple(clips)))
+        candidate = replace(
+            self.snapshot,
+            tracks=tuple(tracks),
+            source_cues=tuple(
+                replace(cue, range=shift_range(cue.range)) for cue in self.snapshot.source_cues
+            ),
+            translated_cues=tuple(
+                replace(cue, range=shift_range(cue.range)) for cue in self.snapshot.translated_cues
+            ),
+            overlays=tuple(
+                replace(overlay, range=shift_range(overlay.range))
+                for overlay in self.snapshot.overlays
+            ),
+        )
+        # Assemble the insert in a temporary editor: one user action, one Undo.
+        temporary = TimelineEditor(candidate, id_factory=self._id_factory)
+        return self._commit(temporary.paste_video(bundle, insertion, new_layer=False))
+
+    def set_clip_muted(
+        self, clip_id: str, muted: bool, *, include_fragments: bool = False
+    ) -> ProjectSnapshot:
+        if type(muted) is not bool:
+            raise TimelineEditError("Trạng thái tắt tiếng không hợp lệ")
+        targets = (
+            tuple(
+                clip
+                for track in self.copy_video(clip_id, include_fragments=True).tracks
+                for clip in track.clips
+            )
+            if include_fragments
+            else self._targets(clip_id, apply_linked=True)
+        )
+        self._assert_editable(targets)
         return self._commit(
-            self._replace_clips({clip.id: () for clip in targets})
+            self._replace_clips(
+                {
+                    clip.id: (
+                        replace(clip, muted=muted, payload_revision=clip.payload_revision + 1),
+                    )
+                    for clip in targets
+                }
+            )
         )
 
     def undo(self) -> ProjectSnapshot:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+from bisect import bisect_right
 from collections.abc import Callable, Iterable
 from dataclasses import replace
 from uuid import uuid4
@@ -13,6 +14,9 @@ from ducai_studio.domain.project import (
     SCENE_TEXT_DEFAULT_BACKGROUND_COLOR,
     SCENE_TEXT_DEFAULT_BACKGROUND_OPACITY_PERCENT,
     SCENE_TEXT_DEFAULT_BACKGROUND_STYLE,
+    SCENE_TEXT_DEFAULT_FADE_DURATION_MS,
+    SCENE_TEXT_DEFAULT_FADE_ENABLED,
+    SCENE_TEXT_DEFAULT_FONT_SIZE,
     SCENE_TEXT_DEFAULT_STYLE_HINT,
     SCENE_TEXT_DEFAULT_TEXT_COLOR,
     ProjectSnapshot,
@@ -20,6 +24,7 @@ from ducai_studio.domain.project import (
     TimelineClip,
     TimelineTrack,
     TrackKind,
+    grow_dialogue_panel_for_font,
     subtitle_ranges_overlap,
     subtitle_track_number,
 )
@@ -106,7 +111,7 @@ class SubtitleEditor:
     @staticmethod
     def _normalize_cues(cues: Iterable[SubtitleCue]) -> tuple[SubtitleCue, ...]:
         return tuple(
-            replace(cue, index=index)
+            cue if cue.index == index else replace(cue, index=index)
             for index, cue in enumerate(
                 sorted(cues, key=lambda item: (item.range.start_us, item.range.end_us, item.id)),
                 start=1,
@@ -365,8 +370,8 @@ class SubtitleEditor:
     ) -> ProjectSnapshot:
         """Format one subtitle cue and its translated/source counterpart."""
 
-        if type(font_size) is not int or not 1 <= font_size <= 100:
-            raise SubtitleEditError("Kích thước chữ phải nằm trong khoảng 1 đến 100")
+        if type(font_size) is not int or font_size < 1:
+            raise SubtitleEditError("Kích thước chữ phải là số nguyên dương")
         if orientation not in {"horizontal", "vertical"}:
             raise SubtitleEditError("Hướng chữ phải là ngang hoặc dọc")
         color = background_color.strip().upper()
@@ -396,6 +401,8 @@ class SubtitleEditor:
         def formatted(cue: SubtitleCue) -> SubtitleCue:
             return replace(
                 cue,
+                panel_box=grow_dialogue_panel_for_font(cue.panel_box, cue.text_font_size, font_size)
+                if cue.is_dialogue else cue.panel_box,
                 text_font_size=font_size,
                 scene_font_scale=1.0,
                 orientation=orientation,
@@ -456,8 +463,8 @@ class SubtitleEditor:
         selected = tuple(dict.fromkeys(value.strip() for value in cue_ids if value.strip()))
         if not selected:
             raise SubtitleEditError("Hãy chọn ít nhất một cue chữ")
-        if type(font_size) is not int or not 1 <= font_size <= 100:
-            raise SubtitleEditError("Kích thước chữ phải nằm trong khoảng 1 đến 100")
+        if type(font_size) is not int or font_size < 1:
+            raise SubtitleEditError("Kích thước chữ phải là số nguyên dương")
         if orientation not in {"horizontal", "vertical"}:
             raise SubtitleEditError("Hướng chữ phải là ngang hoặc dọc")
         if style_hint not in {
@@ -479,10 +486,11 @@ class SubtitleEditor:
             (background_padding_x, "Nền ngang"),
             (background_padding_y, "Nền dọc"),
         ):
-            if type(value) is not int or not 0 <= value <= 100:
-                raise SubtitleEditError(f"{label} phải nằm trong khoảng 0 đến 100")
+            if type(value) is not int or value < 0:
+                raise SubtitleEditError(f"{label} phải là số nguyên không âm")
+        if type(letter_spacing_percent) is not int or letter_spacing_percent < 0:
+            raise SubtitleEditError("Khoảng cách chữ phải là số nguyên không âm")
         for value, label in (
-            (letter_spacing_percent, "Khoảng cách chữ"),
             (text_opacity_percent, "Độ đục chữ"),
             (background_opacity_percent, "Độ đục nền"),
         ):
@@ -522,6 +530,8 @@ class SubtitleEditor:
                 return cue
             return replace(
                 cue,
+                panel_box=grow_dialogue_panel_for_font(cue.panel_box, cue.text_font_size, font_size)
+                if cue.is_dialogue else cue.panel_box,
                 text_font_size=font_size,
                 scene_font_scale=1.0,
                 orientation=orientation,
@@ -643,6 +653,8 @@ class SubtitleEditor:
             background_opacity_percent=(
                 SCENE_TEXT_DEFAULT_BACKGROUND_OPACITY_PERCENT
             ),
+            fade_enabled=SCENE_TEXT_DEFAULT_FADE_ENABLED,
+            fade_duration_ms=SCENE_TEXT_DEFAULT_FADE_DURATION_MS,
         )
 
     def add_subtitle_cue(
@@ -771,7 +783,8 @@ class SubtitleEditor:
             return getattr(dialogue_template, name)
 
         resolved_font_size = int(
-            inherited("text_font_size", 12) if font_size is None else font_size
+            (SCENE_TEXT_DEFAULT_FONT_SIZE if cue_role == "scene_text"
+             else inherited("text_font_size", 12)) if font_size is None else font_size
         )
         resolved_orientation = str(
             inherited("orientation", "horizontal")
@@ -853,12 +866,15 @@ class SubtitleEditor:
             else background_opacity_percent
         )
         resolved_fade_enabled = bool(
-            inherited("fade_enabled", False)
+            inherited(
+                "fade_enabled",
+                SCENE_TEXT_DEFAULT_FADE_ENABLED if cue_role == "scene_text" else False,
+            )
             if fade_enabled is None
             else fade_enabled
         )
         resolved_fade_duration = int(
-            inherited("fade_duration_ms", 300)
+            inherited("fade_duration_ms", SCENE_TEXT_DEFAULT_FADE_DURATION_MS)
             if fade_duration_ms is None
             else fade_duration_ms
         )
@@ -871,8 +887,8 @@ class SubtitleEditor:
                 int(color[1:], 16)
             except ValueError as exc:
                 raise SubtitleEditError("Màu nền phải dùng định dạng #RRGGBB") from exc
-        if not 1 <= resolved_font_size <= 100:
-            raise SubtitleEditError("Kích thước chữ phải nằm trong khoảng 1 đến 100")
+        if resolved_font_size < 1:
+            raise SubtitleEditError("Kích thước chữ phải là số nguyên dương")
         if resolved_orientation not in {"horizontal", "vertical"}:
             raise SubtitleEditError("Hướng chữ phải là ngang hoặc dọc")
         foreground = resolved_text_color.strip().upper()
@@ -887,10 +903,10 @@ class SubtitleEditor:
             raise SubtitleEditError("Kiểu chữ không hợp lệ")
         if resolved_background_style not in CUE_BACKGROUND_STYLES:
             raise SubtitleEditError("Kiểu nền chữ không hợp lệ")
-        if not 0 <= resolved_padding_x <= 100 or not 0 <= resolved_padding_y <= 100:
-            raise SubtitleEditError("Khoảng nền chữ phải nằm trong khoảng 0 đến 100")
-        if not 0 <= resolved_letter_spacing <= 100:
-            raise SubtitleEditError("Khoảng cách chữ phải nằm trong khoảng 0 đến 100")
+        if resolved_padding_x < 0 or resolved_padding_y < 0:
+            raise SubtitleEditError("Khoảng nền chữ phải là số nguyên không âm")
+        if resolved_letter_spacing < 0:
+            raise SubtitleEditError("Khoảng cách chữ phải là số nguyên không âm")
         if not 0 <= resolved_text_opacity <= 100 or not 0 <= resolved_background_opacity <= 100:
             raise SubtitleEditError("Độ đục chữ và nền phải nằm trong khoảng 0 đến 100")
         if not 50 <= resolved_fade_duration <= 2_000:
@@ -1022,6 +1038,7 @@ class SubtitleEditor:
         delta_y: float,
         scale_x: float = 1.0,
         scale_y: float = 1.0,
+        panel_seeds: dict[str, tuple[float, float, float, float]] | None = None,
     ) -> ProjectSnapshot:
         """Move/resize generated subtitle geometry as one atomic edit."""
 
@@ -1033,6 +1050,18 @@ class SubtitleEditor:
             raise SubtitleEditError("Tọa độ chữ không hợp lệ")
         if scale_x <= 0 or scale_y <= 0:
             raise SubtitleEditError("Kích thước chữ phải lớn hơn 0")
+        seeds = panel_seeds or {}
+        if not isinstance(seeds, dict):
+            raise SubtitleEditError("Vùng đặt chữ không hợp lệ")
+        for cue_id, box in seeds.items():
+            if cue_id not in selected or not isinstance(box, (tuple, list)) or len(box) != 4:
+                raise SubtitleEditError("Vùng đặt chữ không hợp lệ")
+            if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                       and math.isfinite(v) for v in box):
+                raise SubtitleEditError("Vùng đặt chữ không hợp lệ")
+            x, y, w, h = box
+            if min(x, y) < 0 or min(w, h) <= 0 or x + w > 1.001 or y + h > 1.001:
+                raise SubtitleEditError("Vùng đặt chữ phải nằm trong video")
 
         source = list(self.snapshot.source_cues)
         translated = list(self.snapshot.translated_cues)
@@ -1042,6 +1071,9 @@ class SubtitleEditor:
         if not selected_indexes:
             raise LookupError(f"Unknown subtitle cue: {sorted(selected)[0]}")
 
+        seed_by_index = {value.index: tuple(seeds[value.id])
+                         for value in source if value.id in seeds}
+
         def transformed(cue: SubtitleCue) -> SubtitleCue:
             if cue.index not in selected_indexes:
                 return cue
@@ -1050,7 +1082,13 @@ class SubtitleEditor:
                 if cue.is_dialogue
                 else (0.35, 0.35, 0.30, 0.14)
             )
-            panel = cue.panel_box or cue.visual_box or fallback
+            panel = cue.panel_box or seed_by_index.get(cue.index)
+            if panel is None and not cue.is_dialogue and cue.visual_box:
+                x, y, w, h = cue.visual_box
+                px, py = max(.012, w * .12), max(.008, h * .16)
+                left, top = max(0, x - px), max(0, y - py)
+                panel = (left, top, min(1, x + w + px) - left, min(1, y + h + py) - top)
+            panel = panel or fallback
             next_panel = self._transform_box(
                 panel,
                 delta_x=float(delta_x),
@@ -1059,7 +1097,7 @@ class SubtitleEditor:
                 scale_y=float(scale_y),
             )
             visual = cue.visual_box
-            if cue.source == "manual_scene_text" or cue.is_dialogue:
+            if cue.source == "manual_scene_text":
                 visual = self._transform_box(
                     visual or panel,
                     delta_x=float(delta_x),
@@ -1085,12 +1123,229 @@ class SubtitleEditor:
             )
         )
 
+    def set_cue_role_many(self, cue_ids: tuple[str, ...], *, role: str) -> ProjectSnapshot:
+        """Explicitly classify pairs and move their display clips, without retiming."""
+        if role not in {"dialogue", "scene_text"}:
+            raise SubtitleEditError("Loại cue phải là thoại S1 hoặc chữ trong cảnh S2")
+        selected = {value.strip() for value in cue_ids if value.strip()}
+        if not selected:
+            raise SubtitleEditError("Hãy chọn ít nhất một cue để chuyển loại")
+        if selected & {cue.id for cue in self.snapshot.title_cues}:
+            raise SubtitleEditError("Chữ tiêu đề trên track T không chuyển thành S1/S2")
+        source_by_id = {cue.id: cue for cue in self.snapshot.source_cues}
+        source_by_index = {cue.index: cue for cue in self.snapshot.source_cues}
+        translated_by_id = {cue.id: cue for cue in self.snapshot.translated_cues}
+        translated_by_index = {cue.index: cue for cue in self.snapshot.translated_cues}
+        targets: dict[str, SubtitleCue] = {}
+        for cue_id in selected:
+            source_cue = source_by_id.get(cue_id)
+            if source_cue is None:
+                translation = translated_by_id.get(cue_id)
+                if translation is None:
+                    raise LookupError(f"Unknown subtitle cue: {cue_id}")
+                source_cue = source_by_index.get(translation.index)
+                if source_cue is None:
+                    raise SubtitleEditError("Cue dịch không có cue nguồn tương ứng để chuyển loại")
+            targets[source_cue.id] = source_cue
+        destination = "S1" if role == "dialogue" else "S2"
+        assignments = {cue.id: (role, destination) for cue in targets.values()}
+        changed_source_ids = {
+            cue.id for cue in targets.values()
+            if cue.role != role or cue.subtitle_track_id != destination
+        }
+        if role == "dialogue" and changed_source_ids:
+            # Reserve the post-conversion layout before allocating displaced
+            # scene cues. Merged intervals make even overlapping dialogue
+            # occupancy safe to query with a binary search.
+            dialogue_ranges: list[TimeRange] = []
+            for cue in sorted(
+                (item for item in targets.values() if item.id in changed_source_ids),
+                key=lambda item: item.range.start_us,
+            ):
+                if dialogue_ranges and cue.range.start_us <= dialogue_ranges[-1].end_us:
+                    previous = dialogue_ranges[-1]
+                    dialogue_ranges[-1] = TimeRange(
+                        previous.start_us, max(previous.end_us, cue.range.end_us)
+                    )
+                else:
+                    dialogue_ranges.append(cue.range)
+            displaced: list[SubtitleCue] = []
+            occupied: dict[int, list[TimeRange]] = {}
+            for cue in self.snapshot.source_cues:
+                lane = cue.subtitle_track_id or ("S1" if cue.is_dialogue else "S2")
+                if cue.id in targets:
+                    lane = destination
+                elif cue.is_scene_text and lane == "S1":
+                    slot = bisect_right(dialogue_ranges, cue.range.start_us,
+                                        key=lambda item: item.end_us)
+                    if (slot < len(dialogue_ranges)
+                            and dialogue_ranges[slot].start_us < cue.range.end_us):
+                        displaced.append(cue)
+                        continue
+                occupied.setdefault(subtitle_track_number(lane, fallback=2), []).append(cue.range)
+            for lane, intervals in occupied.items():
+                merged: list[TimeRange] = []
+                for interval in sorted(intervals, key=lambda item: item.start_us):
+                    if merged and interval.start_us <= merged[-1].end_us:
+                        merged[-1] = TimeRange(
+                            merged[-1].start_us, max(merged[-1].end_us, interval.end_us)
+                        )
+                    else:
+                        merged.append(interval)
+                occupied[lane] = merged
+            for cue in sorted(
+                displaced, key=lambda item: (item.range.start_us, item.range.end_us, item.id)
+            ):
+                lane = 2
+                while True:
+                    intervals = occupied.setdefault(lane, [])
+                    slot = bisect_right(intervals, cue.range.start_us, key=lambda item: item.end_us)
+                    if slot == len(intervals) or intervals[slot].start_us >= cue.range.end_us:
+                        intervals.insert(slot, cue.range)
+                        assignments[cue.id] = (cue.role, f"S{lane}")
+                        targets[cue.id] = cue
+                        break
+                    lane += 1
+
+        paired_translations: dict[str, SubtitleCue] = {}
+        source_for_translation: dict[str, SubtitleCue] = {}
+        translation_for_source: dict[str, SubtitleCue] = {}
+        for cue in targets.values():
+            translation = translated_by_id.get(cue.id)
+            if translation is None:
+                legacy = translated_by_index.get(cue.index)
+                if legacy is not None and legacy.id not in source_by_id:
+                    translation = legacy
+            if translation is not None:
+                paired_translations[translation.id] = translation
+                source_for_translation[translation.id] = cue
+                translation_for_source[cue.id] = translation
+        if any(cue.role not in {"dialogue", "scene_text"}
+               for cue in (*targets.values(), *paired_translations.values())):
+            raise SubtitleEditError("Chữ tiêu đề trên track T không chuyển thành S1/S2")
+        def converted(cue: SubtitleCue, source_id: str) -> SubtitleCue:
+            assignment = assignments.get(source_id)
+            if assignment is None or (cue.role, cue.subtitle_track_id) == assignment:
+                return cue
+            return replace(cue, role=assignment[0], subtitle_track_id=assignment[1],
+                           revision=cue.revision + 1)
+
+        source = tuple(converted(cue, cue.id) for cue in self.snapshot.source_cues)
+        translated = tuple(converted(cue, source_for_translation[cue.id].id)
+                           if cue.id in source_for_translation else cue
+                           for cue in self.snapshot.translated_cues)
+        if destination == "S2" and changed_source_ids:
+            # A colliding explicit scene lane is repaired on decode. Reject
+            # that destination instead of silently undoing the user's lane.
+            latest_end = latest_selected_end = 0
+            for cue in sorted(source, key=lambda item: item.range.start_us):
+                lane = cue.subtitle_track_id or ("S1" if cue.is_dialogue else "S2")
+                if lane != "S2":
+                    continue
+                is_selected = cue.id in changed_source_ids
+                if (is_selected and latest_end > cue.range.start_us
+                        or latest_selected_end > cue.range.start_us):
+                    raise SubtitleEditError(
+                        "Không thể chuyển sang S2 vì trùng thời gian với cue trên S2. "
+                        "Hãy chỉnh thời gian hoặc chuyển từng cue; chưa thay đổi cue nào."
+                    )
+                latest_end = max(latest_end, cue.range.end_us)
+                if is_selected:
+                    latest_selected_end = max(latest_selected_end, cue.range.end_us)
+
+        selected_by_index = {cue.index: cue for cue in targets.values()}
+        buckets: dict[str, list[TimelineClip]] = {}
+        represented: set[str] = set()
+        changed_tracks = {
+            lane for cue in targets.values()
+            if cue.role != assignments[cue.id][0] or cue.subtitle_track_id != assignments[cue.id][1]
+            for lane in (cue.subtitle_track_id or ("S1" if cue.is_dialogue else "S2"),
+                         assignments[cue.id][1])
+        }
+        for track in self.snapshot.tracks:
+            if track.kind is not TrackKind.SUBTITLE:
+                continue
+            buckets.setdefault(track.id, [])
+            for clip in track.clips:
+                cue = targets.get(clip.cue_id or "") or source_for_translation.get(
+                    clip.cue_id or ""
+                )
+                if cue is None and clip.cue_id is None:
+                    cue = selected_by_index.get(clip.cue_index)
+                if cue is None:
+                    buckets[track.id].append(clip)
+                    continue
+                represented.add(cue.id)
+                next_lane = assignments[cue.id][1]
+                if track.id != next_lane or clip.track_id != next_lane:
+                    changed_tracks.update((track.id, next_lane))
+                    clip = replace(clip, track_id=next_lane,
+                                   payload_revision=clip.payload_revision + 1)
+                buckets.setdefault(next_lane, []).append(clip)
+        for cue in targets.values():
+            if cue.id in represented:
+                continue
+            translation = translation_for_source.get(cue.id)
+            next_lane = assignments[cue.id][1]
+            buckets.setdefault(next_lane, []).append(TimelineClip(
+                f"subtitle-{cue.id}", next_lane, cue.range, cue_id=cue.id,
+                cue_index=cue.index, cue_text=translation.text if translation else cue.text,
+            ))
+            changed_tracks.add(next_lane)
+
+        roles_by_track: dict[str, set[str]] = {}
+        for cue in source:
+            lane = cue.subtitle_track_id or ("S1" if cue.is_dialogue else "S2")
+            if lane in changed_tracks:
+                roles_by_track.setdefault(lane, set()).add(cue.role)
+
+        def automatic_name(lane: str) -> str:
+            roles = roles_by_track.get(lane)
+            if roles == {"dialogue"}:
+                return "Phụ đề thoại"
+            if roles == {"scene_text"}:
+                return "Chữ trong cảnh"
+            return "Phụ đề / Chữ trong cảnh"
+
+        automatic_names = {
+            "Phụ đề thoại", "Phụ đề nguồn", "Chữ trong cảnh", "Phụ đề / Chữ trong cảnh",
+        }
+        tracks: list[TimelineTrack] = []
+        for track in self.snapshot.tracks:
+            if track.kind is not TrackKind.SUBTITLE or track.id not in changed_tracks:
+                tracks.append(track)
+                continue
+            clips = buckets[track.id]
+            if clips:
+                tracks.append(replace(
+                    track,
+                    name=automatic_name(track.id) if track.name in automatic_names else track.name,
+                    clips=tuple(sorted(
+                        clips, key=lambda item: (item.timeline_range.start_us, item.id)
+                    )),
+                ))
+        remaining_lanes = changed_tracks - {track.id for track in tracks}
+        for lane in sorted(
+            remaining_lanes, key=lambda item: subtitle_track_number(item, fallback=10_000)
+        ):
+            if not buckets.get(lane):
+                continue
+            tracks.append(TimelineTrack(
+                lane, TrackKind.SUBTITLE, automatic_name(lane),
+                tuple(sorted(buckets[lane],
+                             key=lambda item: (item.timeline_range.start_us, item.id))),
+            ))
+        candidate = replace(self.snapshot, source_cues=source, translated_cues=translated,
+                            tracks=tuple(tracks))
+        return self.snapshot if candidate == self.snapshot else self._commit(candidate)
+
     def move_scene_texts(
         self,
         cue_ids: tuple[str, ...],
         *,
         delta_us: int,
         lane_delta: int = 0,
+        range_overrides: dict[str, TimeRange] | None = None,
     ) -> ProjectSnapshot:
         """Shift selected subtitle cues in time and between display lanes.
 
@@ -1137,25 +1392,31 @@ class SubtitleEditor:
         ordered_selected = sorted(
             selected_source,
             key=lambda item: (
-                subtitle_track_number(item.subtitle_track_id),
+                subtitle_track_number(
+                    item.subtitle_track_id, fallback=1 if item.is_dialogue else 2,
+                ),
                 item.range.start_us,
                 item.id,
             ),
         )
         minimum_lane = min(
-            max(1, subtitle_track_number(cue.subtitle_track_id))
+            max(1, subtitle_track_number(
+                cue.subtitle_track_id, fallback=1 if cue.is_dialogue else 2,
+            ))
             for cue in ordered_selected
         )
         applied_lane_delta = max(lane_delta, 1 - minimum_lane)
         projected: list[tuple[SubtitleCue, TimeRange, int]] = []
         for cue in ordered_selected:
-            next_range = TimeRange(
+            next_range = (range_overrides or {}).get(cue.id) or TimeRange(
                 cue.range.start_us + applied_delta,
                 cue.range.end_us + applied_delta,
             )
             lane = max(
                 1,
-                subtitle_track_number(cue.subtitle_track_id) + applied_lane_delta,
+                subtitle_track_number(
+                    cue.subtitle_track_id, fallback=1 if cue.is_dialogue else 2,
+                ) + applied_lane_delta,
             )
             projected.append((cue, next_range, lane))
 
@@ -1209,6 +1470,106 @@ class SubtitleEditor:
 
         next_source = tuple(moved(cue) for cue in source)
         next_translated = tuple(moved(cue) for cue in self.snapshot.translated_cues)
+        return self._commit(
+            replace(
+                self.snapshot,
+                source_cues=next_source,
+                translated_cues=next_translated,
+                tracks=self._rebuild_subtitle_tracks(next_source, next_translated),
+            )
+        )
+
+    def resize_scene_texts(
+        self,
+        cue_ids: tuple[str, ...],
+        *,
+        edge: str,
+        delta_us: int,
+        range_overrides: dict[str, TimeRange] | None = None,
+    ) -> ProjectSnapshot:
+        """Resize selected subtitle cues with one shared edge delta."""
+
+        selected = {value.strip() for value in cue_ids if value.strip()}
+        if not selected:
+            raise SubtitleEditError("Hãy chọn ít nhất một cue chữ")
+        if edge not in {"left", "right"} or type(delta_us) is not int:
+            raise SubtitleEditError("Cạnh và độ dịch thời gian cue không hợp lệ")
+        source = list(self.snapshot.source_cues)
+        selected_source = [cue for cue in source if cue.id in selected]
+        if len(selected_source) != len(selected):
+            missing = selected - {cue.id for cue in selected_source}
+            raise LookupError(f"Unknown subtitle cue: {sorted(missing)[0]}")
+        video_end_us = max(
+            (
+                clip.timeline_range.end_us
+                for track in self.snapshot.tracks
+                if track.kind is TrackKind.VIDEO
+                for clip in track.clips
+            ),
+            default=max((cue.range.end_us for cue in source), default=0),
+        )
+        if edge == "left":
+            minimum_delta = -min(cue.range.start_us for cue in selected_source)
+            maximum_delta = min(
+                cue.range.duration_us - SCENE_TEXT_MIN_DURATION_US
+                for cue in selected_source
+            )
+        else:
+            minimum_delta = max(
+                SCENE_TEXT_MIN_DURATION_US - cue.range.duration_us
+                for cue in selected_source
+            )
+            maximum_delta = video_end_us - max(
+                cue.range.end_us for cue in selected_source
+            )
+        applied_delta = max(minimum_delta, min(maximum_delta, delta_us))
+
+        assignments: dict[str, TimeRange] = {}
+        for cue in selected_source:
+            assignments[cue.id] = (range_overrides or {}).get(cue.id) or TimeRange(
+                cue.range.start_us + (applied_delta if edge == "left" else 0),
+                cue.range.end_us + (applied_delta if edge == "right" else 0),
+            )
+        for cue in selected_source:
+            lane = max(
+                1,
+                subtitle_track_number(
+                    cue.subtitle_track_id,
+                    fallback=1 if cue.is_dialogue else 2,
+                ),
+            )
+            next_range = assignments[cue.id]
+            if any(
+                other.id not in selected
+                and max(
+                    1,
+                    subtitle_track_number(
+                        other.subtitle_track_id,
+                        fallback=1 if other.is_dialogue else 2,
+                    ),
+                )
+                == lane
+                and ranges_overlap(next_range, other.range)
+                for other in source
+            ):
+                raise SubtitleEditError(
+                    f"Không thể resize nhóm vì {cue.subtitle_track_id or f'S{lane}'} "
+                    "sẽ chồng lên cue khác"
+                )
+
+        index_assignment = {
+            cue.index: assignments[cue.id]
+            for cue in selected_source
+        }
+
+        def resized(cue: SubtitleCue) -> SubtitleCue:
+            next_range = index_assignment.get(cue.index)
+            if next_range is None:
+                return cue
+            return replace(cue, range=next_range, revision=cue.revision + 1)
+
+        next_source = tuple(resized(cue) for cue in source)
+        next_translated = tuple(resized(cue) for cue in self.snapshot.translated_cues)
         return self._commit(
             replace(
                 self.snapshot,
@@ -1498,37 +1859,53 @@ class SubtitleEditor:
         return sum(counts), sum(count > 0 for count in counts)
 
     def delete(self, cue_id: str) -> ProjectSnapshot:
+        return self.delete_many((cue_id,))
+
+    def delete_many(self, cue_ids: tuple[str, ...]) -> ProjectSnapshot:
+        """Remove selected pairs atomically without revalidating unrelated overlaps."""
+        selected = set(cue_ids)
+        if not selected:
+            raise SubtitleEditError("Hãy chọn cue trước khi xóa")
         source = list(self.snapshot.source_cues)
         translated = list(self.snapshot.translated_cues)
-        matched = next(
-            (cue for cue in (*source, *translated) if cue.id == cue_id),
-            None,
-        )
-        if matched is None:
-            raise LookupError(f"Unknown subtitle cue: {cue_id}")
-
-        cue_index = matched.index
-        matching_ids = {
-            cue.id
-            for cue in (*source, *translated)
-            if cue.id == cue_id or cue.index == cue_index
+        all_cues = (*source, *translated)
+        missing = selected - {cue.id for cue in all_cues}
+        if missing:
+            raise LookupError(f"Unknown subtitle cue: {sorted(missing)[0]}")
+        source_ids = {cue.id for cue in source}
+        selected_indices = {cue.index for cue in source if cue.id in selected} | {
+            cue.index for cue in translated if cue.id in selected and cue.id not in source_ids
         }
+        selected_source_ids = {cue.id for cue in source if cue.index in selected_indices}
+        matching_ids = {
+            cue.id for cue in translated
+            if cue.id in selected or cue.id in selected_source_ids
+            or (cue.id not in source_ids and cue.index in selected_indices)
+        } | selected_source_ids
         source = [
             cue
             for cue in source
-            if cue.id not in matching_ids and cue.index != cue_index
+            if cue.id not in matching_ids
         ]
         translated = [
             cue
             for cue in translated
-            if cue.id not in matching_ids and cue.index != cue_index
+            if cue.id not in matching_ids
         ]
-        self._assert_timeline(source)
-        self._assert_timeline(translated)
+        # Removing cues cannot introduce an overlap. Existing imported/OCR
+        # timing remains editable even when another pair needs manual repair.
         normalized_source = self._normalize_cues(source)
-        normalized_translated = self._normalize_cues(translated)
+        index_by_id = {cue.id: cue.index for cue in normalized_source}
+        index_by_previous = {cue.index: index_by_id[cue.id] for cue in source}
+        normalized_translated = (
+            tuple(replace(cue, index=index_by_id.get(cue.id) or index_by_previous[cue.index])
+                  for cue in translated)
+            if source else self._normalize_cues(translated)
+        )
         source_by_id = {cue.id: cue for cue in normalized_source}
         translated_by_id = {cue.id: cue for cue in normalized_translated}
+        source_by_previous_index = {cue.index: source_by_id[cue.id] for cue in source}
+        translated_by_index = {cue.index: cue for cue in normalized_translated}
         tracks: list[TimelineTrack] = []
         for track in self.snapshot.tracks:
             if track.kind is not TrackKind.SUBTITLE:
@@ -1538,23 +1915,16 @@ class SubtitleEditor:
             for clip in track.clips:
                 if (
                     clip.cue_id in matching_ids
-                    or (clip.cue_id is None and clip.cue_index == cue_index)
+                    or (clip.cue_id is None and clip.cue_index in selected_indices)
                 ):
                     continue
                 cue = source_by_id.get(clip.cue_id or "")
-                if cue is None and clip.cue_index is not None:
-                    cue = next(
-                        (
-                            item
-                            for item in normalized_source
-                            if item.index == clip.cue_index
-                        ),
-                        None,
-                    )
+                if cue is None and clip.cue_id is None and clip.cue_index is not None:
+                    cue = source_by_previous_index.get(clip.cue_index)
                 if cue is None:
                     clips.append(clip)
                     continue
-                translated_cue = translated_by_id.get(cue.id)
+                translated_cue = translated_by_id.get(cue.id) or translated_by_index.get(cue.index)
                 clips.append(
                     replace(
                         clip,

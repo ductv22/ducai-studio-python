@@ -6,14 +6,16 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QCoreApplication, QLockFile, QStandardPaths, QTimer, QUrl
-from PySide6.QtGui import QFont, QFontDatabase, QGuiApplication
+from PySide6.QtGui import QFont, QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtWidgets import QApplication
 from shiboken6 import delete as delete_qt_object
 
 from ducai_studio import __version__
+from ducai_studio.providers.font_loading import load_application_font
 from ducai_studio.ui.multi_thumbnail_provider import MultiThumbnailProvider
+from ducai_studio.ui.qt_runtime import configure_qt_plugin_dll_search
 from ducai_studio.ui.viewmodels.application_view_model import ApplicationViewModel
 
 
@@ -50,13 +52,59 @@ def _register_bundled_fonts() -> None:
     font_root = _ui_resource_root() / "assets" / "fonts"
     font_paths = sorted((*font_root.glob("*.ttf"), *font_root.glob("*.otf")))
     for font_path in font_paths:
-        if QFontDatabase.addApplicationFont(str(font_path)) < 0:
+        if load_application_font(font_path) < 0:
             raise RuntimeError(f"Cannot register bundled font: {font_path.name}")
+
+
+def _seed_signed_update_smoke_candidate(app_model: ApplicationViewModel) -> None:
+    """Let isolated frozen-GUI tests exercise the real install-button flow.
+
+    This only supplies a genuinely signed, already extracted candidate. The
+    normal reservation, discovery, verification, shutdown and helper still run.
+    No installation is initiated here, and normal launches have no candidate.
+    """
+
+    raw_candidate = os.environ.get("DUCAI_SMOKE_UPDATE_CANDIDATE", "").strip()
+    if not raw_candidate:
+        return
+    if not os.environ.get("DUCAI_APP_DATA_ROOT") or not os.environ.get("DUCAI_SMOKE_EXIT_MS"):
+        raise ValueError("Signed update smoke requires isolated app data and a bounded exit")
+    from ducai_studio.infrastructure.github_updates import (
+        OWNER,
+        REPOSITORY,
+        GitHubRelease,
+        ReleaseAsset,
+        VerifiedRelease,
+    )
+    from ducai_studio.infrastructure.update_manifest import verify_manifest
+
+    candidate = Path(raw_candidate).expanduser().resolve(strict=True)
+    manifest_path = candidate / "update-manifest.json"
+    signature_path = candidate / "update-manifest.sig"
+    manifest_bytes = manifest_path.read_bytes()
+    signature_bytes = signature_path.read_bytes()
+    manifest = verify_manifest(manifest_bytes, signature_bytes)
+    if not (candidate / "payload").is_dir():
+        raise ValueError("Signed update smoke requires an extracted payload")
+    tag = f"v{manifest.version}"
+    base = f"https://github.com/{OWNER}/{REPOSITORY}/releases/download/{tag}"
+    release = GitHubRelease(
+        manifest.version, tag, manifest.channel == "testing", "",
+        ReleaseAsset(manifest.archive.name, f"{base}/{manifest.archive.name}",
+                     manifest.archive.size, manifest.archive.sha256),
+        ReleaseAsset(manifest_path.name, f"{base}/{manifest_path.name}", len(manifest_bytes)),
+        ReleaseAsset(signature_path.name, f"{base}/{signature_path.name}", len(signature_bytes)),
+    )
+    updater = app_model.updater_model
+    updater._set_state("checking", "Signed update smoke")
+    updater._checked(VerifiedRelease(release, manifest, manifest_bytes, signature_bytes), "")
+    updater._set_state("downloading", "Signed update smoke")
+    updater._downloaded((candidate / "payload", manifest_path, signature_path), "")
 
 
 def run(argv: list[str] | None = None) -> int:
     """Run the QML desktop shell and own the backend lifecycle."""
-    os.environ.setdefault("QT_FFMPEG_DEBUG", "0")
+    configure_qt_plugin_dll_search()
     os.environ.setdefault(
         "QT_LOGGING_RULES",
         "qt.multimedia.ffmpeg=false;qt.multimedia.ffmpeg.*=false",
@@ -88,6 +136,12 @@ def run(argv: list[str] | None = None) -> int:
     engine.addImportPath(str(qml_root))
     thumbnail_provider = MultiThumbnailProvider(data_root / "preview_tiles" / "multi")
     engine.addImageProvider("multi-thumbnail", thumbnail_provider)
+    from ducai_studio.ui.timeline_media_provider import TimelineMediaProvider
+    engine.addImageProvider(
+        "timeline-media", TimelineMediaProvider(data_root / "preview_tiles" / "timeline")
+    )
+    from ducai_studio.ui.subtitle_artwork_provider import SubtitleArtworkProvider
+    engine.addImageProvider("subtitle-artwork", SubtitleArtworkProvider())
     engine.setInitialProperties({"appModel": app_model})
     engine.load(QUrl.fromLocalFile(str(qml_root / "Main.qml")))
     if not engine.rootObjects():
@@ -253,6 +307,7 @@ def run(argv: list[str] | None = None) -> int:
 
         app_model.backendReadyChanged.connect(start_smoke_import)
 
+    _seed_signed_update_smoke_candidate(app_model)
     app_model.start()
     publish_update_health()
 

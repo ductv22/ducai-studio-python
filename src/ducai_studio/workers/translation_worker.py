@@ -10,7 +10,6 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
-from hashlib import sha256
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -52,6 +51,7 @@ from ducai_studio.application.translation_pipeline import (
     translation_style_qa,
     wrap_vietnamese_subtitle,
 )
+from ducai_studio.application.voice_pipeline import file_sha256
 from ducai_studio.domain.jobs import thaw_json
 from ducai_studio.domain.project import SubtitleCue
 from ducai_studio.domain.timebase import TimeRange
@@ -846,7 +846,7 @@ class TranslationWorker:
             self._emit_provider_request(request, response)
             return response
         try:
-            response = self.provider.generate(request)
+            response = self._generate_with_control(self.provider, request)
         except TransientProviderFailure as exc:
             self.send(
                 "warning",
@@ -877,6 +877,40 @@ class TranslationWorker:
         self._phase_failure_streaks[request.purpose.value] = 0
         self._emit_provider_request(request, response)
         return response
+
+    def _generate_with_control(
+        self, provider: TranslationProvider, request: TranslationRequest,
+    ):
+        # HTTP providers have no browser/thread affinity. Keep exactly one
+        # request in flight while the worker thread checkpoints and handles
+        # controls. A paused response waits here until resume; a cancelled
+        # response is discarded when this isolated worker exits. Do not move
+        # Playwright/CLI sessions onto a different thread.
+        if not isinstance(provider, (GeminiApiProvider, OpenAICompatibleProvider)):
+            return provider.generate(request)
+        self._provider_control_point()
+        results: queue.Queue[object] = queue.Queue(maxsize=1)
+
+        def generate() -> None:
+            try:
+                results.put(provider.generate(request))
+            except BaseException as exc:
+                results.put(exc)
+
+        thread = threading.Thread(target=generate, name="translation-http", daemon=True)
+        thread.start()
+        while True:
+            self._provider_control_point()
+            try:
+                result = results.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            # A command queued as the HTTP call completed still owns priority
+            # over publishing a response or starting a later request.
+            self._provider_control_point()
+            if isinstance(result, BaseException):
+                raise result
+            return result
 
     def _record_provider_failure(
         self,
@@ -1685,7 +1719,7 @@ class TranslationWorker:
                 "input_fingerprint": self.spec.get("input_fingerprint", ""),
                 "settings_fingerprint": self.spec.get("settings_fingerprint", ""),
                 "output_path": str(output_path),
-                "output_sha256": sha256(output_path.read_bytes()).hexdigest(),
+                "output_sha256": file_sha256(output_path),
                 "output_size": output_stat.st_size,
                 "output_mtime_ns": output_stat.st_mtime_ns,
             }
@@ -1825,7 +1859,7 @@ class TranslationWorker:
             self.ledger_path.write_text(working, encoding="utf-8", newline="\n")
             source = self.job_staging / f"ledger-{uuid4().hex}.json.partial"
             shutil.copyfile(self.ledger_path, source)
-        digest = sha256(source.read_bytes()).hexdigest()
+        digest = file_sha256(source)
         completed_ids = sorted(int(value) for value in self.ledger.translations)
         cursor_us = self.cues[completed_ids[-1] - 1].range.end_us if completed_ids else 0
         payload = {
@@ -1857,6 +1891,11 @@ class TranslationWorker:
 def main() -> int:
     if len(sys.argv) != 2 or not sys.argv[1].strip():
         return 2
+    from ducai_studio.infrastructure.licensing_state import worker_activation_exit_code
+
+    denied = worker_activation_exit_code()
+    if denied:
+        return denied
     return TranslationWorker(sys.argv[1]).run()
 
 

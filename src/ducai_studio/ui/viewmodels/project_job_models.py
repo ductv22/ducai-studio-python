@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
+from copy import deepcopy
 from math import ceil
 from pathlib import Path
 from time import monotonic
@@ -18,15 +19,136 @@ from PySide6.QtCore import (
 )
 
 from ducai_studio.domain.multi_video import stage_local_progress
+from ducai_studio.domain.project import (
+    TranslationPreferences,
+    TranslationStylePreset,
+    grow_dialogue_panel_for_font,
+    subtitle_track_number,
+)
 from ducai_studio.domain.timebase import TimeRange
 from ducai_studio.domain.timeline import (
     VOICE_TIMING_OVERFLOW,
     classify_voice_timing,
 )
+from ducai_studio.domain.timeline_edit import (
+    base_to_timeline_us,
+    project_json_for_timeline,
+    timeline_to_base_us,
+)
 from ducai_studio.domain.voice_conform import VoiceConformPlan, decode_voice_conform_plan
 from ducai_studio.ui.multi_thumbnail_provider import multi_thumbnail_url
 
 _INVALID_INDEX = QModelIndex()
+
+
+def _replace_visible_rows(model, items: list[dict], identity: str) -> None:
+    """Reuse a bounded bank of delegates; positioning comes from row geometry.
+
+    Row order is deliberately not a time index. The complete track index owns
+    time queries; rows only paint x/y derived from each clip's own timestamps.
+    """
+    old = model._items
+    if old == items:
+        return
+    old_count = len(old)
+    common_count = min(old_count, len(items))
+    remaining = {item[identity]: item for item in items}
+    replacements = [None] * common_count
+    for row in range(common_count):
+        replacements[row] = remaining.pop(old[row][identity], None)
+    pending = iter(remaining.values())
+    changed = []
+    for row in range(common_count):
+        value = replacements[row]
+        if value is None:
+            value = next(pending)
+        if old[row] != value:
+            old[row] = value
+            changed.append(row)
+    if changed:
+        first = previous = changed[0]
+        for row in [*changed[1:], -1]:
+            if row == previous + 1:
+                previous = row
+                continue
+            model.dataChanged.emit(model.index(first, 0), model.index(previous, 0), [])
+            first = previous = row
+    if len(items) < old_count:
+        model.beginRemoveRows(_INVALID_INDEX, len(items), old_count - 1)
+        del old[len(items) :]
+        model.endRemoveRows()
+    elif len(items) > old_count:
+        model.beginInsertRows(_INVALID_INDEX, old_count, len(items) - 1)
+        old.extend(pending)
+        model.endInsertRows()
+    if len(old) != old_count:
+        model.countChanged.emit()
+
+
+def _substantial_overlap_ids(clips: list[dict], threshold: float = 2 / 3) -> set[str]:
+    """Return subtitle clip ids whose same-lane overlap is visibly dangerous.
+
+    This is a display-only warning.  It deliberately does not reject or
+    rewrite imported/OCR cues.  The active-window scan is bounded so a
+    malformed project containing thousands of identical intervals cannot
+    freeze Timeline construction.
+    """
+
+    # ``replace`` already sorts every track once.  Avoid sorting a second time
+    # for the common 10k+ cue case; retain a defensive sort for direct callers
+    # and older models that hand us an unsorted list.
+    ordered = [
+        clip
+        for clip in clips
+        if isinstance(clip, dict)
+        and isinstance(clip.get("id"), str)
+        and isinstance(clip.get("timeline_range"), dict)
+        and type(clip["timeline_range"].get("start_us")) is int
+        and type(clip["timeline_range"].get("end_us")) is int
+    ]
+    if any(
+        left["timeline_range"]["start_us"] > right["timeline_range"]["start_us"]
+        for left, right in zip(ordered, ordered[1:], strict=False)
+    ):
+        ordered.sort(
+            key=lambda item: (
+                item["timeline_range"]["start_us"],
+                item["timeline_range"]["end_us"],
+                item["id"],
+            )
+        )
+    active: list[dict] = []
+    warned: set[str] = set()
+    for current in ordered:
+        current_range = current["timeline_range"]
+        current_start = current_range["start_us"]
+        current_end = current_range["end_us"]
+        current_duration = current_end - current_start
+        if current_duration <= 0:
+            continue
+        active = [
+            previous
+            for previous in active
+            if previous["timeline_range"]["end_us"] > current_start
+        ]
+        # Normal OCR output has at most a few neighbouring candidates.  Stop
+        # after a bounded number of oldest active rows to protect the editor
+        # from adversarial all-overlap input while still checking the newest
+        # rows first (the rows users normally see stacked together).
+        for previous in reversed(active[-64:]):
+            previous_range = previous["timeline_range"]
+            overlap = min(previous_range["end_us"], current_end) - max(
+                previous_range["start_us"], current_start
+            )
+            previous_duration = previous_range["end_us"] - previous_range["start_us"]
+            if overlap <= 0 or previous_duration <= 0:
+                continue
+            if overlap / min(current_duration, previous_duration) >= threshold:
+                warned.add(str(previous["id"]))
+                warned.add(str(current["id"]))
+                break
+        active.append(current)
+    return warned
 
 
 def _range_from_mapping(raw: object) -> TimeRange | None:
@@ -168,8 +290,7 @@ class MultiVideoListModel(QAbstractListModel):
         # The batch-owned child is authoritative for the current card. A
         # concurrent manual job must not replace its stage/progress in the UI.
         return (
-            item.get("project_status_override") is True
-            and item.get("is_batch_current") is not True
+            item.get("project_status_override") is True and item.get("is_batch_current") is not True
         )
 
     @staticmethod
@@ -223,8 +344,7 @@ class MultiVideoListModel(QAbstractListModel):
             )
         if (
             str(item.get("state", "waiting")) in {"waiting", "idle"}
-            and str(item.get("batch_state", "idle"))
-            not in {"running", "pause_requested"}
+            and str(item.get("batch_state", "idle")) not in {"running", "pause_requested"}
             and "artifact_status_progress" in item
         ):
             return max(
@@ -264,17 +384,21 @@ class MultiVideoListModel(QAbstractListModel):
             "cpu_fallback": "Đang chuyển Whisper sang CPU",
             "finalize": "Đang kiểm tra SRT Whisper",
         }
-        if (
-            stage == "ocr"
-            and child_phase in whisper_phases
-            and state in {"running", "retrying"}
-        ):
+        if stage == "ocr" and child_phase in whisper_phases and state in {"running", "retrying"}:
             return f"{whisper_phases[child_phase]} · {progress}%"
         if child_phase in {"cache_restore", "conform_cache_restore"} and state in {
             "running",
             "retrying",
         }:
-            return f"Đang khôi phục cache · {labels.get(stage, stage)} {progress}%"
+            return f"Đang kiểm tra cache · {labels.get(stage, stage)} {progress}%"
+        if stage == "tts" and state in {"running", "retrying"}:
+            tts_phases = {
+                "model_loading": "Đang nạp model",
+                "warmup": "Đang làm nóng",
+                "synthesis": "Đang tạo giọng",
+            }
+            if child_phase in tts_phases:
+                return f"{tts_phases[child_phase]} · lồng tiếng {progress}%"
         if child_state == "start_requested" and state in {"running", "retrying"}:
             suffix = " từ cache" if progress > 0 else ""
             return f"Đang khởi động bộ máy{suffix} · {labels.get(stage, stage)} {progress}%"
@@ -296,11 +420,7 @@ class MultiVideoListModel(QAbstractListModel):
             payload = item.get("error_payload", {})
             payload = payload if isinstance(payload, dict) else {}
             blocker_count = max(0, int(payload.get("blocker_count", 0) or 0))
-            review_text = (
-                f"{blocker_count} mục cần xem lại"
-                if blocker_count
-                else "cần xem lại QA"
-            )
+            review_text = f"{blocker_count} mục cần xem lại" if blocker_count else "cần xem lại QA"
             suffix = "chờ cuối lượt" if state == "deferred" else "đã bỏ qua"
             return f"OCR đã xong · {review_text} · {suffix}"
         if item.get("error_code") == "translation_review_required" and state in {
@@ -353,9 +473,7 @@ class MultiVideoListModel(QAbstractListModel):
         else:
             reason = str(error_payload.get("message") or error_payload.get("reason") or "")
             action = str(error_payload.get("action") or "")
-            error_message = " ".join(
-                value.strip() for value in (reason, action) if value.strip()
-            )
+            error_message = " ".join(value.strip() for value in (reason, action) if value.strip())
         values = {
             self.ProjectIdRole: item.get("project_id", ""),
             self.NameRole: item.get("name", ""),
@@ -367,9 +485,7 @@ class MultiVideoListModel(QAbstractListModel):
             self.StageRole: item.get("stage", "ocr"),
             self.ProgressRole: float(
                 item.get("project_status_progress", item.get("progress", 0.0))
-                if (
-                    MultiVideoListModel._uses_project_status(item)
-                )
+                if (MultiVideoListModel._uses_project_status(item))
                 else (
                     item.get("artifact_status_progress", item.get("progress", 0.0))
                     if (
@@ -396,9 +512,7 @@ class MultiVideoListModel(QAbstractListModel):
             self.HasOriginalAudioRole: bool(item.get("has_original_audio", False)),
             self.StatusTextRole: status_text,
             self.ErrorMessageRole: error_message,
-            self.ThumbnailUrlRole: multi_thumbnail_url(
-                item.get("video_path", ""), duration
-            ),
+            self.ThumbnailUrlRole: multi_thumbnail_url(item.get("video_path", ""), duration),
             self.StageProgressRole: self._stage_progress(item),
             Qt.ItemDataRole.DisplayRole: status_text,
         }
@@ -807,7 +921,12 @@ class TimelineTrackListModel(QAbstractListModel):
             kind = str(item.get("kind", ""))
             prefix = prefixes.get(kind, "T")
             counters[prefix] = counters.get(prefix, 0) + 1
-            item["display_label"] = f"{prefix}{counters[prefix]}"
+            track_id = str(item.get("id", ""))
+            item["display_label"] = (
+                track_id
+                if kind == "subtitle" and subtitle_track_number(track_id, fallback=0) > 0
+                else f"{prefix}{counters[prefix]}"
+            )
         if items == self._items:
             return
         self.beginResetModel()
@@ -844,6 +963,8 @@ class TimelineClipListModel(QAbstractListModel):
     TimingRequiredSpeedRole = Qt.ItemDataRole.UserRole + 23
     LinkGroupIdRole = Qt.ItemDataRole.UserRole + 24
     TrackLockedRole = Qt.ItemDataRole.UserRole + 25
+    MutedRole = Qt.ItemDataRole.UserRole + 26
+    OverlapWarningRole = Qt.ItemDataRole.UserRole + 27
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -852,8 +973,16 @@ class TimelineClipListModel(QAbstractListModel):
         self._viewport_start_us = 0
         self._viewport_end_us = 60_000_000
         self._prefetch_us = 10_000_000
+        self._track_view_start = 0
+        self._track_view_end = 2_147_483_647
+        self._track_prefetch = 0
+        self._materialized_start_us: int | None = None
+        self._materialized_end_us: int | None = None
+        self._materialized_first_track: int | None = None
+        self._materialized_last_track: int | None = None
         self._max_delegates = 480
         self._max_sparse_track_clips = 120
+        self._role_data_cache: dict[int, tuple[dict, dict]] = {}
 
     def rowCount(self, parent: QModelIndex = _INVALID_INDEX) -> int:
         return 0 if parent.isValid() else len(self._items)
@@ -862,6 +991,9 @@ class TimelineClipListModel(QAbstractListModel):
         if not index.isValid() or not 0 <= index.row() < len(self._items):
             return None
         item = self._items[index.row()]
+        cached = self._role_data_cache.get(id(item))
+        if cached is not None and cached[0] is item:
+            return cached[1].get(role)
         time_range = item["timeline_range"]
         speed = item.get("speed", {"numerator": 1, "denominator": 1})
         timing = _voice_timing_metrics(item)
@@ -899,8 +1031,11 @@ class TimelineClipListModel(QAbstractListModel):
             self.TimingRequiredSpeedRole: timing["required_speed"],
             self.LinkGroupIdRole: item.get("link_group_id", "") or "",
             self.TrackLockedRole: item.get("track_locked", False),
+            self.MutedRole: item.get("muted", False),
+            self.OverlapWarningRole: item.get("overlap_warning", False),
             Qt.ItemDataRole.DisplayRole: item["id"],
         }
+        self._role_data_cache[id(item)] = (item, values)
         return values.get(role)
 
     def roleNames(self) -> dict[int, bytes]:
@@ -930,6 +1065,8 @@ class TimelineClipListModel(QAbstractListModel):
             self.TimingRequiredSpeedRole: b"timingRequiredSpeed",
             self.LinkGroupIdRole: b"linkGroupId",
             self.TrackLockedRole: b"trackLocked",
+            self.MutedRole: b"muted",
+            self.OverlapWarningRole: b"overlapWarning",
         }
 
     @Property(int, notify=countChanged)
@@ -954,6 +1091,12 @@ class TimelineClipListModel(QAbstractListModel):
                     indexed_clips.append(
                         {
                             **clip,
+                            # The owning track is the identity authority.  Old
+                            # snapshots did not always repeat it on every clip,
+                            # while compact patches do.  Normalizing here keeps
+                            # every role readable without weakening patch
+                            # validation.
+                            "track_id": track.get("id", ""),
                             "track_kind": track.get("kind", ""),
                             "track_name": track.get("name", ""),
                             "track_index": track_index,
@@ -961,6 +1104,15 @@ class TimelineClipListModel(QAbstractListModel):
                         }
                     )
                 indexed_clips.sort(key=lambda item: item["timeline_range"]["start_us"])
+                overlap_ids = (
+                    _substantial_overlap_ids(indexed_clips)
+                    if track.get("kind") == "subtitle"
+                    else set()
+                )
+                indexed_clips = [
+                    {**item, "overlap_warning": item["id"] in overlap_ids}
+                    for item in indexed_clips
+                ]
                 starts = [item["timeline_range"]["start_us"] for item in indexed_clips]
                 prefix_max: list[int] = []
                 maximum = -1
@@ -968,7 +1120,7 @@ class TimelineClipListModel(QAbstractListModel):
                     maximum = max(maximum, item["timeline_range"]["end_us"])
                     prefix_max.append(maximum)
                 self._track_indexes.append((indexed_clips, starts, prefix_max))
-        self._refresh()
+        self._refresh(force=True)
 
     @Slot(float, float, float)
     def setViewport(self, start_us: float, end_us: float, prefetch_us: float) -> None:
@@ -984,13 +1136,82 @@ class TimelineClipListModel(QAbstractListModel):
         self._viewport_start_us = start
         self._viewport_end_us = end
         self._prefetch_us = prefetch
-        self._refresh()
+        if self._time_viewport_needs_refresh():
+            self._refresh()
 
-    def _refresh(self) -> None:
+    @Slot(float, float, float)
+    def setTrackViewport(
+        self,
+        first_track: float,
+        last_track: float,
+        prefetch_tracks: float,
+    ) -> None:
+        first = max(0, int(first_track))
+        last = max(first, int(last_track))
+        prefetch = max(0, int(prefetch_tracks))
+        if (
+            first == self._track_view_start
+            and last == self._track_view_end
+            and prefetch == self._track_prefetch
+        ):
+            return
+        self._track_view_start = first
+        self._track_view_end = last
+        self._track_prefetch = prefetch
+        if self._track_viewport_needs_refresh():
+            self._refresh()
+
+    def _time_viewport_needs_refresh(self) -> bool:
+        materialized_start = self._materialized_start_us
+        materialized_end = self._materialized_end_us
+        if materialized_start is None or materialized_end is None:
+            return True
+        if self._viewport_start_us < materialized_start or self._viewport_end_us > materialized_end:
+            return True
+
+        # A wide materialization window is useful while panning, but after a
+        # substantial zoom-in it would keep dense aggregate blocks alive even
+        # when individual cues can be edited again.  Rebuild only at geometric
+        # thresholds instead of resetting the QML delegates on every wheel tick.
+        desired_start = max(0, self._viewport_start_us - self._prefetch_us)
+        desired_end = self._viewport_end_us + self._prefetch_us
+        desired_span = max(1, desired_end - desired_start)
+        materialized_span = max(1, materialized_end - materialized_start)
+        return materialized_span > desired_span * 2
+
+    def _track_viewport_needs_refresh(self) -> bool:
+        materialized_first = self._materialized_first_track
+        materialized_last = self._materialized_last_track
+        if materialized_first is None or materialized_last is None:
+            return True
+        if self._track_view_start < materialized_first or self._track_view_end > materialized_last:
+            return True
+        desired_first = max(0, self._track_view_start - self._track_prefetch)
+        desired_last = self._track_view_end + self._track_prefetch
+        desired_count = max(1, desired_last - desired_first + 1)
+        materialized_count = max(1, materialized_last - materialized_first + 1)
+        return materialized_count > desired_count * 2
+
+    def _refresh(self, *, force: bool = False) -> None:
         query_start = max(0, self._viewport_start_us - self._prefetch_us)
         query_end = self._viewport_end_us + self._prefetch_us
+        first_track = max(0, self._track_view_start - self._track_prefetch)
+        last_track = self._track_view_end + self._track_prefetch
+        if (
+            not force
+            and not self._time_viewport_needs_refresh()
+            and not self._track_viewport_needs_refresh()
+        ):
+            return
+        self._materialized_start_us = query_start
+        self._materialized_end_us = query_end
+        self._materialized_first_track = first_track
+        self._materialized_last_track = last_track
         tracks_in_view: list[list[dict]] = []
-        for clips, starts, prefix_max in self._track_indexes:
+        for track_index, (clips, starts, prefix_max) in enumerate(self._track_indexes):
+            if track_index < first_track or track_index > last_track:
+                tracks_in_view.append([])
+                continue
             lower = bisect_right(prefix_max, query_start)
             upper = bisect_left(starts, query_end)
             tracks_in_view.append(
@@ -1065,12 +1286,8 @@ class TimelineClipListModel(QAbstractListModel):
                 item["timeline_range"]["start_us"],
             )
         )
-        if items == self._items:
-            return
-        self.beginResetModel()
-        self._items = items
-        self.endResetModel()
-        self.countChanged.emit()
+        self._role_data_cache.clear()
+        _replace_visible_rows(self, items, "id")
 
 
 class VoiceConformCueListModel(QAbstractListModel):
@@ -1105,6 +1322,8 @@ class VoiceConformCueListModel(QAbstractListModel):
         self._viewport_start_us = 0
         self._viewport_end_us = 60_000_000
         self._prefetch_us = 10_000_000
+        self._materialized_start_us: int | None = None
+        self._materialized_end_us: int | None = None
         self._max_delegates = 480
 
     def rowCount(self, parent: QModelIndex = _INVALID_INDEX) -> int:
@@ -1265,7 +1484,7 @@ class VoiceConformCueListModel(QAbstractListModel):
         for item in self._all:
             maximum = max(maximum, item["voice_end_us"])
             self._prefix_max.append(maximum)
-        self._refresh()
+        self._refresh(force=True)
         if total_changed:
             self.totalCountChanged.emit()
 
@@ -1283,11 +1502,29 @@ class VoiceConformCueListModel(QAbstractListModel):
         self._viewport_start_us = start
         self._viewport_end_us = end
         self._prefetch_us = prefetch
-        self._refresh()
+        if self._viewport_needs_refresh():
+            self._refresh()
 
-    def _refresh(self) -> None:
+    def _viewport_needs_refresh(self) -> bool:
+        materialized_start = self._materialized_start_us
+        materialized_end = self._materialized_end_us
+        if materialized_start is None or materialized_end is None:
+            return True
+        if self._viewport_start_us < materialized_start or self._viewport_end_us > materialized_end:
+            return True
+        desired_start = max(0, self._viewport_start_us - self._prefetch_us)
+        desired_end = self._viewport_end_us + self._prefetch_us
+        desired_span = max(1, desired_end - desired_start)
+        materialized_span = max(1, materialized_end - materialized_start)
+        return materialized_span > desired_span * 2
+
+    def _refresh(self, *, force: bool = False) -> None:
         query_start = max(0, self._viewport_start_us - self._prefetch_us)
         query_end = self._viewport_end_us + self._prefetch_us
+        if not force and not self._viewport_needs_refresh():
+            return
+        self._materialized_start_us = query_start
+        self._materialized_end_us = query_end
         lower = bisect_right(self._prefix_max, query_start)
         upper = bisect_left(self._starts, query_end)
         visible = [
@@ -1386,19 +1623,45 @@ class SubtitleCueListModel(QAbstractListModel):
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._items: list[dict] = []
+        self._source_cues: list[dict] = []
+        self._translated_cues: list[dict] = []
         self._row_by_cue_id: dict[str, int] = {}
         self._row_by_cue_index: dict[int, int] = {}
         self._start_us: list[int] = []
         self._max_end_prefix: list[int] = []
         self._scene_timing_previews: dict[str, tuple[int, int]] = {}
+        # QML asks for many roles separately for every visible row.  Keep the
+        # immutable role projection for the current item objects and invalidate
+        # it on every model/data notification.  Mutations in this model are
+        # always followed by one of those notifications, so this cannot expose
+        # stale text/style values while avoiding repeated dict construction.
+        self._role_data_cache: dict[int, tuple[dict, dict]] = {}
+        self.dataChanged.connect(self._invalidate_role_data_cache)
+        self.modelReset.connect(self._invalidate_role_data_cache)
+        self.rowsInserted.connect(self._invalidate_role_data_cache)
+        self.rowsRemoved.connect(self._invalidate_role_data_cache)
+        # Shared inspector commands can resolve independent titles without
+        # adding them to subtitle editor rows, QA indices or translation data.
+        self.extra_text_model: SubtitleCueListModel | None = None
 
     def rowCount(self, parent: QModelIndex = _INVALID_INDEX) -> int:
         return 0 if parent.isValid() else len(self._items)
 
+    def _invalidate_role_data_cache(self, *_args) -> None:
+        self._role_data_cache.clear()
+
     def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole):
         if not index.isValid() or not 0 <= index.row() < len(self._items):
             return None
-        item = self._with_scene_timing_preview(self._items[index.row()])
+        base_item = self._items[index.row()]
+        preview = self._scene_timing_previews.get(str(base_item.get("cue_id", "")))
+        if preview is None:
+            cached = self._role_data_cache.get(id(base_item))
+            if cached is not None and cached[0] is base_item:
+                return cached[1].get(role)
+            item = base_item
+        else:
+            item = self._with_scene_timing_preview(base_item)
         values = {
             self.CueIdRole: item["cue_id"],
             self.CueIndexRole: item["index"],
@@ -1436,13 +1699,13 @@ class SubtitleCueListModel(QAbstractListModel):
             self.FontBoldRole: item.get("font_bold", False),
             self.FontItalicRole: item.get("font_italic", False),
             self.TextOpacityPercentRole: item.get("text_opacity_percent", 100),
-            self.BackgroundOpacityPercentRole: item.get(
-                "background_opacity_percent", 90
-            ),
+            self.BackgroundOpacityPercentRole: item.get("background_opacity_percent", 90),
             self.FadeEnabledRole: item.get("fade_enabled", False),
             self.FadeDurationMsRole: item.get("fade_duration_ms", 300),
             Qt.ItemDataRole.DisplayRole: item["source_text"],
         }
+        if preview is None:
+            self._role_data_cache[id(base_item)] = (base_item, values)
         return values.get(role)
 
     def roleNames(self) -> dict[int, bytes]:
@@ -1492,15 +1755,13 @@ class SubtitleCueListModel(QAbstractListModel):
     @Slot(int, result="QVariantMap")
     def get(self, row: int) -> dict:
         return (
-            self._with_scene_timing_preview(self._items[row])
-            if 0 <= row < len(self._items)
-            else {}
+            self._with_scene_timing_preview(self._items[row]) if 0 <= row < len(self._items) else {}
         )
 
     def find(self, cue_id: str) -> dict:
         row = self._row_by_cue_id.get(cue_id, -1)
         if not 0 <= row < len(self._items):
-            return {}
+            return self.extra_text_model.find(cue_id) if self.extra_text_model else {}
         item = self._items[row]
         return self._with_scene_timing_preview(item) if item["cue_id"] == cue_id else {}
 
@@ -1522,6 +1783,8 @@ class SubtitleCueListModel(QAbstractListModel):
         }
 
     def preview_scene_text_timing(self, cue_id: str, start_us: int, end_us: int) -> bool:
+        if self.extra_text_model and self.extra_text_model.find(cue_id):
+            return self.extra_text_model.preview_scene_text_timing(cue_id, start_us, end_us)
         for row, item in enumerate(self._items):
             if item.get("cue_id") != cue_id:
                 continue
@@ -1551,6 +1814,8 @@ class SubtitleCueListModel(QAbstractListModel):
         return False
 
     def scene_text_base_timing(self, cue_id: str) -> tuple[int, int] | None:
+        if self.extra_text_model and self.extra_text_model.find(cue_id):
+            return self.extra_text_model.scene_text_base_timing(cue_id)
         """Return persisted timing, excluding any pointer-move preview."""
 
         for item in self._items:
@@ -1580,6 +1845,33 @@ class SubtitleCueListModel(QAbstractListModel):
                 changed.append(cue_id)
         return changed
 
+    def preview_scene_text_edge_delta(
+        self,
+        cue_ids: set[str],
+        edge: str,
+        delta_us: int,
+    ) -> list[str]:
+        """Preview one shared left/right edge delta from persisted timing."""
+
+        if edge not in {"left", "right"}:
+            return []
+        changed: list[str] = []
+        for item in self._items:
+            cue_id = str(item.get("cue_id", ""))
+            if cue_id not in cue_ids:
+                continue
+            start_us = int(item["start_us"])
+            end_us = int(item["end_us"])
+            if edge == "left":
+                start_us += delta_us
+            else:
+                end_us += delta_us
+            if end_us - start_us < 100_000 or start_us < 0:
+                continue
+            if self.preview_scene_text_timing(cue_id, start_us, end_us):
+                changed.append(cue_id)
+        return changed
+
     def match_summary(self, find: str, *, language: str = "translated") -> dict[str, int]:
         key = "source_text" if language == "source" else "translated_text"
         counts = [str(item.get(key, "")).count(find) for item in self._items] if find else []
@@ -1595,6 +1887,8 @@ class SubtitleCueListModel(QAbstractListModel):
         *,
         language: str,
     ) -> list[dict[str, str]]:
+        if self.extra_text_model and self.extra_text_model.find(cue_id):
+            return self.extra_text_model.optimistic_update_text(cue_id, text, language=language)
         id_key = "cue_id" if language == "source" else "translation_cue_id"
         text_key = "source_text" if language == "source" else "translated_text"
         role = self.SourceTextRole if language == "source" else self.TranslatedTextRole
@@ -1615,9 +1909,12 @@ class SubtitleCueListModel(QAbstractListModel):
         return []
 
     def optimistic_update_scene_font_scale(self, cue_id: str, scale: float) -> bool:
+        if self.extra_text_model and self.extra_text_model.find(cue_id):
+            return self.extra_text_model.optimistic_update_scene_font_scale(cue_id, scale)
         normalized = round(max(0.5, min(2.0, float(scale))), 2)
         for row, item in enumerate(self._items):
-            if item.get("cue_id") != cue_id or item.get("cue_role") != "scene_text":
+            if (item.get("cue_id") != cue_id
+                    or item.get("cue_role") not in {"scene_text", "title_text"}):
                 continue
             if float(item.get("scene_font_scale", 1.0)) == normalized:
                 return False
@@ -1647,12 +1944,16 @@ class SubtitleCueListModel(QAbstractListModel):
         font_italic: bool = False,
         text_opacity_percent: int = 100,
         background_opacity_percent: int = 90,
+        _notify: bool = True,
     ) -> list[dict[str, object]]:
-        for row, item in enumerate(self._items):
+        matched_row = self._row_by_cue_id.get(cue_id, -1)
+        for row in (matched_row,) if matched_row >= 0 else ():
+            item = self._items[row]
             if item.get("cue_id") != cue_id:
                 continue
             previous = {
                 "font_size": int(item.get("text_font_size", 12)),
+                "panel_box": item.get("panel_box"),
                 "orientation": str(item.get("orientation", "horizontal")),
                 "background_color": str(item.get("background_color", "")),
                 "text_color": str(item.get("text_color", "")),
@@ -1660,20 +1961,17 @@ class SubtitleCueListModel(QAbstractListModel):
                 "background_padding_x": int(item.get("background_padding_x", 20)),
                 "background_padding_y": int(item.get("background_padding_y", 10)),
                 "background_style": str(item.get("background_style", "solid")),
-                "letter_spacing_percent": int(
-                    item.get("letter_spacing_percent", 0)
-                ),
+                "letter_spacing_percent": int(item.get("letter_spacing_percent", 0)),
                 "font_bold": bool(item.get("font_bold", False)),
                 "font_italic": bool(item.get("font_italic", False)),
-                "text_opacity_percent": int(
-                    item.get("text_opacity_percent", 100)
-                ),
-                "background_opacity_percent": int(
-                    item.get("background_opacity_percent", 90)
-                ),
+                "text_opacity_percent": int(item.get("text_opacity_percent", 100)),
+                "background_opacity_percent": int(item.get("background_opacity_percent", 90)),
             }
             applied = {
                 "font_size": int(font_size),
+                "panel_box": grow_dialogue_panel_for_font(
+                    previous["panel_box"], previous["font_size"], int(font_size))
+                    if item.get("cue_role", "dialogue") == "dialogue" else previous["panel_box"],
                 "orientation": orientation,
                 "background_color": background_color,
                 "text_color": text_color,
@@ -1690,6 +1988,7 @@ class SubtitleCueListModel(QAbstractListModel):
             if previous == applied:
                 return []
             item["text_font_size"] = applied["font_size"]
+            item["panel_box"] = applied["panel_box"]
             item["orientation"] = applied["orientation"]
             item["background_color"] = applied["background_color"]
             item["text_color"] = applied["text_color"]
@@ -1701,28 +2000,9 @@ class SubtitleCueListModel(QAbstractListModel):
             item["font_bold"] = applied["font_bold"]
             item["font_italic"] = applied["font_italic"]
             item["text_opacity_percent"] = applied["text_opacity_percent"]
-            item["background_opacity_percent"] = applied[
-                "background_opacity_percent"
-            ]
-            self.dataChanged.emit(
-                self.index(row, 0),
-                self.index(row, 0),
-                [
-                    self.TextFontSizeRole,
-                    self.OrientationRole,
-                    self.BackgroundColorRole,
-                    self.TextColorRole,
-                    self.StyleHintRole,
-                    self.BackgroundPaddingXRole,
-                    self.BackgroundPaddingYRole,
-                    self.BackgroundStyleRole,
-                    self.LetterSpacingPercentRole,
-                    self.FontBoldRole,
-                    self.FontItalicRole,
-                    self.TextOpacityPercentRole,
-                    self.BackgroundOpacityPercentRole,
-                ],
-            )
+            item["background_opacity_percent"] = applied["background_opacity_percent"]
+            if _notify:
+                self._emit_changed_ranges([row], self._text_format_roles())
             return [
                 {
                     "kind": "text_format",
@@ -1733,6 +2013,46 @@ class SubtitleCueListModel(QAbstractListModel):
             ]
         return []
 
+    def optimistic_update_text_format_many(
+        self, cue_ids: list[str], **values
+    ) -> list[dict[str, object]]:
+        if self.extra_text_model:
+            titles = [cue_id for cue_id in cue_ids if self.extra_text_model.find(cue_id)]
+            if titles:
+                return (self.extra_text_model.optimistic_update_text_format_many(titles, **values)
+                        + self.optimistic_update_text_format_many(
+                            [cue_id for cue_id in cue_ids if cue_id not in titles], **values))
+        changes: list[dict[str, object]] = []
+        rows: list[int] = []
+        for cue_id in dict.fromkeys(cue_ids):
+            changed = self.optimistic_update_text_format(cue_id, _notify=False, **values)
+            if changed:
+                changes.extend(changed)
+                rows.append(self._row_by_cue_id[cue_id])
+        if rows:
+            self.dataChanged.emit(
+                self.index(min(rows), 0), self.index(max(rows), 0), self._text_format_roles()
+            )
+        return changes
+
+    def _text_format_roles(self) -> list[int]:
+        return [
+            self.TextFontSizeRole,
+            self.PanelBoxRole,
+            self.OrientationRole,
+            self.BackgroundColorRole,
+            self.TextColorRole,
+            self.StyleHintRole,
+            self.BackgroundPaddingXRole,
+            self.BackgroundPaddingYRole,
+            self.BackgroundStyleRole,
+            self.LetterSpacingPercentRole,
+            self.FontBoldRole,
+            self.FontItalicRole,
+            self.TextOpacityPercentRole,
+            self.BackgroundOpacityPercentRole,
+        ]
+
     def optimistic_update_scene_fade(
         self,
         cue_id: str,
@@ -1740,8 +2060,12 @@ class SubtitleCueListModel(QAbstractListModel):
         enabled: bool,
         duration_ms: int,
     ) -> list[dict[str, object]]:
+        if self.extra_text_model and self.extra_text_model.find(cue_id):
+            return self.extra_text_model.optimistic_update_scene_fade(
+                cue_id, enabled=enabled, duration_ms=duration_ms)
         for row, item in enumerate(self._items):
-            if item.get("cue_id") != cue_id or item.get("cue_role") != "scene_text":
+            if (item.get("cue_id") != cue_id
+                    or item.get("cue_role") not in {"scene_text", "title_text"}):
                 continue
             previous = {
                 "enabled": bool(item.get("fade_enabled", False)),
@@ -1799,6 +2123,11 @@ class SubtitleCueListModel(QAbstractListModel):
         return changes
 
     def rollback_text_changes(self, raw_changes: object) -> None:
+        if self.extra_text_model and isinstance(raw_changes, list):
+            title_changes = [change for change in raw_changes if isinstance(change, dict)
+                             and self.extra_text_model.find(str(change.get("cue_id", "")))]
+            self.extra_text_model.rollback_text_changes(title_changes)
+            raw_changes = [change for change in raw_changes if change not in title_changes]
         changes = raw_changes if isinstance(raw_changes, list) else []
         changed_by_role: dict[int, list[int]] = {
             self.SourceTextRole: [],
@@ -1858,11 +2187,10 @@ class SubtitleCueListModel(QAbstractListModel):
                 for row, item in enumerate(self._items):
                     if item.get("cue_id") != cue_id:
                         continue
-                    if (
-                        bool(item.get("fade_enabled", False))
-                        != bool(applied.get("enabled", False))
-                        or int(item.get("fade_duration_ms", 300))
-                        != int(applied.get("duration_ms", 300))
+                    if bool(item.get("fade_enabled", False)) != bool(
+                        applied.get("enabled", False)
+                    ) or int(item.get("fade_duration_ms", 300)) != int(
+                        applied.get("duration_ms", 300)
                     ):
                         break
                     item["fade_enabled"] = bool(previous.get("enabled", False))
@@ -1884,14 +2212,12 @@ class SubtitleCueListModel(QAbstractListModel):
                     if item.get("cue_id") != cue_id:
                         continue
                     if (
-                        int(item.get("text_font_size", 12))
-                        != int(applied.get("font_size", 12))
+                        int(item.get("text_font_size", 12)) != int(applied.get("font_size", 12))
                         or str(item.get("orientation", "horizontal"))
                         != str(applied.get("orientation", "horizontal"))
                         or str(item.get("background_color", ""))
                         != str(applied.get("background_color", ""))
-                        or str(item.get("text_color", ""))
-                        != str(applied.get("text_color", ""))
+                        or str(item.get("text_color", "")) != str(applied.get("text_color", ""))
                         or str(item.get("style_hint", "standard"))
                         != str(applied.get("style_hint", "standard"))
                         or int(item.get("background_padding_x", 20))
@@ -1913,31 +2239,19 @@ class SubtitleCueListModel(QAbstractListModel):
                     ):
                         break
                     item["text_font_size"] = int(previous.get("font_size", 12))
-                    item["orientation"] = str(
-                        previous.get("orientation", "horizontal")
-                    )
-                    item["background_color"] = str(
-                        previous.get("background_color", "")
-                    )
+                    if "panel_box" in previous:
+                        item["panel_box"] = previous["panel_box"]
+                    item["orientation"] = str(previous.get("orientation", "horizontal"))
+                    item["background_color"] = str(previous.get("background_color", ""))
                     item["text_color"] = str(previous.get("text_color", ""))
                     item["style_hint"] = str(previous.get("style_hint", "standard"))
-                    item["background_padding_x"] = int(
-                        previous.get("background_padding_x", 20)
-                    )
-                    item["background_padding_y"] = int(
-                        previous.get("background_padding_y", 10)
-                    )
-                    item["background_style"] = str(
-                        previous.get("background_style", "solid")
-                    )
-                    item["letter_spacing_percent"] = int(
-                        previous.get("letter_spacing_percent", 0)
-                    )
+                    item["background_padding_x"] = int(previous.get("background_padding_x", 20))
+                    item["background_padding_y"] = int(previous.get("background_padding_y", 10))
+                    item["background_style"] = str(previous.get("background_style", "solid"))
+                    item["letter_spacing_percent"] = int(previous.get("letter_spacing_percent", 0))
                     item["font_bold"] = bool(previous.get("font_bold", False))
                     item["font_italic"] = bool(previous.get("font_italic", False))
-                    item["text_opacity_percent"] = int(
-                        previous.get("text_opacity_percent", 100)
-                    )
+                    item["text_opacity_percent"] = int(previous.get("text_opacity_percent", 100))
                     item["background_opacity_percent"] = int(
                         previous.get("background_opacity_percent", 90)
                     )
@@ -1946,6 +2260,7 @@ class SubtitleCueListModel(QAbstractListModel):
                         self.index(row, 0),
                         [
                             self.TextFontSizeRole,
+                            self.PanelBoxRole,
                             self.OrientationRole,
                             self.BackgroundColorRole,
                             self.TextColorRole,
@@ -1996,19 +2311,25 @@ class SubtitleCueListModel(QAbstractListModel):
     @Slot(float, result="QVariantList")
     def sceneTextsAtTime(self, timeline_us: float) -> list[dict]:
         position_us = max(0, int(timeline_us))
-        if self._scene_timing_previews:
-            return [
-                timed
-                for item in self._items
-                if item.get("cue_role") == "scene_text"
-                for timed in (self._with_scene_timing_preview(item),)
-                if int(timed["start_us"]) <= position_us < int(timed["end_us"])
-            ]
         return [
-            dict(item)
-            for item in self._items_at_time(position_us)
+            item
+            for item in self._preview_items_at_time(position_us)
             if item.get("cue_role") == "scene_text"
         ]
+
+    def _preview_items_at_time(self, timeline_us: int | float) -> list[dict]:
+        active = self._items_at_time(timeline_us)
+        if not self._scene_timing_previews:
+            return [dict(item) for item in active]
+        # A dragged cue can leave its persisted interval or enter from a
+        # distant one. Query the stable index plus all temporary overrides,
+        # retaining original row order rather than sorting by preview time.
+        rows = {self._row_by_cue_id[item["cue_id"]] for item in active}
+        rows.update(self._row_by_cue_id[cue_id] for cue_id in self._scene_timing_previews
+                    if cue_id in self._row_by_cue_id)
+        return [timed for row in sorted(rows)
+                for timed in (self._with_scene_timing_preview(self._items[row]),)
+                if timed["start_us"] <= timeline_us < timed["end_us"]]
 
     def _items_at_time(self, timeline_us: int) -> list[dict]:
         row = bisect_right(self._start_us, timeline_us) - 1
@@ -2022,6 +2343,37 @@ class SubtitleCueListModel(QAbstractListModel):
             row -= 1
         active.reverse()
         return active
+
+    def cue_ids_in_range(
+        self,
+        lower_us: int,
+        upper_us: int,
+        track_ids: set[str] | None = None,
+    ) -> list[str]:
+        """Return intersecting cue IDs without scanning the whole model.
+
+        Subtitle rows are kept sorted by start time and carry a prefix maximum
+        of their end times.  Use those indexes to skip rows that cannot
+        intersect the requested interval, while retaining the model's stable
+        row order and the existing half-open range semantics.
+        """
+
+        lower = max(0, int(lower_us))
+        upper = max(lower, int(upper_us))
+        if upper <= lower or not self._items:
+            return []
+        first = bisect_right(self._max_end_prefix, lower)
+        stop = bisect_left(self._start_us, upper)
+        result: list[str] = []
+        for item in self._items[first:stop]:
+            if track_ids is not None and str(item.get("subtitle_track_id", "")) not in track_ids:
+                continue
+            if int(item.get("end_us", 0)) <= lower:
+                continue
+            cue_id = str(item.get("cue_id", ""))
+            if cue_id:
+                result.append(cue_id)
+        return result
 
     def _emit_changed_ranges(self, rows: list[int], roles: list[int]) -> None:
         """Notify QML in contiguous ranges instead of once for every cue."""
@@ -2048,11 +2400,14 @@ class SubtitleCueListModel(QAbstractListModel):
         *,
         preserve_live_translations: bool = False,
     ) -> None:
+        self._role_data_cache.clear()
         self._scene_timing_previews.clear()
         source = [dict(item) for item in raw_source] if isinstance(raw_source, list) else []
         translated = (
             [dict(item) for item in raw_translated] if isinstance(raw_translated, list) else []
         )
+        self._source_cues = [dict(item) for item in source]
+        self._translated_cues = [dict(item) for item in translated]
         live_by_index = {
             item["index"]: dict(item)
             for item in self._items
@@ -2065,12 +2420,20 @@ class SubtitleCueListModel(QAbstractListModel):
         translated_by_index = {
             item.get("index"): item for item in translated if type(item.get("index")) is int
         }
+        translated_by_id = {str(item.get("id", "")): item for item in translated}
+        source_ids = {str(item.get("id", "")) for item in source}
         rows: list[dict] = []
         base = source if source else translated
         for fallback_index, cue in enumerate(base, start=1):
             index = cue.get("index", fallback_index)
             timing = cue.get("range", {})
-            translation = translated_by_index.get(index, {}) if source else cue
+            translation = (translated_by_id.get(str(cue.get("id", "")))
+                           or translated_by_index.get(index, {})) if source else cue
+            if (source and translation.get("id") in source_ids
+                    and translation.get("id") != cue.get("id")):
+                translation = {}
+            if translation and _range_from_mapping(translation.get("range")) is not None:
+                timing = translation["range"]
             live = live_by_index.get(index, {}) if source and not translation else {}
             if live and not (
                 live.get("cue_id") == str(cue.get("id", ""))
@@ -2118,26 +2481,16 @@ class SubtitleCueListModel(QAbstractListModel):
                     "background_padding_x": int(cue.get("background_padding_x", 20)),
                     "background_padding_y": int(cue.get("background_padding_y", 10)),
                     "background_style": str(cue.get("background_style", "solid")),
-                    "letter_spacing_percent": int(
-                        cue.get("letter_spacing_percent", 0)
-                    ),
+                    "letter_spacing_percent": int(cue.get("letter_spacing_percent", 0)),
                     "font_bold": bool(cue.get("font_bold", False)),
                     "font_italic": bool(cue.get("font_italic", False)),
-                    "text_opacity_percent": int(
-                        cue.get("text_opacity_percent", 100)
-                    ),
-                    "background_opacity_percent": int(
-                        cue.get("background_opacity_percent", 90)
-                    ),
+                    "text_opacity_percent": int(cue.get("text_opacity_percent", 100)),
+                    "background_opacity_percent": int(cue.get("background_opacity_percent", 90)),
                     "fade_enabled": bool(cue.get("fade_enabled", False)),
                     "fade_duration_ms": int(cue.get("fade_duration_ms", 300)),
                     "subtitle_track_id": str(
                         cue.get("subtitle_track_id", "")
-                        or (
-                            "S1"
-                            if str(cue.get("role", "dialogue")) == "dialogue"
-                            else "S2"
-                        )
+                        or ("S1" if str(cue.get("role", "dialogue")) == "dialogue" else "S2")
                     ),
                     "translation_cue_id": (
                         str(translation.get("id", ""))
@@ -2149,7 +2502,75 @@ class SubtitleCueListModel(QAbstractListModel):
                     "timing_too_long": False,
                 }
             )
+            if translation:
+                for key in (
+                    "visual_box",
+                    "visual_box_source",
+                    "orientation",
+                    "style_hint",
+                    "panel_box",
+                    "background_color",
+                    "text_color",
+                    "review_state",
+                    "scene_font_scale",
+                    "text_font_size",
+                    "background_padding_x",
+                    "background_padding_y",
+                    "background_style",
+                    "letter_spacing_percent",
+                    "font_bold",
+                    "font_italic",
+                    "text_opacity_percent",
+                    "background_opacity_percent",
+                    "fade_enabled",
+                    "fade_duration_ms",
+                    "subtitle_track_id",
+                ):
+                    if key in translation:
+                        rows[-1][key] = translation[key]
         self._patch_rows(rows)
+
+    def apply_cue_patch(
+        self,
+        source_upserts: object,
+        removed_source_ids: object,
+        translated_upserts: object,
+        removed_translated_ids: object,
+    ) -> None:
+        """Apply a compact project cue delta while preserving stable model rows."""
+
+        def patched(current: list[dict], upserts: object, removed_ids: object) -> list[dict]:
+            removed = (
+                {str(value) for value in removed_ids if isinstance(value, str) and value}
+                if isinstance(removed_ids, list)
+                else set()
+            )
+            by_id = {
+                str(item.get("id", "")): dict(item)
+                for item in current
+                if str(item.get("id", "")) and str(item.get("id", "")) not in removed
+            }
+            if isinstance(upserts, list):
+                for raw in upserts:
+                    if not isinstance(raw, dict):
+                        continue
+                    cue_id = str(raw.get("id", ""))
+                    if cue_id:
+                        by_id[cue_id] = dict(raw)
+            return sorted(
+                by_id.values(),
+                key=lambda item: (
+                    int(item.get("index", 0) or 0),
+                    int((item.get("range") or {}).get("start_us", 0))
+                    if isinstance(item.get("range"), dict)
+                    else 0,
+                    str(item.get("id", "")),
+                ),
+            )
+
+        source = patched(self._source_cues, source_upserts, removed_source_ids)
+        translated = patched(self._translated_cues, translated_upserts, removed_translated_ids)
+        self.replace(source, translated)
 
     def set_qa_issues(self, raw_issues: object) -> int:
         issues = (
@@ -2274,22 +2695,34 @@ class SubtitleCueListModel(QAbstractListModel):
             suffix += 1
         old_middle = len(old_ids) - prefix - suffix
         new_middle = len(new_ids) - prefix - suffix
+        changed_rows = [index for index in range(prefix) if self._items[index] != rows[index]]
+        changed_rows.extend(
+            len(rows) - offset
+            for offset in range(suffix, 0, -1)
+            if self._items[-offset] != rows[-offset]
+        )
+        # Qt notifications can synchronously query Preview and cue selection.
+        # Publish coherent rows and lookup indexes before each notification,
+        # including the intermediate remove-before-insert state. Use the final
+        # retained values so retimed prefix/suffix rows remain time-ordered.
         if old_middle:
             self.beginRemoveRows(_INVALID_INDEX, prefix, prefix + old_middle - 1)
-            del self._items[prefix : prefix + old_middle]
+            self._items[:] = rows[:prefix] + (rows[-suffix:] if suffix else [])
+            self._rebuild_lookup_indexes()
             self.endRemoveRows()
         if new_middle:
             self.beginInsertRows(_INVALID_INDEX, prefix, prefix + new_middle - 1)
-            self._items[prefix:prefix] = rows[prefix : prefix + new_middle]
+            self._items[:] = rows
+            self._rebuild_lookup_indexes()
             self.endInsertRows()
-        changed_rows: list[int] = []
-        for index, row in enumerate(rows):
-            if index >= len(self._items):
-                break
-            if self._items[index] != row:
-                self._items[index] = row
-                changed_rows.append(index)
+        if not old_middle and not new_middle:
+            self._items[:] = rows
+            self._rebuild_lookup_indexes()
         self._emit_changed_ranges(changed_rows, list(self.roleNames()))
+        if len(old_ids) != len(new_ids):
+            self.countChanged.emit()
+
+    def _rebuild_lookup_indexes(self) -> None:
         self._row_by_cue_index = {
             int(item["index"]): row
             for row, item in enumerate(self._items)
@@ -2306,8 +2739,6 @@ class SubtitleCueListModel(QAbstractListModel):
         for item in self._items:
             maximum = max(maximum, int(item["end_us"]))
             self._max_end_prefix.append(maximum)
-        if len(old_ids) != len(new_ids):
-            self.countChanged.emit()
 
 
 class OverlayListModel(QAbstractListModel):
@@ -2345,11 +2776,11 @@ class OverlayListModel(QAbstractListModel):
         self.countChanged.emit()
 
     def apply_patch(self, upserts: object, removed_ids: object) -> None:
-        removed = {
-            str(value)
-            for value in removed_ids
-            if isinstance(value, str) and value
-        } if isinstance(removed_ids, list) else set()
+        removed = (
+            {str(value) for value in removed_ids if isinstance(value, str) and value}
+            if isinstance(removed_ids, list)
+            else set()
+        )
         for row in range(len(self._items) - 1, -1, -1):
             if str(self._items[row].get("id", "")) not in removed:
                 continue
@@ -2357,8 +2788,11 @@ class OverlayListModel(QAbstractListModel):
             self._items.pop(row)
             self.endRemoveRows()
             self.countChanged.emit()
-        values = [dict(item) for item in upserts if isinstance(item, dict)] \
-            if isinstance(upserts, list) else []
+        values = (
+            [dict(item) for item in upserts if isinstance(item, dict)]
+            if isinstance(upserts, list)
+            else []
+        )
         for value in values:
             overlay_id = str(value.get("id", ""))
             row = next(
@@ -2392,6 +2826,12 @@ class ProjectStateModel(QObject):
         self.clips = TimelineClipListModel(self)
         self.voice_conform_cues = VoiceConformCueListModel(self)
         self.subtitle_cues = SubtitleCueListModel(self)
+        self.title_cues = SubtitleCueListModel(self)
+        self.subtitle_cues.extra_text_model = self.title_cues
+        self.title_cues.dataChanged.connect(self._bump_subtitle_visual_revision)
+        self.title_cues.modelReset.connect(self._bump_subtitle_visual_revision)
+        self.title_cues.rowsInserted.connect(self._bump_subtitle_visual_revision)
+        self.title_cues.rowsRemoved.connect(self._bump_subtitle_visual_revision)
         self.subtitle_cues.dataChanged.connect(self._bump_subtitle_visual_revision)
         self.subtitle_cues.modelReset.connect(self._bump_subtitle_visual_revision)
         self.subtitle_cues.rowsInserted.connect(self._bump_subtitle_visual_revision)
@@ -2400,6 +2840,7 @@ class ProjectStateModel(QObject):
         self._project_id = ""
         self._name = ""
         self._revision = 0
+        self._content_revision = 0
         self._duration_us = 0
         self._video_source = QUrl()
         self._clip_by_id: dict[str, dict] = {}
@@ -2418,11 +2859,19 @@ class ProjectStateModel(QObject):
         self._voice_track_index = -1
         self._translation_style_preset = "auto"
         self._translation_custom_rules = ""
+        self._translation_style_presets: list[dict[str, str]] = []
+        self._translation_active_style_name = ""
+        self._translation_preferences_revision = 0
         self._ocr_dialogue_region: list[float] = []
         self._ocr_exclusion_regions: list[list[float]] = []
+        self._timeline_markers: list[int] = []
         self._source_region_ocr_count = 0
         self._source_region_total = 0
         self._subtitle_visual_revision = 0
+        # Timeline cuts are non-destructive.  Models render a projected copy,
+        # while every later compact patch is applied to this canonical source
+        # snapshot before it is projected again.
+        self._canonical_snapshot: dict = {}
 
     def _bump_subtitle_visual_revision(self, *_args) -> None:
         self._subtitle_visual_revision += 1
@@ -2443,6 +2892,15 @@ class ProjectStateModel(QObject):
     @Property(int, notify=changed)
     def revision(self) -> int:
         return self._revision
+
+    @property
+    def content_revision(self) -> int:
+        """Last acknowledged non-style snapshot, excluding disjoint style ACKs."""
+
+        return self._content_revision
+
+    def content_patch_snapshot(self) -> dict:
+        return {**self._canonical_snapshot, "revision": self._content_revision}
 
     @Property(int, notify=subtitleVisualsChanged)
     def subtitleVisualRevision(self) -> int:
@@ -2484,12 +2942,24 @@ class ProjectStateModel(QObject):
         return self._translation_custom_rules
 
     @Property("QVariantList", notify=changed)
+    def translationStylePresets(self) -> list[dict[str, str]]:
+        return [dict(item) for item in self._translation_style_presets]
+
+    @Property(str, notify=changed)
+    def translationActiveStyleName(self) -> str:
+        return self._translation_active_style_name
+
+    @Property("QVariantList", notify=changed)
     def ocrDialogueRegion(self) -> list[float]:
         return list(self._ocr_dialogue_region)
 
     @Property("QVariantList", notify=changed)
     def ocrExclusionRegions(self) -> list[list[float]]:
         return [list(item) for item in self._ocr_exclusion_regions]
+
+    @Property("QVariantList", notify=changed)
+    def timelineMarkers(self) -> list[int]:
+        return list(self._timeline_markers)
 
     @Property(str, notify=changed)
     def sourceSubtitleRegionStatus(self) -> str:
@@ -2579,6 +3049,20 @@ class ProjectStateModel(QObject):
         position_us = max(0, int(timeline_us))
         return self.subtitle_cues.sceneTextsAtTime(position_us)
 
+    @Slot(float, result="QVariantList")
+    def titleTextsAt(self, timeline_us: float) -> list[dict]:
+        if any(track.get("kind") == "text" and not track.get("visible", True)
+               for track in self.tracks._items):
+            return []
+        return self.title_cues._preview_items_at_time(timeline_us)
+
+    @Slot(result="QVariantList")
+    def titleCueIds(self) -> list[str]:
+        return [cue["cue_id"] for cue in self.title_cues._items]
+
+    def text_cue_model(self, cue_id: str) -> SubtitleCueListModel:
+        return self.title_cues if self.title_cues.find(cue_id) else self.subtitle_cues
+
     @Slot(float, float, int, int, result="QVariantList")
     def subtitleCueIdsInRange(
         self,
@@ -2592,28 +3076,33 @@ class ProjectStateModel(QObject):
         lower_track = min(first_track_index, last_track_index)
         upper_track = max(first_track_index, last_track_index)
         track_positions = {
-            str(item.get("id", "")): index
-            for index, item in enumerate(self.tracks._items)
+            str(item.get("id", "")): index for index, item in enumerate(self.tracks._items)
         }
-        result: list[str] = []
-        for row in range(self.subtitle_cues.count):
-            cue = self.subtitle_cues.get(row)
-            track_id = str(cue.get("subtitle_track_id", ""))
-            track_index = track_positions.get(track_id, -1)
-            if not lower_track <= track_index <= upper_track:
-                continue
-            if int(cue.get("end_us", 0)) <= lower_time:
-                continue
-            if int(cue.get("start_us", 0)) >= upper_time:
-                continue
-            cue_id = str(cue.get("cue_id", ""))
-            if cue_id:
-                result.append(cue_id)
-        return result
+        visible_track_ids = {
+            track_id
+            for track_id, track_index in track_positions.items()
+            if track_id and lower_track <= track_index <= upper_track
+        }
+        # Each subtitle model already maintains a sorted start-time index and
+        # prefix maximum of end times.  Query those indexes separately to keep
+        # the historical subtitle-then-title ordering without scanning every
+        # cue on every marquee release.
+        return [
+            *self.subtitle_cues.cue_ids_in_range(
+                lower_time,
+                upper_time,
+                visible_track_ids,
+            ),
+            *self.title_cues.cue_ids_in_range(
+                lower_time,
+                upper_time,
+                visible_track_ids,
+            ),
+        ]
 
     @Slot(str, result=int)
     def subtitleTrackIndexForCueId(self, cue_id: str) -> int:
-        cue = self.subtitle_cues.find(str(cue_id or ""))
+        cue = self.text_cue_model(cue_id).find(str(cue_id or ""))
         track_id = str(cue.get("subtitle_track_id", ""))
         if not track_id:
             return -1
@@ -2628,23 +3117,82 @@ class ProjectStateModel(QObject):
 
     @Slot(str, result=bool)
     def isSceneTextCue(self, cue_id: str) -> bool:
-        cue = self.subtitle_cues.find(str(cue_id or ""))
-        return cue.get("cue_role") == "scene_text"
+        cue = self.text_cue_model(cue_id).find(str(cue_id or ""))
+        return cue.get("cue_role") in {"scene_text", "title_text"}
 
     @Slot(float, result=float)
     def sourceToOutputUs(self, source_us: float) -> float:
-        if self._voice_conform_plan is None:
-            return float(max(0, int(source_us)))
-        return float(self._voice_conform_plan.source_to_output_us(int(source_us)))
+        mapped = base_to_timeline_us(
+            self._canonical_snapshot,
+            max(0, int(source_us)),
+            endpoint="start",
+        )
+        if (
+            mapped is None
+            and not self._canonical_snapshot.get("timeline_edit")
+            and self._voice_conform_plan is not None
+        ):
+            mapped = self._voice_conform_plan.source_to_output_us(int(source_us))
+        return -1.0 if mapped is None else float(mapped)
 
     @Slot(float, result=float)
     def outputToSourceUs(self, output_us: float) -> float:
-        if self._voice_conform_plan is None:
-            return float(max(0, int(output_us)))
-        return float(self._voice_conform_plan.output_to_source_us(int(output_us)))
+        try:
+            mapped = timeline_to_base_us(
+                self._canonical_snapshot,
+                max(0, int(output_us)),
+                endpoint="start",
+            )
+        except ValueError:
+            if self._canonical_snapshot.get("timeline_edit") or self._voice_conform_plan is None:
+                raise
+            mapped = self._voice_conform_plan.output_to_source_us(int(output_us))
+        return float(mapped)
 
     def clip_info(self, clip_id: str) -> dict | None:
         return self._clip_by_id.get(clip_id)
+
+    @Slot(str, float, float, float, result="QVariantList")
+    def timelineMediaTiles(self, clip_id: str, start_us: float, end_us: float,
+                           width: float) -> list[dict]:
+        from ducai_studio.application.timeline_previews import visible_media_tiles
+        from ducai_studio.ui.timeline_media_provider import timeline_tile_url
+
+        clip = self._clip_by_id.get(clip_id, {})
+        kind = self._track_by_id.get(clip.get("track_id"), {}).get("kind")
+        path = self._media_path_by_id.get(clip.get("media_id"), "")
+        timeline = clip.get("timeline_range", {})
+        source = clip.get("source_range")
+        if kind not in {"video", "original_audio", "voice", "background_music"} or not path:
+            return []
+        if not isinstance(source, dict) or end_us <= start_us or width < 24:
+            return []
+        begin, end = int(timeline.get("start_us", 0)), int(timeline.get("end_us", 0))
+        speed = clip.get("speed", {})
+        numerator, denominator = speed.get("numerator", 1), speed.get("denominator", 1)
+        if min(numerator, denominator) <= 0 or end <= begin:
+            return []
+
+        def source_time(position):
+            return min(int(source["end_us"]), int(source["start_us"])
+                       + (position - begin) * numerator // denominator)
+
+        segments = []
+        plan = self._voice_conform_plan if kind in {"video", "original_audio"} else None
+        if plan is not None:
+            for segment in plan.segments:
+                left, right = max(begin, segment.source_start_us), min(end, segment.source_end_us)
+                if right > left:
+                    segments.append({"start_us": plan.source_to_output_us(left),
+                                     "end_us": plan.source_to_output_us(right),
+                                     "source_start_us": source_time(left),
+                                     "source_end_us": source_time(right)})
+        else:
+            segments = [{"start_us": begin, "end_us": end,
+                         "source_start_us": source_time(begin), "source_end_us": source_time(end)}]
+        result = visible_media_tiles(segments, int(start_us), int(end_us),
+                                     width / (end_us - start_us), waveform=kind != "video")
+        return [{**tile, "url": timeline_tile_url(path, tile)} for tile in result]
 
     def clip_timing_info(self, clip_id: str) -> dict[str, object]:
         clip = self._clip_by_id.get(clip_id)
@@ -2661,6 +3209,10 @@ class ProjectStateModel(QObject):
 
     def track_info(self, track_id: str) -> dict | None:
         return self._track_by_id.get(track_id)
+
+    def track_is_persisted(self, track_id: str) -> bool:
+        return any(track.get("id") == track_id
+                   for track in self._canonical_snapshot.get("tracks", []))
 
     @Slot(str, result="QVariantMap")
     def track(self, track_id: str) -> dict:
@@ -2728,9 +3280,9 @@ class ProjectStateModel(QObject):
         )
         if linked_audio is not None:
             audio_volume = linked_audio.get("volume", 1.0)
-            if linked_audio.get("track_muted") is True:
+            if linked_audio.get("track_muted") is True or linked_audio.get("muted") is True:
                 audio_volume = 0.0
-        elif clip.get("track_muted") is True:
+        if clip.get("track_muted") is True or clip.get("muted") is True:
             audio_volume = 0.0
         if isinstance(audio_volume, bool) or not isinstance(audio_volume, (int, float)):
             audio_volume = 1.0
@@ -2761,7 +3313,7 @@ class ProjectStateModel(QObject):
                     )
                     voice_volume = (
                         0.0
-                        if voice_clip.get("track_muted") is True
+                        if voice_clip.get("track_muted") is True or voice_clip.get("muted") is True
                         else voice_clip.get("volume", 1.0)
                     )
                     if isinstance(voice_volume, bool) or not isinstance(voice_volume, (int, float)):
@@ -2791,11 +3343,9 @@ class ProjectStateModel(QObject):
         plan = self._voice_conform_plan
         if plan is None or not self._video_clips or position_us >= plan.output_duration_us:
             return {"available": False, "nextTimelineStartUs": -1}
-        segment = next(
-            item
-            for item in plan.segments
-            if item.output_start_us <= position_us < item.output_end_us
-        )
+        segment = plan.segments[bisect_right(
+            plan.segments, position_us, key=lambda item: item.output_end_us
+        )]
         clip = self._video_clips[0]
         media_path = self._media_path_by_id.get(clip.get("media_id"), "")
         if not media_path:
@@ -2809,9 +3359,9 @@ class ProjectStateModel(QObject):
         )
         if linked_audio is not None:
             audio_volume = linked_audio.get("volume", 1.0)
-            if linked_audio.get("track_muted") is True:
+            if linked_audio.get("track_muted") is True or linked_audio.get("muted") is True:
                 audio_volume = 0.0
-        elif clip.get("track_muted") is True:
+        if clip.get("track_muted") is True or clip.get("muted") is True:
             audio_volume = 0.0
         if isinstance(audio_volume, bool) or not isinstance(audio_volume, (int, float)):
             audio_volume = 1.0
@@ -2857,8 +3407,45 @@ class ProjectStateModel(QObject):
         raw_snapshot: object,
         *,
         preserve_live_translations: bool = False,
+        take_ownership: bool = False,
     ) -> None:
-        snapshot = raw_snapshot if isinstance(raw_snapshot, dict) else {}
+        # IPC decoding already created an owned object graph. Transferring it
+        # avoids a second O(project-size) Python deepcopy on the QML thread.
+        # Normal callers retain the original defensive-copy contract.
+        canonical = (
+            raw_snapshot if take_ownership else deepcopy(raw_snapshot)
+        ) if isinstance(raw_snapshot, dict) else {}
+        self._replace_canonical_snapshot(
+            canonical,
+            preserve_live_translations=preserve_live_translations,
+        )
+
+    def _replace_canonical_snapshot(
+        self,
+        canonical: dict,
+        *,
+        preserve_live_translations: bool = False,
+    ) -> None:
+        projected = (
+            project_json_for_timeline(canonical)
+            if canonical.get("timeline_edit")
+            else canonical
+        )
+        self._canonical_snapshot = canonical
+        revision = canonical.get("revision", 0)
+        self._translation_preferences_revision = revision if type(revision) is int else 0
+        self._content_revision = self._translation_preferences_revision
+        self._replace_projected_snapshot(
+            projected,
+            preserve_live_translations=preserve_live_translations,
+        )
+
+    def _replace_projected_snapshot(
+        self,
+        snapshot: dict,
+        *,
+        preserve_live_translations: bool = False,
+    ) -> None:
         raw_conform = snapshot.get("voice_conform")
         self._voice_conform_plan = None
         if isinstance(raw_conform, dict):
@@ -2876,6 +3463,7 @@ class ProjectStateModel(QObject):
             and len(cue["visual_box"]) == 4
         )
         translated_cues = self._map_cue_ranges(snapshot.get("translated_cues", []))
+        title_cues = self._map_cue_ranges(snapshot.get("title_cues", []))
         raw_tracks = self._restore_legacy_voice_cue_metadata(
             snapshot.get("tracks", []),
             source_cues,
@@ -2886,6 +3474,13 @@ class ProjectStateModel(QObject):
             source_cues,
             translated_cues,
         )
+        # The empty Text line is an affordance, not a persisted fake clip.
+        if snapshot.get("id"):
+            text_tracks = [track for track in raw_tracks if track.get("kind") == "text"]
+            raw_tracks = (text_tracks or [{"id": "T1", "kind": "text", "name": "Text",
+                                          "clips": []}]) + [
+                track for track in raw_tracks if track.get("kind") != "text"
+            ]
         self._track_by_id = {
             track["id"]: track
             for track in raw_tracks
@@ -2900,13 +3495,14 @@ class ProjectStateModel(QObject):
             -1,
         )
         self.tracks.replace(raw_tracks)
-        self.clips.replace(raw_tracks)
+        self.clips.replace(self._display_clip_tracks(raw_tracks))
         self.voice_conform_cues.replace(self._voice_conform_plan)
         self.subtitle_cues.replace(
             source_cues,
             translated_cues,
             preserve_live_translations=preserve_live_translations,
         )
+        self.title_cues.replace(title_cues, [])
         clips = [
             clip
             for track in raw_tracks
@@ -2942,19 +3538,9 @@ class ProjectStateModel(QObject):
             and isinstance(item.get("id"), str)
             and isinstance(item.get("path"), str)
         }
-        self._video_clips = sorted(
-            (
-                {**clip, "track_muted": track.get("muted", False)}
-                for track in raw_tracks
-                if isinstance(track, dict) and track.get("kind") == "video"
-                for clip in track.get("clips", [])
-                if isinstance(clip, dict)
-                and isinstance(clip.get("timeline_range"), dict)
-                and type(clip["timeline_range"].get("start_us")) is int
-                and type(clip["timeline_range"].get("end_us")) is int
-            ),
-            key=lambda item: item["timeline_range"]["start_us"],
-        )
+        from ducai_studio.domain.video_layers import resolved_video_rows
+
+        self._video_clips = resolved_video_rows({"tracks": raw_tracks})
         self._video_starts = [item["timeline_range"]["start_us"] for item in self._video_clips]
         self._voice_clips = sorted(
             (
@@ -3005,65 +3591,513 @@ class ProjectStateModel(QObject):
         self._video_source = QUrl.fromLocalFile(video_path) if video_path else QUrl()
         self._overlays = self._map_overlay_ranges(snapshot.get("overlays", []))
         self.overlay_model.replace(self._overlays)
-        raw_preferences = snapshot.get("translation_preferences", {})
+        self._set_translation_preference_values(snapshot.get("translation_preferences", {}))
+        raw_dialogue_region = snapshot.get("ocr_dialogue_region")
+        self._ocr_dialogue_region = (
+            [float(value) for value in raw_dialogue_region]
+            if isinstance(raw_dialogue_region, (list, tuple)) and len(raw_dialogue_region) == 4
+            else []
+        )
+        raw_exclusions = snapshot.get("ocr_exclusion_regions", [])
+        self._ocr_exclusion_regions = (
+            [
+                [float(value) for value in item]
+                for item in raw_exclusions
+                if isinstance(item, (list, tuple)) and len(item) == 4
+            ]
+            if isinstance(raw_exclusions, list)
+            else []
+        )
+        raw_markers = snapshot.get("timeline_markers", [])
+        self._timeline_markers = sorted(
+            {
+                int(value)
+                for value in raw_markers
+                if type(value) is int and value >= 0
+            }
+        ) if isinstance(raw_markers, (list, tuple)) else []
+        self._has_translated_subtitles = bool(snapshot.get("translated_cues", []))
+        self.changed.emit()
+
+    def _set_translation_preference_values(self, raw_preferences: object) -> None:
         if not isinstance(raw_preferences, dict):
             raw_preferences = {}
         preset = raw_preferences.get("preset", "auto")
         custom_rules = raw_preferences.get("custom_rules", "")
-        self._translation_style_preset = (
-            preset if isinstance(preset, str) and preset else "auto"
+        self._translation_style_preset = preset if isinstance(preset, str) and preset else "auto"
+        self._translation_custom_rules = custom_rules if isinstance(custom_rules, str) else ""
+        raw_saved_styles = raw_preferences.get("saved_styles", [])
+        if isinstance(raw_saved_styles, dict):
+            raw_saved_styles = [
+                {"name": name, **value}
+                for name, value in raw_saved_styles.items()
+                if isinstance(value, dict)
+            ]
+        self._translation_style_presets = [
+            {
+                "name": str(item.get("name", "")).strip(),
+                "preset": str(item.get("preset", "auto")).strip() or "auto",
+                "custom_rules": str(item.get("custom_rules", "")),
+            }
+            for item in raw_saved_styles
+            if isinstance(item, dict) and str(item.get("name", "")).strip()
+        ] if isinstance(raw_saved_styles, list) else []
+        active_style_name = raw_preferences.get("active_style_name", "")
+        self._translation_active_style_name = (
+            active_style_name if isinstance(active_style_name, str) else ""
         )
-        self._translation_custom_rules = (
-            custom_rules if isinstance(custom_rules, str) else ""
+
+    def apply_translation_preferences(self, response: object) -> None:
+        """Merge a disjoint style ACK without resetting live cue/editor models."""
+
+        if not isinstance(response, dict) or response.get("id") != self._project_id:
+            raise ValueError("Translation preferences belong to another project")
+        revision = response.get("revision")
+        if type(revision) is not int or revision <= 0:
+            raise ValueError("Translation preferences revision is invalid")
+        raw = response.get("translation_preferences")
+        if not isinstance(raw, dict):
+            raise ValueError("Translation preferences are invalid")
+        styles = raw.get("saved_styles", [])
+        if isinstance(styles, dict):
+            styles = [{**value, "name": name} for name, value in styles.items()
+                      if isinstance(value, dict)]
+        if not isinstance(styles, list) or any(not isinstance(item, dict) for item in styles):
+            raise ValueError("Saved translation styles are invalid")
+        for item in [raw, *styles]:
+            for key in ("name", "preset", "custom_rules", "active_style_name"):
+                if key in item and not isinstance(item[key], str):
+                    raise ValueError("Translation preference values must be strings")
+        preferences = TranslationPreferences(
+            preset=raw.get("preset", "auto"), custom_rules=raw.get("custom_rules", ""),
+            saved_styles=tuple(TranslationStylePreset(
+                name=item.get("name", ""), preset=item.get("preset", "auto"),
+                custom_rules=item.get("custom_rules", ""),
+            ) for item in styles),
+            active_style_name=raw.get("active_style_name", ""),
         )
-        raw_dialogue_region = snapshot.get("ocr_dialogue_region")
-        self._ocr_dialogue_region = (
-            [float(value) for value in raw_dialogue_region]
-            if isinstance(raw_dialogue_region, (list, tuple))
-            and len(raw_dialogue_region) == 4
-            else []
-        )
-        raw_exclusions = snapshot.get("ocr_exclusion_regions", [])
-        self._ocr_exclusion_regions = [
-            [float(value) for value in item]
-            for item in raw_exclusions
-            if isinstance(item, (list, tuple)) and len(item) == 4
-        ] if isinstance(raw_exclusions, list) else []
-        self._has_translated_subtitles = bool(snapshot.get("translated_cues", []))
+        if revision < self._translation_preferences_revision:
+            return
+        normalized = {"preset": preferences.preset, "custom_rules": preferences.custom_rules}
+        if preferences.saved_styles:
+            normalized["saved_styles"] = [
+                {"name": item.name, "preset": item.preset, "custom_rules": item.custom_rules}
+                for item in preferences.saved_styles
+            ]
+        if preferences.active_style_name:
+            normalized["active_style_name"] = preferences.active_style_name
+        self._revision = max(self._revision, revision)
+        self._canonical_snapshot = {**self._canonical_snapshot, "revision": self._revision,
+                                    "translation_preferences": normalized}
+        self._translation_preferences_revision = revision
+        self._set_translation_preference_values(normalized)
         self.changed.emit()
+
+    def _preserve_translation_preferences(self, snapshot: dict) -> dict:
+        # A projection worker may have copied the project before a style ACK.
+        # Cue/timeline patches do not own these fields and must keep their head.
+        snapshot = dict(snapshot)
+        if "translation_preferences" in self._canonical_snapshot:
+            snapshot["translation_preferences"] = (
+                self._canonical_snapshot["translation_preferences"]
+            )
+        else:
+            snapshot.pop("translation_preferences", None)
+        return snapshot
 
     def apply_effect_patch(self, raw_patch: object) -> None:
         patch = raw_patch if isinstance(raw_patch, dict) else {}
         if patch.get("_effect_patch") is not True or str(patch.get("id", "")) != self._project_id:
             raise ValueError("Effect patch belongs to another project")
         revision = patch.get("revision")
-        if type(revision) is not int or revision < self._revision:
+        if type(revision) is not int or revision < self._content_revision:
             raise ValueError("Effect patch revision is invalid")
-        upserts = patch.get("overlay_upserts", [])
+        candidate = deepcopy(self._canonical_snapshot)
+        candidate["overlays"] = self._patched_items(
+            candidate.get("overlays", []),
+            patch.get("overlay_upserts", []),
+            patch.get("removed_overlay_ids", []),
+            label="overlay",
+        )
+        candidate["media"] = self._patched_items(
+            candidate.get("media", []),
+            patch.get("media_upserts", []),
+            patch.get("removed_media_ids", []),
+            label="media",
+        )
+        candidate["revision"] = max(self._revision, revision)
+        projected = (
+            project_json_for_timeline(candidate)
+            if candidate.get("timeline_edit")
+            else candidate
+        )
+        projected_by_id = {
+            str(item.get("id", "")): item
+            for item in projected.get("overlays", [])
+            if isinstance(item, dict) and str(item.get("id", ""))
+        }
         removed_ids = patch.get("removed_overlay_ids", [])
-        mapped_upserts = self._map_overlay_ranges(upserts)
+        mapped_upserts = [
+            projected_by_id[str(item["id"])]
+            for item in patch.get("overlay_upserts", [])
+            if isinstance(item, dict) and str(item.get("id", "")) in projected_by_id
+        ]
         self.overlay_model.apply_patch(mapped_upserts, removed_ids)
-        removed = set(removed_ids) if isinstance(removed_ids, list) else set()
+        removed = set(removed_ids)
         by_id = {
             str(item.get("id", "")): dict(item)
             for item in self._overlays
             if str(item.get("id", "")) not in removed
         }
         for item in mapped_upserts:
-            if str(item.get("id", "")):
-                by_id[str(item["id"])] = item
+            by_id[str(item["id"])] = item
         self._overlays = list(by_id.values())
-        removed_media = patch.get("removed_media_ids", [])
-        if isinstance(removed_media, list):
-            for media_id in removed_media:
-                self._media_path_by_id.pop(str(media_id), None)
-        media_upserts = patch.get("media_upserts", [])
-        if isinstance(media_upserts, list):
-            for item in media_upserts:
-                if isinstance(item, dict) and isinstance(item.get("id"), str):
-                    self._media_path_by_id[item["id"]] = str(item.get("path", ""))
-        self._revision = revision
+        self._media_path_by_id = {
+            str(item["id"]): str(item.get("path", ""))
+            for item in candidate.get("media", [])
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        }
+        self._canonical_snapshot = candidate
+        self._revision = candidate["revision"]
+        self._content_revision = revision
         self.changed.emit()
+
+    @staticmethod
+    def _patched_items(
+        current: object,
+        upserts: object,
+        removed_ids: object,
+        *,
+        label: str,
+    ) -> list[dict]:
+        if not isinstance(current, list):
+            raise ValueError(f"Canonical {label} list is invalid")
+        if not isinstance(upserts, list) or not isinstance(removed_ids, list):
+            raise ValueError(f"Compact {label} patch is invalid")
+        removed = {
+            value for value in removed_ids if isinstance(value, str) and value
+        }
+        ordered_ids: list[str] = []
+        by_id: dict[str, dict] = {}
+        for raw in current:
+            if not isinstance(raw, dict):
+                raise ValueError(f"Canonical {label} is invalid")
+            item_id = raw.get("id")
+            if not isinstance(item_id, str) or not item_id:
+                raise ValueError(f"Canonical {label} identity is invalid")
+            if item_id in removed:
+                continue
+            ordered_ids.append(item_id)
+            by_id[item_id] = deepcopy(raw)
+        for raw in upserts:
+            if not isinstance(raw, dict):
+                raise ValueError(f"Compact {label} upsert is invalid")
+            item_id = raw.get("id")
+            if not isinstance(item_id, str) or not item_id:
+                raise ValueError(f"Compact {label} identity is invalid")
+            if item_id not in by_id:
+                ordered_ids.append(item_id)
+            by_id[item_id] = deepcopy(raw)
+        return [by_id[item_id] for item_id in ordered_ids if item_id in by_id]
+
+    @staticmethod
+    def _patched_timeline_cues(
+        current: object,
+        upserts: object,
+        removed_ids: object,
+        indices: object,
+        *,
+        label: str,
+    ) -> list[dict]:
+        if not isinstance(current, list) or not isinstance(upserts, list):
+            raise ValueError(f"Compact {label} cue patch is invalid")
+        if not isinstance(removed_ids, list) or not isinstance(indices, dict):
+            raise ValueError(f"Compact {label} cue identity patch is invalid")
+        removed = {
+            value for value in removed_ids if isinstance(value, str) and value
+        }
+        by_id: dict[str, dict] = {}
+        order: list[str] = []
+        for raw in current:
+            if not isinstance(raw, dict):
+                raise ValueError(f"Canonical {label} cue is invalid")
+            cue_id = raw.get("id")
+            if not isinstance(cue_id, str) or not cue_id:
+                raise ValueError(f"Canonical {label} cue identity is invalid")
+            if cue_id in removed:
+                continue
+            order.append(cue_id)
+            by_id[cue_id] = deepcopy(raw)
+        for raw in upserts:
+            if not isinstance(raw, dict):
+                raise ValueError(f"Compact {label} cue upsert is invalid")
+            cue_id = raw.get("id")
+            if not isinstance(cue_id, str) or not cue_id:
+                raise ValueError(f"Compact {label} cue identity is invalid")
+            if cue_id not in by_id:
+                order.append(cue_id)
+            by_id[cue_id] = {**by_id.get(cue_id, {}), **deepcopy(raw)}
+        for cue_id, value in indices.items():
+            if cue_id not in by_id or type(value) is not int or value <= 0:
+                raise ValueError(f"Compact {label} cue index map is invalid")
+            by_id[cue_id]["index"] = value
+        values = [by_id[cue_id] for cue_id in order if cue_id in by_id]
+        values.sort(key=lambda item: (int(item.get("index", 0)), str(item.get("id", ""))))
+        return values
+
+    @classmethod
+    def _patched_tracks(
+        cls,
+        current: object,
+        *,
+        track_upserts: object,
+        removed_track_ids: object,
+        clip_upserts: object,
+        removed_clip_ids: object,
+        track_order: object = None,
+        clip_metadata: object = None,
+    ) -> list[dict]:
+        if not all(
+            isinstance(value, list)
+            for value in (
+                current,
+                track_upserts,
+                removed_track_ids,
+                clip_upserts,
+                removed_clip_ids,
+            )
+        ):
+            raise ValueError("Compact timeline patch lists are invalid")
+        removed_tracks = {
+            value for value in removed_track_ids if isinstance(value, str) and value
+        }
+        tracks: dict[str, dict] = {}
+        order: list[str] = []
+        for raw_track in current:
+            if not isinstance(raw_track, dict):
+                raise ValueError("Canonical track is invalid")
+            track_id = raw_track.get("id")
+            if not isinstance(track_id, str) or not track_id:
+                raise ValueError("Canonical track identity is invalid")
+            if track_id in removed_tracks:
+                continue
+            track = {key: deepcopy(value) for key, value in raw_track.items() if key != "clips"}
+            track["clips"] = raw_track.get("clips", [])
+            raw_clips = track.get("clips", [])
+            if not isinstance(raw_clips, list):
+                raise ValueError("Canonical track clips are invalid")
+            normalized: list[dict] = []
+            for raw_clip in raw_clips:
+                if not isinstance(raw_clip, dict):
+                    raise ValueError("Canonical clip is invalid")
+                clip = deepcopy(raw_clip)
+                clip_id = clip.get("id")
+                if not isinstance(clip_id, str) or not clip_id:
+                    raise ValueError("Canonical clip identity is invalid")
+                owner_id = str(clip.get("track_id", track_id))
+                if owner_id != track_id:
+                    raise ValueError("Canonical clip belongs to another track")
+                clip["track_id"] = track_id
+                normalized.append(clip)
+            track["clips"] = normalized
+            tracks[track_id] = track
+            order.append(track_id)
+        for raw_track in track_upserts:
+            if not isinstance(raw_track, dict):
+                raise ValueError("Compact track upsert is invalid")
+            track_id = raw_track.get("id")
+            if not isinstance(track_id, str) or not track_id:
+                raise ValueError("Compact track identity is invalid")
+            if track_id in removed_tracks:
+                raise ValueError("Compact patch removes and upserts the same track")
+            previous = tracks.get(track_id, {"id": track_id, "clips": []})
+            incoming = deepcopy(raw_track)
+            if "clips" in incoming:
+                raise ValueError("Track upserts must not replace clips")
+            tracks[track_id] = {**previous, **incoming, "clips": previous["clips"]}
+            if track_id not in order:
+                order.append(track_id)
+
+        removed_clips = {
+            value for value in removed_clip_ids if isinstance(value, str) and value
+        }
+        owners: dict[str, str] = {}
+        clips_by_track: dict[str, dict[str, dict]] = {}
+        for track_id, track in tracks.items():
+            kept: dict[str, dict] = {}
+            for clip in track["clips"]:
+                clip_id = str(clip.get("id", ""))
+                if clip_id in owners:
+                    raise ValueError("Canonical clip identity is duplicated")
+                owners[clip_id] = track_id
+                if clip_id not in removed_clips:
+                    kept[clip_id] = clip
+            clips_by_track[track_id] = kept
+
+        for raw_clip in clip_upserts:
+            if not isinstance(raw_clip, dict):
+                raise ValueError("Compact clip upsert is invalid")
+            clip_id = raw_clip.get("id")
+            track_id = raw_clip.get("track_id")
+            if (
+                not isinstance(clip_id, str)
+                or not clip_id
+                or not isinstance(track_id, str)
+                or track_id not in tracks
+            ):
+                raise ValueError("Compact clip identity or owning track is invalid")
+            previous_owner = owners.get(clip_id)
+            if previous_owner is not None:
+                clips_by_track[previous_owner].pop(clip_id, None)
+            clip = deepcopy(raw_clip)
+            clip["track_id"] = track_id
+            clips_by_track[track_id][clip_id] = clip
+            owners[clip_id] = track_id
+
+        if clip_metadata is not None:
+            if not isinstance(clip_metadata, dict):
+                raise ValueError("Compact clip metadata patch is invalid")
+            for clip_id, values in clip_metadata.items():
+                owner = owners.get(clip_id)
+                if (owner is None or clip_id not in clips_by_track[owner]
+                        or not isinstance(values, dict)
+                        or set(values) != {"cue_index", "payload_revision"}
+                        or any(type(value) is not int or value <= 0 for value in values.values())):
+                    raise ValueError("Compact clip metadata identity or values are invalid")
+                clips_by_track[owner][clip_id].update(values)
+
+        for track_id, track in tracks.items():
+            track["clips"] = sorted(
+                clips_by_track[track_id].values(),
+                key=lambda clip: (
+                    int((clip.get("timeline_range") or {}).get("start_us", 0)),
+                    str(clip.get("id", "")),
+                )
+            )
+        if track_order is not None:
+            if (not isinstance(track_order, list) or len(track_order) != len(tracks)
+                    or any(not isinstance(item, str) for item in track_order)
+                    or set(track_order) != set(tracks)):
+                raise ValueError("Thứ tự track trong patch không hợp lệ")
+            order = track_order
+        return [tracks[track_id] for track_id in order if track_id in tracks]
+
+    def apply_timeline_patch(self, raw_patch: object) -> None:
+        canonical, projected = self.prepare_timeline_patch(
+            self.content_patch_snapshot(),
+            raw_patch,
+        )
+        self.apply_prepared_timeline_patch(canonical, projected)
+
+    @classmethod
+    def prepare_timeline_patch(
+        cls,
+        raw_snapshot: object,
+        raw_patch: object,
+    ) -> tuple[dict, dict]:
+        """Validate and project a timeline patch without touching Qt models.
+
+        This method is deliberately side-effect free so large cut projections
+        can run on the snapshot worker instead of blocking the GUI thread.
+        """
+
+        snapshot = raw_snapshot if isinstance(raw_snapshot, dict) else {}
+        patch = raw_patch if isinstance(raw_patch, dict) else {}
+        if (
+            patch.get("_timeline_patch") is not True
+            or str(patch.get("id", "")) != str(snapshot.get("id", ""))
+        ):
+            raise ValueError("Timeline patch belongs to another project")
+        revision = patch.get("revision")
+        current_revision = snapshot.get("revision", 0)
+        if type(current_revision) is not int:
+            raise ValueError("Canonical timeline revision is invalid")
+        if type(revision) is not int or revision <= current_revision:
+            raise ValueError("Timeline patch revision is invalid")
+        candidate = dict(snapshot)
+        if "media_upserts" in patch or "removed_media_ids" in patch:
+            candidate["media"] = cls._patched_items(
+                candidate.get("media", []),
+                patch.get("media_upserts", []),
+                patch.get("removed_media_ids", []),
+                label="media",
+            )
+        candidate["tracks"] = cls._patched_tracks(
+            candidate.get("tracks", []),
+            track_upserts=patch.get("track_upserts", []),
+            removed_track_ids=patch.get("removed_track_ids", []),
+            clip_upserts=patch.get("clip_upserts", []),
+            removed_clip_ids=patch.get("removed_clip_ids", []),
+            track_order=patch.get("track_order"),
+        )
+        if "timeline_edit" in patch:
+            timeline_edit = patch.get("timeline_edit")
+            if timeline_edit is not None and not isinstance(timeline_edit, dict):
+                raise ValueError("Timeline edit patch is invalid")
+            candidate["timeline_edit"] = deepcopy(timeline_edit)
+        if "timeline_markers" in patch:
+            markers = patch.get("timeline_markers")
+            if not isinstance(markers, (list, tuple)) or any(
+                type(value) is not int or value < 0 for value in markers
+            ):
+                raise ValueError("Timeline markers are invalid")
+            normalized_markers = sorted(set(markers))
+            if normalized_markers != list(markers):
+                raise ValueError("Timeline markers must be sorted and unique")
+            candidate["timeline_markers"] = normalized_markers
+        if "voice_conform" in patch:
+            voice_conform = patch.get("voice_conform")
+            if voice_conform is not None and not isinstance(voice_conform, dict):
+                raise ValueError("Voice conform patch is invalid")
+            candidate["voice_conform"] = deepcopy(voice_conform)
+        if "overlay_upserts" in patch or "removed_overlay_ids" in patch:
+            candidate["overlays"] = cls._patched_items(
+                candidate.get("overlays", []),
+                patch.get("overlay_upserts", []),
+                patch.get("removed_overlay_ids", []),
+                label="overlay",
+            )
+        for label, key in (("source", "source_cues"), ("translated", "translated_cues"),
+                           ("title", "title_cues")):
+            if any(
+                name in patch
+                for name in (
+                    f"{label}_cue_upserts",
+                    f"removed_{label}_cue_ids",
+                    f"{label}_cue_indices",
+                )
+            ):
+                candidate[key] = cls._patched_timeline_cues(
+                    candidate.get(key, []),
+                    patch.get(f"{label}_cue_upserts", []),
+                    patch.get(f"removed_{label}_cue_ids", []),
+                    patch.get(f"{label}_cue_indices", {}),
+                    label=label,
+                )
+        candidate["revision"] = revision
+        projected = (
+            project_json_for_timeline(candidate)
+            if candidate.get("timeline_edit")
+            else candidate
+        )
+        return candidate, projected
+
+    def apply_prepared_timeline_patch(self, canonical: dict, projected: dict) -> None:
+        """Commit a worker-prepared snapshot as one Qt model update batch."""
+
+        if str(canonical.get("id", "")) != self._project_id:
+            raise ValueError("Timeline patch belongs to another project")
+        revision = canonical.get("revision")
+        if type(revision) is not int or revision <= self._content_revision:
+            raise ValueError("Timeline patch revision is invalid")
+        # Model replacement only happens after the complete candidate has
+        # validated, so malformed identities cannot partially mutate state.
+        self._canonical_snapshot = self._preserve_translation_preferences(canonical)
+        self._canonical_snapshot["revision"] = max(self._revision, revision)
+        projected = self._preserve_translation_preferences(projected)
+        projected["revision"] = self._canonical_snapshot["revision"]
+        self._content_revision = revision
+        self._replace_projected_snapshot(projected)
 
     def apply_local_effect_command(
         self,
@@ -3137,11 +4171,16 @@ class ProjectStateModel(QObject):
         )
 
     def _apply_local_effect_patch(self, upserts: object, removed_ids: object) -> None:
-        values = [dict(item) for item in upserts if isinstance(item, dict)] \
-            if isinstance(upserts, list) else []
-        removed = {
-            str(item) for item in removed_ids if isinstance(item, str) and item
-        } if isinstance(removed_ids, list) else set()
+        values = (
+            [dict(item) for item in upserts if isinstance(item, dict)]
+            if isinstance(upserts, list)
+            else []
+        )
+        removed = (
+            {str(item) for item in removed_ids if isinstance(item, str) and item}
+            if isinstance(removed_ids, list)
+            else set()
+        )
         self.overlay_model.apply_patch(values, list(removed))
         by_id = {
             str(item.get("id", "")): dict(item)
@@ -3156,37 +4195,79 @@ class ProjectStateModel(QObject):
         self.changed.emit()
 
     def apply_subtitle_patch(self, raw_patch: object) -> None:
+        canonical, projected = self.prepare_subtitle_patch(self.content_patch_snapshot(), raw_patch)
+        self.apply_prepared_subtitle_patch(canonical, projected)
+
+    @classmethod
+    def prepare_subtitle_patch(cls, snapshot: dict, raw_patch: object) -> tuple[dict, dict]:
         patch = raw_patch if isinstance(raw_patch, dict) else {}
-        if str(patch.get("id", "")) != self._project_id:
+        if str(patch.get("id", "")) != snapshot.get("id"):
             raise ValueError("Subtitle patch belongs to another project")
         revision = patch.get("revision")
-        if type(revision) is not int or revision < self._revision:
+        if type(revision) is not int or revision < snapshot.get("revision", 0):
             raise ValueError("Subtitle patch revision is invalid")
-        source_cues = self._map_cue_ranges(patch.get("source_cues", []))
-        translated_cues = self._map_cue_ranges(patch.get("translated_cues", []))
-        self.subtitle_cues.replace(source_cues, translated_cues)
-        self._apply_subtitle_clip_patch(
-            patch.get("subtitle_clip_upserts", []),
-            patch.get("removed_subtitle_clip_ids", []),
-            patch.get("subtitle_track_upserts", []),
-            patch.get("removed_subtitle_track_ids", []),
+        candidate = dict(snapshot)
+        if "source_cues" in patch or "translated_cues" in patch:
+            source_cues = patch.get("source_cues", [])
+            translated_cues = patch.get("translated_cues", [])
+            if not isinstance(source_cues, list) or not isinstance(translated_cues, list):
+                raise ValueError("Subtitle cue lists are invalid")
+            candidate["source_cues"] = deepcopy(source_cues)
+            candidate["translated_cues"] = deepcopy(translated_cues)
+        else:
+            candidate["source_cues"] = cls._patched_timeline_cues(
+                candidate.get("source_cues", []),
+                patch.get("source_cue_upserts", []),
+                patch.get("removed_source_cue_ids", []),
+                patch.get("source_cue_indices", {}),
+                label="source cue",
+            )
+            candidate["translated_cues"] = cls._patched_timeline_cues(
+                candidate.get("translated_cues", []),
+                patch.get("translated_cue_upserts", []),
+                patch.get("removed_translated_cue_ids", []),
+                patch.get("translated_cue_indices", {}),
+                label="translated cue",
+            )
+        if any(
+            key in patch
+            for key in (
+                "subtitle_clip_upserts",
+                "removed_subtitle_clip_ids",
+                "subtitle_track_upserts",
+                "removed_subtitle_track_ids",
+                "subtitle_clip_metadata",
+            )
+        ):
+            candidate["tracks"] = cls._patched_tracks(
+                candidate.get("tracks", []),
+                track_upserts=patch.get("subtitle_track_upserts", []),
+                removed_track_ids=patch.get("removed_subtitle_track_ids", []),
+                clip_upserts=patch.get("subtitle_clip_upserts", []),
+                removed_clip_ids=patch.get("removed_subtitle_clip_ids", []),
+                clip_metadata=patch.get("subtitle_clip_metadata"),
+            )
+        if "ocr_dialogue_region" in patch:
+            candidate["ocr_dialogue_region"] = deepcopy(patch.get("ocr_dialogue_region"))
+        if "ocr_exclusion_regions" in patch:
+            candidate["ocr_exclusion_regions"] = deepcopy(patch.get("ocr_exclusion_regions"))
+        candidate["revision"] = revision
+        projected = (
+            project_json_for_timeline(candidate) if candidate.get("timeline_edit") else candidate
         )
-        raw_dialogue_region = patch.get("ocr_dialogue_region")
-        self._ocr_dialogue_region = (
-            [float(value) for value in raw_dialogue_region]
-            if isinstance(raw_dialogue_region, (list, tuple))
-            and len(raw_dialogue_region) == 4
-            else []
-        )
-        raw_exclusions = patch.get("ocr_exclusion_regions", [])
-        self._ocr_exclusion_regions = [
-            [float(value) for value in item]
-            for item in raw_exclusions
-            if isinstance(item, (list, tuple)) and len(item) == 4
-        ] if isinstance(raw_exclusions, list) else []
-        self._revision = revision
-        self._has_translated_subtitles = bool(translated_cues)
-        self.changed.emit()
+        return candidate, projected
+
+    def apply_prepared_subtitle_patch(self, canonical: dict, projected: dict) -> None:
+        revision = canonical.get("revision")
+        if (canonical.get("id") != self._project_id or type(revision) is not int
+                or revision < self._content_revision):
+            raise ValueError("Subtitle patch belongs to an outdated project revision")
+        self._canonical_snapshot = self._preserve_translation_preferences(canonical)
+        self._canonical_snapshot["revision"] = max(self._revision, revision)
+        projected = self._preserve_translation_preferences(projected)
+        projected["revision"] = self._canonical_snapshot["revision"]
+        self._content_revision = revision
+        self._replace_projected_snapshot(projected, preserve_live_translations=True)
 
     def _apply_subtitle_clip_patch(
         self,
@@ -3211,11 +4292,7 @@ class ProjectStateModel(QObject):
             else []
         )
         removed_tracks = (
-            {
-                str(value)
-                for value in removed_track_ids
-                if isinstance(value, str) and value
-            }
+            {str(value) for value in removed_track_ids if isinstance(value, str) and value}
             if isinstance(removed_track_ids, list)
             else set()
         )
@@ -3226,11 +4303,7 @@ class ProjectStateModel(QObject):
             track_id = str(item.get("track_id", ""))
             if track_id:
                 by_track.setdefault(track_id, []).append(item)
-        upsert_ids = {
-            str(item.get("id", ""))
-            for item in values
-            if str(item.get("id", ""))
-        }
+        upsert_ids = {str(item.get("id", "")) for item in values if str(item.get("id", ""))}
         upsert_target_by_id = {
             str(item.get("id", "")): str(item.get("track_id", ""))
             for item in values
@@ -3262,8 +4335,11 @@ class ProjectStateModel(QObject):
             if track_id not in by_track and not removed and not upsert_ids:
                 continue
             raw_clips = track.get("clips", [])
-            clips = [dict(item) for item in raw_clips if isinstance(item, dict)] \
-                if isinstance(raw_clips, list) else []
+            clips = (
+                [dict(item) for item in raw_clips if isinstance(item, dict)]
+                if isinstance(raw_clips, list)
+                else []
+            )
             ordered_ids = [str(item.get("id", "")) for item in clips]
             by_id = {
                 str(item.get("id", "")): item
@@ -3279,10 +4355,7 @@ class ProjectStateModel(QObject):
                 clip_id
                 for clip_id in ordered_ids
                 if clip_id not in removed
-                and (
-                    clip_id not in upsert_ids
-                    or upsert_target_by_id.get(clip_id) == track_id
-                )
+                and (clip_id not in upsert_ids or upsert_target_by_id.get(clip_id) == track_id)
             ]
             for item in by_track.get(track_id, []):
                 clip_id = str(item.get("id", ""))
@@ -3291,11 +4364,7 @@ class ProjectStateModel(QObject):
                 if clip_id not in ordered_ids:
                     ordered_ids.append(clip_id)
                 by_id[clip_id] = item
-            track["clips"] = [
-                by_id[clip_id]
-                for clip_id in ordered_ids
-                if clip_id in by_id
-            ]
+            track["clips"] = [by_id[clip_id] for clip_id in ordered_ids if clip_id in by_id]
         self._track_by_id = {
             str(track["id"]): track
             for track in tracks
@@ -3313,6 +4382,22 @@ class ProjectStateModel(QObject):
     def replace_voice_timing_rows(self, raw_rows: object) -> None:
         if self._voice_conform_plan is None:
             self.voice_conform_cues.replace_timing_rows(raw_rows)
+
+    def _display_clip_tracks(self, tracks: list) -> list:
+        plan = self._voice_conform_plan
+        if plan is None:
+            return tracks
+        # Keep source ranges and the clip lookup canonical for media decoding
+        # and commands. Only the paint model uses conformed display time.
+        return [
+            {**track, "clips": [
+                {**clip, "timeline_range": {
+                    "start_us": plan.source_to_output_us(clip["timeline_range"]["start_us"]),
+                    "end_us": plan.source_to_output_us(clip["timeline_range"]["end_us"]),
+                }} for clip in track.get("clips", [])
+            ]} if track.get("kind") in {"video", "original_audio", "subtitle", "text"}
+            else track for track in tracks
+        ]
 
     def _map_cue_ranges(self, raw_cues: object) -> list[dict]:
         if not isinstance(raw_cues, list):
@@ -3439,25 +4524,18 @@ class ProjectStateModel(QObject):
 
         tracks = raw_tracks if isinstance(raw_tracks, list) else []
         translated_by_id = {
-            str(cue.get("id", "")): cue
-            for cue in translated_cues
-            if str(cue.get("id", ""))
+            str(cue.get("id", "")): cue for cue in translated_cues if str(cue.get("id", ""))
         }
+        source_ids = {str(cue.get("id", "")) for cue in source_cues}
         translated_by_index = {
-            int(cue["index"]): cue
-            for cue in translated_cues
-            if type(cue.get("index")) is int
+            int(cue["index"]): cue for cue in translated_cues if type(cue.get("index")) is int
         }
         cues_by_role = {
             "S1": [
-                cue
-                for cue in source_cues
-                if cue.get("cue_role", cue.get("role")) != "scene_text"
+                cue for cue in source_cues if cue.get("cue_role", cue.get("role")) != "scene_text"
             ],
             "S2": [
-                cue
-                for cue in source_cues
-                if cue.get("cue_role", cue.get("role")) == "scene_text"
+                cue for cue in source_cues if cue.get("cue_role", cue.get("role")) == "scene_text"
             ],
         }
         restored: list[object] = []
@@ -3491,6 +4569,9 @@ class ProjectStateModel(QObject):
                 translated = translated_by_id.get(cue_id) or (
                     translated_by_index.get(cue_index) if type(cue_index) is int else None
                 )
+                if (isinstance(translated, dict) and translated.get("id") in source_ids
+                        and translated.get("id") != cue_id):
+                    translated = None
                 text = translated.get("text") if isinstance(translated, dict) else ""
                 clip["cue_text"] = (
                     str(text)

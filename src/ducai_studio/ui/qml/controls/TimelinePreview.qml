@@ -14,6 +14,9 @@ Item {
     required property var appModel
     property bool showProjectOverlays: false
     property bool editableOverlays: false
+    property bool editableProjectOverlays: false
+    property bool videoContextMenuEnabled: false
+    signal videoContextMenuRequested(real x, real y)
     property string selectedOverlayId: "overlay-default-logo"
     // Optional editing mode used by the extraction/subtitle workspace. The
     // paused, painted video itself is the coordinate authority.
@@ -26,6 +29,9 @@ Item {
     property string subtitleGeometryCueId: ""
     property string subtitleGeometryMode: ""
     property point subtitleGeometryPress: Qt.point(0, 0)
+    property size subtitleGeometryBaseSize: Qt.size(1, 1)
+    property var subtitleGeometrySeedArtwork: ({})
+    readonly property var selectionIds: root.appModel.selectedCueIds
     property real subtitleGeometryDeltaX: 0
     property real subtitleGeometryDeltaY: 0
     property real subtitleGeometryScaleX: 1
@@ -41,15 +47,14 @@ Item {
     property real pendingVoicePositionMs: -1
     property bool pendingVoicePlay: false
     property bool updatingPlayheadFromPlayer: false
-    // Transport is an overlay, not permanent chrome. It appears only while
-    // the pointer is over the video/transport surface and fades immediately
-    // after the pointer leaves, matching the familiar YouTube interaction.
-    property bool controlsVisible: false
+    // Playback chrome has its own space below the video; it never hides text.
+    property bool controlsVisible: true
     property bool viewportHovered: false
     property bool transportHovered: false
     readonly property bool controlsHovered: viewportHovered || transportHovered
     property bool volumeHovered: false
     readonly property int playbackState: player.playbackState
+    readonly property bool playing: player.playbackState === MediaPlayer.PlayingState
     readonly property int voicePlaybackState: voicePlayer.playbackState
     readonly property int mediaStatus: player.mediaStatus
     readonly property real positionMs: root.appModel.playheadUs / 1000
@@ -59,26 +64,46 @@ Item {
     readonly property bool muted: audioOutput.muted && voiceAudio.muted
     readonly property real masterVolume: root.appModel.previewMasterVolumePercent / 100
     property var activeSubtitle: {
+        if (!root.visible) return ({})
         const playhead = root.appModel.playheadUs
         const revision = root.appModel.currentProject.revision
+        const visualRevision = root.appModel.currentProject.subtitleVisualRevision
         return root.appModel.currentProject.subtitleAt(playhead)
     }
     property var activeSubtitleRegions: {
+        if (!root.visible) return []
         const playhead = root.appModel.playheadUs
         const revision = root.appModel.currentProject.revision
+        const visualRevision = root.appModel.currentProject.subtitleVisualRevision
         return root.appModel.currentProject.sourceSubtitleRegionsAt(playhead)
     }
     property var activeSceneTexts: {
+        if (!root.visible) return []
         const playhead = root.appModel.playheadUs
         const revision = root.appModel.currentProject.revision
         const visualRevision = root.appModel.currentProject.subtitleVisualRevision
         return root.appModel.currentProject.sceneTextsAt(playhead)
     }
+    property var activeTitleTexts: {
+        if (!root.visible) return []
+        const playhead = root.appModel.playheadUs
+        const revision = root.appModel.currentProject.revision
+        const visualRevision = root.appModel.currentProject.subtitleVisualRevision
+        return root.appModel.currentProject.titleTextsAt(playhead)
+    }
     readonly property string activeSubtitleText: activeSubtitle.translated_text
         || activeSubtitle.source_text || ""
     property var blurOverlay: {
         const revision = root.appModel.currentProject.revision
-        return root.appModel.currentProject.overlay("overlay-default-blur")
+        const stored = root.appModel.currentProject.overlay("overlay-default-blur")
+        return Object.assign({id: "overlay-default-blur", kind: "blur",
+            range: {start_us: 0, end_us: root.appModel.currentProject.durationUs},
+            blur_radius: 22, opacity: 1, padding_x: 0.012, padding_y: 0.008,
+            concealment_mode: "blur"}, stored, {
+            enabled: root.appModel.exportSubtitleBackgroundEnabled
+                && root.appModel.exportSubtitleBackgroundMode === "blur",
+            tracking_mode: "source_subtitle"
+        })
     }
     property var logoOverlay: {
         const revision = root.appModel.currentProject.revision
@@ -168,6 +193,21 @@ Item {
     function trackedSubtitleBlur(overlay, activeCue) {
         if (!overlay || overlay.tracking_mode !== "source_subtitle") return overlay
         const cue = activeCue || ({})
+        const canvas = root.exportCanvasSize()
+        const artwork = root.artworkForCue(cue)
+        if (artwork.concealment_rect || artwork.text_rect) {
+            const rect = artwork.concealment_rect || artwork.text_rect
+            const padX = root.overlayNumber(overlay, "padding_x", 0.012)
+            const padY = root.overlayNumber(overlay, "padding_y", 0.008)
+            const left = Math.max(0, rect[0] / canvas.width - padX)
+            const top = Math.max(0, rect[1] / canvas.height - padY)
+            const right = Math.min(1, (rect[0] + rect[2]) / canvas.width + padX)
+            const bottom = Math.min(1, (rect[1] + rect[3]) / canvas.height + padY)
+            return Object.assign({}, overlay, {
+                "x": left, "y": top, "width": right - left, "height": bottom - top,
+                "region_source": "estimated"
+            })
+        }
         const rawBox = cue.visual_box
         let x = 0
         let y = 0
@@ -217,93 +257,47 @@ Item {
         return rect.height / Math.max(1, canvas.height)
     }
 
-    function subtitleHorizontalAlignment() {
-        if (root.appModel.exportSubtitleAlignment === 1) return Text.AlignLeft
-        if (root.appModel.exportSubtitleAlignment === 3) return Text.AlignRight
-        return Text.AlignHCenter
+    function cueSelected(cueId) {
+        return root.selectionIds.length > 0 && root.appModel.isCueSelected(String(cueId || ""))
     }
 
-    function sceneDisplayText(cue) {
-        const raw = String(cue.translated_text || cue.source_text || "").trim()
-        const lines = raw.split("\n").map(function(line) {
-            return line.trim().replace(/\s+/g, " ")
-        }).filter(function(line) { return line.length > 0 })
-        const value = lines.join("\n")
-        if (cue.orientation !== "vertical") return value
-        const words = value.split(/\s+/).filter(function(word) { return word.length > 0 })
-        return (words.length > 1 ? words : value.split("")).join("\n")
+    function baseArtworkForCue(cue) {
+        if (!cue || !cue.cue_id) return ({})
+        // Read every setting here so edits refresh even while playback is paused.
+        const settingsRevision = root.appModel.exportFontSize
+            + root.appModel.exportSubtitleMarginBottom
+            + root.appModel.exportSubtitleOutlineWidth
+            + root.appModel.exportSubtitleAlignment
+            + root.appModel.exportSubtitleOpacityPercent
+            + root.appModel.exportFontFamily
+            + root.appModel.exportSubtitlePrimaryColor
+            + root.appModel.exportSubtitleOutlineColor
+            + root.appModel.exportSubtitleBackgroundMode
+            + root.appModel.exportSubtitleBackgroundEnabled
+        const canvas = root.exportCanvasSize()
+        return root.appModel.subtitleArtwork(cue, Math.round(canvas.width), Math.round(canvas.height))
     }
 
-    function dialogueFontPixels(cue, scaleFactor) {
-        const requested = Number(cue && cue.text_font_size || 12)
-        const editorScale = Math.max(
-            1,
-            Math.min(100, isFinite(requested) ? requested : 12)
-        ) / 12.0
-        return Math.max(
-            1,
-            root.appModel.exportFontSize * scaleFactor * editorScale
-        )
-    }
-
-    function subtitleFontFamily(cue, fallback) {
-        const style = String(cue && cue.style_hint || "standard")
-        if (style === "calligraphy") return "Playwrite VN"
-        if (style === "calligraphy_soft") return "Dancing Script"
-        if (style === "calligraphy_bold") return "Lobster"
-        if (style === "calligraphy_ink") return "Agbalumo"
-        if (style === "calligraphy_brush") return "Comforter Brush"
-        if (style === "calligraphy_water") return "Water Brush"
-        if (style === "calligraphy_splash") return "Splash"
-        if (style === "calligraphy_hurricane") return "Hurricane"
-        return fallback
-    }
-
-    function sceneFontPixels(cue, panelWidth, panelHeight) {
-        const value = sceneDisplayText(cue)
-        const lines = value.split("\n")
-        const glyph = sceneGlyphRect(cue)
-        const glyphWidth = Math.max(1, glyph.width)
-        const glyphHeight = Math.max(1, glyph.height)
-        const legacyScaleValue = Number(cue.scene_font_scale || 1.0)
-        const legacyScale = Math.max(0.5, Math.min(2.0,
-            isFinite(legacyScaleValue) ? legacyScaleValue : 1.0))
-        const editorSizeValue = Number(cue.text_font_size || 12)
-        const editorScale = Math.max(1, Math.min(100,
-            isFinite(editorSizeValue) ? editorSizeValue : 12)) / 12.0
-        const fontScale = legacyScale * editorScale
-        let longest = 1
-        for (let index = 0; index < lines.length; ++index)
-            longest = Math.max(longest, lines[index].length)
-        let panelFit
-        let sourceSize
-        const calligraphy = String(cue.style_hint || "").indexOf("calligraphy") === 0
-        const widthRatio = calligraphy ? 1.96 : 1.28
-        const lineHeightRatio = calligraphy ? 2.55 : 1.32
-        if (cue.orientation === "vertical") {
-            panelFit = Math.min(
-                panelWidth * 0.88 / Math.max(1.0, longest * widthRatio),
-                panelHeight * 0.88 / Math.max(1.25,
-                    lines.length * lineHeightRatio)
-            )
-            sourceSize = Math.min(
-                glyphWidth * 0.92,
-                glyphHeight / Math.max(1.0, lines.length * 1.08)
-            )
-        } else {
-            panelFit = Math.min(
-                panelWidth * 0.88 / Math.max(1.0, longest * widthRatio),
-                panelHeight * 0.88 / Math.max(1.0,
-                    lines.length * lineHeightRatio)
-            )
-            sourceSize = glyphHeight * 0.92
+    function artworkForCue(cue) {
+        if (!cue || !cue.cue_id) return ({})
+        const base = root.subtitleGeometryActive && root.cueSelected(cue.cue_id)
+            ? (root.subtitleGeometrySeedArtwork[String(cue.cue_id)] || root.baseArtworkForCue(cue))
+            : root.baseArtworkForCue(cue)
+        if (root.subtitleGeometryActive
+                && root.cueSelected(cue.cue_id)) {
+            const copy = Object.assign({}, cue)
+            const panel = cue.cue_role !== "dialogue"
+                ? root.scenePanelRect(cue) : root.dialoguePanelRect(cue)
+            const video = root.renderedVideoRect()
+            copy.panel_box = [(panel.x - video.x) / video.width,
+                (panel.y - video.y) / video.height,
+                panel.width / video.width, panel.height / video.height]
+            const canvas = root.exportCanvasSize()
+            return root.appModel.subtitleArtwork(copy, Math.round(canvas.width), Math.round(canvas.height))
         }
-        const automaticSize = Math.min(sourceSize, panelFit)
-        const safeRenderMax = Math.max(
-            panelWidth, panelHeight, glyphWidth, glyphHeight
-        ) * 8
-        return Math.max(1, Math.min(automaticSize * fontScale, safeRenderMax))
+        return base
     }
+
 
     function normalizedSceneRect(cue, key) {
         const raw = cue && cue[key]
@@ -346,7 +340,7 @@ Item {
             normalized.height * video.height
         )
         if (root.subtitleGeometryActive
-                && root.appModel.isCueSelected(String(cue.cue_id || ""))) {
+                && root.cueSelected(cue.cue_id)) {
             result.x += root.subtitleGeometryDeltaX * video.width
             result.y += root.subtitleGeometryDeltaY * video.height
             result.width *= root.subtitleGeometryScaleX
@@ -360,8 +354,14 @@ Item {
     function dialoguePanelRect(cue) {
         const video = renderedVideoRect()
         let normalized = normalizedSceneRect(cue, "panel_box")
-        if (normalized.width <= 0 || normalized.height <= 0)
-            normalized = Qt.rect(0.10, 0.74, 0.80, 0.16)
+        if (normalized.width <= 0 || normalized.height <= 0) {
+            const base = root.subtitleGeometrySeedArtwork[String(cue.cue_id)]
+                || root.baseArtworkForCue(cue)
+            const rect = base.placement_rect
+            const canvas = root.exportCanvasSize()
+            normalized = rect ? Qt.rect(rect[0] / canvas.width, rect[1] / canvas.height,
+                rect[2] / canvas.width, rect[3] / canvas.height) : Qt.rect(0.1, 0.74, 0.8, 0.16)
+        }
         let result = Qt.rect(
             video.x + normalized.x * video.width,
             video.y + normalized.y * video.height,
@@ -369,7 +369,7 @@ Item {
             normalized.height * video.height
         )
         if (root.subtitleGeometryActive
-                && root.appModel.isCueSelected(String(cue.cue_id || ""))) {
+                && root.cueSelected(cue.cue_id)) {
             result.x += root.subtitleGeometryDeltaX * video.width
             result.y += root.subtitleGeometryDeltaY * video.height
             result.width *= root.subtitleGeometryScaleX
@@ -383,10 +383,9 @@ Item {
     function beginSubtitleGeometry(cue, mode, viewportX, viewportY, modifiers) {
         if (!cue || !cue.cue_id || root.appModel.subtitleBusy
                 || root.subtitleGeometryPending) return
-        if (!root.appModel.isCueSelected(String(cue.cue_id)))
-            root.appModel.selectCueWithAdditive(
+        if (!root.cueSelected(cue.cue_id))
+            root.appModel.selectTimelineCue(
                 String(cue.cue_id),
-                Number(cue.start_us || 0),
                 Boolean(Number(modifiers || Qt.NoModifier) & Qt.ControlModifier)
             )
         root.pause()
@@ -397,6 +396,13 @@ Item {
         root.subtitleGeometryDeltaY = 0
         root.subtitleGeometryScaleX = 1
         root.subtitleGeometryScaleY = 1
+        const panel = cue.cue_role !== "dialogue"
+            ? root.scenePanelRect(cue) : root.dialoguePanelRect(cue)
+        root.subtitleGeometryBaseSize = Qt.size(panel.width, panel.height)
+        let seeds = ({})
+        for (const visibleCue of root.activeSubtitleRegions)
+            seeds[String(visibleCue.cue_id)] = root.baseArtworkForCue(visibleCue)
+        root.subtitleGeometrySeedArtwork = seeds
         root.subtitleGeometryActive = true
     }
 
@@ -406,8 +412,10 @@ Item {
         const dx = viewportX - root.subtitleGeometryPress.x
         const dy = viewportY - root.subtitleGeometryPress.y
         if (root.subtitleGeometryMode === "resize") {
-            root.subtitleGeometryScaleX = Math.max(0.1, (baseWidth + dx) / Math.max(1, baseWidth))
-            root.subtitleGeometryScaleY = Math.max(0.1, (baseHeight + dy) / Math.max(1, baseHeight))
+            root.subtitleGeometryScaleX = Math.max(0.1,
+                (root.subtitleGeometryBaseSize.width + dx) / Math.max(1, root.subtitleGeometryBaseSize.width))
+            root.subtitleGeometryScaleY = Math.max(0.1,
+                (root.subtitleGeometryBaseSize.height + dy) / Math.max(1, root.subtitleGeometryBaseSize.height))
         } else {
             root.subtitleGeometryDeltaX = dx / Math.max(1, video.width)
             root.subtitleGeometryDeltaY = dy / Math.max(1, video.height)
@@ -426,7 +434,10 @@ Item {
         const sy = root.subtitleGeometryScaleY
         if (changed) {
             root.subtitleGeometryPending = true
-            root.appModel.transformSelectedSubtitleGeometry(dx, dy, sx, sy)
+            const canvas = root.exportCanvasSize()
+            if (!root.appModel.transformSelectedSubtitleGeometry(dx, dy, sx, sy,
+                    Math.round(canvas.width), Math.round(canvas.height)))
+                root.resetSubtitleGeometry()
         } else {
             root.resetSubtitleGeometry()
         }
@@ -441,19 +452,27 @@ Item {
         root.subtitleGeometryDeltaY = 0
         root.subtitleGeometryScaleX = 1
         root.subtitleGeometryScaleY = 1
+        root.subtitleGeometrySeedArtwork = ({})
     }
 
-    function validSceneBackgroundColor(value) {
-        return /^#[0-9a-fA-F]{6}$/.test(String(value || ""))
+    function cancelSubtitleGeometry() {
+        // Only a released gesture commits. A destroyed grab must not leave
+        // playback disabled or submit a partial movement against another cue.
+        if (!root.subtitleGeometryPending) root.resetSubtitleGeometry()
     }
 
-    function isInkBackgroundStyle(value) {
-        const style = String(value || "solid")
-        return style === "ink_splash"
-            || style === "ink_wash"
-            || style === "ink_cloud"
-            || style === "brush_stroke"
+    function cancelHiddenSubtitleGeometry() {
+        if (!root.subtitleGeometryActive || root.subtitleGeometryPending) return
+        for (const cue of root.activeSceneTexts.concat(root.activeTitleTexts, root.activeSubtitleRegions)) {
+            if (String(cue.cue_id) === root.subtitleGeometryCueId) return
+        }
+        root.cancelSubtitleGeometry()
     }
+
+    onActiveSceneTextsChanged: root.cancelHiddenSubtitleGeometry()
+    onActiveTitleTextsChanged: root.cancelHiddenSubtitleGeometry()
+    onActiveSubtitleRegionsChanged: root.cancelHiddenSubtitleGeometry()
+
 
     function openSubtitleMenu(cue) {
         root.subtitleMenuCue = cue || ({})
@@ -548,6 +567,8 @@ Item {
         }
     }
     function pause() {
+        pendingPlay = false
+        pendingVoicePlay = false
         player.pause()
         voicePlayer.pause()
     }
@@ -694,6 +715,17 @@ Item {
         return String(hours).padStart(2, "0") + ":"
             + String(minutes).padStart(2, "0") + ":"
             + String(rest).padStart(2, "0")
+            + "." + String(Math.floor(Math.max(0, milliseconds)) % 1000).padStart(3, "0")
+    }
+
+    function seekTimeText(value) {
+        const match = /^(\d+):([0-5]\d):([0-5]\d)(?:\.(\d{1,3}))?$/.exec(String(value).trim())
+        if (!match) return false
+        const millis = Number(match[1]) * 3600000 + Number(match[2]) * 60000
+            + Number(match[3]) * 1000 + Number(String(match[4] || "0").padEnd(3, "0"))
+        if (millis > durationMs) return false
+        seekTimeline(millis, false)
+        return true
     }
 
     MediaPlayer {
@@ -723,7 +755,7 @@ Item {
             player.setPosition(requested)
             if (shouldPlay) player.play()
         }
-        onPositionChanged: {
+        onPositionChanged: function(position) {
             if (root.applyingTimelineSeek || !root.activeDescriptor.available) return
             const sourceOffset = Math.max(
                 0, position - root.activeDescriptor.sourceStartMs
@@ -774,7 +806,10 @@ Item {
 
     onVisibleChanged: {
         if (visible) seekTimeline(root.positionMs, false)
-        else pause()
+        else {
+            pause()
+            root.cancelSubtitleGeometry()
+        }
     }
 
     Connections {
@@ -790,6 +825,7 @@ Item {
 
     Connections {
         target: root.appModel
+        function onOverlaySelectionRequested(overlayId) { root.selectedOverlayId = overlayId }
         function onPlayheadChanged() {
             if (!root.visible || root.applyingTimelineSeek
                     || root.updatingPlayheadFromPlayer) return
@@ -808,9 +844,8 @@ Item {
             root.pendingVoicePositionMs = -1
             root.pendingVoicePlay = false
         }
-        function onSubtitleBusyChanged() {
-            if (root.subtitleGeometryPending && !root.appModel.subtitleBusy)
-                root.resetSubtitleGeometry()
+        function onSubtitleGeometrySettled(generation, succeeded) {
+            if (root.subtitleGeometryPending) root.resetSubtitleGeometry()
         }
     }
 
@@ -827,13 +862,13 @@ Item {
         sequence: "Left"
         context: Qt.WindowShortcut
         enabled: root.visible && !root.textEditorHasFocus()
-        onActivated: root.seekRelative(-5_000)
+        onActivated: root.seekRelative(-root.appModel.timelineSeekStepMs)
     }
     Shortcut {
         sequence: "Right"
         context: Qt.WindowShortcut
         enabled: root.visible && !root.textEditorHasFocus()
-        onActivated: root.seekRelative(5_000)
+        onActivated: root.seekRelative(root.appModel.timelineSeekStepMs)
     }
 
     AudioOutput {
@@ -858,7 +893,7 @@ Item {
             // Effects mode is a static editing canvas. The playback transport
             // is not part of that surface, so every video pixel remains usable
             // for direct logo/blur manipulation.
-            anchors.bottom: parent.bottom
+            anchors.bottom: transport.top
             clip: true
 
             HoverHandler {
@@ -872,6 +907,7 @@ Item {
 
             VideoOutput {
                 id: videoOutput
+                objectName: "previewVideoOutput"
                 readonly property rect outputRect: root.renderedVideoRect()
                 x: outputRect.x
                 y: outputRect.y
@@ -908,6 +944,7 @@ Item {
 
             MouseArea {
                 id: videoPlaybackToggleArea
+                objectName: "videoPlaybackToggleArea"
                 x: filteredVideo.x
                 y: filteredVideo.y
                 width: filteredVideo.width
@@ -917,19 +954,27 @@ Item {
                     && root.ocrRegionEditorMode.length === 0
                     && root.colorPickerTarget.length === 0
                     && !root.subtitleGeometryActive
-                acceptedButtons: Qt.LeftButton
+                acceptedButtons: root.videoContextMenuEnabled
+                    ? Qt.LeftButton | Qt.RightButton : Qt.LeftButton
                 cursorShape: Qt.PointingHandCursor
-                onClicked: root.togglePlayback()
+                onClicked: function(mouse) {
+                    if (mouse.button === Qt.RightButton) {
+                        const descriptor = root.appModel.currentProject.previewDescriptor(
+                            root.appModel.playheadUs)
+                        if (!descriptor.available) return
+                        root.appModel.selectClip(descriptor.clipId)
+                        const point = mapToItem(root, mouse.x, mouse.y)
+                        root.videoContextMenuRequested(point.x, point.y)
+                    } else root.togglePlayback()
+                }
                 Accessible.name: "Phát hoặc tạm dừng video"
             }
 
-            // Scene text is separate from dialogue subtitles. Only accepted
-            // cues alter the picture: blur/fill the detected Chinese glyphs,
-            // retain the surrounding panel and place the Vietnamese label in
-            // the panel. Review cues show a yellow editor guide but are not
-            // silently rendered into the export.
+            // Scene cues render only their chosen text/background, never an
+            // extra source-glyph blur. Manual blur and dialogue covers are separate.
             Repeater {
-                model: root.appModel.exportSubtitleEnabled ? root.activeSceneTexts : []
+                model: (root.appModel.exportSubtitleEnabled ? root.activeSceneTexts : [])
+                    .concat(root.activeTitleTexts)
                 delegate: Item {
                     id: sceneTextFrame
                     required property var modelData
@@ -942,155 +987,20 @@ Item {
                     anchors.fill: parent
                     z: 60
 
-                    Item {
-                        id: sceneGlyphCover
-                        x: sceneTextFrame.glyphRect.x
-                        y: sceneTextFrame.glyphRect.y
-                        width: sceneTextFrame.glyphRect.width
-                        height: sceneTextFrame.glyphRect.height
-                        visible: sceneTextFrame.accepted && width > 0 && height > 0
 
-                        ShaderEffectSource {
-                            id: sceneGlyphSource
-                            width: Math.max(1, sceneGlyphCover.width)
-                            height: Math.max(1, sceneGlyphCover.height)
-                            visible: false
-                            live: true
-                            recursive: true
-                            sourceItem: filteredVideo
-                            sourceRect: Qt.rect(
-                                sceneGlyphCover.x - filteredVideo.x,
-                                sceneGlyphCover.y - filteredVideo.y,
-                                width,
-                                height
-                            )
-                        }
-
-                        MultiEffect {
-                            anchors.fill: parent
-                            source: sceneGlyphSource
-                            blurEnabled: true
-                            blurMax: 64
-                            blur: Math.max(0.01, Math.min(
-                                1.0, 30 * root.subtitleScale() / 64
-                            ))
-                            autoPaddingEnabled: false
-                        }
-
-                    }
-
-                    Rectangle {
-                        id: sceneTextBackground
-                        readonly property real padX: sceneTextLabel.font.pixelSize
-                            * Number(sceneTextFrame.modelData.background_padding_x ?? 20)
-                            / 100
-                        readonly property real padY: sceneTextLabel.font.pixelSize
-                            * Number(sceneTextFrame.modelData.background_padding_y ?? 10)
-                            / 100
-                        x: sceneTextFrame.panelRect.x
-                            + (sceneTextFrame.panelRect.width - width) / 2
-                        y: sceneTextFrame.panelRect.y
-                            + (sceneTextFrame.panelRect.height - height) / 2
-                        width: Math.max(1, sceneTextLabel.paintedWidth + padX * 2)
-                        height: Math.max(1, sceneTextLabel.paintedHeight + padY * 2)
-                        visible: sceneTextFrame.accepted
-                            && root.validSceneBackgroundColor(
-                                sceneTextFrame.modelData.background_color
-                            )
-                            && String(
-                                sceneTextFrame.modelData.background_style || "solid"
-                            ) === "solid"
-                        color: sceneTextFrame.modelData.background_color || "transparent"
-                        opacity: sceneTextFrame.presentationOpacity * Number(
-                            sceneTextFrame.modelData.background_opacity_percent ?? 90
-                        ) / 100
-                        radius: Math.min(8, Math.max(2, sceneTextLabel.font.pixelSize * 0.08))
-                    }
-
-                    InkSplashBackground {
-                        id: sceneInkBackground
+                    Image {
                         readonly property rect videoRect: root.renderedVideoRect()
-                        readonly property real extraX: Math.max(
-                            3,
-                            sceneTextLabel.font.pixelSize
-                                * (vertical ? 0.34 : 0.22)
-                        )
-                        readonly property real extraY: Math.max(
-                            3,
-                            sceneTextLabel.font.pixelSize
-                                * (vertical ? 0.22 : 0.34)
-                        )
-                        readonly property real leftEdge: Math.max(
-                            videoRect.x, sceneTextBackground.x - extraX
-                        )
-                        readonly property real topEdge: Math.max(
-                            videoRect.y, sceneTextBackground.y - extraY
-                        )
-                        readonly property real rightEdge: Math.min(
-                            videoRect.x + videoRect.width,
-                            sceneTextBackground.x + sceneTextBackground.width + extraX
-                        )
-                        readonly property real bottomEdge: Math.min(
-                            videoRect.y + videoRect.height,
-                            sceneTextBackground.y + sceneTextBackground.height + extraY
-                        )
-                        x: leftEdge
-                        y: topEdge
-                        width: Math.max(1, rightEdge - leftEdge)
-                        height: Math.max(1, bottomEdge - topEdge)
+                        x: videoRect.x
+                        y: videoRect.y
+                        width: videoRect.width
+                        height: videoRect.height
+                        source: sceneTextFrame.accepted
+                            ? (root.artworkForCue(sceneTextFrame.modelData).source || "") : ""
                         visible: sceneTextFrame.accepted
-                            && root.validSceneBackgroundColor(
-                                sceneTextFrame.modelData.background_color
-                            )
-                            && root.isInkBackgroundStyle(
-                                sceneTextFrame.modelData.background_style || "solid"
-                            )
-                        inkColor: sceneTextFrame.modelData.background_color || "#080808"
-                        variant: String(
-                            sceneTextFrame.modelData.background_style || "ink_splash"
-                        )
-                        vertical: sceneTextFrame.modelData.orientation === "vertical"
-                        mirrored: Number(sceneTextFrame.modelData.index || 0) % 2 === 0
-                        opacity: sceneTextFrame.presentationOpacity * Number(
-                            sceneTextFrame.modelData.background_opacity_percent ?? 90
-                        ) / 100
-                    }
-
-                    Text {
-                        id: sceneTextLabel
-                        x: sceneTextFrame.panelRect.x
-                        y: sceneTextFrame.panelRect.y
-                        width: sceneTextFrame.panelRect.width
-                        height: sceneTextFrame.panelRect.height
-                        visible: sceneTextFrame.accepted && width > 0 && height > 0
-                        text: root.sceneDisplayText(sceneTextFrame.modelData)
-                        color: sceneTextFrame.modelData.text_color || "#FFFFFFFF"
-                        opacity: sceneTextFrame.presentationOpacity * Number(
-                            sceneTextFrame.modelData.text_opacity_percent ?? 100
-                        ) / 100
-                        style: Text.Outline
-                        styleColor: "#A0000000"
-                        font.family: root.subtitleFontFamily(
-                            sceneTextFrame.modelData, Theme.fontFamily
-                        )
-                        font.pixelSize: root.sceneFontPixels(
-                            sceneTextFrame.modelData, width, height
-                        )
-                        font.letterSpacing: font.pixelSize * Number(
-                            sceneTextFrame.modelData.letter_spacing_percent || 0
-                        ) / 100
-                        font.italic: Boolean(sceneTextFrame.modelData.font_italic)
-                        font.weight: Boolean(sceneTextFrame.modelData.font_bold)
-                            ? Font.Bold
-                            : (String(
-                                sceneTextFrame.modelData.style_hint || ""
-                            ).indexOf("calligraphy") === 0
-                                ? Font.Medium : Font.DemiBold)
-                        horizontalAlignment: Text.AlignHCenter
-                        verticalAlignment: Text.AlignVCenter
-                        wrapMode: Text.NoWrap
-                        elide: Text.ElideNone
-                        clip: false
+                        asynchronous: false
+                        cache: true
+                        opacity: sceneTextFrame.presentationOpacity
+                        fillMode: Image.Stretch
                     }
 
                     Rectangle {
@@ -1160,20 +1070,26 @@ Item {
                                 )
                         }
                         onReleased: function(mouse) {
-                            if (mouse.button === Qt.LeftButton)
+                            if (mouse.button === Qt.LeftButton) {
+                                const point = mapToItem(videoViewport, mouse.x, mouse.y)
+                                if (geometryDragged || Math.abs(point.x - pressInViewport.x) >= 3
+                                        || Math.abs(point.y - pressInViewport.y) >= 3) {
+                                    geometryDragged = true
+                                    root.updateSubtitleGeometry(point.x, point.y, width, height)
+                                }
                                 root.finishSubtitleGeometry()
+                            }
                         }
-                        onCanceled: root.finishSubtitleGeometry()
+                        onCanceled: root.cancelSubtitleGeometry()
                         onClicked: function(mouse) {
                             if (geometryDragged) return
                             if (mouse.button === Qt.RightButton) {
                                 root.openSubtitleMenu(sceneTextFrame.modelData)
                                 return
                             }
-                            if (selectedOnPress)
-                                root.appModel.selectCueWithAdditive(
+                            if (selectedOnPress && (mouse.modifiers & Qt.ControlModifier))
+                                root.appModel.selectTimelineCue(
                                     String(sceneTextFrame.modelData.cue_id || ""),
-                                    Number(sceneTextFrame.modelData.start_us || 0),
                                     Boolean(mouse.modifiers & Qt.ControlModifier)
                                 )
                         }
@@ -1189,11 +1105,8 @@ Item {
                         width: 14
                         height: 14
                         radius: 2
-                        visible: !root.editableOverlays
-                            && sceneTextFrame.accepted
-                            && root.appModel.isCueSelected(
-                                String(sceneTextFrame.modelData.cue_id || "")
-                            )
+                        visible: !root.editableOverlays && sceneTextFrame.accepted
+                            && root.cueSelected(sceneTextFrame.modelData.cue_id)
                         color: Theme.primary
                         border.width: 1
                         border.color: Theme.textPrimary
@@ -1226,8 +1139,12 @@ Item {
                                     baseHeight
                                 )
                             }
-                            onReleased: root.finishSubtitleGeometry()
-                            onCanceled: root.finishSubtitleGeometry()
+                            onReleased: function(mouse) {
+                                const point = mapToItem(videoViewport, mouse.x, mouse.y)
+                                root.updateSubtitleGeometry(point.x, point.y, baseWidth, baseHeight)
+                                root.finishSubtitleGeometry()
+                            }
+                            onCanceled: root.cancelSubtitleGeometry()
                         }
                     }
                 }
@@ -1237,39 +1154,17 @@ Item {
                 id: liveSubtitlePreview
                 objectName: "liveSubtitlePreview"
                 readonly property rect videoRect: root.renderedVideoRect()
-                readonly property rect cuePanelRect: root.dialoguePanelRect(
-                    root.activeSubtitle
-                )
-                readonly property bool customGeometry:
-                    root.normalizedSceneRect(root.activeSubtitle, "panel_box").width > 0
-                    || (root.subtitleGeometryActive
-                        && root.appModel.isCueSelected(
-                            String(root.activeSubtitle.cue_id || "")
-                        ))
                 readonly property real scaleFactor: root.subtitleScale()
-                readonly property real outlinePixels: Math.max(
-                    0,
-                    root.appModel.exportSubtitleOutlineWidth * scaleFactor
-                )
-                readonly property var outlineOffsets: [
-                    Qt.point(-1, -1), Qt.point(0, -1), Qt.point(1, -1),
-                    Qt.point(-1, 0), Qt.point(1, 0),
-                    Qt.point(-1, 1), Qt.point(0, 1), Qt.point(1, 1)
-                ]
-                x: customGeometry
-                    ? cuePanelRect.x
-                    : videoRect.x + Math.max(8, 40 * scaleFactor)
-                y: customGeometry ? cuePanelRect.y : videoRect.y
-                width: customGeometry
-                    ? cuePanelRect.width
-                    : Math.max(0, videoRect.width - Math.max(16, 80 * scaleFactor))
-                height: customGeometry
-                    ? cuePanelRect.height
-                    : Math.max(
-                        0,
-                        videoRect.height
-                            - root.appModel.exportSubtitleMarginBottom * scaleFactor
-                    )
+                readonly property var artwork: root.artworkForCue(root.activeSubtitle)
+                readonly property rect selectionRect: {
+                    const r = artwork.selection_rect || artwork.text_rect
+                    return r ? Qt.rect(r[0] * scaleFactor - 3, r[1] * scaleFactor - 3,
+                        r[2] * scaleFactor + 6, r[3] * scaleFactor + 6) : Qt.rect(0, 0, 0, 0)
+                }
+                x: videoRect.x
+                y: videoRect.y
+                width: videoRect.width
+                height: videoRect.height
                 visible: root.appModel.exportSubtitleEnabled
                     && root.activeSubtitleText.length > 0
                     && videoRect.width > 0 && videoRect.height > 0
@@ -1278,107 +1173,29 @@ Item {
                 // cover the original hard-sub without hiding the new subtitle.
                 z: 110
 
-                Rectangle {
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    anchors.bottom: parent.bottom
-                    width: Math.min(
-                        parent.width,
-                        Math.max(1, subtitleMainText.paintedWidth + Theme.space16)
-                    )
-                    height: Math.max(1, subtitleMainText.paintedHeight + Theme.space8)
-                    visible: root.validSceneBackgroundColor(
-                        root.activeSubtitle.background_color
-                    )
-                    color: root.activeSubtitle.background_color || "transparent"
-                    opacity: Number(
-                        root.activeSubtitle.background_opacity_percent ?? 90
-                    ) / 100
-                    radius: Theme.radiusSmall
-                }
+
 
                 Repeater {
-                    model: root.appModel.exportSubtitleOutlineWidth > 0
-                        ? liveSubtitlePreview.outlineOffsets : []
-                    delegate: Text {
-                        required property var modelData
-                        x: modelData.x * liveSubtitlePreview.outlinePixels
-                        y: modelData.y * liveSubtitlePreview.outlinePixels
-                        width: liveSubtitlePreview.width
-                        height: liveSubtitlePreview.height
-                        text: root.sceneDisplayText(root.activeSubtitle)
-                        color: root.appModel.exportSubtitleOutlineColor
-                        font.family: root.subtitleFontFamily(
-                            root.activeSubtitle, root.appModel.exportFontFamily
-                        )
-                        font.pixelSize: root.dialogueFontPixels(
-                            root.activeSubtitle,
-                            liveSubtitlePreview.scaleFactor
-                        )
-                        font.letterSpacing: font.pixelSize * Number(
-                            root.activeSubtitle.letter_spacing_percent || 0
-                        ) / 100
-                        font.bold: Boolean(root.activeSubtitle.font_bold)
-                        font.italic: Boolean(root.activeSubtitle.font_italic)
-                        horizontalAlignment: root.subtitleHorizontalAlignment()
-                        verticalAlignment: Text.AlignBottom
-                        wrapMode: Text.Wrap
-                        elide: Text.ElideNone
+                    model: root.activeSubtitleRegions
+                    delegate: Image {
+                    required property var modelData
+                    x: liveSubtitlePreview.videoRect.x - parent.x
+                    y: liveSubtitlePreview.videoRect.y - parent.y
+                    width: liveSubtitlePreview.videoRect.width
+                    height: liveSubtitlePreview.videoRect.height
+                    source: root.artworkForCue(modelData).source || ""
+                    asynchronous: false
+                    cache: true
+                    fillMode: Image.Stretch
                     }
                 }
 
-                Text {
-                    id: subtitleMainText
-                    anchors.fill: parent
-                    text: root.sceneDisplayText(root.activeSubtitle)
-                    color: root.activeSubtitle.text_color
-                        || root.appModel.exportSubtitlePrimaryColor
-                    opacity: root.appModel.exportSubtitleOpacityPercent / 100
-                        * Number(
-                            root.activeSubtitle.text_opacity_percent ?? 100
-                        ) / 100
-                    font.family: root.subtitleFontFamily(
-                        root.activeSubtitle, root.appModel.exportFontFamily
-                    )
-                    font.pixelSize: root.dialogueFontPixels(
-                        root.activeSubtitle,
-                        liveSubtitlePreview.scaleFactor
-                    )
-                    font.letterSpacing: font.pixelSize * Number(
-                        root.activeSubtitle.letter_spacing_percent || 0
-                    ) / 100
-                    font.bold: Boolean(root.activeSubtitle.font_bold)
-                    font.italic: Boolean(root.activeSubtitle.font_italic)
-                    horizontalAlignment: root.subtitleHorizontalAlignment()
-                    verticalAlignment: Text.AlignBottom
-                    wrapMode: Text.Wrap
-                    elide: Text.ElideNone
-                }
-
                 MouseArea {
-                    x: liveSubtitlePreview.customGeometry
-                        ? 0
-                        : Math.max(0, (parent.width - width) / 2)
-                    y: liveSubtitlePreview.customGeometry
-                        ? 0
-                        : Math.max(0, parent.height - height)
-                    width: liveSubtitlePreview.customGeometry
-                        ? parent.width
-                        : Math.min(
-                            parent.width,
-                            Math.max(
-                                48,
-                                subtitleMainText.paintedWidth + Theme.space16
-                            )
-                        )
-                    height: liveSubtitlePreview.customGeometry
-                        ? parent.height
-                        : Math.min(
-                            parent.height,
-                            Math.max(
-                                32,
-                                subtitleMainText.paintedHeight + Theme.space8
-                            )
-                        )
+                    objectName: "dialogueTextMoveArea"
+                    x: liveSubtitlePreview.selectionRect.x
+                    y: liveSubtitlePreview.selectionRect.y
+                    width: liveSubtitlePreview.selectionRect.width
+                    height: liveSubtitlePreview.selectionRect.height
                     enabled: !root.editableOverlays
                         && root.ocrRegionEditorMode.length === 0
                         && Boolean(root.activeSubtitle && root.activeSubtitle.cue_id)
@@ -1417,20 +1234,26 @@ Item {
                             )
                     }
                     onReleased: function(mouse) {
-                        if (mouse.button === Qt.LeftButton)
+                        if (mouse.button === Qt.LeftButton) {
+                            const point = mapToItem(videoViewport, mouse.x, mouse.y)
+                            if (geometryDragged || Math.abs(point.x - pressInViewport.x) >= 3
+                                    || Math.abs(point.y - pressInViewport.y) >= 3) {
+                                geometryDragged = true
+                                root.updateSubtitleGeometry(point.x, point.y, width, height)
+                            }
                             root.finishSubtitleGeometry()
+                        }
                     }
-                    onCanceled: root.finishSubtitleGeometry()
+                    onCanceled: root.cancelSubtitleGeometry()
                     onClicked: function(mouse) {
                         if (geometryDragged) return
                         if (mouse.button === Qt.RightButton) {
                             root.openSubtitleMenu(root.activeSubtitle)
                             return
                         }
-                        if (selectedOnPress)
-                            root.appModel.selectCueWithAdditive(
+                        if (selectedOnPress && (mouse.modifiers & Qt.ControlModifier))
+                            root.appModel.selectTimelineCue(
                                 String(root.activeSubtitle.cue_id || ""),
-                                Number(root.activeSubtitle.start_us || 0),
                                 Boolean(mouse.modifiers & Qt.ControlModifier)
                             )
                     }
@@ -1441,10 +1264,12 @@ Item {
                 }
 
                 Rectangle {
-                    anchors.fill: parent
-                    visible: !root.editableOverlays && root.appModel.isCueSelected(
-                        String(root.activeSubtitle.cue_id || "")
-                    )
+                    objectName: "dialogueTextSelectionFrame"
+                    x: liveSubtitlePreview.selectionRect.x
+                    y: liveSubtitlePreview.selectionRect.y
+                    width: liveSubtitlePreview.selectionRect.width
+                    height: liveSubtitlePreview.selectionRect.height
+                    visible: !root.editableOverlays && root.cueSelected(root.activeSubtitle.cue_id)
                     color: "transparent"
                     border.width: 2
                     border.color: Theme.primary
@@ -1452,19 +1277,18 @@ Item {
                 }
 
                 Rectangle {
-                    x: parent.width - width / 2
-                    y: parent.height - height / 2
+                    x: liveSubtitlePreview.selectionRect.x + liveSubtitlePreview.selectionRect.width - width / 2
+                    y: liveSubtitlePreview.selectionRect.y + liveSubtitlePreview.selectionRect.height - height / 2
                     width: 14
                     height: 14
                     radius: 2
-                    visible: root.appModel.isCueSelected(
-                        String(root.activeSubtitle.cue_id || "")
-                    )
+                    visible: !root.editableOverlays && root.cueSelected(root.activeSubtitle.cue_id)
                     color: Theme.primary
                     border.width: 1
                     border.color: Theme.textPrimary
                     z: 6
                     MouseArea {
+                        objectName: "dialogueTextResizeArea"
                         anchors.fill: parent
                         cursorShape: Qt.SizeFDiagCursor
                         preventStealing: true
@@ -1490,8 +1314,12 @@ Item {
                                 point.x, point.y, baseWidth, baseHeight
                             )
                         }
-                        onReleased: root.finishSubtitleGeometry()
-                        onCanceled: root.finishSubtitleGeometry()
+                        onReleased: function(mouse) {
+                            const point = mapToItem(videoViewport, mouse.x, mouse.y)
+                            root.updateSubtitleGeometry(point.x, point.y, baseWidth, baseHeight)
+                            root.finishSubtitleGeometry()
+                        }
+                        onCanceled: root.cancelSubtitleGeometry()
                     }
                 }
             }
@@ -1530,9 +1358,8 @@ Item {
                 }
             }
 
-            // A source SRT can contain overlapping cues. Render every active
-            // source region instead of reusing subtitleAt(), which deliberately
-            // returns only one text cue for the Vietnamese subtitle renderer.
+            // Each active dialogue cue supplies its final Vietnamese layout.
+            // The list retains overlapping cues rather than a single OCR box.
             Repeater {
                 model: root.showProjectOverlays
                     && Boolean(root.blurOverlay && root.blurOverlay.enabled)
@@ -1611,8 +1438,7 @@ Item {
                         anchors.bottom: parent.top
                         anchors.bottomMargin: 2
                         visible: root.editableOverlays
-                        text: trackedBlurFrame.displayedOverlay.region_source === "ocr"
-                            ? "BLUR THEO OCR" : "BLUR ƯỚC LƯỢNG"
+                        text: "BÁM CHỮ VIỆT"
                         color: Theme.info
                         font.family: Theme.fontFamily
                         font.pixelSize: 9
@@ -1645,6 +1471,7 @@ Item {
 
                     visible: root.showProjectOverlays
                         && Boolean(overlay.enabled)
+                        && overlay.id !== "overlay-default-blur"
                         && (overlay.kind === "blur" || overlay.kind === "logo")
                         && !tracksSourceSubtitle
                     x: localOverride ? manualX : root.overlayX(displayedOverlay)
@@ -1656,7 +1483,7 @@ Item {
                     // The selected frame must stay reachable even when a
                     // damaged saved geometry sits underneath the transport.
                     // Non-editing previews keep the normal stacking order.
-                    z: root.editableOverlays
+                    z: (root.editableOverlays || root.editableProjectOverlays)
                         && root.selectedOverlayId === overlayFrame.overlay.id
                         ? 100 : 40
 
@@ -1696,7 +1523,7 @@ Item {
                     }
 
                     function resizeHandleVisible(corner) {
-                        if (overlayFrame.tracksAutomaticRegion || !root.editableOverlays
+                        if (overlayFrame.tracksAutomaticRegion || !(root.editableOverlays || root.editableProjectOverlays)
                                 || root.selectedOverlayId !== overlayFrame.overlay.id)
                             return false
                         const compact = overlayFrame.width < 52 || overlayFrame.height < 52
@@ -1777,7 +1604,7 @@ Item {
 
                     Rectangle {
                         anchors.fill: parent
-                        visible: root.editableOverlays
+                        visible: (root.editableOverlays || root.editableProjectOverlays)
                         color: "transparent"
                         border.width: root.selectedOverlayId === overlayFrame.overlay.id
                             ? 2 : 1
@@ -1815,7 +1642,7 @@ Item {
                                 : (overlayFrame.overlay.tracking_mode === "ocr_watermark"
                                     ? "CHE WATERMARK OCR" : "BLUR THỦ CÔNG"))
                             : "LOGO"
-                        visible: root.editableOverlays
+                        visible: (root.editableOverlays || root.editableProjectOverlays)
                         color: overlayFrame.overlay.kind === "blur"
                             ? Theme.info : Theme.primary
                         font.family: Theme.fontFamily
@@ -1827,7 +1654,7 @@ Item {
                     MouseArea {
                         id: moveArea
                         anchors.fill: parent
-                        enabled: root.editableOverlays && !overlayFrame.tracksAutomaticRegion
+                        enabled: (root.editableOverlays || root.editableProjectOverlays) && !overlayFrame.tracksAutomaticRegion
                         cursorShape: Qt.SizeAllCursor
                         preventStealing: true
                         z: 25
@@ -2327,20 +2154,14 @@ Item {
 
         Rectangle {
             id: transport
+            objectName: "previewTransport"
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.bottom: parent.bottom
-            height: 58
-            // A translucent control strip keeps the video visible underneath
-            // while retaining enough contrast for controls and timecode.
-            color: Qt.rgba(0.03, 0.06, 0.09, 0.78)
-            opacity: root.controlsVisible ? 1.0 : 0.0
-            visible: !root.editableOverlays && opacity > 0.01
+            height: root.editableOverlays ? 0 : 46
+            color: Theme.surfacePanel
+            visible: !root.editableOverlays
             z: 120
-            Behavior on opacity {
-                NumberAnimation { duration: Theme.motionFast }
-            }
-
             HoverHandler {
                 onHoveredChanged: {
                     root.transportHovered = hovered
@@ -2368,23 +2189,48 @@ Item {
 
                 DsIconButton {
                     iconName: "chevron-left"
-                    tooltipText: "Lùi 5 giây"
+                    tooltipText: "Lùi " + root.appModel.timelineSeekStepMs + " ms"
                     enabled: root.appModel.currentProject.hasVideo && root.positionMs > 0
                     disabledReason: "Video đang ở đầu timeline."
-                    onClicked: root.seekRelative(-5_000)
+                    onClicked: root.seekRelative(-root.appModel.timelineSeekStepMs)
                 }
 
                 DsIconButton {
                     iconName: "chevron-right"
-                    tooltipText: "Tiến 5 giây"
+                    tooltipText: "Tiến " + root.appModel.timelineSeekStepMs + " ms"
                     enabled: root.appModel.currentProject.hasVideo
                         && root.positionMs < root.durationMs
                     disabledReason: "Video đang ở cuối timeline."
-                    onClicked: root.seekRelative(5_000)
+                    onClicked: root.seekRelative(root.appModel.timelineSeekStepMs)
+                }
+
+                TextField {
+                    id: exactTimeField
+                    objectName: "previewExactTimeField"
+                    Layout.preferredWidth: 114
+                    text: root.timeText(root.positionMs)
+                    enabled: root.appModel.currentProject.hasVideo
+                    selectByMouse: true
+                    Accessible.name: "Thời gian phát chính xác HH:MM:SS.mmm"
+                    onEditingFinished: {
+                        root.seekTimeText(text)
+                        text = root.timeText(root.positionMs)
+                    }
+                    Binding {
+                        target: exactTimeField
+                        property: "text"
+                        value: root.timeText(root.positionMs)
+                        when: !exactTimeField.activeFocus
+                    }
+                    ToolTip.visible: hovered
+                    ToolTip.text: "Nhập HH:MM:SS.mmm rồi Enter để tua chính xác"
+                    color: Theme.textSecondary
+                    font.family: Theme.timecodeFamily
+                    font.pixelSize: 10
                 }
 
                 Text {
-                    text: root.timeText(root.positionMs) + " / " + root.timeText(root.durationMs)
+                    text: "/ " + root.timeText(root.durationMs)
                     color: Theme.textSecondary
                     font.family: Theme.timecodeFamily
                     font.pixelSize: 10

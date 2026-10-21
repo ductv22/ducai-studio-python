@@ -5,12 +5,12 @@ import json
 import os
 import stat
 import subprocess
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from secrets import token_urlsafe
 from typing import Any
 
+from ducai_studio.infrastructure.runtime_program import runtime_program_path
 from ducai_studio.infrastructure.update_manifest import (
     PUBLIC_KEY_BYTES,
     UpdateManifest,
@@ -68,7 +68,10 @@ _HELPER_SCRIPT = r'''param(
     [Parameter(Mandatory=$true)][int]$ParentPid
 )
 $ErrorActionPreference = "Stop"
-Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
+# A host can pass PowerShell 7's PSModulePath to Windows PowerShell 5.1.
+# Resolve our required system module from this interpreter, not that search path.
+Import-Module ([IO.Path]::Combine($PSHOME,
+    'Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1')) -ErrorAction Stop
 
 function Fail([string]$Message) { throw $Message }
 function Sha256([string]$Path) {
@@ -124,6 +127,34 @@ function Stop-Owned-Tree([int]$ProcessId) {
     if ($ProcessId -le 0) { return }
     if ($null -ne (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
         & taskkill.exe /PID $ProcessId /T /F | Out-Null
+    }
+}
+function Write-Journal {
+    $temporary = $journalPath + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
+    try {
+        $encoded = $journal | ConvertTo-Json -Depth 5
+        [IO.File]::WriteAllText($temporary, $encoded, [Text.UTF8Encoding]::new($false))
+        for ($attempt = 0; $attempt -lt 50; $attempt++) {
+            try {
+                if ([IO.File]::Exists($journalPath)) {
+                    [IO.File]::Replace(
+                        $temporary, $journalPath,
+                        [System.Management.Automation.Language.NullString]::Value
+                    )
+                } else {
+                    [IO.File]::Move($temporary, $journalPath)
+                }
+                return
+            } catch [IO.IOException] {
+                $code = $_.Exception.HResult -band 0xFFFF
+                if (($code -ne 32 -and $code -ne 33) -or $attempt -eq 49) { throw }
+                Start-Sleep -Milliseconds 100
+            }
+        }
+    } finally {
+        if ([IO.File]::Exists($temporary)) {
+            Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -193,7 +224,7 @@ if ($verifier.ExitCode -ne 0) {
 Wait-Exit -ProcessId $ParentPid -Seconds 45
 New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
 $journal = [ordered]@{ state = "backing_up"; installed = @(); backed_up = @() }
-$journal | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $journalPath -Encoding UTF8
+Write-Journal
 $process = $null
 $pendingTarget = ""
 
@@ -238,7 +269,7 @@ try {
         $pendingTarget = ""
         $journal.installed += $relative
         $journal.state = "installing"
-        $journal | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $journalPath -Encoding UTF8
+        Write-Journal
     }
 
     $exe = Assert-Under (Join-Path $installRoot ([string]$request.executable_name)) $installRoot
@@ -281,7 +312,7 @@ try {
     }
     if (-not $healthy) { Fail "Bản mới không xác nhận trạng thái sẵn sàng." }
     $journal.state = "healthy"
-    $journal | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $journalPath -Encoding UTF8
+    Write-Journal
     Remove-Item -LiteralPath $backupRoot -Recurse -Force -ErrorAction SilentlyContinue
     if ($cleanupRoot) {
         Remove-Item -LiteralPath $cleanupRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -304,7 +335,7 @@ try {
     }
     $journal.state = "rolled_back"
     $journal.error = $_.Exception.Message
-    $journal | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $journalPath -Encoding UTF8
+    Write-Journal
     $oldExe = Join-Path $installRoot ([string]$request.executable_name)
     if (Test-Path -LiteralPath $oldExe -PathType Leaf) {
         Start-Process -FilePath $oldExe -WorkingDirectory $installRoot | Out-Null
@@ -442,7 +473,7 @@ def launch_update_helper(
 
 
 def current_install_root(executable_path: str | Path | None = None) -> Path:
-    executable = Path(executable_path or sys.executable).expanduser().resolve()
-    if executable.name.casefold() != "ducaistudio2.exe":
+    executable = Path(executable_path or runtime_program_path()).expanduser().resolve()
+    if executable.name.casefold() != "ducaistudio2.exe" or not executable.is_file():
         raise RuntimeError("Tự cập nhật chỉ khả dụng trong bản DUCAI STUDIO đã đóng gói")
     return executable.parent

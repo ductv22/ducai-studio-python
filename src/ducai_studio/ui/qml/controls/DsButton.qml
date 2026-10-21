@@ -9,6 +9,7 @@ Button {
     property bool warning: false
     property bool danger: false
     property bool compact: false
+    property bool emphasized: false
     property bool feedbackEnabled: true
     property string feedbackText: ""
     property string feedbackKind: ""
@@ -93,7 +94,7 @@ Button {
             if (control.successState) return Theme.success
             if (control.activeState) return Theme.info
             return control.enabled
-                ? (control.primary ? Theme.textPrimary : Theme.textSecondary)
+                ? (control.primary || control.emphasized ? Theme.textPrimary : Theme.textSecondary)
                 : Theme.textMuted
         }
         font.family: Theme.fontFamily
@@ -134,7 +135,7 @@ Button {
             }
             if (control.down) return Theme.borderStrong
             if (control.hovered) return Theme.surfaceHover
-            return Theme.surfaceRaised
+            return control.emphasized ? Theme.surfaceHover : Theme.surfaceRaised
         }
         border.width: control.visualFocus ? 2 : 1
         border.color: control.visualFocus ? Theme.focusRing
@@ -142,7 +143,8 @@ Button {
             : (control.warning ? Theme.warningBorder
             : (control.failedState ? Theme.errorBorder
             : (control.successState ? Theme.successBorder
-            : (control.activeState ? Theme.warningBorder : Theme.borderSubtle)))))
+            : (control.activeState ? Theme.warningBorder
+            : (control.emphasized && control.enabled ? Theme.iconMuted : Theme.borderSubtle))))))
 
         Behavior on color {
             ColorAnimation { duration: Theme.motionFast }

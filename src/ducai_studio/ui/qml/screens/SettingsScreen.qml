@@ -2,6 +2,7 @@ pragma ComponentBehavior: Bound
 
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Dialogs
 import QtQuick.Layouts
 import DucaiStudio 1.0
 import "../controls"
@@ -13,6 +14,14 @@ Item {
     activeFocusOnTab: true
     Accessible.name: "Cài đặt và chẩn đoán"
 
+    FileDialog {
+        id: licenseDialog
+        title: "Chọn file key DUCAI STUDIO"
+        fileMode: FileDialog.OpenFile
+        nameFilters: ["Key DUCAI (*.ducai-license *.txt)", "Tất cả file (*)"]
+        onAccepted: root.appModel.activation.importLicense(selectedFile)
+    }
+
     ScrollView {
         anchors.fill: parent
         anchors.margins: Theme.space12
@@ -21,6 +30,127 @@ Item {
         ColumnLayout {
             width: parent.width
             spacing: Theme.space12
+
+            Panel {
+                Layout.fillWidth: true
+                Layout.preferredHeight: activationColumn.implicitHeight + Theme.space32
+                ColumnLayout {
+                    id: activationColumn
+                    anchors.fill: parent
+                    anchors.margins: Theme.space16
+                    spacing: Theme.space8
+                    RowLayout {
+                        Layout.fillWidth: true
+                        SectionTitle { text: "Kích hoạt DUCAI STUDIO" }
+                        Item { Layout.fillWidth: true }
+                        Text {
+                            text: root.appModel.activation.active ? "Đã kích hoạt" : "Chưa kích hoạt"
+                            color: root.appModel.activation.active ? Theme.success : Theme.warning
+                            font.family: Theme.fontFamily
+                            font.pixelSize: 12
+                        }
+                    }
+                    Text {
+                        Layout.fillWidth: true
+                        text: "Sao chép mã máy và gửi người cấp key. Bạn có thể được cấp key vĩnh viễn hoặc key thử nghiệm có thời hạn; key chỉ dùng trên máy này và không cần Internet để kiểm tra."
+                        color: Theme.textSecondary
+                        font.family: Theme.fontFamily
+                        font.pixelSize: 12
+                        wrapMode: Text.Wrap
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        TextField {
+                            Layout.fillWidth: true
+                            text: root.appModel.activation.requestCode
+                            readOnly: true
+                            selectByMouse: true
+                            placeholderText: "Đang đọc mã máy…"
+                            font.family: Theme.fontFamily
+                            font.pixelSize: 12
+                            Accessible.name: "Mã máy để cấp key"
+                        }
+                        DsButton {
+                            text: "Sao chép mã máy"
+                            enabled: root.appModel.activation.requestCode.length > 0
+                            tooltipText: "Sao chép đầy đủ mã máy để gửi người cấp key."
+                            onClicked: root.appModel.activation.copyRequestCode()
+                        }
+                    }
+                    ScrollView {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 76
+                        TextArea {
+                            id: licenseInput
+                            placeholderText: "Dán key DUCAI-L3. có thời hạn, DUCAI-L2. vĩnh viễn hoặc key cũ DUCAI-L1. vào đây"
+                            wrapMode: TextEdit.WrapAnywhere
+                            selectByMouse: true
+                            font.family: Theme.fontFamily
+                            font.pixelSize: 11
+                            Accessible.name: "Key kích hoạt được cấp"
+                            background: Rectangle {
+                                color: Theme.surfaceRaised
+                                border.color: Theme.borderSubtle
+                                border.width: 1
+                                radius: Theme.radiusSmall
+                            }
+                        }
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        DsButton {
+                            text: root.appModel.activation.busy ? "Đang kiểm tra…" : "Kích hoạt"
+                            primary: true
+                            enabled: !root.appModel.activation.busy && licenseInput.text.trim().length > 0
+                            tooltipText: "Kiểm tra chữ ký và mã máy, sau đó lưu kích hoạt trên máy này."
+                            feedbackEnabled: false
+                            onClicked: root.appModel.activation.activate(licenseInput.text)
+                        }
+                        DsButton {
+                            text: "Nhập file key"
+                            enabled: !root.appModel.activation.busy
+                            tooltipText: "Chọn file giấy phép do người cấp key gửi."
+                            feedbackEnabled: false
+                            onClicked: licenseDialog.open()
+                        }
+                        DsButton {
+                            text: "Kiểm tra lại"
+                            enabled: !root.appModel.activation.busy
+                            tooltipText: "Kiểm tra lại mã máy và giấy phép đã lưu."
+                            feedbackEnabled: false
+                            onClicked: root.appModel.activation.refresh()
+                        }
+                        Item { Layout.fillWidth: true }
+                    }
+                    Text {
+                        Layout.fillWidth: true
+                        text: root.appModel.activation.message
+                        color: root.appModel.activation.hasError ? Theme.error
+                            : (root.appModel.activation.active ? Theme.success : Theme.warning)
+                        font.family: Theme.fontFamily
+                        font.pixelSize: 12
+                        wrapMode: Text.Wrap
+                        textFormat: Text.PlainText
+                        Accessible.name: "Trạng thái kích hoạt: " + text
+                    }
+                    Text {
+                        Layout.fillWidth: true
+                        visible: root.appModel.activation.licenseId.length > 0
+                        text: "Mã giấy phép: " + root.appModel.activation.licenseId
+                        color: Theme.textMuted
+                        font.family: Theme.fontFamily
+                        font.pixelSize: 11
+                    }
+                    Text {
+                        Layout.fillWidth: true
+                        visible: root.appModel.activation.expiresAt.length > 0
+                        text: "Hết hạn (UTC): " + root.appModel.activation.expiresAt
+                        color: Theme.textMuted
+                        font.family: Theme.fontFamily
+                        font.pixelSize: 11
+                    }
+                }
+            }
 
             Panel {
                 Layout.fillWidth: true
@@ -286,6 +416,64 @@ Item {
 
             Panel {
                 Layout.fillWidth: true
+                Layout.preferredHeight: 124
+                RowLayout {
+                    anchors.fill: parent
+                    anchors.margins: Theme.space16
+                    spacing: Theme.space12
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: Theme.space4
+                        SectionTitle { text: "Tối ưu dữ liệu dự án" }
+                        Text {
+                            Layout.fillWidth: true
+                            text: root.appModel.databaseMaintenance.state === "completed"
+                                ? "Đã nén "
+                                    + root.appModel.databaseMaintenance.compressed_revisions
+                                    + " revision. Bản sao an toàn sẽ được xóa sau lần health-check khởi động kế tiếp."
+                                : (root.appModel.databaseMaintenance.state === "cancelled"
+                                    ? "Đã hủy trước khi đổi file; database hiện tại không bị thay đổi."
+                                    : "Nén lịch sử revision theo batch, xác minh SHA-256, foreign key và integrity_check rồi mới đổi file. Cache voice không bị xóa.")
+                            color: Theme.textSecondary
+                            font.family: Theme.fontFamily
+                            font.pixelSize: 11
+                            wrapMode: Text.Wrap
+                        }
+                    }
+                    StatusPill {
+                        runtimeState: root.appModel.databaseMaintenance.state === "completed"
+                            ? "ready" : "starting"
+                        text: root.appModel.databaseMaintenanceBusy
+                            ? (root.appModel.databaseMaintenance.state === "cancelling"
+                                ? "Đang hủy" : "Đang tối ưu")
+                            : (root.appModel.databaseMaintenance.state === "failed"
+                                ? "Thất bại" : (root.appModel.databaseMaintenance.state === "completed"
+                                    ? "Đã hoàn tất" : "Chưa chạy"))
+                    }
+                    DsButton {
+                        text: root.appModel.databaseMaintenanceBusy
+                            ? (root.appModel.databaseMaintenance.state === "cancelling"
+                                ? "Đang hủy…" : "Hủy tối ưu")
+                            : "Tối ưu dữ liệu dự án"
+                        primary: !root.appModel.databaseMaintenanceBusy
+                        enabled: root.appModel.backendReady
+                            && (root.appModel.activation.active || root.appModel.databaseMaintenanceBusy)
+                            && root.appModel.databaseMaintenance.state !== "cancelling"
+                        disabledReason: root.appModel.databaseMaintenance.state === "cancelling"
+                            ? "Đang chờ checkpoint an toàn trước khi đổi database."
+                            : "Chỉ chạy khi không còn job hoặc Multi video hoạt động."
+                        onClicked: {
+                            if (root.appModel.databaseMaintenanceBusy)
+                                root.appModel.cancelProjectDatabaseOptimization()
+                            else
+                                root.appModel.optimizeProjectDatabase()
+                        }
+                    }
+                }
+            }
+
+            Panel {
+                Layout.fillWidth: true
                 Layout.preferredHeight: 188
                 ColumnLayout {
                     anchors.fill: parent
@@ -297,12 +485,14 @@ Item {
                         Item { Layout.fillWidth: true }
                         DsButton {
                             text: "Chọn dự án cũ"
+                            enabled: root.appModel.activation.active
                             onClicked: root.appModel.showLegacyImportDialog()
                         }
                         DsButton {
                             text: "Nhập sau dry-run"
                             primary: true
-                            enabled: root.appModel.legacyMigrationReport.dry_run === true
+                            enabled: root.appModel.activation.active
+                                && root.appModel.legacyMigrationReport.dry_run === true
                                 && root.appModel.legacyMigrationReport.source_unchanged === true
                             disabledReason: "Phải dry-run nguồn bất biến trước."
                             onClicked: root.appModel.importInspectedLegacyProject()

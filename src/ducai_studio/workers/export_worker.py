@@ -153,21 +153,50 @@ class ExportWorker:
         self.capabilities = probe_ffmpeg_capabilities(ffmpeg)
         if not self.capabilities.ready:
             raise ValueError("export_ffmpeg_capabilities_missing")
-        signature = stable_fingerprint(
-            {
-                "schema": "ducai-export-ledger-v1",
-                "snapshot": config["snapshot"],
-                "ffmpeg": self.capabilities.version_line,
-            }
+        signature_input = {
+            "schema": "ducai-export-ledger-v1",
+            "snapshot": config["snapshot"],
+            "ffmpeg": self.capabilities.version_line,
+        }
+        legacy_signature = stable_fingerprint(signature_input)
+        previous_signature = stable_fingerprint(
+            {**signature_input, "render_contract": "measured-glyph-v1"}
         )
-        restored = self._restore_checkpoint(start_payload.get("checkpoint"), signature)
+        readable_signature = stable_fingerprint(
+            {**signature_input, "render_contract": "readable-glyph-panel-v2"})
+        from ducai_studio.providers.export.ffmpeg import _bundled_font_directory
+
+        directory = _bundled_font_directory()
+        font_assets = {path.name: file_sha256(path) for path in sorted(directory.iterdir())
+                       if path.suffix.casefold() in {".ttf", ".otf"}} if directory else {}
+        signature = stable_fingerprint({**signature_input,
+            "render_contract": "subtitle-system-fonts-v4", "font_assets": font_assets})
+        background_signature = stable_fingerprint({**signature_input,
+            "render_contract": "subtitle-background-layers-v3", "font_assets": font_assets})
+        restored = self._restore_checkpoint(
+            start_payload.get("checkpoint"),
+            signature,
+            legacy_signature=legacy_signature,
+            previous_signature=previous_signature,
+            readable_signature=readable_signature,
+            background_signature=background_signature,
+        )
         self.ledger = restored or {
             "schema_version": 1,
             "signature": signature,
             "entries": {},
         }
 
-    def _restore_checkpoint(self, checkpoint: object, signature: str) -> dict[str, Any] | None:
+    def _restore_checkpoint(
+        self,
+        checkpoint: object,
+        signature: str,
+        *,
+        legacy_signature: str | None = None,
+        previous_signature: str | None = None,
+        readable_signature: str | None = None,
+        background_signature: str | None = None,
+    ) -> dict[str, Any] | None:
         if not isinstance(checkpoint, dict):
             return None
         artifact = checkpoint.get("artifact")
@@ -175,6 +204,21 @@ class ExportWorker:
             return None
         source = Path(str(artifact["uri"])).expanduser().resolve(strict=True)
         raw = json.loads(source.read_text(encoding="utf-8-sig"))
+        if (
+            isinstance(raw, dict)
+            and isinstance(raw.get("signature"), str)
+            and raw["signature"]
+            in {
+                legacy_signature,
+                previous_signature,
+                readable_signature,
+                background_signature,
+            }
+            - {None, signature}
+        ):
+            # The input is the same but its old chunks used different font/ink
+            # layout. Re-render without deleting valid historical cache files.
+            return None
         if not isinstance(raw, dict) or raw.get("signature") != signature:
             raise ValueError("export_checkpoint_signature_mismatch")
         entries = raw.get("entries")
@@ -214,16 +258,20 @@ class ExportWorker:
                 continue
             raw_output = self.chunk_work / f"chunk-{index:05d}.partial.mp4"
             raw_output.unlink(missing_ok=True)
-            plan = materialize_export_chunk(
-                self.snapshot,
-                index=index,
-                start_us=start_us,
-                end_us=end_us,
-                work_dir=self.chunk_work,
-                output_path=raw_output,
-                capabilities=self.capabilities,
-            )
-            self._run_ffmpeg(plan.arguments, plan.duration_us, ranges, cwd=self.chunk_work)
+            try:
+                plan = materialize_export_chunk(
+                    self.snapshot,
+                    index=index,
+                    start_us=start_us,
+                    end_us=end_us,
+                    work_dir=self.chunk_work,
+                    output_path=raw_output,
+                    capabilities=self.capabilities,
+                )
+                self._run_ffmpeg(plan.arguments, plan.duration_us, ranges, cwd=self.chunk_work)
+            finally:
+                for temporary_path in self.chunk_work.glob(f"voice-chunk-{index:05d}-*.wav"):
+                    temporary_path.unlink(missing_ok=True)
             qa = self._probe_media(raw_output, plan.duration_us)
             self._control_between_chunks()
             if qa["playable"] is not True:
@@ -467,9 +515,7 @@ class ExportWorker:
         )
         output = Path(str(self.config["output_path"]))
         output.parent.mkdir(parents=True, exist_ok=True)
-        finalizing_marker = output.with_name(
-            f".{output.name}.{self.job_id}.finalizing.json"
-        )
+        finalizing_marker = output.with_name(f".{output.name}.{self.job_id}.finalizing.json")
         if output.exists() and self.snapshot.settings.overwrite is not True:
             adopted = self._adopt_interrupted_finalization(output, finalizing_marker, ranges)
             if adopted:
@@ -691,9 +737,7 @@ class ExportWorker:
             raw = json.loads(result.stdout or "{}")
             duration_us = int(round(float(raw.get("format", {}).get("duration", 0)) * 1_000_000))
             kinds = {
-                item.get("codec_type")
-                for item in raw.get("streams", [])
-                if isinstance(item, dict)
+                item.get("codec_type") for item in raw.get("streams", []) if isinstance(item, dict)
             }
         except (TypeError, ValueError, json.JSONDecodeError):
             duration_us = 0
@@ -719,7 +763,7 @@ class ExportWorker:
         atomic_write_json(self.ledger_path, self.ledger)
         source = self.job_staging / f"ledger-{uuid4().hex}.json.partial"
         shutil.copyfile(self.ledger_path, source)
-        digest = sha256(source.read_bytes()).hexdigest()
+        digest = file_sha256(source)
         entries = self.ledger.get("entries", {})
         completed = len(entries) if isinstance(entries, dict) else 0
         cursor_us = ranges[completed - 1][1] if completed else self.snapshot.timeline_start_us
@@ -795,11 +839,7 @@ class ExportWorker:
         current = max(0, min(phase_total, phase_current))
         phase_elapsed_seconds = max(0.001, now - phase_started)
         phase_rate = current / phase_elapsed_seconds
-        eta_ms = (
-            int(max(0, phase_total - current) / phase_rate * 1_000)
-            if phase_rate > 0
-            else None
-        )
+        eta_ms = int(max(0, phase_total - current) / phase_rate * 1_000) if phase_rate > 0 else None
         elapsed_ms = max(1, int((now - self._job_started) * 1_000))
         chunk_total = len(ranges)
         self.send(
@@ -863,6 +903,11 @@ def _nt_process_call(pid: int, function_name: str) -> None:
 def main() -> int:
     if len(sys.argv) != 2 or not sys.argv[1].strip():
         return 2
+    from ducai_studio.infrastructure.licensing_state import worker_activation_exit_code
+
+    denied = worker_activation_exit_code()
+    if denied:
+        return denied
     return ExportWorker(sys.argv[1]).run()
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from bisect import bisect_right
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 from fractions import Fraction
@@ -165,11 +166,12 @@ class VoiceConformPlan:
         position = max(0, min(self.source_duration_us, int(source_us)))
         if position == self.source_duration_us:
             return self.output_duration_us
-        segment = next(
-            item
-            for item in self.segments
-            if item.source_start_us <= position < item.source_end_us
-        )
+        # Validation guarantees contiguous, strictly increasing endpoints.
+        # Bisect the immutable segments directly; do not rebuild an index for
+        # each of the many cue/clip projections performed during a load.
+        segment = self.segments[bisect_right(
+            self.segments, position, key=lambda item: item.source_end_us
+        )]
         return segment.output_start_us + _map_duration(
             position - segment.source_start_us,
             segment.source_duration_us,
@@ -180,11 +182,9 @@ class VoiceConformPlan:
         position = max(0, min(self.output_duration_us, int(output_us)))
         if position == self.output_duration_us:
             return self.source_duration_us
-        segment = next(
-            item
-            for item in self.segments
-            if item.output_start_us <= position < item.output_end_us
-        )
+        segment = self.segments[bisect_right(
+            self.segments, position, key=lambda item: item.output_end_us
+        )]
         return segment.source_start_us + _map_duration(
             position - segment.output_start_us,
             segment.output_duration_us,

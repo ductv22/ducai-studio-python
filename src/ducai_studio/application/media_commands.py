@@ -264,6 +264,8 @@ class MediaImportService:
                         font_italic=source.font_italic,
                         text_opacity_percent=source.text_opacity_percent,
                         background_opacity_percent=source.background_opacity_percent,
+                        fade_enabled=source.fade_enabled,
+                        fade_duration_ms=source.fade_duration_ms,
                     )
                 )
             without_voice = (
@@ -294,11 +296,14 @@ class MediaImportService:
             if snapshot.source_cues
             else snapshot
         )
-        tracks = [track for track in without_voice.tracks if track.id != "S1"]
+        # Replace the generated subtitle projection atomically. Keeping S2…
+        # while removing their backing subtitle media leaves dangling clips.
+        tracks = [track for track in without_voice.tracks if track.kind is not TrackKind.SUBTITLE]
         tracks.append(TimelineTrack("S1", TrackKind.SUBTITLE, "Phụ đề nguồn", clips))
-        media = tuple(
-            item for item in without_voice.media if item.kind is not MediaKind.SUBTITLE
-        )
+        retained_media_ids = {clip.media_id for track in tracks for clip in track.clips}
+        retained_media_ids.update(overlay.asset_id for overlay in without_voice.overlays)
+        media = tuple(item for item in without_voice.media
+                      if item.kind is not MediaKind.SUBTITLE or item.id in retained_media_ids)
         return replace(
             without_voice,
             revision=snapshot.revision + 1,
@@ -328,10 +333,14 @@ class MediaImportService:
                     snapshot.voice_conform.conformed_voice_media_id,
                 }
             )
+        tracks = tuple(track for track in snapshot.tracks if track.id != "D1")
+        retained_media_ids = {clip.media_id for track in tracks for clip in track.clips}
+        retained_media_ids.update(overlay.asset_id for overlay in snapshot.overlays)
         return replace(
             snapshot,
-            media=tuple(item for item in snapshot.media if item.id not in voice_media_ids),
-            tracks=tuple(track for track in snapshot.tracks if track.id != "D1"),
+            media=tuple(item for item in snapshot.media
+                        if item.id not in voice_media_ids or item.id in retained_media_ids),
+            tracks=tracks,
             voice_conform=None,
         )
 
@@ -380,8 +389,11 @@ class MediaImportService:
                     snapshot.voice_conform.conformed_voice_media_id,
                 }
             )
-        media = tuple(item for item in snapshot.media if item.id not in old_media_ids)
         tracks = [track for track in snapshot.tracks if track.id != "D1"]
+        retained_media_ids = {clip.media_id for track in tracks for clip in track.clips}
+        retained_media_ids.update(overlay.asset_id for overlay in snapshot.overlays)
+        media = tuple(item for item in snapshot.media
+                      if item.id not in old_media_ids or item.id in retained_media_ids)
         media_id = self._id("media")
         asset = MediaAsset(media_id, str(path), MediaKind.AUDIO, result.duration_us)
         source_range = TimeRange(0, result.duration_us)

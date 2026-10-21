@@ -14,6 +14,7 @@ ApplicationWindow {
     required property var appModel
     property bool shutdownComplete: false
     property string parallelWarningMessage: ""
+    readonly property bool featuresEnabled: window.appModel.activation.active
 
     function publicStatusMessage(value) {
         const message = String(value || "")
@@ -44,6 +45,21 @@ ApplicationWindow {
     minimumWidth: 1180
     minimumHeight: 720
     color: Theme.canvas
+    font.family: Theme.fontFamily
+    font.pixelSize: 13
+    palette.window: Theme.surfaceBase
+    palette.windowText: Theme.textPrimary
+    palette.base: Theme.surfaceRaised
+    palette.alternateBase: Theme.surfacePanel
+    palette.text: Theme.textPrimary
+    palette.button: Theme.surfaceRaised
+    palette.buttonText: Theme.textPrimary
+    palette.highlight: Theme.primary
+    palette.highlightedText: Theme.textPrimary
+    palette.mid: Theme.borderStrong
+    palette.dark: Theme.borderSubtle
+    palette.light: Theme.surfaceHover
+    palette.placeholderText: Theme.textMuted
     title: "DUCAI STUDIO 2"
 
     onClosing: function(close) {
@@ -54,6 +70,34 @@ ApplicationWindow {
     }
 
     Shortcut { sequence: "Ctrl+1"; onActivated: window.appModel.navigate("dashboard") }
+    function saveFocusedProject() {
+        if (!window.featuresEnabled) return
+        // Commit the focused text field before flushing its queued domain edit.
+        window.contentItem.forceActiveFocus()
+        Qt.callLater(window.appModel.saveProject)
+    }
+    Shortcut {
+        sequences: [ StandardKey.Save ]
+        context: Qt.WindowShortcut
+        onActivated: window.saveFocusedProject()
+    }
+    function textEditorHasFocus() {
+        const item = window.activeFocusItem
+        return Boolean(item && ("cursorPosition" in item
+            || "selectionStart" in item || "inputMethodComposing" in item))
+    }
+    Shortcut {
+        sequence: "Ctrl+Z"
+        context: Qt.WindowShortcut
+        enabled: window.featuresEnabled && !window.textEditorHasFocus()
+        onActivated: window.appModel.undoTimeline()
+    }
+    Shortcut {
+        sequence: "Ctrl+Y"
+        context: Qt.WindowShortcut
+        enabled: window.featuresEnabled && !window.textEditorHasFocus()
+        onActivated: window.appModel.redoTimeline()
+    }
     Shortcut { sequence: "Ctrl+2"; onActivated: window.appModel.navigate("subtitles") }
     Shortcut { sequence: "Ctrl+3"; onActivated: window.appModel.navigate("voice") }
     Shortcut { sequence: "Ctrl+4"; onActivated: window.appModel.navigate("timeline") }
@@ -61,8 +105,12 @@ ApplicationWindow {
 
     Connections {
         target: window.appModel
+        function onProjectAutosaveRequested() { window.saveFocusedProject() }
         function onStatusNotificationRequested(message, kind, durationMs) {
             UiFeedback.show(window.publicStatusMessage(message), kind, durationMs)
+        }
+        function onStatusNotificationDismissRequested() {
+            actionToast.dismiss()
         }
         function onCurrentIndexChanged() {
             Qt.callLater(function() {
@@ -515,6 +563,15 @@ ApplicationWindow {
 
             Item { Layout.fillWidth: true }
 
+            DsButton {
+                text: window.appModel.projectSaveBusy ? "Đang lưu…" : "Lưu"
+                enabled: window.featuresEnabled && window.appModel.backendReady
+                    && window.appModel.currentProject.hasProject
+                tooltipText: "Lưu dự án (Ctrl+S). Tự lưu mỗi 5 phút khi có thay đổi."
+                feedbackEnabled: false
+                onClicked: window.saveFocusedProject()
+            }
+
             StatusPill {
                 runtimeState: window.appModel.runtimeState
                 text: {
@@ -528,7 +585,8 @@ ApplicationWindow {
 
             DsButton {
                 text: window.appModel.importBusy ? "Đang nhập..." : "Nhập media"
-                enabled: window.appModel.backendReady && !window.appModel.importBusy
+                enabled: window.featuresEnabled && window.appModel.backendReady
+                    && !window.appModel.importBusy
                 disabledReason: window.appModel.importBusy
                     ? "Một file đang được nhập."
                     : "Job Manager chưa sẵn sàng."
@@ -537,6 +595,8 @@ ApplicationWindow {
 
             DsButton {
                 text: "Xuất video"
+                enabled: window.featuresEnabled
+                disabledReason: "Hãy kích hoạt tại Cài đặt để sử dụng chức năng."
                 primary: true
                 onClicked: window.appModel.navigate("export")
             }
@@ -586,6 +646,7 @@ ApplicationWindow {
                     iconName: model.iconName
                     compact: window.compactSidebar
                     selected: window.appModel.currentWorkspace === model.workspaceId
+                    opacity: window.featuresEnabled || model.workspaceId === "settings" ? 1 : 0.45
                     onClicked: window.appModel.navigate(model.workspaceId)
                 }
             }
@@ -605,18 +666,19 @@ ApplicationWindow {
             Layout.fillHeight: true
             currentIndex: window.appModel.currentIndex
 
-            DashboardScreen { appModel: window.appModel }
-            ProjectsScreen { appModel: window.appModel }
-            SubtitleEditorScreen { appModel: window.appModel }
-            VoiceStudioScreen { appModel: window.appModel }
-            MultiVideoScreen { appModel: window.appModel }
-            TimelineScreen { appModel: window.appModel }
-            ExportScreen { appModel: window.appModel }
+            DashboardScreen { appModel: window.appModel; enabled: window.featuresEnabled }
+            ProjectsScreen { appModel: window.appModel; enabled: window.featuresEnabled }
+            SubtitleEditorScreen { appModel: window.appModel; enabled: window.featuresEnabled }
+            VoiceStudioScreen { appModel: window.appModel; enabled: window.featuresEnabled }
+            MultiVideoScreen { appModel: window.appModel; enabled: window.featuresEnabled }
+            TimelineScreen { appModel: window.appModel; enabled: window.featuresEnabled }
+            ExportScreen { appModel: window.appModel; enabled: window.featuresEnabled }
             SettingsScreen { appModel: window.appModel }
         }
     }
 
     ActionToast {
+        id: actionToast
         anchors.top: parent.top
         anchors.horizontalCenter: parent.horizontalCenter
         z: 900

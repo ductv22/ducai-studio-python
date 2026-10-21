@@ -9,6 +9,7 @@ Rectangle {
     objectName: "subtitleTextToolbar"
 
     required property var appModel
+    property bool inspectorMode: false
     property bool allowManualPlacement: false
     signal manualPlacementRequested()
     signal colorPickRequested(string target)
@@ -16,33 +17,46 @@ Rectangle {
     readonly property var cue: root.appModel.selectedCue || ({})
     readonly property string cueId: String(cue.cue_id || "")
     readonly property bool hasCue: cueId.length > 0
+    readonly property var classification: root.appModel.selectedCueClassification || ({})
+    readonly property bool canConvert: Boolean(classification.can_convert)
     readonly property bool isSceneText:
-        String(cue.cue_role || "dialogue") === "scene_text"
+        String(cue.cue_role || "dialogue") !== "dialogue"
     readonly property string editedCueId: String(
         cue.translation_cue_id || cue.cue_id || ""
     )
     readonly property string editedLanguage:
         String(cue.translation_cue_id || "").length > 0 ? "translated" : "source"
 
-    implicitHeight: toolbarColumn.implicitHeight + Theme.space16
+    enabled: !root.appModel.timelineBusy
+    implicitHeight: root.inspectorMode ? 620 : 196
     color: Theme.surfaceRaised
     border.width: 1
     border.color: root.hasCue ? Theme.info : Theme.borderSubtle
     radius: Theme.radiusSmall
+
+    component TextAction: DsButton { emphasized: true }
+    component TextNumber: DsSpinBox { emphasized: true }
+
+    function convertSelection(role) {
+        if (!root.canConvert || root.appModel.subtitleBusy || root.appModel.timelineBusy) return
+        if (!root.commitText()) return
+        textInput.focus = false
+        root.appModel.setSelectedCueRole(role)
+    }
 
     function overrideValue(values, key, fallback) {
         return values && values[key] !== undefined ? values[key] : fallback
     }
 
     function applyCurrent(values) {
-        if (!root.hasCue || root.appModel.subtitleBusy) return
+        if (!root.hasCue || root.appModel.subtitleBusy || root.appModel.timelineBusy) return
         const overrides = values || ({})
         root.appModel.setSelectedSubtitleTextFormat(
-            Math.max(1, Math.min(100, Number(root.overrideValue(
-                overrides, "fontSize", sizeSpin.value
-            )))),
+            Math.max(1, Number(root.overrideValue(
+                overrides, "fontSize", root.cue.text_font_size || 12
+            ))),
             String(root.overrideValue(
-                overrides, "orientation", orientationBox.currentValue || "horizontal"
+                overrides, "orientation", root.cue.orientation || "horizontal"
             )),
             String(root.overrideValue(
                 overrides, "backgroundColor", root.cue.background_color || ""
@@ -51,20 +65,20 @@ Rectangle {
                 overrides, "textColor", root.cue.text_color || ""
             )),
             String(root.overrideValue(
-                overrides, "styleHint", styleBox.currentValue || "standard"
+                overrides, "styleHint", root.cue.style_hint || "standard"
             )),
-            Math.max(0, Math.min(100, Number(root.overrideValue(
-                overrides, "paddingX", backgroundPaddingX.value
-            )))),
-            Math.max(0, Math.min(100, Number(root.overrideValue(
-                overrides, "paddingY", backgroundPaddingY.value
-            )))),
+            Math.max(0, Number(root.overrideValue(
+                overrides, "paddingX", root.cue.background_padding_x ?? 20
+            ))),
+            Math.max(0, Number(root.overrideValue(
+                overrides, "paddingY", root.cue.background_padding_y ?? 10
+            ))),
             String(root.overrideValue(
-                overrides, "backgroundStyle", backgroundStyleBox.currentValue || "solid"
+                overrides, "backgroundStyle", root.cue.background_style || "solid"
             )),
-            Math.max(0, Math.min(100, Number(root.overrideValue(
-                overrides, "letterSpacing", letterSpacingSpin.value
-            )))),
+            Math.max(0, Number(root.overrideValue(
+                overrides, "letterSpacing", root.cue.letter_spacing_percent || 0
+            ))),
             Boolean(root.overrideValue(
                 overrides, "fontBold", Boolean(root.cue.font_bold)
             )),
@@ -72,10 +86,10 @@ Rectangle {
                 overrides, "fontItalic", Boolean(root.cue.font_italic)
             )),
             Math.max(0, Math.min(100, Number(root.overrideValue(
-                overrides, "textOpacity", textOpacitySpin.value
+                overrides, "textOpacity", root.cue.text_opacity_percent ?? 100
             )))),
             Math.max(0, Math.min(100, Number(root.overrideValue(
-                overrides, "backgroundOpacity", backgroundOpacitySpin.value
+                overrides, "backgroundOpacity", root.cue.background_opacity_percent ?? 90
             ))))
         )
     }
@@ -117,467 +131,379 @@ Rectangle {
         })
     }
 
-    ColumnLayout {
-        id: toolbarColumn
+
+    property string inputCueId: ""
+    property string inputLanguage: "source"
+    property string inputDraft: ""
+    property string inputError: ""
+
+    function commitText() {
+        const id = root.inputCueId
+        if (id.length === 0) return true
+        const draft = root.inputDraft
+        if (draft.trim().length === 0) {
+            root.inputError = "Nội dung cue không được để trống. Nhập chữ hoặc dùng nút Xóa."
+            UiFeedback.show(root.inputError, "error", 5000)
+            return false
+        }
+        const language = root.inputLanguage
+        const changed = draft !== textInput.originalText
+        root.inputCueId = ""
+        root.inputError = ""
+        textInput.originalText = draft
+        if (changed)
+            root.appModel.updateSubtitleText(id, draft, language)
+        return true
+    }
+
+    Connections {
+        target: root.appModel
+        function onSelectedCueChanged() {
+            if (root.inputCueId && root.inputCueId !== root.editedCueId) {
+                root.commitText()
+                // A blank draft is invalid, not a deletion. Changing the
+                // selection leaves the previous cue's stored text intact.
+                root.inputCueId = ""
+                root.inputError = ""
+                textInput.focus = false
+            }
+        }
+    }
+
+    ScrollView {
+        id: textPropertiesScroll
         anchors.fill: parent
         anchors.margins: Theme.space8
-        spacing: Theme.space4
-
-        RowLayout {
-            Layout.fillWidth: true
+        clip: true
+        contentWidth: availableWidth
+        ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+        ColumnLayout {
+            id: toolbarColumn
+            width: textPropertiesScroll.availableWidth
             spacing: Theme.space8
-
             Text {
-                Layout.preferredWidth: 72
+                Layout.fillWidth: true
                 text: root.hasCue
-                    ? String(root.cue.subtitle_track_id || "S")
-                        + " · " + Number(root.appModel.selectedCueCount || 1)
-                        + " cue"
-                    : "CHỮ"
+                    ? (root.classification.role === "mixed" ? "Nhiều loại cue"
+                        : (root.classification.role === "title_text" ? "Chữ tiêu đề"
+                        : (root.classification.role === "scene_text" ? "Chữ cảnh" : "Thoại")))
+                        + (root.classification.track ? " · " + root.classification.track : " · nhiều hàng")
+                        + " · " + Number(root.classification.count || 1) + " cue"
+                    : "Chọn cue để sửa · bảng giữ cue gần nhất"
                 color: root.hasCue ? Theme.info : Theme.textMuted
                 font.family: Theme.fontFamily
                 font.pixelSize: 11
-                font.weight: Font.DemiBold
+                wrapMode: Text.Wrap
             }
-
             DsTextField {
                 id: textInput
+                objectName: "timelineCueTextField"
+                property string originalText: ""
                 Layout.fillWidth: true
-                Layout.minimumWidth: 180
-                placeholderText: root.hasCue
-                    ? "Nội dung cue đang chọn"
-                    : "Cue gần nhất sẽ được giữ để bảng không nhảy"
+                placeholderText: "Nội dung cue đang chọn"
                 enabled: root.hasCue && !root.appModel.subtitleBusy
                 Accessible.name: "Nội dung cue chữ đang chọn"
                 Binding {
                     target: textInput
                     property: "text"
-                    value: String(
-                        root.cue.translated_text || root.cue.source_text || ""
-                    )
+                    value: String(root.cue.translated_text || root.cue.source_text || "")
                     when: !textInput.activeFocus
+                        && (root.inputCueId.length === 0 || root.inputCueId !== root.editedCueId)
                 }
-                onEditingFinished: {
-                    const current = String(
-                        root.cue.translated_text || root.cue.source_text || ""
-                    )
-                    if (root.editedCueId.length > 0 && text.trim().length > 0
-                            && text !== current) {
-                        root.appModel.updateSubtitleText(
-                            root.editedCueId, text, root.editedLanguage
-                        )
+                onActiveFocusChanged: {
+                    if (activeFocus && root.inputCueId !== root.editedCueId) {
+                        root.inputCueId = root.editedCueId
+                        root.inputLanguage = root.editedLanguage
+                        root.inputDraft = text
+                        root.inputError = ""
+                        originalText = text
                     }
                 }
-            }
-
-            DsButton {
-                visible: root.allowManualPlacement
-                text: "Thêm chữ"
-                compact: true
-                primary: true
-                tooltipText: "Thêm một cue thoại hoặc chữ trong cảnh tại playhead."
-                enabled: root.appModel.currentProject.hasVideo
-                    && !root.appModel.subtitleBusy
-                disabledReason: "Cần mở video và chờ thao tác phụ đề hiện tại hoàn tất."
-                onClicked: root.manualPlacementRequested()
-            }
-
-            DsButton {
-                text: "Xóa"
-                compact: true
-                danger: true
-                tooltipText: "Xóa cue đang chọn, gồm cả chữ và nền của cue."
-                enabled: root.hasCue && !root.appModel.subtitleBusy
-                disabledReason: "Hãy chọn một cue chữ trước."
-                onClicked: root.appModel.deleteSubtitleCue(root.cueId)
-            }
-        }
-
-        RowLayout {
-            Layout.fillWidth: true
-            spacing: Theme.space4
-
-            Text {
-                Layout.preferredWidth: 72
-                text: "ĐỊNH DẠNG"
-                color: Theme.textMuted
-                font.family: Theme.fontFamily
-                font.pixelSize: 10
-                font.weight: Font.DemiBold
-            }
-
-            Text { text: "Cỡ"; color: Theme.textSecondary; font.pixelSize: 11 }
-            DsSpinBox {
-                id: sizeSpin
-                Layout.preferredWidth: 104
-                from: 1
-                to: 100
-                stepSize: 1
-                enabled: root.hasCue && !root.appModel.subtitleBusy
-                accessibleName: "Kích thước chữ từ 1 đến 100"
-                Binding {
-                    target: sizeSpin
-                    property: "value"
-                    value: Number(root.cue.text_font_size || 12)
-                    when: !sizeSpin.activeFocus
-                }
-                onValueModified: root.applyCurrent({"fontSize": value})
-            }
-
-            ComboBox {
-                id: orientationBox
-                Layout.preferredWidth: 104
-                implicitHeight: 36
-                enabled: root.hasCue && !root.appModel.subtitleBusy
-                model: [
-                    { text: "Ngang", value: "horizontal" },
-                    { text: "Dọc", value: "vertical" }
-                ]
-                textRole: "text"
-                valueRole: "value"
-                Accessible.name: "Hướng chữ"
-                Binding {
-                    target: orientationBox
-                    property: "currentIndex"
-                    value: root.cue.orientation === "vertical" ? 1 : 0
-                    when: !orientationBox.popup.visible
-                }
-                onActivated: root.applyCurrent({"orientation": currentValue})
-            }
-
-            ComboBox {
-                id: styleBox
-                Layout.preferredWidth: 220
-                Layout.maximumWidth: 280
-                implicitHeight: 36
-                enabled: root.hasCue && !root.appModel.subtitleBusy
-                model: [
-                    { text: "Chuẩn", value: "standard" },
-                    { text: "Hiển thị", value: "display" },
-                    { text: "Thư pháp Playwrite", value: "calligraphy" },
-                    { text: "Thư pháp mềm", value: "calligraphy_soft" },
-                    { text: "Thư pháp đậm", value: "calligraphy_bold" },
-                    { text: "Mực tàu", value: "calligraphy_ink" },
-                    { text: "Bút lông Comforter", value: "calligraphy_brush" },
-                    { text: "Mực nước Water Brush", value: "calligraphy_water" },
-                    { text: "Phóng bút Splash", value: "calligraphy_splash" },
-                    { text: "Thư pháp Hurricane", value: "calligraphy_hurricane" }
-                ]
-                textRole: "text"
-                valueRole: "value"
-                Accessible.name: "Kiểu chữ"
-                Binding {
-                    target: styleBox
-                    property: "currentIndex"
-                    value: {
-                        const style = String(root.cue.style_hint || "standard")
-                        if (style === "calligraphy_hurricane") return 9
-                        if (style === "calligraphy_splash") return 8
-                        if (style === "calligraphy_water") return 7
-                        if (style === "calligraphy_brush") return 6
-                        if (style === "calligraphy_ink") return 5
-                        if (style === "calligraphy_bold") return 4
-                        if (style === "calligraphy_soft") return 3
-                        if (style === "calligraphy") return 2
-                        if (style === "display") return 1
-                        return 0
+                onTextEdited: {
+                    if (root.inputCueId.length === 0) {
+                        root.inputCueId = root.editedCueId
+                        root.inputLanguage = root.editedLanguage
                     }
-                    when: !styleBox.popup.visible
+                    root.inputDraft = text
+                    root.inputError = ""
                 }
-                onActivated: root.applyCurrent({"styleHint": currentValue})
+                onEditingFinished: root.commitText()
             }
-
-            DsButton {
-                text: "B"
-                compact: true
-                primary: Boolean(root.cue.font_bold)
-                tooltipText: "Bật hoặc tắt chữ in đậm cho cue đang chọn."
-                enabled: root.hasCue && !root.appModel.subtitleBusy
-                onClicked: root.applyCurrent({"fontBold": !Boolean(root.cue.font_bold)})
-                Accessible.name: "In đậm chữ"
-            }
-            DsButton {
-                text: "I"
-                compact: true
-                primary: Boolean(root.cue.font_italic)
-                tooltipText: "Bật hoặc tắt chữ in nghiêng cho cue đang chọn."
-                enabled: root.hasCue && !root.appModel.subtitleBusy
-                onClicked: root.applyCurrent({"fontItalic": !Boolean(root.cue.font_italic)})
-                Accessible.name: "In nghiêng chữ"
-            }
-            Item { Layout.fillWidth: true }
-        }
-
-        RowLayout {
-            Layout.fillWidth: true
-            spacing: Theme.space4
-
             Text {
-                Layout.preferredWidth: 72
-                text: "HIỂN THỊ"
-                color: Theme.textMuted
+                objectName: "timelineCueTextValidation"
+                Layout.fillWidth: true
+                visible: root.inputError.length > 0
+                text: root.inputError
+                color: Theme.error
                 font.family: Theme.fontFamily
-                font.pixelSize: 10
-                font.weight: Font.DemiBold
+                font.pixelSize: 11
+                wrapMode: Text.Wrap
+                Accessible.name: text
             }
-            Text { text: "Giãn chữ"; color: Theme.textSecondary; font.pixelSize: 11 }
-            DsSpinBox {
-                id: letterSpacingSpin
-                Layout.preferredWidth: 104
-                from: 0
-                to: 100
-                stepSize: 1
-                enabled: root.hasCue && !root.appModel.subtitleBusy
-                accessibleName: "Khoảng cách chữ theo phần trăm cỡ chữ"
-                Binding {
-                    target: letterSpacingSpin
-                    property: "value"
-                    value: Number(root.cue.letter_spacing_percent || 0)
-                    when: !letterSpacingSpin.activeFocus
+            RowLayout {
+                Layout.fillWidth: true
+                TextAction {
+                    visible: root.allowManualPlacement
+                    text: "Thêm chữ"; compact: true
+                    tooltipText: "Thêm thoại hoặc chữ cảnh tại playhead."
+                    enabled: root.appModel.currentProject.hasVideo
+                    onClicked: root.manualPlacementRequested()
                 }
-                onValueModified: root.applyCurrent({"letterSpacing": value})
+                Item { Layout.fillWidth: true }
+                TextAction {
+                    objectName: "deleteTimelineCueButton"
+                    text: "Xóa"; compact: true; danger: true
+                    tooltipText: "Xóa cue đang chọn, gồm cả chữ và nền."
+                    enabled: root.hasCue
+                    onClicked: root.appModel.deleteSelectedSubtitleCues()
+                }
             }
-            Text { text: "Đục chữ"; color: Theme.textSecondary; font.pixelSize: 11 }
-            DsSpinBox {
-                id: textOpacitySpin
-                Layout.preferredWidth: 104
-                from: 0
-                to: 100
-                stepSize: 1
+
+            SectionTitle { text: "Loại cue" }
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: Theme.space8
+                TextAction {
+                    objectName: "convertCueToS1Button"
+                    Layout.fillWidth: true
+                    text: "S1 · Thoại"
+                    compact: true
+                    primary: root.classification.role === "dialogue" && root.classification.track === "S1"
+                    enabled: root.canConvert && !root.appModel.subtitleBusy
+                    feedbackEnabled: false
+                    tooltipText: "Chuyển cue đang chọn thành thoại S1, có lồng tiếng. Chữ cảnh cũ trùng trên S1 tự chuyển xuống hàng trống bên dưới; giữ chữ, thời gian và định dạng."
+                    disabledReason: root.appModel.subtitleBusy ? "Đang cập nhật cue; hãy chờ hoàn tất."
+                        : "Chọn cue phụ đề S để chuyển loại; chữ tiêu đề T được giữ riêng."
+                    Accessible.name: "Chuyển cue được chọn thành thoại trên S1"
+                    onClicked: root.convertSelection("dialogue")
+                }
+                TextAction {
+                    objectName: "convertCueToS2Button"
+                    Layout.fillWidth: true
+                    text: "S2 · Chữ cảnh"
+                    compact: true
+                    primary: root.classification.role === "scene_text" && root.classification.track === "S2"
+                    enabled: root.canConvert && !root.appModel.subtitleBusy
+                    feedbackEnabled: false
+                    tooltipText: "Chuyển tất cả cue đang chọn thành chữ cảnh trên S2, không lồng tiếng. Giữ chữ, thời gian và định dạng; báo lỗi nếu S2 trùng cue."
+                    disabledReason: root.appModel.subtitleBusy ? "Đang cập nhật cue; hãy chờ hoàn tất."
+                        : "Chọn cue phụ đề S để chuyển loại; chữ tiêu đề T được giữ riêng."
+                    Accessible.name: "Chuyển cue được chọn thành chữ trong cảnh trên S2"
+                    onClicked: root.convertSelection("scene_text")
+                }
+            }
+            Text {
+                Layout.fillWidth: true
+                text: root.canConvert
+                    ? "Áp dụng cho toàn bộ lựa chọn. D1 đã tạo giữ nguyên; tạo lại giọng để áp dụng loại mới."
+                    : "Chọn một hoặc nhiều cue S để đổi loại. Chữ tiêu đề T không đổi."
+                color: Theme.textSecondary
+                font.family: Theme.fontFamily
+                font.pixelSize: 11
+                wrapMode: Text.Wrap
+            }
+
+            SectionTitle { text: "Chữ" }
+            GridLayout {
+                Layout.fillWidth: true
+                columns: root.inspectorMode ? 2 : 6
+                columnSpacing: Theme.space8
+                rowSpacing: Theme.space8
                 enabled: root.hasCue && !root.appModel.subtitleBusy
-                accessibleName: "Độ đục của chữ"
-                Binding {
-                    target: textOpacitySpin
-                    property: "value"
+
+                Text { text: "Font chữ"; color: Theme.textSecondary; font.family: Theme.fontFamily; font.pixelSize: 11 }
+                ComboBox {
+                    id: styleBox
+                    objectName: "styleBox"
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 0
+                    model: [{text: "Chuẩn", value: "standard"},{text: "Hiển thị", value: "display"},{text: "Thư pháp Playwrite", value: "calligraphy"},{text: "Thư pháp mềm", value: "calligraphy_soft"},{text: "Thư pháp đậm", value: "calligraphy_bold"},{text: "Mực tàu", value: "calligraphy_ink"},{text: "Bút lông Comforter", value: "calligraphy_brush"},{text: "Mực nước Water Brush", value: "calligraphy_water"},{text: "Phóng bút Splash", value: "calligraphy_splash"},{text: "Thư pháp Hurricane", value: "calligraphy_hurricane"}]
+                    textRole: "text"; valueRole: "value"
+                    font.family: Theme.fontFamily
+                    font.pixelSize: 12
+                    palette.button: Theme.surfaceRaised
+                    palette.buttonText: Theme.textPrimary
+                    palette.base: Theme.surfaceRaised
+                    palette.text: Theme.textPrimary
+                    palette.window: Theme.surfaceRaised
+                    palette.highlight: Theme.primary
+                    Accessible.name: "Font chữ"
+                    currentIndex: Math.max(0, model.findIndex(function(item) {
+                        return item.value === String(root.cue.style_hint || "standard")
+                    }))
+                    onActivated: root.applyCurrent({"styleHint": currentValue})
+                }
+
+                Text { text: "Cỡ chữ"; color: Theme.textSecondary; font.family: Theme.fontFamily; font.pixelSize: 11 }
+                TextNumber {
+                    id: sizeSpin
+                    objectName: "sizeSpin"
+                    Layout.fillWidth: true
+                    from: 1; to: 2147483647
+                    accessibleName: "Cỡ chữ"
+                    value: Number(root.cue.text_font_size ?? 12)
+                    onValueModified: root.applyCurrent({"fontSize": value})
+                }
+
+                Text { text: "Hướng chữ"; color: Theme.textSecondary; font.family: Theme.fontFamily; font.pixelSize: 11 }
+                ComboBox {
+                    id: orientationBox
+                    objectName: "orientationBox"
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 0
+                    model: [{text: "Ngang", value: "horizontal"},{text: "Dọc", value: "vertical"}]
+                    textRole: "text"; valueRole: "value"
+                    font.family: Theme.fontFamily
+                    font.pixelSize: 12
+                    palette.button: Theme.surfaceRaised
+                    palette.buttonText: Theme.textPrimary
+                    palette.base: Theme.surfaceRaised
+                    palette.text: Theme.textPrimary
+                    palette.window: Theme.surfaceRaised
+                    palette.highlight: Theme.primary
+                    Accessible.name: "Hướng chữ"
+                    currentIndex: Math.max(0, model.findIndex(function(item) {
+                        return item.value === String(root.cue.orientation || "horizontal")
+                    }))
+                    onActivated: root.applyCurrent({"orientation": currentValue})
+                }
+
+                Text { text: "Giãn chữ (%)"; color: Theme.textSecondary; font.family: Theme.fontFamily; font.pixelSize: 11 }
+                TextNumber {
+                    id: letterSpacingSpin
+                    objectName: "letterSpacingSpin"
+                    Layout.fillWidth: true
+                    from: 0; to: 2147483647
+                    accessibleName: "Giãn chữ (%)"
+                    value: Number(root.cue.letter_spacing_percent ?? 0)
+                    onValueModified: root.applyCurrent({"letterSpacing": value})
+                }
+
+                Text { text: "Đục chữ (%)"; color: Theme.textSecondary; font.family: Theme.fontFamily; font.pixelSize: 11 }
+                TextNumber {
+                    id: textOpacitySpin
+                    objectName: "textOpacitySpin"
+                    Layout.fillWidth: true
+                    from: 0; to: 100
+                    accessibleName: "Đục chữ (%)"
                     value: Number(root.cue.text_opacity_percent ?? 100)
-                    when: !textOpacitySpin.activeFocus
+                    onValueModified: root.applyCurrent({"textOpacity": value})
                 }
-                onValueModified: root.applyCurrent({"textOpacity": value})
-            }
-            DsButton {
-                text: "Màu chữ"
-                compact: true
-                tooltipText: "Mở bảng chọn màu chữ cho cue đang chọn."
-                enabled: root.hasCue && !root.appModel.subtitleBusy
-                onClicked: textColorDialog.open()
-            }
-            DsButton {
-                text: "Ống hút"
-                compact: true
-                tooltipText: "Lấy màu chữ trực tiếp từ một điểm trên Preview."
-                enabled: root.hasCue && !root.appModel.subtitleBusy
-                disabledReason: "Chọn cue trước rồi lấy màu trực tiếp trên Preview."
-                onClicked: root.colorPickRequested("text")
-            }
-            Rectangle {
-                Layout.preferredWidth: 24
-                Layout.preferredHeight: 24
-                radius: Theme.radiusSmall
-                color: /^#[0-9a-fA-F]{6}$/.test(String(root.cue.text_color || ""))
-                    ? root.cue.text_color : root.appModel.exportSubtitlePrimaryColor
-                border.width: 1
-                border.color: Theme.borderStrong
-            }
-            Item { Layout.fillWidth: true }
-        }
-
-        RowLayout {
-            Layout.fillWidth: true
-            spacing: Theme.space4
-
-            Text {
-                Layout.preferredWidth: 72
-                text: "NỀN CHỮ"
-                color: Theme.textMuted
-                font.family: Theme.fontFamily
-                font.pixelSize: 10
-                font.weight: Font.DemiBold
-            }
-            ComboBox {
-                id: backgroundStyleBox
-                Layout.preferredWidth: 144
-                implicitHeight: 36
-                enabled: root.hasCue && root.isSceneText && !root.appModel.subtitleBusy
-                model: [
-                    { text: "Nền phẳng", value: "solid" },
-                    { text: "Mực loang", value: "ink_splash" },
-                    { text: "Mực đại mặc", value: "ink_wash" },
-                    { text: "Mực tụ", value: "ink_cloud" },
-                    { text: "Nét cọ", value: "brush_stroke" }
-                ]
-                textRole: "text"
-                valueRole: "value"
-                Accessible.name: "Kiểu nền chữ"
-                Binding {
-                    target: backgroundStyleBox
-                    property: "currentIndex"
-                    value: {
-                        const style = String(root.cue.background_style || "solid")
-                        if (style === "brush_stroke") return 4
-                        if (style === "ink_cloud") return 3
-                        if (style === "ink_wash") return 2
-                        if (style === "ink_splash") return 1
-                        return 0
-                    }
-                    when: !backgroundStyleBox.popup.visible
+                Text { text: "Kiểu chữ"; color: Theme.textSecondary; font.family: Theme.fontFamily; font.pixelSize: 11 }
+                RowLayout {
+                    TextAction { text: "B"; compact: true; tooltipText: "Bật/tắt in đậm cho các cue đang chọn."; onClicked: root.applyCurrent({"fontBold": !Boolean(root.cue.font_bold)}); primary: Boolean(root.cue.font_bold); Accessible.name: "In đậm chữ" }
+                    TextAction { text: "I"; compact: true; tooltipText: "Bật/tắt in nghiêng cho các cue đang chọn."; onClicked: root.applyCurrent({"fontItalic": !Boolean(root.cue.font_italic)}); primary: Boolean(root.cue.font_italic); Accessible.name: "In nghiêng chữ" }
                 }
-                onActivated: root.applyCurrent({"backgroundStyle": currentValue})
+                Text { text: "Màu chữ"; color: Theme.textSecondary; font.family: Theme.fontFamily; font.pixelSize: 11 }
+                RowLayout {
+                    TextAction { text: "Màu"; compact: true; tooltipText: "Chọn màu chữ cho các cue đang chọn."; onClicked: textColorDialog.open();  }
+                    TextAction { text: "Ống hút"; compact: true; tooltipText: "Lấy màu chữ từ frame Preview."; onClicked: root.colorPickRequested("text");  }
+                }
             }
-            Text {
-                text: "Ngang"
-                color: Theme.textSecondary
-                font.pixelSize: 11
-                Accessible.name: "Độ rộng nền theo chiều ngang"
-            }
-            DsSpinBox {
-                id: backgroundPaddingX
-                Layout.preferredWidth: 104
-                from: 0
-                to: 100
-                stepSize: 1
-                enabled: root.hasCue && root.isSceneText && !root.appModel.subtitleBusy
-                accessibleName: "Độ rộng nền chữ"
-                Binding {
-                    target: backgroundPaddingX
-                    property: "value"
+
+            SectionTitle { text: "Nền" }
+            GridLayout {
+                Layout.fillWidth: true
+                columns: root.inspectorMode ? 2 : 6
+                columnSpacing: Theme.space8
+                rowSpacing: Theme.space8
+                enabled: root.hasCue && !root.appModel.subtitleBusy
+
+                Text { text: "Kiểu nền"; color: Theme.textSecondary; font.family: Theme.fontFamily; font.pixelSize: 11 }
+                ComboBox {
+                    id: backgroundStyleBox
+                    objectName: "backgroundStyleBox"
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 0
+                    model: [{text: "Nền phẳng", value: "solid"},{text: "Mực loang", value: "ink_splash"},{text: "Mực đại mặc", value: "ink_wash"},{text: "Mực tụ", value: "ink_cloud"},{text: "Nét cọ", value: "brush_stroke"}]
+                    textRole: "text"; valueRole: "value"
+                    font.family: Theme.fontFamily
+                    font.pixelSize: 12
+                    palette.button: Theme.surfaceRaised
+                    palette.buttonText: Theme.textPrimary
+                    palette.base: Theme.surfaceRaised
+                    palette.text: Theme.textPrimary
+                    palette.window: Theme.surfaceRaised
+                    palette.highlight: Theme.primary
+                    Accessible.name: "Kiểu nền"
+                    currentIndex: Math.max(0, model.findIndex(function(item) {
+                        return item.value === String(root.cue.background_style || "solid")
+                    }))
+                    onActivated: root.applyCurrent({"backgroundStyle": currentValue})
+                }
+
+                Text { text: "Nền ngang (%)"; color: Theme.textSecondary; font.family: Theme.fontFamily; font.pixelSize: 11 }
+                TextNumber {
+                    id: backgroundPaddingX
+                    objectName: "backgroundPaddingX"
+                    Layout.fillWidth: true
+                    from: 0; to: 2147483647
+                    accessibleName: "Nền ngang (%)"
                     value: Number(root.cue.background_padding_x ?? 20)
-                    when: !backgroundPaddingX.activeFocus
+                    onValueModified: root.applyCurrent({"paddingX": value})
                 }
-                onValueModified: root.applyCurrent({"paddingX": value})
-            }
-            Text {
-                text: "Dọc"
-                color: Theme.textSecondary
-                font.pixelSize: 11
-                Accessible.name: "Độ rộng nền theo chiều dọc"
-            }
-            DsSpinBox {
-                id: backgroundPaddingY
-                Layout.preferredWidth: 104
-                from: 0
-                to: 100
-                stepSize: 1
-                enabled: root.hasCue && root.isSceneText && !root.appModel.subtitleBusy
-                accessibleName: "Độ cao nền chữ"
-                Binding {
-                    target: backgroundPaddingY
-                    property: "value"
+
+                Text { text: "Nền dọc (%)"; color: Theme.textSecondary; font.family: Theme.fontFamily; font.pixelSize: 11 }
+                TextNumber {
+                    id: backgroundPaddingY
+                    objectName: "backgroundPaddingY"
+                    Layout.fillWidth: true
+                    from: 0; to: 2147483647
+                    accessibleName: "Nền dọc (%)"
                     value: Number(root.cue.background_padding_y ?? 10)
-                    when: !backgroundPaddingY.activeFocus
+                    onValueModified: root.applyCurrent({"paddingY": value})
                 }
-                onValueModified: root.applyCurrent({"paddingY": value})
-            }
-            Text { text: "Đục nền"; color: Theme.textSecondary; font.pixelSize: 11 }
-            DsSpinBox {
-                id: backgroundOpacitySpin
-                Layout.preferredWidth: 104
-                from: 0
-                to: 100
-                stepSize: 1
-                enabled: root.hasCue && !root.appModel.subtitleBusy
-                accessibleName: "Độ đục của nền"
-                Binding {
-                    target: backgroundOpacitySpin
-                    property: "value"
+
+                Text { text: "Đục nền (%)"; color: Theme.textSecondary; font.family: Theme.fontFamily; font.pixelSize: 11 }
+                TextNumber {
+                    id: backgroundOpacitySpin
+                    objectName: "backgroundOpacitySpin"
+                    Layout.fillWidth: true
+                    from: 0; to: 100
+                    accessibleName: "Đục nền (%)"
                     value: Number(root.cue.background_opacity_percent ?? 90)
-                    when: !backgroundOpacitySpin.activeFocus
+                    onValueModified: root.applyCurrent({"backgroundOpacity": value})
                 }
-                onValueModified: root.applyCurrent({"backgroundOpacity": value})
+                Text { text: "Màu nền"; color: Theme.textSecondary; font.family: Theme.fontFamily; font.pixelSize: 11 }
+                RowLayout {
+                    TextAction { text: "Màu"; compact: true; tooltipText: "Chọn màu nền cho các cue đang chọn."; onClicked: backgroundDialog.open();  }
+                    TextAction { text: "Ống hút"; compact: true; tooltipText: "Lấy màu nền từ frame Preview."; onClicked: root.colorPickRequested("background");  }
+                }
+                Text { text: "Tùy chọn"; color: Theme.textSecondary; font.family: Theme.fontFamily; font.pixelSize: 11 }
+                RowLayout {
+                    TextAction { text: "Bỏ nền"; compact: true; tooltipText: "Bỏ màu nền của các cue đang chọn."; onClicked: root.applyCurrent({"backgroundColor": ""});  }
+                    TextAction { text: "Mực tàu"; compact: true; tooltipText: "Áp dụng kiểu chữ và nền mực tàu cho các cue đang chọn."; onClicked: root.applyInkPreset();  }
+                }
             }
-            Item { Layout.fillWidth: true }
-        }
-
-        RowLayout {
-            Layout.fillWidth: true
-            spacing: Theme.space4
-
-            Text {
-                Layout.preferredWidth: 72
-                text: "MÀU & HIỆU ỨNG"
-                color: Theme.textMuted
-                font.family: Theme.fontFamily
-                font.pixelSize: 10
-                font.weight: Font.DemiBold
-            }
-            DsButton {
-                text: "Màu nền"
-                compact: true
-                tooltipText: "Mở bảng chọn màu nền của cue."
-                enabled: root.hasCue && !root.appModel.subtitleBusy
-                onClicked: backgroundDialog.open()
-            }
-            DsButton {
-                text: "Ống hút nền"
-                compact: true
-                tooltipText: "Lấy màu nền trực tiếp từ một điểm trên Preview."
-                enabled: root.hasCue && !root.appModel.subtitleBusy
-                disabledReason: "Chọn cue trước rồi lấy màu trực tiếp trên Preview."
-                onClicked: root.colorPickRequested("background")
-                Accessible.name: "Ống hút lấy màu nền từ Preview"
-            }
-            Rectangle {
-                Layout.preferredWidth: 24
-                Layout.preferredHeight: 24
-                radius: Theme.radiusSmall
-                color: /^#[0-9a-fA-F]{6}$/.test(
-                    String(root.cue.background_color || "")
-                ) ? root.cue.background_color : "transparent"
-                border.width: 1
-                border.color: Theme.borderStrong
-            }
-            DsButton {
-                text: "Bỏ nền"
-                compact: true
-                tooltipText: "Bỏ màu nền nhưng giữ nguyên nội dung cue."
-                enabled: root.hasCue
-                    && String(root.cue.background_color || "").length > 0
-                    && !root.appModel.subtitleBusy
-                onClicked: root.applyCurrent({"backgroundColor": ""})
-                Accessible.name: "Bỏ màu nền của cue chữ"
-            }
-            DsButton {
-                text: "Mực tàu"
-                compact: true
-                primary: root.cue.background_style === "ink_splash"
-                tooltipText: "Áp nhanh font thư pháp và nền mực tàu cho chữ trong cảnh."
+            SectionTitle { text: "Hiệu ứng" }
+            GridLayout {
+                Layout.fillWidth: true
+                columns: root.inspectorMode ? 2 : 6
+                columnSpacing: Theme.space8
+                rowSpacing: Theme.space8
                 enabled: root.hasCue && root.isSceneText && !root.appModel.subtitleBusy
-                disabledReason: "Preset mực tàu chỉ áp dụng cho cue chữ trong cảnh S2 trở đi."
-                onClicked: root.applyInkPreset()
-                Accessible.name: "Áp preset chữ và nền mực tàu"
-            }
-            DsButton {
-                text: "Mờ vào/ra"
-                compact: true
-                primary: Boolean(root.cue.fade_enabled)
-                tooltipText: "Cho chữ trong cảnh xuất hiện và biến mất mờ dần."
-                enabled: root.hasCue && root.isSceneText && !root.appModel.subtitleBusy
-                disabledReason: "Hiệu ứng mờ vào/ra chỉ áp dụng cho chữ trong cảnh."
-                onClicked: root.appModel.setSelectedSceneTextFade(
-                    !Boolean(root.cue.fade_enabled), fadeDurationSpin.value
-                )
-                Accessible.name: "Bật hoặc tắt hiệu ứng chữ xuất hiện và biến mất mờ dần"
-            }
-            Text { text: "Mỗi đầu"; color: Theme.textSecondary; font.pixelSize: 11 }
-            DsSpinBox {
-                id: fadeDurationSpin
-                Layout.preferredWidth: 112
-                from: 50
-                to: 2000
-                stepSize: 50
-                enabled: root.hasCue && root.isSceneText && !root.appModel.subtitleBusy
-                accessibleName: "Thời lượng mờ dần mỗi đầu tính bằng mili giây"
-                Binding {
-                    target: fadeDurationSpin
-                    property: "value"
+                Text { text: "Mờ vào/ra"; color: Theme.textSecondary; font.family: Theme.fontFamily; font.pixelSize: 11 }
+                TextAction {
+                    text: Boolean(root.cue.fade_enabled) ? "Đang bật" : "Đang tắt"
+                    compact: true; primary: Boolean(root.cue.fade_enabled)
+                    tooltipText: "Bật/tắt mờ dần hai đầu chữ cảnh."
+                    onClicked: root.appModel.setSelectedSceneTextFade(
+                        !Boolean(root.cue.fade_enabled), fadeDurationSpin.value
+                    )
+                }
+                Text { text: "Mỗi đầu (ms)"; color: Theme.textSecondary; font.family: Theme.fontFamily; font.pixelSize: 11 }
+                TextNumber {
+                    id: fadeDurationSpin
+                    objectName: "fadeDurationSpin"
+                    Layout.fillWidth: true
+                    from: 50; to: 2000; stepSize: 50
+                    accessibleName: "Thời lượng mờ dần mỗi đầu tính bằng mili giây"
                     value: Number(root.cue.fade_duration_ms ?? 300)
-                    when: !fadeDurationSpin.activeFocus
+                    onValueModified: root.appModel.setSelectedSceneTextFade(
+                        Boolean(root.cue.fade_enabled), value
+                    )
                 }
-                onValueModified: root.appModel.setSelectedSceneTextFade(
-                    Boolean(root.cue.fade_enabled), value
-                )
             }
-            Text { text: "ms"; color: Theme.textSecondary; font.pixelSize: 11 }
-            Item { Layout.fillWidth: true }
         }
     }
 }

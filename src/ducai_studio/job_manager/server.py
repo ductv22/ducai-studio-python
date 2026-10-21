@@ -5,11 +5,12 @@ import hashlib
 import json
 import zlib
 from pathlib import Path
+from threading import Event
 from time import monotonic
 from typing import Any
 from uuid import uuid4
 
-from PySide6.QtCore import QObject, QTimer, Slot
+from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 from ducai_studio.application.job_commands import control_intent, retry_target
@@ -19,12 +20,18 @@ from ducai_studio.domain.jobs import (
     JobState,
     assert_safe_error_code,
 )
+from ducai_studio.infrastructure.credential_store import WindowsCredentialStore
+from ducai_studio.infrastructure.database_optimizer import DatabaseOptimizationCancelled
 from ducai_studio.infrastructure.ipc.messages import (
     IPC_PROTOCOL_VERSION,
     FrameDecoder,
     IpcMessage,
     encode_frame,
 )
+from ducai_studio.infrastructure.licensing_state import LicensingState
+from ducai_studio.infrastructure.runtime_diagnostics import isolated_runtime_diagnostics
+from ducai_studio.infrastructure.runtime_program import runtime_program_path
+from ducai_studio.providers.translation.model_catalog import ModelCatalogError, discover_models
 from ducai_studio.providers.tts.warm_host import WarmTtsHostConfig, WarmTtsHostPool
 from ducai_studio.workers.protocol import WorkerMessage
 
@@ -59,6 +66,28 @@ _START_CONTROL_FIRST_RETRY_MS = 750
 _START_CONTROL_RETRY_INTERVAL_MS = 3_000
 _START_CONTROL_SLOW_AFTER_SECONDS = 30.0
 _START_CONTROL_SLOW_RETRY_INTERVAL_MS = 5_000
+_TTS_REPLACEMENT_QUIET_MS = 500
+_DATABASE_MAINTENANCE_READ_ACTIONS = frozenset(
+    {
+        "cancel_database_optimization",
+        "get_database_optimization",
+        "get_job",
+        "get_project",
+        "get_translation_preview",
+        "get_update_install_eligibility",
+        "inspect_media_usage",
+        "list_credentials",
+        "list_events",
+        "list_jobs",
+        "list_projects",
+        "list_translation_caches",
+        "multi_list",
+        "multi_status",
+        "ping",
+        "runtime_diagnostics",
+        "shutdown",
+    }
+)
 _MANAGED_ENGINE_HOSTS = {
     JobKind.OCR: (
         "ocr_engine_host.py",
@@ -169,6 +198,110 @@ def _project_transport_payload(
     }
 
 
+def _translation_preferences_transport_payload(
+    snapshot: dict[str, Any], *, compact: bool, staging_root: Path,
+) -> dict[str, Any]:
+    if not compact:
+        return _project_transport_payload(snapshot, staging_root=staging_root)
+    return {
+        "id": snapshot["id"], "revision": snapshot["revision"],
+        "_translation_preferences_patch": True,
+        "translation_preferences": snapshot["translation_preferences"],
+        "_project_dirty": snapshot.get("_project_dirty", False),
+        "_saved_revision": snapshot.get("_saved_revision", snapshot["revision"]),
+    }
+
+
+def _job_transport_payload(result: Any) -> Any:
+    """GUI job acknowledgements need identity/status, never the worker's bulk input."""
+    if isinstance(result, list):
+        return [_job_transport_payload(item) for item in result]
+    if not isinstance(result, dict) or not result.get("id"):
+        return result
+    spec = result.get("spec")
+    if not isinstance(spec, dict) or not isinstance(spec.get("provider_config"), dict):
+        return result
+    config = spec["provider_config"]
+    bulk = {"source_cues", "cues", "snapshot", "export_snapshot", "project_snapshot",
+            "preserved_manual_translations", "source_cue_identities", "translated_cues"}
+    compact = {key: value for key, value in config.items() if key not in bulk}
+    return {**result, "spec": {**spec, "provider_config": compact}}
+
+
+class _DatabaseOptimizerThread(QThread):
+    progressReported = Signal(object)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, service: JobManagerService, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._service = service
+        self._cancel_event = Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    def run(self) -> None:
+        try:
+            result = self._service.optimize_database(
+                cancel_event=self._cancel_event,
+                progress_callback=self.progressReported.emit,
+            )
+        except DatabaseOptimizationCancelled as exc:
+            self.completed.emit({"state": "cancelled", "message": str(exc)})
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.completed.emit({"state": "completed", **result})
+
+
+class _ModelCatalogThread(QThread):
+    completed = Signal(object)
+
+    def __init__(self, socket: QLocalSocket, request_id: str, params: dict, parent: QObject):
+        super().__init__(parent)
+        self.socket = socket
+        self.request_id = request_id
+        self.params = params
+
+    def run(self) -> None:
+        try:
+            secret = WindowsCredentialStore().read(self.params["credential_reference"])
+            result = discover_models(
+                self.params["provider_id"], secret, base_url=self.params.get("base_url", ""),
+                cancelled=self.isInterruptionRequested,
+            )
+        except ModelCatalogError as exc:
+            result = {"models": [], "error": str(exc)}
+        except Exception:
+            result = {"models": [], "error": (
+                "Không đọc được key hoặc danh sách model. Hãy nhập tên thủ công."
+            )}
+        self.completed.emit(result)
+
+
+class _RuntimeDiagnosticsThread(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, socket: QLocalSocket, request_id: str, data_root: str | None,
+                 parent: QObject):
+        super().__init__(parent)
+        self.socket = socket
+        self.request_id = request_id
+        self.data_root = data_root
+
+    def run(self) -> None:
+        try:
+            result = isolated_runtime_diagnostics(
+                data_root=self.data_root, cancelled=self.isInterruptionRequested)
+        except Exception:
+            self.failed.emit("Chẩn đoán chưa hoàn tất. Hãy thử lại khi máy rảnh.")
+        else:
+            if result is not None and not self.isInterruptionRequested():
+                self.completed.emit(result)
+
+
 class JobManagerServer(QObject):
     def __init__(
         self,
@@ -180,13 +313,21 @@ class JobManagerServer(QObject):
         super().__init__()
         self.name = name
         self.service = service
+        self.licensing = LicensingState()
         self.workers = workers or WorkerSupervisor(self)
         self.server = QLocalServer(self)
         self._decoders: dict[QLocalSocket, FrameDecoder] = {}
+        self._catalog_threads: set[_ModelCatalogThread] = set()
+        self._diagnostic_threads: set[_RuntimeDiagnosticsThread] = set()
         self._control_retry_attempts: dict[str, int] = {}
         self._control_retry_started_at: dict[str, float] = {}
         self._slow_start_controls_reported: set[str] = set()
         self._pending_history_deletions: set[str] = set()
+        self._pending_tts_replacements: set[str] = set()
+        self._pending_tts_replacement_projects: dict[str, str] = {}
+        self._pending_tts_replacement_deadlines: dict[str, float] = {}
+        self._database_optimizer_thread: _DatabaseOptimizerThread | None = None
+        self._database_maintenance: dict[str, Any] = {"state": "idle"}
         self._update_install_reservation = ""
         self._shutting_down = False
         self._shutdown_deadline = 0.0
@@ -203,6 +344,16 @@ class JobManagerServer(QObject):
             raise RuntimeError(f"Cannot listen on {self.name}: {self.server.errorString()}")
 
     def close(self) -> None:
+        for thread in tuple(self._diagnostic_threads):
+            thread.requestInterruption()
+            thread.wait(10_000)
+        for thread in tuple(self._catalog_threads):
+            thread.requestInterruption()
+            thread.wait(10_000)
+        optimizer = self._database_optimizer_thread
+        if optimizer is not None and optimizer.isRunning():
+            optimizer.cancel()
+            optimizer.wait(10_000)
         self.workers.force_shutdown()
         self._warm_tts.close()
         for socket in tuple(self._decoders):
@@ -221,6 +372,9 @@ class JobManagerServer(QObject):
 
     def _drop_socket(self, socket: QLocalSocket) -> None:
         self._decoders.pop(socket, None)
+        for thread in self._diagnostic_threads:
+            if thread.socket is socket:
+                thread.requestInterruption()
         socket.deleteLater()
 
     def _broadcast_multi_status(self) -> None:
@@ -287,24 +441,125 @@ class JobManagerServer(QObject):
             )
             return
         try:
-            result = self._dispatch(action, params)
+            self.licensing.require_action(action)
+            if action == "list_translation_models":
+                self._start_model_catalog(socket, message.message_id, params)
+                return
+            if action == "runtime_diagnostics":
+                self._start_runtime_diagnostics(socket, message.message_id, params)
+                return
+            result = _job_transport_payload(self._dispatch(action, params))
+            response = IpcMessage(
+                protocol_version=IPC_PROTOCOL_VERSION,
+                message_id=str(uuid4()),
+                kind="response",
+                payload={"request_id": message.message_id, "ok": True, "result": result},
+            )
+            frame = encode_frame(response)
         except Exception as exc:
             self._send_error(socket, request_id=message.message_id, exc=exc)
             return
-        response = IpcMessage(
-            protocol_version=IPC_PROTOCOL_VERSION,
-            message_id=str(uuid4()),
-            kind="response",
-            payload={"request_id": message.message_id, "ok": True, "result": result},
-        )
-        socket.write(encode_frame(response))
+        socket.write(frame)
         socket.flush()
         if action == "shutdown":
             QTimer.singleShot(0, self._begin_shutdown)
 
+    def _start_model_catalog(self, socket: QLocalSocket, request_id: str, params: dict) -> None:
+        self.licensing.require_active()
+        provider = _required_string(params, "provider_id")
+        reference = _required_string(params, "credential_reference")
+        if provider not in TRANSLATION_API_PROVIDER_IDS:
+            raise ValueError("Nguồn dịch không hỗ trợ danh sách model API")
+        if self._shutting_down or len(self._catalog_threads) >= 2:
+            raise ValueError("Đang tải danh sách model. Hãy chờ rồi thử lại.")
+        thread = _ModelCatalogThread(socket, request_id, {
+            "provider_id": provider, "credential_reference": reference,
+            "base_url": str(params.get("base_url", "")),
+        }, self)
+        self._catalog_threads.add(thread)
+        thread.completed.connect(self._model_catalog_completed)
+        thread.finished.connect(self._model_catalog_finished)
+        thread.start()
+
+    def _start_runtime_diagnostics(self, socket: QLocalSocket, request_id: str,
+                                   params: dict) -> None:
+        data_root = params.get("data_root")
+        if data_root is not None and (not isinstance(data_root, str) or not data_root.strip()):
+            raise ValueError("data_root must be a non-empty string")
+        if self._shutting_down or self._diagnostic_threads:
+            raise ValueError("Đang chẩn đoán. Hãy chờ rồi thử lại.")
+        thread = _RuntimeDiagnosticsThread(socket, request_id, data_root, self)
+        self._diagnostic_threads.add(thread)
+        thread.completed.connect(self._runtime_diagnostics_completed)
+        thread.failed.connect(self._runtime_diagnostics_failed)
+        thread.finished.connect(self._runtime_diagnostics_finished)
+        thread.start()
+
+    @Slot(object)
+    def _runtime_diagnostics_completed(self, result: object) -> None:
+        thread = self.sender()
+        if (not isinstance(thread, _RuntimeDiagnosticsThread) or self._shutting_down
+                or thread.socket not in self._decoders):
+            return
+        thread.socket.write(encode_frame(IpcMessage(
+            protocol_version=IPC_PROTOCOL_VERSION, message_id=str(uuid4()), kind="response",
+            payload={"request_id": thread.request_id, "ok": True, "result": result},
+        )))
+        thread.socket.flush()
+
+    @Slot(str)
+    def _runtime_diagnostics_failed(self, message: str) -> None:
+        thread = self.sender()
+        if (isinstance(thread, _RuntimeDiagnosticsThread) and not self._shutting_down
+                and thread.socket in self._decoders):
+            self._send_error(thread.socket, request_id=thread.request_id, exc=RuntimeError(message))
+
+    @Slot()
+    def _runtime_diagnostics_finished(self) -> None:
+        thread = self.sender()
+        if isinstance(thread, _RuntimeDiagnosticsThread):
+            self._diagnostic_threads.discard(thread)
+            thread.deleteLater()
+
+    @Slot(object)
+    def _model_catalog_completed(self, result: object) -> None:
+        thread = self.sender()
+        if not isinstance(thread, _ModelCatalogThread) or thread.socket not in self._decoders:
+            return
+        thread.socket.write(encode_frame(IpcMessage(
+            protocol_version=IPC_PROTOCOL_VERSION, message_id=str(uuid4()), kind="response",
+            payload={"request_id": thread.request_id, "ok": True, "result": result},
+        )))
+        thread.socket.flush()
+
+    @Slot()
+    def _model_catalog_finished(self) -> None:
+        thread = self.sender()
+        if isinstance(thread, _ModelCatalogThread):
+            self._catalog_threads.discard(thread)
+            thread.deleteLater()
+
     def _dispatch(self, action: str, params: dict[str, Any]) -> Any:
+        self.licensing.require_action(action)
+        if action == "get_license_status":
+            return self.licensing.status(refresh=True)
+        if action == "activate_license":
+            return self.licensing.activate(_required_string(params, "token"))
+        if action == "save_project_edits":
+            return self.service.save_project_edits(_required_string(params, "project_id"))
+        deferred = params.get("deferred", False)
+        if (action in {"subtitle_command", "timeline_command", "effect_command"}
+                and type(deferred) is not bool):
+            raise ValueError("Chế độ lưu bản nháp phải là bật/tắt")
+        if (
+            self._database_maintenance.get("state") in {"running", "cancelling"}
+            and action not in _DATABASE_MAINTENANCE_READ_ACTIONS
+        ):
+            raise ValueError(
+                "Database đang được tối ưu; hãy chờ hoàn tất hoặc bấm Hủy trước khi sửa project."
+            )
         if action == "ping":
-            return {"status": "ready"}
+            return {"status": "ready", "license": self.licensing.status()}
         if action == "get_update_install_eligibility":
             return self._update_install_eligibility()
         if action == "reserve_update_install":
@@ -341,6 +596,7 @@ class JobManagerServer(QObject):
                 device=_required_string(params, "device"),
                 reuse_completed=bool(params.get("reuse_completed", False)),
                 extraction_method=str(params.get("extraction_method", "frame_ocr")),
+                scene_text_enabled=params.get("scene_text_enabled", True),
                 language=str(params.get("language", "zh")),
                 model_id=str(params.get("model_id", "large-v3")),
                 model_path=(
@@ -574,6 +830,12 @@ class JobManagerServer(QObject):
             if data_root is not None and (not isinstance(data_root, str) or not data_root.strip()):
                 raise ValueError("data_root must be a non-empty string")
             return self.service.runtime_diagnostics(data_root=data_root)
+        if action == "optimize_project_database":
+            return self._start_database_optimization()
+        if action == "get_database_optimization":
+            return dict(self._database_maintenance)
+        if action == "cancel_database_optimization":
+            return self._cancel_database_optimization()
         if action == "export_subtitle_srt":
             return self.service.export_subtitle_srt(
                 project_id=_required_string(params, "project_id"),
@@ -618,6 +880,9 @@ class JobManagerServer(QObject):
                 ),
                 staging_root=self.service.checkpoints.staging_root,
             )
+        if action == "copy_video_clip":
+            return self.service.copy_video_clip(_required_string(params, "project_id"),
+                                                _required_string(params, "clip_id"))
         if action == "timeline_command":
             command = _required_string(params, "command")
             clip_id = params.get("clip_id")
@@ -654,6 +919,13 @@ class JobManagerServer(QObject):
                 raise ValueError("auto_fit_voice_timing requires the D1 track")
             if command == "delete_tracks" and not track_ids:
                 raise ValueError("delete_tracks requires track_ids")
+            if command == "set_markers":
+                marker_value = params.get("value")
+                markers = marker_value.get("markers") if isinstance(marker_value, dict) else None
+                if not isinstance(markers, list) or any(
+                    type(value) is not int or value < 0 for value in markers
+                ):
+                    raise ValueError("set_markers requires non-negative integer markers")
             if (
                 command
                 not in {
@@ -662,14 +934,30 @@ class JobManagerServer(QObject):
                     *track_commands,
                     "auto_fit_voice_timing",
                     "delete_tracks",
+                    "cut",
+                    "split_video",
+                    "paste_video",
+                     "set_markers",
                 }
                 and clip_id is None
             ):
                 raise ValueError(f"{command} requires clip_id")
-            if command in {"split", "trim_head", "trim_tail"} and timeline_us is None:
+            if (command in {"split", "split_video", "trim_head", "trim_tail", "paste_video"}
+                    and timeline_us is None):
                 raise ValueError(f"{command} requires timeline_us")
             if command == "resize" and (timeline_start_us is None or timeline_end_us is None):
                 raise ValueError("resize requires timeline_start_us and timeline_end_us")
+            for key in ("range_start_us", "range_end_us", "base_revision"):
+                if key in params and (type(params[key]) is not int or params[key] < 0):
+                    raise ValueError(f"{key} phải là số nguyên không âm")
+            if params.get("request_id") is not None and (
+                not isinstance(params["request_id"], str) or not params["request_id"].strip()
+            ):
+                raise ValueError("Mã yêu cầu cắt không hợp lệ")
+            if command == "cut" and params.get("operation") not in {
+                "keep_from", "keep_until", "keep_range", "remove_range",
+            }:
+                raise ValueError("Thao tác cắt video không hợp lệ")
             return _project_transport_payload(
                 self.service.timeline_command(
                     project_id=_required_string(params, "project_id"),
@@ -682,6 +970,12 @@ class JobManagerServer(QObject):
                     track_ids=tuple(track_ids),
                     value=params.get("value"),
                     apply_linked=apply_linked,
+                    operation=params.get("operation"),
+                    range_start_us=params.get("range_start_us"),
+                    range_end_us=params.get("range_end_us"),
+                    base_revision=params.get("base_revision"),
+                    request_id=params.get("request_id"),
+                    deferred=deferred,
                 ),
                 staging_root=self.service.checkpoints.staging_root,
             )
@@ -700,6 +994,7 @@ class JobManagerServer(QObject):
                     command=_required_string(params, "command"),
                     overlay_id=overlay_id,
                     values=values,
+                    deferred=deferred,
                 ),
                 staging_root=self.service.checkpoints.staging_root,
             )
@@ -708,12 +1003,39 @@ class JobManagerServer(QObject):
             custom_rules = params.get("custom_rules", "")
             if not isinstance(custom_rules, str):
                 raise ValueError("Translation custom rules must be a string")
-            return _project_transport_payload(
+            active_style_name = params.get("active_style_name", "")
+            if not isinstance(active_style_name, str):
+                raise ValueError("Translation style name must be a string")
+            compact = params.get("compact", False)
+            if type(compact) is not bool:
+                raise ValueError("Translation compact response flag must be boolean")
+            return _translation_preferences_transport_payload(
                 self.service.set_translation_preferences(
                     project_id=_required_string(params, "project_id"),
                     preset=preset,
                     custom_rules=custom_rules,
+                    active_style_name=active_style_name,
                 ),
+                compact=compact,
+                staging_root=self.service.checkpoints.staging_root,
+            )
+        if action == "save_translation_style":
+            preset = _required_string(params, "preset")
+            name = _required_string(params, "name")
+            custom_rules = params.get("custom_rules", "")
+            if not isinstance(custom_rules, str):
+                raise ValueError("Translation custom rules must be a string")
+            compact = params.get("compact", False)
+            if type(compact) is not bool:
+                raise ValueError("Translation compact response flag must be boolean")
+            return _translation_preferences_transport_payload(
+                self.service.save_translation_style(
+                    project_id=_required_string(params, "project_id"),
+                    name=name,
+                    preset=preset,
+                    custom_rules=custom_rules,
+                ),
+                compact=compact,
                 staging_root=self.service.checkpoints.staging_root,
             )
         if action == "subtitle_command":
@@ -729,15 +1051,19 @@ class JobManagerServer(QObject):
             compact = params.get("compact", False)
             if type(compact) is not bool:
                 raise ValueError("Subtitle compact response flag must be boolean")
-            return _project_transport_payload(
-                self.service.subtitle_command(
-                    project_id=_required_string(params, "project_id"),
+            project_id = _required_string(params, "project_id")
+            result = self.service.subtitle_command(
+                    project_id=project_id,
                     command=_required_string(params, "command"),
                     cue_id=cue_id,
                     language=language,
                     params=values,
                     compact=compact,
-                ),
+                    deferred=deferred,
+                )
+            self._request_tts_replacement_after_edit(project_id)
+            return _project_transport_payload(
+                result,
                 staging_root=self.service.checkpoints.staging_root,
             )
         if action == "start_job":
@@ -801,6 +1127,7 @@ class JobManagerServer(QObject):
             )
 
     def _start_job(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.licensing.require_active()
         self._ensure_update_admission_open()
         job_id = _required_string(params, "job_id")
         job = self.service.jobs.get(job_id)
@@ -958,8 +1285,10 @@ class JobManagerServer(QObject):
         credential_references: object = None,
         provider_options: object = None,
     ) -> dict[str, Any]:
+        self.licensing.require_active()
         self._ensure_update_admission_open()
         job = self.service.jobs.get(job_id)
+        retry_state = retry_target(job.state)
         if (
             job.spec.kind is JobKind.TTS
             and job.spec.provider_id == "vieneu-3.3"
@@ -968,6 +1297,10 @@ class JobManagerServer(QObject):
                 "Tác vụ VieNeu 3.3 cũ không thể tiếp tục bằng engine 3.8.1. "
                 "Hãy tạo tác vụ voice mới; trạng thái và cache cũ vẫn được giữ nguyên."
             )
+        if job.spec.kind is JobKind.TTS:
+            replacement = self.service.rebase_tts_retry(job_id)
+            if replacement is not None:
+                return replacement
         self._ensure_no_other_active_stage(job)
         if job.state is JobState.CANCELLED and job.spec.kind.value != "translate":
             raise ValueError("Chỉ tác vụ dịch có checkpoint mới được tiếp tục sau khi hủy")
@@ -998,7 +1331,7 @@ class JobManagerServer(QObject):
             raise ValueError(
                 "Only API translation jobs or Gemini Web accept translation retry options"
             )
-        return self.service.transition_job(job_id, retry_target(job.state).value)
+        return self.service.transition_job(job_id, retry_state.value)
 
     def _pause_job(self, job_id: str) -> dict[str, Any]:
         job = self.service.jobs.get(job_id)
@@ -1014,6 +1347,7 @@ class JobManagerServer(QObject):
         return self.service.get_job(job_id)
 
     def _resume_job(self, job_id: str) -> dict[str, Any]:
+        self.licensing.require_active()
         self._ensure_update_admission_open()
         job = self.service.jobs.get(job_id)
         self._ensure_no_other_active_stage(job)
@@ -1081,6 +1415,154 @@ class JobManagerServer(QObject):
         intent = control_intent("cancel", job.state)
         self.service.transition_job(job_id, intent.target.value)
         return self.service.transition_job(job_id, JobState.CANCELLED.value)
+
+    def _request_tts_replacement_after_edit(self, project_id: str) -> None:
+        """Stop one stale production worker and defer one rebased replacement.
+
+        Replacement creation is intentionally delayed until the old worker has
+        acknowledged its checkpoint-safe stop. More edits during that window
+        only update the project head, so they are coalesced into the same new
+        job instead of spawning parallel TTS workers.
+        """
+
+        quiet_deadline = monotonic() + (_TTS_REPLACEMENT_QUIET_MS / 1_000)
+        for pending_id, pending_project_id in tuple(
+            self._pending_tts_replacement_projects.items()
+        ):
+            if pending_project_id == project_id:
+                self._pending_tts_replacement_deadlines[pending_id] = quiet_deadline
+
+        job_id = self.service.jobs.active_id(project_id=project_id, kind=JobKind.TTS)
+        if not job_id or job_id in self._pending_tts_replacements:
+            return
+        job = self.service.jobs.get(job_id)
+        if not self.workers.has_worker(job_id):
+            return
+        if not self.service.tts_job_needs_rebase(job_id):
+            return
+        self._pending_tts_replacements.add(job_id)
+        self._pending_tts_replacement_projects[job_id] = project_id
+        self._pending_tts_replacement_deadlines[job_id] = quiet_deadline
+        self.service.jobs.append_event(
+            event_id=str(uuid4()),
+            job_id=job_id,
+            kind="replacement_requested",
+            payload={
+                "reason": "dialogue_input_changed",
+                "latest_revision": self.service.projects.head_revision(project_id),
+            },
+        )
+        if job.state is not JobState.CANCEL_REQUESTED:
+            self._cancel_job(job_id)
+
+    def _start_pending_tts_replacement(self, replaced_job_id: str) -> None:
+        if replaced_job_id not in self._pending_tts_replacements:
+            return
+        remaining_ms = round(
+            max(
+                0.0,
+                self._pending_tts_replacement_deadlines.get(replaced_job_id, 0.0)
+                - monotonic(),
+            )
+            * 1_000
+        )
+        if remaining_ms > 0:
+            QTimer.singleShot(
+                max(1, remaining_ms),
+                lambda: self._start_pending_tts_replacement(replaced_job_id),
+            )
+            return
+        self._pending_tts_replacements.discard(replaced_job_id)
+        self._pending_tts_replacement_projects.pop(replaced_job_id, None)
+        self._pending_tts_replacement_deadlines.pop(replaced_job_id, None)
+        if self._shutting_down:
+            return
+        try:
+            replacement = self.service.rebase_tts_retry(replaced_job_id)
+            if replacement is None:
+                return
+            replacement_id = str(replacement.get("id", ""))
+            if not replacement_id:
+                raise RuntimeError("Tác vụ voice thay thế không có mã job")
+            self._start_job(
+                {
+                    "job_id": replacement_id,
+                    "program": str(runtime_program_path()),
+                    "arguments": [
+                        "-m",
+                        "ducai_studio.workers.tts_worker",
+                        replacement_id,
+                    ],
+                    "resume_stage_key": "tts",
+                    "resume_checkpoint_key": "latest",
+                }
+            )
+        except Exception as exc:
+            self.service.jobs.append_event(
+                event_id=str(uuid4()),
+                job_id=replaced_job_id,
+                kind="replacement_start_failed",
+                payload={"message": str(exc)[:300]},
+            )
+
+    def _start_database_optimization(self) -> dict[str, Any]:
+        thread = self._database_optimizer_thread
+        if thread is not None and thread.isRunning():
+            return dict(self._database_maintenance)
+        self.service.ensure_database_optimization_allowed()
+        thread = _DatabaseOptimizerThread(self.service, self)
+        thread.progressReported.connect(self._database_optimization_progress)
+        thread.completed.connect(self._database_optimization_completed)
+        thread.failed.connect(self._database_optimization_failed)
+        thread.finished.connect(self._database_optimization_thread_finished)
+        self._database_optimizer_thread = thread
+        self._database_maintenance = {"state": "running", "stage": "starting"}
+        thread.start()
+        return dict(self._database_maintenance)
+
+    def _cancel_database_optimization(self) -> dict[str, Any]:
+        thread = self._database_optimizer_thread
+        if thread is None or not thread.isRunning():
+            return dict(self._database_maintenance)
+        thread.cancel()
+        self._database_maintenance = {
+            **self._database_maintenance,
+            "state": "cancelling",
+        }
+        return dict(self._database_maintenance)
+
+    @Slot(object)
+    def _database_optimization_progress(self, progress: object) -> None:
+        if not isinstance(progress, dict):
+            return
+        state = str(self._database_maintenance.get("state", "running"))
+        self._database_maintenance = {
+            **self._database_maintenance,
+            **progress,
+            "state": "cancelling" if state == "cancelling" else "running",
+        }
+
+    @Slot(object)
+    def _database_optimization_completed(self, result: object) -> None:
+        if isinstance(result, dict):
+            self._database_maintenance = dict(result)
+        else:
+            self._database_maintenance = {"state": "completed"}
+
+    @Slot(str)
+    def _database_optimization_failed(self, message: str) -> None:
+        self._database_maintenance = {
+            "state": "failed",
+            "message": message[:500],
+        }
+
+    @Slot()
+    def _database_optimization_thread_finished(self) -> None:
+        thread = self._database_optimizer_thread
+        if thread is None:
+            return
+        self._database_optimizer_thread = None
+        thread.deleteLater()
 
     def _delete_job_history(self, job_id: str) -> dict[str, Any]:
         job = self.service.jobs.get(job_id)
@@ -1556,22 +2038,38 @@ class JobManagerServer(QObject):
         if self._shutting_down:
             self._poll_shutdown()
         self.multi.on_worker_finished(job_id)
+        self._start_pending_tts_replacement(job_id)
 
     def _begin_shutdown(self) -> None:
         if self._shutting_down:
             return
         self._shutting_down = True
         self._shutdown_deadline = monotonic() + 10
+        for thread in self._diagnostic_threads:
+            thread.requestInterruption()
+        for thread in self._catalog_threads:
+            thread.requestInterruption()
         self.server.close()
+        optimizer = self._database_optimizer_thread
+        if optimizer is not None and optimizer.isRunning():
+            optimizer.cancel()
         self.workers.shutdown()
         self._poll_shutdown()
 
     def _poll_shutdown(self) -> None:
-        if not self.workers.active_job_ids():
+        optimizer = self._database_optimizer_thread
+        optimizer_running = optimizer is not None and optimizer.isRunning()
+        catalog_running = any(thread.isRunning() for thread in self._catalog_threads)
+        diagnostic_running = any(thread.isRunning() for thread in self._diagnostic_threads)
+        if (not self.workers.active_job_ids() and not optimizer_running
+                and not catalog_running and not diagnostic_running):
             self._quit_application()
             return
         if monotonic() >= self._shutdown_deadline:
             self.workers.force_shutdown()
+            if optimizer_running:
+                optimizer.cancel()
+                optimizer.wait(1_000)
             self._quit_application()
             return
         QTimer.singleShot(50, self._poll_shutdown)

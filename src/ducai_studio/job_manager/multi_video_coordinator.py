@@ -88,6 +88,7 @@ class MultiVideoCoordinator(QObject):
         return self.service.list_multi_videos()
 
     def start(self, settings: Mapping[str, object]) -> dict[str, object]:
+        self.server.licensing.require_active()
         if self._drain_pending_removals():
             raise ValueError(
                 "Multi video đang chờ tác vụ cũ dừng an toàn; hãy đợi video được xóa "
@@ -242,6 +243,7 @@ class MultiVideoCoordinator(QObject):
         self._publish_status()
 
     def resume(self) -> dict[str, object]:
+        self.server.licensing.require_active()
         batch = self.service.multi_videos.get_batch()
         if batch["state"] not in {
             MultiBatchState.PAUSED.value,
@@ -402,6 +404,10 @@ class MultiVideoCoordinator(QObject):
             )
             return
         if batch["state"] != MultiBatchState.RUNNING.value:
+            return
+        if not self.server.licensing.status()["active"]:
+            # Do not admit another child; pause current work at its normal safe checkpoint.
+            self.pause()
             return
         items = self.service.multi_videos.list_items()
         current_project = str(batch.get("current_project_id", ""))
@@ -896,6 +902,7 @@ class MultiVideoCoordinator(QObject):
         self._start_child(project_id, stage)
 
     def _start_child(self, project_id: str, stage: MultiStage) -> None:
+        self.server.licensing.require_active()
         config = self._settings
         try:
             self._ensure_stage_capacity(stage)
@@ -904,6 +911,7 @@ class MultiVideoCoordinator(QObject):
                 result = self.service.create_ocr_job(
                     project_id=project_id,
                     sample_interval_us=int(options.get("sample_interval_us", 800_000)),
+                    scene_text_enabled=options.get("scene_text_enabled", True),
                     engine_python=str(options.get("engine_python", runtime_program_path())),
                     device=str(options.get("device", "gpu:0")),
                     extraction_method=str(
@@ -1110,6 +1118,7 @@ class MultiVideoCoordinator(QObject):
         *,
         counts_as_retry: bool,
     ) -> None:
+        self.server.licensing.require_active()
         try:
             self._ensure_stage_capacity(stage)
         except OSError as exc:

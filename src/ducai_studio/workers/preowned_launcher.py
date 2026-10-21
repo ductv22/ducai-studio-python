@@ -29,6 +29,7 @@ def main() -> int:
         stderr=sys.stderr.buffer,
         env=os.environ.copy(),
         close_fds=False,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
     return child.wait()
 

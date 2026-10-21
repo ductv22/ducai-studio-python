@@ -4,12 +4,13 @@ import json
 import os
 import shutil
 import stat
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import asdict, replace
 from enum import Enum
 from hashlib import sha256
 from pathlib import Path
+from threading import Event
 from typing import Any
 from uuid import uuid4
 
@@ -21,6 +22,7 @@ from ducai_studio.application.export_pipeline import (
 )
 from ducai_studio.application.job_commands import decode_job_spec
 from ducai_studio.application.media_commands import MediaImportService, MediaProbe
+from ducai_studio.application.ocr_pipeline import OCR_AGGREGATION_VERSION
 from ducai_studio.application.subtitle_commands import (
     SubtitleEditor,
     allocate_scene_text_lanes,
@@ -48,8 +50,10 @@ from ducai_studio.domain.fingerprint import stable_fingerprint
 from ducai_studio.domain.jobs import (
     TERMINAL_JOB_STATES,
     JobKind,
+    JobRecord,
     JobState,
     redact_sensitive_text,
+    thaw_json,
 )
 from ducai_studio.domain.multi_video import (
     MultiBatchState,
@@ -58,9 +62,17 @@ from ducai_studio.domain.multi_video import (
     worker_progress_fraction,
 )
 from ducai_studio.domain.project import (
+    CUE_BACKGROUND_STYLES,
+    CUE_ORIENTATIONS,
+    CUE_REVIEW_STATES,
+    CUE_ROLES,
+    CUE_STYLE_HINTS,
     SCENE_TEXT_DEFAULT_BACKGROUND_COLOR,
     SCENE_TEXT_DEFAULT_BACKGROUND_OPACITY_PERCENT,
     SCENE_TEXT_DEFAULT_BACKGROUND_STYLE,
+    SCENE_TEXT_DEFAULT_FADE_DURATION_MS,
+    SCENE_TEXT_DEFAULT_FADE_ENABLED,
+    SCENE_TEXT_DEFAULT_FONT_SIZE,
     SCENE_TEXT_DEFAULT_STYLE_HINT,
     SCENE_TEXT_DEFAULT_TEXT_COLOR,
     TRANSLATION_STYLE_PRESETS,
@@ -73,11 +85,20 @@ from ducai_studio.domain.project import (
     TimelineTrack,
     TrackKind,
     TranslationPreferences,
+    TranslationStylePreset,
     dialogue_cues,
     subtitle_ranges_overlap,
     subtitle_track_number,
 )
 from ducai_studio.domain.timebase import TimeRange
+from ducai_studio.domain.timeline_edit import (
+    build_scan_plan,
+    project_for_timeline,
+    range_on_scan_timeline,
+    range_on_timeline,
+    scan_time_to_base_us,
+    timeline_to_base_us,
+)
 from ducai_studio.domain.voice_conform import (
     VoiceConformCueInput,
     VoiceConformSettings,
@@ -88,6 +109,10 @@ from ducai_studio.domain.voice_conform import (
 from ducai_studio.infrastructure.checkpoint_repository import CheckpointRepository
 from ducai_studio.infrastructure.credential_store import WindowsCredentialStore
 from ducai_studio.infrastructure.database import Database
+from ducai_studio.infrastructure.database_optimizer import (
+    finalize_verified_optimizer_backup,
+    optimize_project_database,
+)
 from ducai_studio.infrastructure.job_repository import JobRepository, utc_now_text
 from ducai_studio.infrastructure.legacy_importer import LegacyProjectImporter
 from ducai_studio.infrastructure.multi_video_repository import MultiVideoRepository
@@ -102,6 +127,7 @@ from ducai_studio.infrastructure.whisper_runtime import (
     whisper_runtime_is_ready,
 )
 from ducai_studio.providers.media_probe import FfprobeProvider
+from ducai_studio.providers.ocr import DEFAULT_SUBTITLE_BANDS
 from ducai_studio.providers.translation.openai_compatible import (
     OPENAI_COMPATIBLE_PROVIDER_IDS,
     preset_for,
@@ -111,6 +137,19 @@ from ducai_studio.providers.tts import TtsCueRequest, VoiceCatalog, discover_dat
 from ducai_studio.providers.tts.vieneu import profile_fingerprint
 
 TRANSLATION_API_PROVIDER_IDS = frozenset({"gemini-api", *OPENAI_COMPATIBLE_PROVIDER_IDS})
+
+_TTS_INPUT_FINGERPRINT_SCHEMA = "ducai-tts-input-v2"
+_TTS_INPUT_SETTING_KEYS = (
+    "voice_id",
+    "voice_identity",
+    "reference_denoise",
+    "engine_speed",
+    "voice_read_speed",
+    "target_lufs",
+    "pipeline_settings",
+    "qa_non_blocking",
+    "defer_timing_conform",
+)
 
 
 def _json_value(value: Any) -> Any:
@@ -160,11 +199,101 @@ def _translation_cue_payload(cue: SubtitleCue) -> dict[str, object]:
     }
 
 
+def _tts_input_fingerprint(
+    cues: list[dict[str, Any]],
+    *,
+    provider_id: str,
+    provider_version: str,
+    model_id: str,
+    provider_config: Mapping[str, Any],
+) -> str:
+    """Fingerprint every semantic input that can change production speech.
+
+    Runtime paths, output paths, timeouts and batching are deliberately absent:
+    they affect execution but not the voice waveform. Voice identity already
+    carries the enrolled profile fingerprint for cloned voices.
+    """
+
+    return stable_fingerprint(
+        {
+            "schema": _TTS_INPUT_FINGERPRINT_SCHEMA,
+            "cues": cues,
+            "provider_id": provider_id,
+            "provider_version": provider_version,
+            "model_id": model_id,
+            "settings": {
+                key: provider_config[key]
+                for key in _TTS_INPUT_SETTING_KEYS
+                if key in provider_config
+            },
+        }
+    )
+
+
+def _voice_subtitle_pairs(
+    snapshot: ProjectSnapshot,
+) -> tuple[tuple[SubtitleCue, SubtitleCue], ...]:
+    """Join saved subtitle identities without depending on presentation order."""
+    source = snapshot.source_cues
+    translated = snapshot.translated_cues
+    if len(source) != len(translated):
+        raise ValueError("Bản dịch chưa khớp đủ các cue gốc; hãy kiểm tra các cue chưa dịch.")
+    translated_by_id = {cue.id: cue for cue in translated}
+    if len({cue.id for cue in source}) != len(source) or len(translated_by_id) != len(translated):
+        raise ValueError("Dữ liệu phụ đề bị lặp mã cue; không thể ghép giọng một cách an toàn.")
+    pairs = []
+    for cue in source:
+        translation = translated_by_id.get(cue.id)
+        if translation is None or translation.index != cue.index:
+            raise ValueError(
+                f"Cue {cue.index}: bản dịch chưa khớp định danh với cue gốc; "
+                "hãy kiểm tra cặp phụ đề này."
+            )
+        pairs.append((cue, translation))
+    return tuple(pairs)
+
+
 def _apply_ocr_cue_regions(
     snapshot: ProjectSnapshot,
     qa: Mapping[str, object],
 ) -> ProjectSnapshot:
     """Attach OCR cue geometry and repeat-proven platform-mark masks."""
+
+    def normalized_box(value: object) -> tuple[float, float, float, float] | None:
+        if (
+            not isinstance(value, list)
+            or len(value) != 4
+            or not all(
+                isinstance(item, (int, float)) and not isinstance(item, bool)
+                for item in value
+            )
+        ):
+            return None
+        x, y, width, height = (float(item) for item in value)
+        if x < 0 or y < 0 or width <= 0 or height <= 0:
+            return None
+        if x + width > 1.000001 or y + height > 1.000001:
+            return None
+        return x, y, width, height
+
+    def enum_value(value: object, fallback: str, allowed: frozenset[str]) -> str:
+        return value if isinstance(value, str) and value in allowed else fallback
+
+    def color_value(value: object, fallback: str) -> str:
+        if not isinstance(value, str):
+            return fallback
+        if len(value) != 7 or not value.startswith("#"):
+            return fallback
+        try:
+            int(value[1:], 16)
+        except ValueError:
+            return fallback
+        return value.upper()
+
+    def integer_value(value: object, fallback: int, minimum: int, maximum: int) -> int:
+        if type(value) is not int:
+            return fallback
+        return max(minimum, min(maximum, value))
 
     raw_regions = qa.get("cue_regions", [])
     if not isinstance(raw_regions, list):
@@ -180,56 +309,134 @@ def _apply_ocr_cue_regions(
         if region is None:
             cues.append(cue)
             continue
-        raw_box = region.get("box")
-        box = None
-        if (
-            isinstance(raw_box, list)
-            and len(raw_box) == 4
-            and all(
-                isinstance(value, (int, float)) and not isinstance(value, bool)
-                for value in raw_box
-            )
-        ):
-            box = tuple(float(value) for value in raw_box)
-        raw_panel_box = region.get("panel_box")
-        panel_box = None
-        if (
-            isinstance(raw_panel_box, list)
-            and len(raw_panel_box) == 4
-            and all(
-                isinstance(value, (int, float)) and not isinstance(value, bool)
-                for value in raw_panel_box
-            )
-        ):
-            panel_box = tuple(float(value) for value in raw_panel_box)
+        box = normalized_box(region.get("box"))
+        panel_box = normalized_box(region.get("panel_box"))
         timestamps_match = bool(
             region.get("start_us") == cue.range.start_us
             and region.get("end_us") == cue.range.end_us
         )
+        role = enum_value(region.get("role"), cue.role, CUE_ROLES)
+        font_size = region.get("text_font_size")
+        if type(font_size) is not int or font_size < 1:
+            font_size = (
+                SCENE_TEXT_DEFAULT_FONT_SIZE
+                if role == "scene_text" and not cue.is_scene_text
+                else cue.text_font_size
+            )
         cues.append(
             replace(
                 cue,
+                confidence=(float(region["confidence"]) if timestamps_match
+                    and isinstance(region.get("confidence"), (int, float))
+                    and not isinstance(region.get("confidence"), bool)
+                    and 0 <= region["confidence"] <= 1 else cue.confidence),
+                evidence_ids=(tuple(dict.fromkeys(region["evidence_ids"]))
+                    if timestamps_match and isinstance(region.get("evidence_ids"), list)
+                    and all(isinstance(key, str) and key for key in region["evidence_ids"])
+                    else cue.evidence_ids),
                 visual_box=box if timestamps_match else None,
                 visual_box_source="ocr" if timestamps_match and box is not None else "",
-                role=str(region.get("role", cue.role)) if timestamps_match else cue.role,
+                role=(
+                    role
+                    if timestamps_match
+                    else cue.role
+                ),
+                text_font_size=font_size if timestamps_match else cue.text_font_size,
                 orientation=(
-                    str(region.get("orientation", cue.orientation))
+                    enum_value(
+                        region.get("orientation"), cue.orientation, CUE_ORIENTATIONS
+                    )
                     if timestamps_match
                     else cue.orientation
                 ),
                 style_hint=(
-                    str(region.get("style_hint", cue.style_hint))
+                    enum_value(
+                        region.get("style_hint"),
+                        SCENE_TEXT_DEFAULT_STYLE_HINT
+                        if enum_value(region.get("role"), cue.role, CUE_ROLES)
+                        == "scene_text"
+                        else cue.style_hint,
+                        CUE_STYLE_HINTS,
+                    )
                     if timestamps_match
                     else cue.style_hint
                 ),
                 panel_box=panel_box if timestamps_match else cue.panel_box,
                 background_color=(
-                    str(region.get("background_color", cue.background_color))
+                    color_value(
+                        region.get("background_color"),
+                        SCENE_TEXT_DEFAULT_BACKGROUND_COLOR
+                        if enum_value(region.get("role"), cue.role, CUE_ROLES)
+                        == "scene_text"
+                        else cue.background_color,
+                    )
                     if timestamps_match
                     else cue.background_color
                 ),
+                text_color=(
+                    color_value(
+                        region.get("text_color"),
+                        SCENE_TEXT_DEFAULT_TEXT_COLOR
+                        if enum_value(region.get("role"), cue.role, CUE_ROLES)
+                        == "scene_text"
+                        else cue.text_color,
+                    )
+                    if timestamps_match
+                    else cue.text_color
+                ),
+                background_style=(
+                    enum_value(
+                        region.get("background_style"),
+                        SCENE_TEXT_DEFAULT_BACKGROUND_STYLE
+                        if enum_value(region.get("role"), cue.role, CUE_ROLES)
+                        == "scene_text"
+                        else cue.background_style,
+                        CUE_BACKGROUND_STYLES,
+                    )
+                    if timestamps_match
+                    else cue.background_style
+                ),
+                background_opacity_percent=(
+                    integer_value(
+                        region.get("background_opacity_percent"),
+                        SCENE_TEXT_DEFAULT_BACKGROUND_OPACITY_PERCENT
+                        if enum_value(region.get("role"), cue.role, CUE_ROLES)
+                        == "scene_text"
+                        else cue.background_opacity_percent,
+                        0,
+                        100,
+                    )
+                    if timestamps_match
+                    else cue.background_opacity_percent
+                ),
+                fade_enabled=(
+                    (
+                        region.get("fade_enabled")
+                        if type(region.get("fade_enabled")) is bool
+                        else (
+                            SCENE_TEXT_DEFAULT_FADE_ENABLED
+                            if enum_value(region.get("role"), cue.role, CUE_ROLES)
+                            == "scene_text"
+                            else cue.fade_enabled
+                        )
+                    )
+                    if timestamps_match
+                    else cue.fade_enabled
+                ),
+                fade_duration_ms=(
+                    integer_value(
+                        region.get("fade_duration_ms"),
+                        SCENE_TEXT_DEFAULT_FADE_DURATION_MS,
+                        50,
+                        2_000,
+                    )
+                    if timestamps_match
+                    else cue.fade_duration_ms
+                ),
                 review_state=(
-                    str(region.get("review_state", cue.review_state))
+                    enum_value(
+                        region.get("review_state"), cue.review_state, CUE_REVIEW_STATES
+                    )
                     if timestamps_match
                     else cue.review_state
                 ),
@@ -545,6 +752,16 @@ def _merge_preserved_manual_subtitle_cues(
     )
 
 
+def _cue_content_changed(previous: SubtitleCue | None, current: SubtitleCue) -> bool:
+    if previous is current:
+        return False
+    if previous is None:
+        return True
+    if previous.index == current.index:
+        return previous != current
+    return replace(previous, index=current.index) != current
+
+
 def _file_sha256(path: Path) -> str:
     digest = sha256()
     with path.open("rb") as stream:
@@ -775,6 +992,7 @@ class JobManagerService:
     ) -> None:
         self.database = Database(database_path)
         self.database.initialize(applied_at=utc_now_text())
+        finalize_verified_optimizer_backup(self.database.path)
         self.jobs = JobRepository(self.database)
         self.projects = ProjectRepository(self.database)
         self.multi_videos = MultiVideoRepository(self.database)
@@ -783,6 +1001,7 @@ class JobManagerService:
         self.media_probe = media_probe or FfprobeProvider()
         self.media_imports = MediaImportService(self.media_probe)
         self._timeline_editors: dict[str, TimelineEditor] = {}
+        self._video_clipboards = {}
         self._subtitle_editors: dict[str, SubtitleEditor] = {}
         self._effects_editors: dict[str, EffectsEditor] = {}
         # Approved production WAVs and their ledger are immutable cache inputs.
@@ -809,7 +1028,38 @@ class JobManagerService:
         self.multi_videos.mark_interrupted()
         return recovered
 
+    def ensure_database_optimization_allowed(self) -> None:
+        if self.jobs.active_jobs():
+            raise ValueError(
+                "Chỉ có thể tối ưu dữ liệu dự án khi không có tác vụ đang chạy hoặc tạm dừng."
+            )
+        batch_state = str(self.multi_videos.get_batch().get("state", "idle"))
+        if batch_state in {"running", "pause_requested"}:
+            raise ValueError("Hãy dừng Multi video tại checkpoint an toàn trước khi tối ưu.")
+
+    def optimize_database(
+        self,
+        *,
+        cancel_event: Event | None = None,
+        progress_callback: Callable[[dict[str, int | str]], None] | None = None,
+    ) -> dict[str, Any]:
+        self.ensure_database_optimization_allowed()
+        self.projects.flush_all_edits()
+        self._timeline_editors.clear()
+        self._subtitle_editors.clear()
+        self._effects_editors.clear()
+        return dict(
+            optimize_project_database(
+                self.database,
+                cancel_event=cancel_event,
+                progress_callback=progress_callback,
+            )
+        )
+
     def create_job(self, raw: dict[str, Any]) -> dict[str, Any]:
+        project_id = raw.get("project_id")
+        if isinstance(project_id, str) and self.projects.has_pending_edits(project_id):
+            self.projects.flush_edits(project_id)
         return _json_value(asdict(self.jobs.create(decode_job_spec(raw))))
 
     def _ensure_no_active_stage(self, project_id: str, kind: JobKind) -> None:
@@ -840,6 +1090,10 @@ class JobManagerService:
         """
 
         spec = decode_job_spec(raw)
+        # Staged outputs and TTS replacements also reference immutable revisions.
+        # Persist the working input before creating any job record or reusing output.
+        if self.projects.has_pending_edits(spec.project_id):
+            self.projects.flush_edits(spec.project_id)
         if reuse_completed:
             for candidate in self.jobs.list_project_jobs(project_id=spec.project_id):
                 if (
@@ -1095,7 +1349,10 @@ class JobManagerService:
         language: str = "zh",
         model_id: str = WHISPER_MODEL_ID,
         model_path: str | None = None,
+        scene_text_enabled: bool = True,
     ) -> dict[str, Any]:
+        if type(scene_text_enabled) is not bool:
+            raise ValueError("Bật/tắt OCR chữ trong cảnh phải là giá trị đúng/sai")
         method = extraction_method.strip().casefold()
         if method not in {"frame_ocr", "whisper_audio"}:
             raise ValueError("Phương thức trích xuất phải là OCR khung hình hoặc Whisper âm thanh")
@@ -1143,24 +1400,7 @@ class JobManagerService:
             ]
             dialogue_region = list(snapshot.ocr_dialogue_region)
         else:
-            bands = [
-                {
-                    "name": "upper",
-                    "x1": 0.06,
-                    "y1": 0.765,
-                    "x2": 0.94,
-                    "y2": 0.935,
-                    "scale": 0.90,
-                },
-                {
-                    "name": "lower",
-                    "x1": 0.08,
-                    "y1": 0.885,
-                    "x2": 0.92,
-                    "y2": 0.982,
-                    "scale": 0.75,
-                },
-            ]
+            bands = [asdict(band) for band in DEFAULT_SUBTITLE_BANDS]
             # The scene-text pass owns only pixels outside this dialogue band.
             # Keeping one explicit full-frame box in the job fingerprint makes
             # the S1/S2 routing deterministic for legacy projects too.
@@ -1172,6 +1412,8 @@ class JobManagerService:
             "engine_python": str(runtime),
             "device": device,
             "extraction_method": method,
+            "ocr_aggregation_version": OCR_AGGREGATION_VERSION,
+            "scene_text_enabled": scene_text_enabled,
             "engine_batch_size": 12,
             "window_frame_count": 12,
             "bands": bands,
@@ -1180,6 +1422,11 @@ class JobManagerService:
             "output_path": str(output_path),
             "engine_runtime_fingerprint": _external_runtime_fingerprint(runtime),
         }
+        if method == "frame_ocr":
+            scan_plan = build_scan_plan(snapshot)
+            if not scan_plan["segments"] or scan_plan["duration_us"] <= 0:
+                raise ValueError("Timeline không còn đoạn video hợp lệ để OCR")
+            provider_config["scan_plan"] = scan_plan
         if method == "frame_ocr":
             provider_config["model_fingerprint"] = _paddle_model_fingerprint()
         else:
@@ -1275,6 +1522,18 @@ class JobManagerService:
                     ],
                 }
             )
+            if method == "frame_ocr" and "scan_plan" in provider_config:
+                visible = range_on_timeline(snapshot, cue.range)
+                if visible is None:
+                    raise ValueError("Cue cần quét lại đã nằm trong đoạn video bị bỏ")
+                provider_config["rescan_cue_start_us"] = visible.start_us
+                provider_config["rescan_cue_end_us"] = visible.end_us
+                provider_config["scan_windows"] = [{
+                    "start_us": max(0, visible.start_us - 1_200_000),
+                    "end_us": min(provider_config["scan_plan"]["duration_us"],
+                                  visible.end_us + 1_200_000),
+                    "reasons": ["user_targeted_rescan"],
+                }]
         raw = {
             "kind": "ocr",
             "project_id": project_id,
@@ -1299,7 +1558,8 @@ class JobManagerService:
                 else "PP-OCRv6-tiny-small+medium-rescue"
             ),
             "input_fingerprint": stable_fingerprint(
-                {
+                self._ocr_source_identities(snapshot, provider_config["scan_plan"])
+                if method == "frame_ocr" else {
                     "path": str(media_path),
                     "size": media_stat.st_size,
                     "mtime_ns": media_stat.st_mtime_ns,
@@ -1315,6 +1575,20 @@ class JobManagerService:
             reuse_completed=reuse_completed,
             stage_output=rescan_cue_id is None,
         )
+
+    @staticmethod
+    def _ocr_source_identities(snapshot: ProjectSnapshot, plan: dict) -> list[dict]:
+        media = {item.path: item for item in snapshot.media}
+        identities = []
+        for raw_path in sorted({segment["media_path"] for segment in plan["segments"]}):
+            path = Path(raw_path).expanduser().resolve(strict=True)
+            stat = path.stat()
+            asset = media.get(raw_path)
+            identities.append({"path": str(path), "size": stat.st_size,
+                               "mtime_ns": stat.st_mtime_ns,
+                               "duration_us": asset.duration_us if asset else None,
+                               "sha256": asset.sha256 if asset else None})
+        return identities
 
     def create_translation_job(
         self,
@@ -1628,49 +1902,7 @@ class JobManagerService:
             output_path = data_root / "voice_previews" / f"{provider_id}-{preview_key}.wav"
             media_duration_us = 30_000_000
         else:
-            if not snapshot.translated_cues:
-                raise ValueError("Project has no Vietnamese subtitles for voice generation")
-            if len(snapshot.translated_cues) != len(snapshot.source_cues):
-                raise ValueError("Vietnamese subtitle cue count does not match source")
-            for source, translated in zip(
-                snapshot.source_cues, snapshot.translated_cues, strict=True
-            ):
-                if (
-                    source.id != translated.id
-                    or source.index != translated.index
-                    or source.range != translated.range
-                    or not translated.text.strip()
-                ):
-                    raise ValueError(
-                        f"Vietnamese subtitle violates source cue {source.index} integrity"
-                    )
-            dialogue_pairs = tuple(
-                (source, translated)
-                for source, translated in zip(
-                    snapshot.source_cues, snapshot.translated_cues, strict=True
-                )
-                if source.is_dialogue
-            )
-            if not dialogue_pairs:
-                raise ValueError("Project has no dialogue subtitles for voice generation")
-            cues = []
-            for _source, cue in dialogue_pairs:
-                warning_codes = [
-                    evidence.removeprefix("translation-warning:")
-                    for evidence in cue.evidence_ids
-                    if evidence.startswith("translation-warning:")
-                ]
-                item = {
-                    "id": cue.id,
-                    "index": cue.index,
-                    "start_us": cue.range.start_us,
-                    "end_us": cue.range.end_us,
-                    "text": cue.text,
-                }
-                if warning_codes:
-                    item["content_warning"] = True
-                    item["content_warning_codes"] = warning_codes
-                cues.append(item)
+            cues = self._tts_cues_for_snapshot(snapshot)
             available_cue_ids = {str(cue["id"]) for cue in cues}
             unknown_force_ids = sorted(set(force_cue_ids) - available_cue_ids)
             if unknown_force_ids:
@@ -1845,6 +2077,15 @@ class JobManagerService:
             "qa_non_blocking": qa_non_blocking,
             "defer_timing_conform": defer_timing_conform,
         }
+        tts_input_fingerprint = _tts_input_fingerprint(
+            cues,
+            provider_id=provider_id,
+            provider_version=provider_version,
+            model_id=model_id,
+            provider_config=common_config,
+        )
+        common_config["tts_input_fingerprint_schema"] = _TTS_INPUT_FINGERPRINT_SCHEMA
+        common_config["tts_input_fingerprint"] = tts_input_fingerprint
         raw = {
             "kind": "tts",
             "project_id": project_id,
@@ -1852,7 +2093,7 @@ class JobManagerService:
             "provider_id": provider_id,
             "provider_version": provider_version,
             "model_id": model_id,
-            "input_fingerprint": stable_fingerprint(cues),
+            "input_fingerprint": tts_input_fingerprint,
             "settings_fingerprint": stable_fingerprint(common_config),
             "provider_config": common_config,
         }
@@ -1861,6 +2102,149 @@ class JobManagerService:
             reuse_completed=reuse_completed,
             stage_output=purpose == "production",
         )
+
+    @staticmethod
+    def _tts_cues_for_snapshot(snapshot: ProjectSnapshot) -> list[dict[str, Any]]:
+        if not snapshot.translated_cues:
+            raise ValueError("Dự án chưa có phụ đề tiếng Việt để tạo giọng.")
+        pairs = _voice_subtitle_pairs(snapshot)
+        for source, translated in pairs:
+            if source.range != translated.range:
+                raise ValueError(
+                    f"Cue {source.index}: thời gian bản dịch chưa khớp cue gốc; "
+                    "hãy kiểm tra thời gian của cặp phụ đề này."
+                )
+            if not translated.text.strip():
+                raise ValueError(f"Cue {source.index}: bản dịch đang trống; hãy nhập nội dung.")
+        dialogue_pairs = tuple(pair for pair in pairs if pair[0].is_dialogue)
+        if not dialogue_pairs:
+            raise ValueError("Project has no dialogue subtitles for voice generation")
+        cues: list[dict[str, Any]] = []
+        for _source, cue in dialogue_pairs:
+            warning_codes = [
+                evidence.removeprefix("translation-warning:")
+                for evidence in cue.evidence_ids
+                if evidence.startswith("translation-warning:")
+            ]
+            item: dict[str, Any] = {
+                "id": cue.id,
+                "index": cue.index,
+                "start_us": cue.range.start_us,
+                "end_us": cue.range.end_us,
+                "text": cue.text,
+            }
+            if warning_codes:
+                item["content_warning"] = True
+                item["content_warning_codes"] = warning_codes
+            cues.append(item)
+        return cues
+
+    def rebase_tts_retry(self, job_id: str) -> dict[str, Any] | None:
+        """Create a current-revision replacement when TTS semantic input changed.
+
+        ``None`` means the old job remains semantically valid and can use the
+        normal retry transition. The replacement keeps all provider settings;
+        per-cue fingerprints let the worker adopt unchanged WAV cache entries.
+        """
+
+        job = self.jobs.get(job_id)
+        if job.spec.kind is not JobKind.TTS:
+            return None
+        config = dict(job.spec.provider_config)
+        if config.get("purpose") != "production" or config.get("job_mode") == "voice_conform":
+            return None
+        snapshot = self.projects.load(job.spec.project_id)
+        current_cues = self._tts_cues_for_snapshot(snapshot)
+        if self._tts_fingerprint_for_job(job, current_cues) == job.spec.input_fingerprint:
+            return None
+        active = self.jobs.active_id(
+            project_id=job.spec.project_id,
+            kind=JobKind.TTS,
+            exclude_job_id=job.id,
+        )
+        if active:
+            raise ValueError("Dự án đã có tác vụ tạo giọng thay thế đang hoạt động")
+        config.pop("staging_output_path", None)
+        config.pop("staging_qa_path", None)
+        config["cues"] = current_cues
+        config["replaces_job_id"] = job.id
+        config["tts_input_fingerprint_schema"] = _TTS_INPUT_FINGERPRINT_SCHEMA
+        config["tts_input_fingerprint"] = _tts_input_fingerprint(
+            current_cues,
+            provider_id=job.spec.provider_id,
+            provider_version=job.spec.provider_version,
+            model_id=job.spec.model_id,
+            provider_config=config,
+        )
+        settings_payload = {
+            key: value for key, value in config.items() if key != "replaces_job_id"
+        }
+        raw = {
+            "kind": "tts",
+            "project_id": snapshot.id,
+            "input_revision": snapshot.revision,
+            "provider_id": job.spec.provider_id,
+            "provider_version": job.spec.provider_version,
+            "model_id": job.spec.model_id,
+            "input_fingerprint": config["tts_input_fingerprint"],
+            "settings_fingerprint": stable_fingerprint(settings_payload),
+            "provider_config": config,
+        }
+        replacement = self._create_or_reuse_completed_job(
+            raw,
+            reuse_completed=False,
+            stage_output=True,
+        )
+        replacement_id = str(replacement.get("id", ""))
+        if replacement_id:
+            self.jobs.append_event(
+                event_id=str(uuid4()),
+                job_id=job.id,
+                kind="superseded",
+                payload={
+                    "replacement_job_id": replacement_id,
+                    "replacement_revision": snapshot.revision,
+                },
+            )
+        return {
+            **replacement,
+            "replacement": True,
+            "replaced_job_id": job.id,
+        }
+
+    @staticmethod
+    def _tts_fingerprint_for_job(job: Any, cues: list[dict[str, Any]]) -> str:
+        config = job.spec.provider_config
+        if config.get("tts_input_fingerprint_schema") != _TTS_INPUT_FINGERPRINT_SCHEMA:
+            # Jobs created before a121 used the cue-only input hash. Keep them
+            # resumable and only rebase when those original semantic cues differ.
+            return stable_fingerprint(cues)
+        return _tts_input_fingerprint(
+            cues,
+            provider_id=job.spec.provider_id,
+            provider_version=job.spec.provider_version,
+            model_id=job.spec.model_id,
+            provider_config=config,
+        )
+
+    def tts_job_needs_rebase(self, job_id: str) -> bool:
+        """Return whether the latest dialogue input differs from a TTS job.
+
+        This deliberately ignores the project revision itself. Visual-only
+        edits (font, colour, scene text, effects) remain compatible with the
+        running voice job, while dialogue text/timestamp changes request a
+        checkpoint-safe replacement.
+        """
+
+        job = self.jobs.get(job_id)
+        if job.spec.kind is not JobKind.TTS:
+            return False
+        config = job.spec.provider_config
+        if config.get("purpose") != "production" or config.get("job_mode") == "voice_conform":
+            return False
+        snapshot = self.projects.load(job.spec.project_id)
+        current_cues = self._tts_cues_for_snapshot(snapshot)
+        return self._tts_fingerprint_for_job(job, current_cues) != job.spec.input_fingerprint
 
     def estimate_voice_conform(
         self,
@@ -2160,19 +2544,9 @@ class JobManagerService:
         raw_entries = ledger.get("entries") if isinstance(ledger, Mapping) else None
         if not isinstance(raw_entries, Mapping):
             raise ValueError("Ledger TTS nền không có danh sách WAV hợp lệ.")
-        if len(snapshot.source_cues) != len(snapshot.translated_cues):
-            raise ValueError("Vietnamese subtitle cue count does not match source")
         cues: list[VoiceConformCueInput] = []
         entries: list[dict[str, Any]] = []
-        for source_cue, translated_cue in zip(
-            snapshot.source_cues,
-            snapshot.translated_cues,
-            strict=True,
-        ):
-            if source_cue.id != translated_cue.id or source_cue.index != translated_cue.index:
-                raise ValueError(
-                    f"Vietnamese subtitle identity does not match source cue {source_cue.index}."
-                )
+        for source_cue, translated_cue in _voice_subtitle_pairs(snapshot):
             if not source_cue.is_dialogue:
                 continue
             raw = raw_entries.get(source_cue.id)
@@ -2367,6 +2741,7 @@ class JobManagerService:
             raise ValueError("OCR rescan result is incomplete")
         snapshot = self.projects.load(job.spec.project_id)
         editor = self._subtitle_editors.get(snapshot.id)
+        self._validate_ocr_scan_layout(snapshot, config)
         if editor is None or editor.snapshot.revision != snapshot.revision:
             editor = SubtitleEditor(snapshot)
             self._subtitle_editors[snapshot.id] = editor
@@ -2396,8 +2771,15 @@ class JobManagerService:
         checkpoint_key: str = "latest",
     ) -> dict[str, Any] | None:
         job = self.jobs.get(job_id)
+        return self._load_worker_checkpoint_for_job(
+            job, stage_key=stage_key, checkpoint_key=checkpoint_key,
+        )
+
+    def _load_worker_checkpoint_for_job(
+        self, job: JobRecord, *, stage_key: str, checkpoint_key: str,
+    ) -> dict[str, Any] | None:
         checkpoint = self.checkpoints.load(
-            job_id=job_id,
+            job_id=job.id,
             stage_key=stage_key,
             checkpoint_key=checkpoint_key,
             resume_fingerprint=job.spec.resume_fingerprint,
@@ -2432,10 +2814,14 @@ class JobManagerService:
         source_cues = [_translation_cue_payload(cue) for cue in snapshot.source_cues]
         return stable_fingerprint(source_cues)
 
-    def _load_translation_cache(self, job_id: str) -> tuple[Any, Any] | None:
-        job = self.jobs.get(job_id)
-        checkpoint = self.load_worker_checkpoint(
-            job.id,
+    def _load_translation_cache(
+        self, job_id: str, *, job: JobRecord | None = None,
+    ) -> tuple[Any, Any] | None:
+        job = job if job is not None else self.jobs.get(job_id)
+        if job.id != job_id:
+            raise ValueError("Translation cache identity mismatch")
+        checkpoint = self._load_worker_checkpoint_for_job(
+            job,
             stage_key="translation",
             checkpoint_key="latest",
         )
@@ -2533,16 +2919,17 @@ class JobManagerService:
             project_id=project_id,
             kind=JobKind.TRANSLATE,
             input_fingerprint=source_fingerprint,
+            compact_translation=True,
         ):
             try:
-                loaded = self._load_translation_cache(job.id)
+                loaded = self._load_translation_cache(job.id, job=job)
                 if loaded is None:
                     continue
                 _record, ledger = loaded
                 translated_ids = tuple(sorted(int(index) for index in ledger.translations))
                 if any(index < 1 or index > cue_total for index in translated_ids):
                     continue
-                review = self._manual_translation_review_state(project_id, job)
+                review = self._manual_translation_review_state(project_id, job, snapshot=snapshot)
                 qa = self._overlay_manual_translation_review(
                     translation_qa_snapshot(ledger, snapshot.source_cues),
                     review,
@@ -2588,6 +2975,7 @@ class JobManagerService:
                     "provider_id": job.spec.provider_id,
                     "model_id": job.spec.model_id,
                     "created_at": job.created_at,
+                    "provider_config": self._translation_selection_config(job),
                     "resumable": job.state
                     in {
                         JobState.QUEUED,
@@ -2625,7 +3013,7 @@ class JobManagerService:
                 or selected_job.spec.input_fingerprint != source_fingerprint
             ):
                 raise ValueError("Cache dịch không tương thích với phụ đề nguồn hiện tại")
-            loaded = self._load_translation_cache(selected_id)
+            loaded = self._load_translation_cache(selected_id, job=selected_job)
             if loaded is None:
                 raise ValueError("Cache dịch chưa có checkpoint để xem hoặc tiếp tục")
             job, ledger = loaded
@@ -2705,9 +3093,18 @@ class JobManagerService:
             "provider_id": job.spec.provider_id,
             "model_id": job.spec.model_id,
             "completed_cues": len(values),
+            "provider_config": self._translation_selection_config(job),
             "qa": qa,
             "values": values,
         }
+
+    @staticmethod
+    def _translation_selection_config(job: JobRecord) -> dict[str, Any]:
+        """Expose selection identity without transporting the full cue snapshot."""
+        return {key: thaw_json(job.spec.provider_config[key]) for key in (
+            "base_url", "credential_references", "translation_style_preset",
+            "translation_custom_rules",
+        ) if key in job.spec.provider_config}
 
     def get_translation_qa(self, job_id: str) -> dict[str, Any]:
         loaded = self._load_translation_cache(job_id)
@@ -3382,6 +3779,7 @@ class JobManagerService:
             "settings_fingerprint": stable_fingerprint(config),
             "provider_config": config,
         }
+        self.projects.flush_edits(project_id)
         record = self.jobs.create(decode_job_spec(raw), job_id=repair_id)
         return _json_value(asdict(record))
 
@@ -3458,7 +3856,7 @@ class JobManagerService:
             "settings_fingerprint": stable_fingerprint(config),
             "provider_config": config,
         }
-        return _json_value(asdict(self.jobs.create(decode_job_spec(raw))))
+        return self.create_job(raw)
 
     def create_tts_timing_override_job(
         self,
@@ -3521,7 +3919,7 @@ class JobManagerService:
             "settings_fingerprint": stable_fingerprint(config),
             "provider_config": config,
         }
-        return _json_value(asdict(self.jobs.create(decode_job_spec(raw))))
+        return self.create_job(raw)
 
     def list_projects(self, limit: int = 100) -> list[dict[str, Any]]:
         return list(self.projects.list_summaries(limit=limit))
@@ -4064,7 +4462,27 @@ class JobManagerService:
         effects_editor = self._effects_editors.get(project_id)
         if effects_editor is None or effects_editor.snapshot.revision != snapshot.revision:
             self._effects_editors[project_id] = EffectsEditor(snapshot)
-        return _json_value(asdict(snapshot))
+        return {**_json_value(asdict(snapshot)), **self._edit_persistence_state(project_id)}
+
+    def _edit_persistence_state(
+        self, project_id: str, *, include_clean: bool = False,
+    ) -> dict[str, Any]:
+        if not include_clean and not self.projects.has_pending_edits(project_id):
+            return {}
+        return {"_project_dirty": self.projects.has_pending_edits(project_id),
+                "_saved_revision": self.projects.persisted_head_revision(project_id)}
+
+    def save_project_edits(self, project_id: str) -> dict[str, Any]:
+        revision = self.projects.flush_edits(project_id)
+        return {"id": project_id, "revision": revision,
+                **self._edit_persistence_state(project_id, include_clean=True)}
+
+    def _store_editor_snapshot(self, snapshot: ProjectSnapshot, *, deferred: bool) -> None:
+        summary = self.projects.get_summary(snapshot.id)
+        if deferred:
+            self.projects.stage_edits(project_path=summary["path"], snapshot=snapshot)
+        else:
+            self.projects.save(project_path=summary["path"], snapshot=snapshot)
 
     def export_subtitle_srt(
         self,
@@ -4085,7 +4503,7 @@ class JobManagerService:
         if target.suffix.casefold() != ".srt":
             raise ValueError("File xuất phụ đề phải có đuôi .srt")
 
-        snapshot = self.projects.load(project_id)
+        snapshot = project_for_timeline(self.projects.load(project_id))
         all_cues = (
             snapshot.source_cues
             if normalized_language == "source"
@@ -4199,14 +4617,18 @@ class JobManagerService:
         project_id: str,
         preset: str,
         custom_rules: str,
+        active_style_name: str = "",
     ) -> dict[str, Any]:
+        snapshot = self.projects.load(project_id)
         preferences = TranslationPreferences(
             preset=preset.strip().casefold(),
             custom_rules=custom_rules,
+            saved_styles=snapshot.translation_preferences.saved_styles,
+            active_style_name=active_style_name,
         )
-        snapshot = self.projects.load(project_id)
         if snapshot.translation_preferences == preferences:
-            return _json_value(asdict(snapshot))
+            return {**_json_value(asdict(snapshot)),
+                    **self._edit_persistence_state(project_id, include_clean=True)}
         updated = replace(
             snapshot,
             revision=snapshot.revision + 1,
@@ -4214,7 +4636,54 @@ class JobManagerService:
         )
         summary = self.projects.get_summary(project_id)
         self.projects.save(project_path=summary["path"], snapshot=updated)
-        return _json_value(asdict(updated))
+        return {**_json_value(asdict(updated)),
+                **self._edit_persistence_state(project_id, include_clean=True)}
+
+    def save_translation_style(
+        self,
+        *,
+        project_id: str,
+        name: str,
+        preset: str,
+        custom_rules: str,
+    ) -> dict[str, Any]:
+        """Persist a named style and make it the active project style.
+
+        Names are intentionally immutable identifiers from the user's point of
+        view: silently replacing one would make it too easy to destroy a style
+        while experimenting.  The user can choose another name instead.
+        """
+
+        style = TranslationStylePreset(
+            name=name.strip(),
+            preset=preset.strip().casefold(),
+            custom_rules=custom_rules,
+        )
+        snapshot = self.projects.load(project_id)
+        normalized_name = style.normalized_name.casefold()
+        if any(
+            saved.normalized_name.casefold() == normalized_name
+            for saved in snapshot.translation_preferences.saved_styles
+        ):
+            raise ValueError("Tên văn phong đã tồn tại; hãy chọn tên khác")
+        preferences = TranslationPreferences(
+            preset=style.preset,
+            custom_rules=style.custom_rules,
+            saved_styles=(*snapshot.translation_preferences.saved_styles, style),
+            active_style_name=style.name,
+        )
+        if snapshot.translation_preferences == preferences:
+            return {**_json_value(asdict(snapshot)),
+                    **self._edit_persistence_state(project_id, include_clean=True)}
+        updated = replace(
+            snapshot,
+            revision=snapshot.revision + 1,
+            translation_preferences=preferences,
+        )
+        summary = self.projects.get_summary(project_id)
+        self.projects.save(project_path=summary["path"], snapshot=updated)
+        return {**_json_value(asdict(updated)),
+                **self._edit_persistence_state(project_id, include_clean=True)}
 
     def effect_command(
         self,
@@ -4223,6 +4692,7 @@ class JobManagerService:
         command: str,
         overlay_id: str | None = None,
         values: dict[str, Any] | None = None,
+        deferred: bool = False,
     ) -> dict[str, Any]:
         snapshot = self.projects.load(project_id)
         previous_overlays = {item.id: item for item in snapshot.overlays}
@@ -4232,6 +4702,15 @@ class JobManagerService:
             editor = EffectsEditor(snapshot)
             self._effects_editors[project_id] = editor
         payload = dict(values or {})
+        display_time = payload.pop("display_time", False)
+        if type(display_time) is not bool:
+            raise ValueError("Chế độ thời gian hiệu ứng phải là bật/tắt")
+        if display_time:
+            for key, endpoint in (("start_us", "start"), ("end_us", "end")):
+                if key in payload and payload[key] is not None:
+                    if type(payload[key]) is not int:
+                        raise ValueError("Mốc hiệu ứng phải dùng micro-giây nguyên")
+                    payload[key] = timeline_to_base_us(snapshot, payload[key], endpoint)
         if command == "update":
             if not overlay_id:
                 raise ValueError("Effect update requires an overlay id")
@@ -4274,15 +4753,22 @@ class JobManagerService:
             updated = editor.reset_defaults(logo_path=logo_path or None)
         else:
             raise ValueError(f"Unknown effect command: {command}")
-        summary = self.projects.get_summary(project_id)
-        self.projects.save(project_path=summary["path"], snapshot=updated)
-        self._timeline_editors[project_id] = TimelineEditor(updated)
-        self._subtitle_editors[project_id] = SubtitleEditor(updated)
+        self._store_editor_snapshot(updated, deferred=deferred)
         next_overlays = {item.id: item for item in updated.overlays}
+        history = self._timeline_editors.get(project_id)
+        if history is None or history.snapshot.revision != snapshot.revision:
+            history = TimelineEditor(snapshot)
+        history._commit(updated)
+        self._sync_edit_history(history)
         next_media = {item.id: item for item in updated.media}
         return _json_value(
             {
                 "_effect_patch": True,
+                **self._edit_persistence_state(project_id),
+                "_timeline_can_undo": history.can_undo,
+                "_timeline_can_redo": history.can_redo,
+                "_subtitle_can_undo": history.can_undo,
+                "_subtitle_can_redo": history.can_redo,
                 "id": updated.id,
                 "revision": updated.revision,
                 "overlay_upserts": [
@@ -4300,6 +4786,16 @@ class JobManagerService:
             }
         )
 
+    def _sync_edit_history(self, editor: TimelineEditor | SubtitleEditor) -> None:
+        """Keep one ordered session history for clip and subtitle edits."""
+        project_id = editor.snapshot.id
+        timeline = editor if isinstance(editor, TimelineEditor) else TimelineEditor(editor.snapshot)
+        subtitle = editor if isinstance(editor, SubtitleEditor) else SubtitleEditor(editor.snapshot)
+        timeline._undo, timeline._redo = list(editor._undo), list(editor._redo)
+        subtitle._undo, subtitle._redo = list(editor._undo), list(editor._redo)
+        self._timeline_editors[project_id] = timeline
+        self._subtitle_editors[project_id] = subtitle
+
     def subtitle_command(
         self,
         *,
@@ -4309,13 +4805,46 @@ class JobManagerService:
         language: str = "source",
         params: dict[str, Any] | None = None,
         compact: bool = False,
+        deferred: bool = False,
     ) -> dict[str, Any]:
-        snapshot = self.projects.load(project_id)
+        if (params or {}).get("title_mode") is True and command not in {"undo", "redo"}:
+            return self.timeline_command(
+                project_id=project_id, command="edit_title_text", deferred=deferred,
+                value={"command": command, "cue_id": cue_id, "values": dict(params or {})},
+            )
+        if command in {"undo", "redo"}:
+            patch = self.timeline_command(project_id=project_id, command=command, deferred=deferred)
+            patch["_subtitle_can_undo"] = patch["_timeline_can_undo"]
+            patch["_subtitle_can_redo"] = patch["_timeline_can_redo"]
+            if compact:
+                return patch
+            return {
+                **_json_value(asdict(self._timeline_editors[project_id].snapshot)),
+                "_subtitle_can_undo": patch["_subtitle_can_undo"],
+                "_subtitle_can_redo": patch["_subtitle_can_redo"],
+                "_timeline_can_undo": patch["_timeline_can_undo"],
+                "_timeline_can_redo": patch["_timeline_can_redo"],
+            }
         editor = self._subtitle_editors.get(project_id)
-        if editor is None or editor.snapshot.revision != snapshot.revision:
+        head_revision = self.projects.head_revision(project_id)
+        if editor is not None and editor.snapshot.revision == head_revision:
+            snapshot = editor.snapshot
+        else:
+            snapshot = self.projects.load(project_id, head_revision)
             editor = SubtitleEditor(snapshot)
             self._subtitle_editors[project_id] = editor
-        values = params or {}
+        previous_undo, previous_redo = list(editor._undo), list(editor._redo)
+        values = dict(params or {})
+        display_time = values.pop("display_time", False)
+        if type(display_time) is not bool:
+            raise ValueError("Chế độ thời gian hiển thị phải là bật/tắt")
+        if display_time:
+            for key, endpoint in (("start_us", "start"), ("end_us", "end"),
+                                  ("split_us", "start")):
+                if key in values and values[key] is not None:
+                    if type(values[key]) is not int:
+                        raise ValueError("Mốc phụ đề phải dùng micro-giây nguyên")
+                    values[key] = timeline_to_base_us(snapshot, values[key], endpoint)
 
         def selected_cue_ids() -> tuple[str, ...]:
             raw = values.get("cue_ids")
@@ -4370,6 +4899,17 @@ class JobManagerService:
                     start_us=start_us,
                     end_us=end_us,
                 )
+            elif command == "set_cue_role":
+                raw_ids = values.get("cue_ids")
+                if raw_ids is not None and (
+                    not isinstance(raw_ids, list) or not raw_ids
+                    or any(not isinstance(item, str) or not item.strip() for item in raw_ids)
+                ):
+                    raise ValueError("Hãy chọn các cue hợp lệ để chuyển loại")
+                role = values.get("role")
+                if not isinstance(role, str):
+                    raise ValueError("Loại cue phải là thoại S1 hoặc chữ trong cảnh S2")
+                updated = editor.set_cue_role_many(selected_cue_ids(), role=role)
             elif command == "set_text_format":
                 cue_ids = selected_cue_ids()
                 if not cue_ids:
@@ -4390,7 +4930,7 @@ class JobManagerService:
                     "background_opacity_percent", 90
                 )
                 if type(font_size) is not int:
-                    raise ValueError("Kích thước chữ phải là số nguyên từ 1 đến 100")
+                    raise ValueError("Kích thước chữ phải là số nguyên dương")
                 if (
                     type(background_padding_x) is not int
                     or type(background_padding_y) is not int
@@ -4398,7 +4938,7 @@ class JobManagerService:
                     or type(text_opacity_percent) is not int
                     or type(background_opacity_percent) is not int
                 ):
-                    raise ValueError("Khoảng nền chữ phải là số nguyên từ 0 đến 100")
+                    raise ValueError("Khoảng nền, khoảng cách chữ và độ đục phải là số nguyên")
                 if not all(
                     isinstance(item, str)
                     for item in (
@@ -4452,6 +4992,7 @@ class JobManagerService:
                     delta_y=float(geometry_values[1]),
                     scale_x=float(geometry_values[2]),
                     scale_y=float(geometry_values[3]),
+                    panel_seeds=values.get("panel_seeds"),
                 )
             elif command == "move_scene_texts":
                 cue_ids = selected_cue_ids()
@@ -4463,6 +5004,21 @@ class JobManagerService:
                     cue_ids,
                     delta_us=delta_us,
                     lane_delta=lane_delta,
+                    range_overrides=self._display_cue_time_overrides(
+                        snapshot, cue_ids, delta_us, "move") if display_time else None,
+                )
+            elif command == "resize_scene_texts":
+                cue_ids = selected_cue_ids()
+                edge = values.get("edge", "")
+                delta_us = values.get("delta_us", 0)
+                if not isinstance(edge, str) or type(delta_us) is not int:
+                    raise ValueError("Cạnh và độ dịch thời gian cue không hợp lệ")
+                updated = editor.resize_scene_texts(
+                    cue_ids,
+                    edge=edge,
+                    delta_us=delta_us,
+                    range_overrides=self._display_cue_time_overrides(
+                        snapshot, cue_ids, delta_us, edge) if display_time else None,
                 )
             elif command == "set_scene_text_fade":
                 cue_ids = selected_cue_ids()
@@ -4512,8 +5068,13 @@ class JobManagerService:
                     if scene_text
                     else 90,
                 )
-                fade_enabled = values.get("fade_enabled", False)
-                fade_duration_ms = values.get("fade_duration_ms", 300)
+                fade_enabled = values.get(
+                    "fade_enabled",
+                    SCENE_TEXT_DEFAULT_FADE_ENABLED if scene_text else False,
+                )
+                fade_duration_ms = values.get(
+                    "fade_duration_ms", SCENE_TEXT_DEFAULT_FADE_DURATION_MS
+                )
                 if not isinstance(text, str):
                     raise ValueError("Nội dung chữ thủ công phải là chuỗi")
                 if type(start_us) is not int or type(end_us) is not int:
@@ -4664,23 +5225,38 @@ class JobManagerService:
                 if cue_id is None:
                     raise ValueError("delete requires cue_id")
                 updated = editor.delete(cue_id)
+            elif command == "delete_cues":
+                ids = values.get("cue_ids")
+                if not isinstance(ids, list) or not ids or any(
+                    not isinstance(item, str) or not item.strip() for item in ids
+                ):
+                    raise ValueError("Hãy chọn cue trước khi xóa")
+                updated = editor.delete_many(tuple(ids))
             elif command == "undo":
                 updated = editor.undo()
             elif command == "redo":
                 updated = editor.redo()
             else:
                 raise ValueError(f"Unknown subtitle command: {command}")
-            summary = self.projects.get_summary(project_id)
-            self.projects.save(project_path=summary["path"], snapshot=updated)
+            if updated is not snapshot:
+                self._store_editor_snapshot(updated, deferred=deferred)
         except Exception:
             # A concurrent writer may have occupied the immutable revision
             # while this editor was preparing its candidate. Never reuse the
-            # mutated in-memory history after that failure; the next command
-            # must reload the repository head before editing again.
-            self._subtitle_editors.pop(project_id, None)
+            # mutated in-memory history after that failure. Restore it when the
+            # head is unchanged, otherwise force a fresh load of both editors.
+            editor.snapshot = snapshot
+            editor._undo, editor._redo = previous_undo, previous_redo
+            if self.projects.head_revision(project_id) != snapshot.revision:
+                self._subtitle_editors.pop(project_id, None)
+                self._timeline_editors.pop(project_id, None)
             raise
-        self._timeline_editors[project_id] = TimelineEditor(updated)
+        self._sync_edit_history(editor)
         if compact:
+            previous_source = {cue.id: cue for cue in snapshot.source_cues}
+            next_source = {cue.id: cue for cue in updated.source_cues}
+            previous_translated = {cue.id: cue for cue in snapshot.translated_cues}
+            next_translated = {cue.id: cue for cue in updated.translated_cues}
             previous_clips = {
                 clip.id: clip
                 for track in snapshot.tracks
@@ -4703,20 +5279,52 @@ class JobManagerService:
                 for track in updated.tracks
                 if track.kind is TrackKind.SUBTITLE
             }
+            index_only_clips = {
+                clip_id: {"cue_index": clip.cue_index, "payload_revision": clip.payload_revision}
+                for clip_id, clip in next_clips.items()
+                if clip_id in previous_clips and previous_clips[clip_id] != clip
+                and replace(previous_clips[clip_id], cue_index=clip.cue_index,
+                            payload_revision=clip.payload_revision) == clip
+            }
             payload = {
                 "_subtitle_patch": True,
                 "id": updated.id,
                 "revision": updated.revision,
-                "source_cues": _json_value([asdict(cue) for cue in updated.source_cues]),
-                "translated_cues": _json_value([asdict(cue) for cue in updated.translated_cues]),
+                "source_cue_upserts": _json_value(
+                    [
+                        asdict(cue)
+                        for cue_id, cue in next_source.items()
+                        if _cue_content_changed(previous_source.get(cue_id), cue)
+                    ]
+                ),
+                "removed_source_cue_ids": sorted(set(previous_source) - set(next_source)),
+                "translated_cue_upserts": _json_value(
+                    [
+                        asdict(cue)
+                        for cue_id, cue in next_translated.items()
+                        if _cue_content_changed(previous_translated.get(cue_id), cue)
+                    ]
+                ),
+                "removed_translated_cue_ids": sorted(
+                    set(previous_translated) - set(next_translated)
+                ),
+                "source_cue_indices": {
+                    key: cue.index for key, cue in next_source.items()
+                    if key in previous_source and previous_source[key].index != cue.index
+                },
+                "translated_cue_indices": {
+                    key: cue.index for key, cue in next_translated.items()
+                    if key in previous_translated and previous_translated[key].index != cue.index
+                },
                 "subtitle_clip_upserts": _json_value(
                     [
                         asdict(clip)
                         for clip_id, clip in next_clips.items()
-                        if previous_clips.get(clip_id) != clip
+                        if previous_clips.get(clip_id) != clip and clip_id not in index_only_clips
                     ]
                 ),
                 "removed_subtitle_clip_ids": sorted(set(previous_clips) - set(next_clips)),
+                "subtitle_clip_metadata": index_only_clips,
                 "subtitle_track_upserts": _json_value(
                     [
                         {
@@ -4743,8 +5351,29 @@ class JobManagerService:
         else:
             payload = _json_value(asdict(updated))
         payload["_subtitle_can_undo"] = editor.can_undo
+        payload.update(self._edit_persistence_state(project_id))
         payload["_subtitle_can_redo"] = editor.can_redo
+        payload["_timeline_can_undo"] = editor.can_undo
+        payload["_timeline_can_redo"] = editor.can_redo
         return payload
+
+    def copy_video_clip(self, project_id: str, clip_id: str) -> dict[str, Any]:
+        snapshot = self.projects.load(project_id)
+        view = self._materialized_video_view(snapshot)
+        self._video_clipboards[project_id] = TimelineEditor(view).copy_video(
+            clip_id, include_fragments=(snapshot.voice_conform is not None
+                                        and snapshot.timeline_edit is None))
+        return {"project_id": project_id, "clip_id": clip_id, "copied": True}
+
+    @staticmethod
+    def _materialized_video_view(snapshot: ProjectSnapshot) -> ProjectSnapshot:
+        if snapshot.voice_conform is not None and snapshot.timeline_edit is None:
+            from ducai_studio.domain.timeline_edit import cut_state
+
+            duration = build_scan_plan(snapshot)["duration_us"]
+            snapshot = replace(snapshot, timeline_edit=cut_state(
+                snapshot, "keep_range", 0, duration))
+        return project_for_timeline(snapshot)
 
     def timeline_command(
         self,
@@ -4757,15 +5386,111 @@ class JobManagerService:
         timeline_start_us: int | None = None,
         timeline_end_us: int | None = None,
         track_ids: tuple[str, ...] = (),
-        value: str | int | float | None = None,
+        value: str | int | float | dict | None = None,
         apply_linked: bool = True,
+        operation: str | None = None,
+        range_start_us: int | None = None,
+        range_end_us: int | None = None,
+        base_revision: int | None = None,
+        request_id: str | None = None,
+        deferred: bool = False,
     ) -> dict[str, Any]:
-        snapshot = self.projects.load(project_id)
         editor = self._timeline_editors.get(project_id)
-        if editor is None or editor.snapshot.revision != snapshot.revision:
+        head_revision = self.projects.head_revision(project_id)
+        if editor is not None and editor.snapshot.revision == head_revision:
+            snapshot = editor.snapshot
+        else:
+            snapshot = self.projects.load(project_id, head_revision)
             editor = TimelineEditor(snapshot)
             self._timeline_editors[project_id] = editor
-        if command == "split":
+        if base_revision is not None and base_revision != snapshot.revision:
+            raise ValueError("Dự án đã thay đổi; hãy tải lại trước khi cắt")
+        previous_undo, previous_redo = list(editor._undo), list(editor._redo)
+        original_editor = editor
+        if command in {"cut", "split_video", "delete_video_segment",
+                       "paste_video", "duplicate_video"}:
+            for kind in (JobKind.OCR, JobKind.TRANSLATE, JobKind.TTS, JobKind.EXPORT):
+                if self.jobs.active_id(project_id=project_id, kind=kind):
+                    raise ValueError(
+                        "Không thể cắt khi dự án còn tác vụ OCR/dịch/lồng tiếng/xuất video "
+                        "chưa kết thúc. Hãy hoàn tất hoặc hủy tác vụ trước (tạm dừng chưa đủ)."
+                    )
+        if snapshot.timeline_edit is not None and command in {
+            "split", "split_video", "trim_head", "trim_tail", "speed", "resize", "move",
+            "delete", "volume", "clip_mute", "paste_video", "duplicate_video",
+        }:
+            # A free media edit changes the source layout itself. Materialize the
+            # retained view in the same transaction, so display coordinates and
+            # fragment identities stay exact and Undo restores the original cut.
+            editor = TimelineEditor(project_for_timeline(snapshot))
+        if command in {"paste_video", "duplicate_video", "clip_mute"} and (
+            snapshot.voice_conform is not None and editor is original_editor
+        ):
+            editor = TimelineEditor(self._materialized_video_view(snapshot))
+        if command == "split_video":
+            if timeline_us is None:
+                raise ValueError("Hãy đặt playhead trong đoạn video cần tách")
+            if snapshot.voice_conform is not None and editor is original_editor:
+                from ducai_studio.domain.timeline_edit import cut_state
+
+                duration = build_scan_plan(snapshot)["duration_us"]
+                materialized = replace(snapshot, timeline_edit=cut_state(
+                    snapshot, "keep_range", 0, duration))
+                editor = TimelineEditor(project_for_timeline(materialized))
+            videos = [c for t in editor.snapshot.tracks if t.kind is TrackKind.VIDEO
+                      and t.visible for c in t.clips
+                      if c.timeline_range.start_us < timeline_us < c.timeline_range.end_us]
+            selected_video = next((c for c in videos if c.id == clip_id), None)
+            if selected_video is None and videos:
+                ranks = {t.id: rank for rank, t in enumerate(editor.snapshot.tracks)}
+                selected_video = max(videos, key=lambda c: (
+                    ranks[c.track_id], c.timeline_range.start_us))
+            if selected_video is None:
+                raise ValueError("Hãy đặt playhead bên trong một đoạn video, không ở mép nối")
+            updated = editor.split(selected_video.id, timeline_us, apply_linked=True)
+        elif command == "delete_video_segment":
+            view = project_for_timeline(snapshot)
+            selected = next((c for t in view.tracks if t.kind is TrackKind.VIDEO
+                             for c in t.clips if c.id == clip_id), None)
+            if selected is None:
+                raise ValueError("Hãy chọn đoạn video cần xóa trên V1")
+            interval = selected.timeline_range
+            if snapshot.voice_conform is not None and snapshot.timeline_edit is None:
+                spans = [s for s in build_scan_plan(snapshot)["segments"]
+                         if s["clip_id"] == clip_id]
+                if not spans:
+                    raise ValueError("Đoạn video không còn trong thành phẩm")
+                interval = TimeRange(spans[0]["timeline_start_us"],
+                                     spans[-1]["timeline_end_us"])
+            first_video_track = next(t.id for t in view.tracks if t.kind is TrackKind.VIDEO)
+            if selected.track_id != first_video_track:
+                if editor is original_editor and snapshot.timeline_edit is not None:
+                    editor = TimelineEditor(view)
+                updated = editor.delete(selected.id, apply_linked=True)
+            else:
+                updated = editor.cut("remove_range", interval.start_us, interval.end_us)
+        elif command == "paste_video":
+            bundle = self._video_clipboards.get(project_id)
+            if bundle is None:
+                raise ValueError("Hãy sao chép đoạn video trước khi dán")
+            updated = editor.paste_video(bundle, timeline_us if timeline_us is not None else -1)
+        elif command == "duplicate_video":
+            updated = editor.duplicate_video(clip_id or "", include_fragments=(
+                snapshot.voice_conform is not None and snapshot.timeline_edit is None))
+        elif command == "clip_mute":
+            if type(value) is not bool:
+                raise ValueError("Trạng thái tắt tiếng phải là boolean")
+            updated = editor.set_clip_muted(clip_id or "", value, include_fragments=(
+                snapshot.voice_conform is not None and snapshot.timeline_edit is None))
+        elif command == "cut":
+            if range_start_us is None or range_end_us is None or operation is None:
+                raise ValueError("Cắt video cần thao tác và đủ hai mốc A/B")
+            updated = editor.cut(operation, range_start_us, range_end_us)
+        elif command == "set_markers":
+            if not isinstance(value, dict):
+                raise ValueError("Danh sách mark Timeline không hợp lệ")
+            updated = editor.set_markers(value.get("markers"))
+        elif command == "split":
             updated = editor.split(
                 clip_id or "",
                 timeline_us if timeline_us is not None else -1,
@@ -4826,18 +5551,156 @@ class JobManagerService:
             updated = editor.auto_fit_voice_timing()
         elif command == "delete_tracks":
             updated = editor.delete_tracks(tuple(track_ids))
+        elif command == "edit_title_text":
+            from ducai_studio.application.title_text_commands import edit_title_text
+
+            if not isinstance(value, dict) or not isinstance(value.get("values"), dict):
+                raise ValueError("Thông số Text không hợp lệ")
+            title_values = dict(value["values"])
+            title_command = str(value.get("command", ""))
+            if title_values.pop("display_time", False):
+                for key, endpoint in (("start_us", "start"), ("end_us", "end")):
+                    if key in title_values:
+                        title_values[key] = timeline_to_base_us(
+                            snapshot, title_values[key], endpoint)
+                if title_command in {"move_scene_texts", "resize_scene_texts"}:
+                    title_values["range_overrides"] = self._display_cue_time_overrides(
+                        snapshot, tuple(title_values.get("cue_ids", [])),
+                        title_values.get("delta_us", 0),
+                        "move" if title_command == "move_scene_texts" else title_values["edge"],
+                    )
+            updated = editor._commit(edit_title_text(snapshot, title_command,
+                                                    value.get("cue_id"), title_values))
         elif command == "undo":
             updated = editor.undo()
         elif command == "redo":
             updated = editor.redo()
         else:
             raise ValueError(f"Unknown timeline command: {command}")
-        summary = self.projects.get_summary(project_id)
-        self.projects.save(project_path=summary["path"], snapshot=updated)
-        payload = _json_value(asdict(updated))
+        if editor is not original_editor:
+            updated = original_editor._commit(updated)
+            editor = original_editor
+        try:
+            self._store_editor_snapshot(updated, deferred=deferred)
+        except Exception:
+            editor.snapshot = snapshot
+            editor._undo, editor._redo = previous_undo, previous_redo
+            raise
+        self._sync_edit_history(editor)
+        previous_tracks = {track.id: track for track in snapshot.tracks}
+        next_tracks = {track.id: track for track in updated.tracks}
+        next_clip_tracks = {
+            clip.id: track.id for track in updated.tracks for clip in track.clips
+        }
+        previous_clips = {
+            clip.id: clip for track in snapshot.tracks for clip in track.clips
+        }
+        next_clips = {clip.id: clip for track in updated.tracks for clip in track.clips}
+        payload = {
+            "_timeline_patch": True,
+            **self._edit_persistence_state(project_id),
+            "id": updated.id,
+            "revision": updated.revision,
+            "clip_upserts": _json_value(
+                [
+                    {**asdict(clip), "track_id": next_clip_tracks[clip_id]}
+                    for clip_id, clip in next_clips.items()
+                    if previous_clips.get(clip_id) != clip
+                ]
+            ),
+            "removed_clip_ids": sorted(set(previous_clips) - set(next_clips)),
+            "track_upserts": _json_value(
+                [
+                    {
+                        "id": track.id,
+                        "kind": track.kind.value,
+                        "name": track.name,
+                        "locked": track.locked,
+                        "visible": track.visible,
+                        "muted": track.muted,
+                    }
+                    for track_id, track in next_tracks.items()
+                    if track_id not in previous_tracks
+                    or replace(track, clips=()) != replace(previous_tracks[track_id], clips=())
+                ]
+            ),
+            "removed_track_ids": sorted(set(previous_tracks) - set(next_tracks)),
+            "track_order": [track.id for track in updated.tracks],
+        }
         payload["_timeline_can_undo"] = editor.can_undo
         payload["_timeline_can_redo"] = editor.can_redo
+        payload["_subtitle_can_undo"] = editor.can_undo
+        payload["_subtitle_can_redo"] = editor.can_redo
+        previous_media = {item.id: item for item in snapshot.media}
+        current_media = {item.id: item for item in updated.media}
+        payload["media_upserts"] = _json_value([
+            asdict(item) for key, item in current_media.items()
+            if previous_media.get(key) != item
+        ])
+        payload["removed_media_ids"] = sorted(set(previous_media) - set(current_media))
+        payload["timeline_edit"] = (
+            _json_value(asdict(updated.timeline_edit)) if updated.timeline_edit else None
+        )
+        if updated.timeline_markers != snapshot.timeline_markers:
+            payload["timeline_markers"] = list(updated.timeline_markers)
+        payload["request_id"] = request_id
+        payload["base_revision"] = snapshot.revision
+        if updated.voice_conform != snapshot.voice_conform:
+            payload["voice_conform"] = (
+                _json_value(asdict(updated.voice_conform)) if updated.voice_conform else None
+            )
+        if updated.overlays != snapshot.overlays:
+            previous_overlays = {overlay.id: overlay for overlay in snapshot.overlays}
+            current_overlays = {overlay.id: overlay for overlay in updated.overlays}
+            payload["overlay_upserts"] = _json_value([
+                asdict(overlay) for key, overlay in current_overlays.items()
+                if previous_overlays.get(key) != overlay
+            ])
+            payload["removed_overlay_ids"] = sorted(
+                set(previous_overlays) - set(current_overlays)
+            )
+        for field, prefix in (("source_cues", "source_cue"),
+                              ("translated_cues", "translated_cue"),
+                              ("title_cues", "title_cue")):
+            previous_cues = getattr(snapshot, field)
+            current_cues = getattr(updated, field)
+            # Independent edits retain immutable collections by identity; do
+            # not scan or resend thousands of untouched subtitle indices.
+            if current_cues is previous_cues:
+                payload[prefix + "_upserts"] = []
+                payload["removed_" + prefix + "_ids"] = []
+                payload[prefix + "_indices"] = {}
+                continue
+            previous = {cue.id: cue for cue in previous_cues}
+            current = {cue.id: cue for cue in current_cues}
+            payload[prefix + "_upserts"] = _json_value([
+                asdict(cue) for key, cue in current.items()
+                if key not in previous or replace(cue, index=1) != replace(previous[key], index=1)
+            ])
+            payload["removed_" + prefix + "_ids"] = sorted(set(previous) - set(current))
+            payload[prefix + "_indices"] = {key: cue.index for key, cue in current.items()}
         return payload
+
+    @staticmethod
+    def _display_cue_time_overrides(snapshot: ProjectSnapshot, cue_ids: tuple[str, ...],
+                                    delta_us: int, edge: str) -> dict[str, TimeRange]:
+        selected = set(cue_ids)
+        result = {}
+        plan = build_scan_plan(snapshot)
+        for cue in (*snapshot.source_cues, *snapshot.title_cues):
+            if cue.id not in selected:
+                continue
+            interval = (range_on_scan_timeline(plan, cue.range)
+                        if snapshot.timeline_edit or snapshot.voice_conform else cue.range)
+            if interval is None:
+                raise ValueError("Cue không còn nằm trong phần video giữ lại")
+            start = interval.start_us + (delta_us if edge in {"move", "left"} else 0)
+            end = interval.end_us + (delta_us if edge in {"move", "right"} else 0)
+            result[cue.id] = (TimeRange(scan_time_to_base_us(plan, start, "start"),
+                                       scan_time_to_base_us(plan, end, "end"))
+                              if snapshot.timeline_edit or snapshot.voice_conform
+                              else TimeRange(start, end))
+        return result
 
     def list_jobs(self, limit: int = 100) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
@@ -4976,12 +5839,6 @@ class JobManagerService:
             ):
                 raise ValueError("TTS QA report does not match the candidate output")
         snapshot = self.projects.load(job.spec.project_id)
-        if snapshot.revision != job.spec.input_revision:
-            raise ValueError(
-                "Phụ đề hoặc nội dung dịch đã thay đổi; project revision đã thay đổi "
-                "trong lúc tạo voice. Hãy tiếp tục từ cache của phụ đề hiện tại trước "
-                "khi nhập WAV này."
-            )
         raw_cues = config.get("cues", ())
         try:
             job_cues = tuple(
@@ -4999,25 +5856,19 @@ class JobManagerService:
             job_cues = ()
         current_cues = tuple(
             (
-                source.id,
-                source.index,
-                source.range.start_us,
-                source.range.end_us,
-                translated.text,
+                cue["id"],
+                cue["index"],
+                cue["start_us"],
+                cue["end_us"],
+                cue["text"],
             )
-            for source, translated in zip(
-                snapshot.source_cues,
-                snapshot.translated_cues,
-                strict=False,
-            )
-            if source.is_dialogue
-            and source.id == translated.id
-            and source.index == translated.index
+            for cue in self._tts_cues_for_snapshot(snapshot)
         )
         if not job_cues or job_cues != current_cues:
             raise ValueError(
-                "Phụ đề hoặc nội dung dịch đã thay đổi sau khi tạo tác vụ voice; "
-                "hãy tạo lại voice từ cache của phụ đề hiện tại trước khi nhập."
+                "Phụ đề hoặc nội dung dịch đã thay đổi; project revision đã thay đổi "
+                "phần thoại hoặc timestamp sau khi tạo tác vụ voice. "
+                "hãy bấm Tiếp tục từ cache để tool tạo tác vụ thay thế trên bản sửa mới nhất."
             )
         cue_timing: tuple[Mapping[str, object], ...] | None = None
         coverage = self._load_voice_qa_coverage(job)
@@ -5217,17 +6068,25 @@ class JobManagerService:
             ):
                 raise ValueError("OCR coverage QA report does not match the guarded final output")
         snapshot = self.projects.load(job.spec.project_id)
+        self._validate_ocr_scan_layout(snapshot, config)
         videos = [item for item in snapshot.media if item.kind is MediaKind.VIDEO]
         if not videos:
             raise ValueError("OCR project no longer has a video")
         candidate_snapshot = self.media_imports.import_srt(snapshot, target, language="zh")
         if method != "whisper_audio":
             candidate_snapshot = _apply_ocr_cue_regions(candidate_snapshot, qa)
+            candidate_snapshot = self._canonicalize_ocr_result(
+                candidate_snapshot, config,
+                watermarks_in_timeline=isinstance(qa.get("watermark_regions"), list),
+            )
         if method == "whisper_audio" and len(candidate_snapshot.source_cues) != int(
             qa["cue_count"]
         ):
             raise ValueError("Whisper cue count does not match the guarded final output")
-        if candidate_snapshot.source_cues[-1].range.end_us > videos[0].duration_us + 1_000:
+        maximum_end = max((segment["base_end_us"]
+                           for segment in config.get("scan_plan", {}).get("segments", [])),
+                          default=videos[0].duration_us)
+        if candidate_snapshot.source_cues[-1].range.end_us > maximum_end + 1_000:
             raise ValueError("OCR subtitle timeline exceeds the source video")
         active_qa = active.with_name(active.stem + "_QA.json")
         with _promote_output_files(((target, active), (qa_path, active_qa))):
@@ -5241,6 +6100,10 @@ class JobManagerService:
                 )
             else:
                 updated = _apply_ocr_cue_regions(updated, qa)
+                updated = self._canonicalize_ocr_result(
+                    updated, config,
+                    watermarks_in_timeline=isinstance(qa.get("watermark_regions"), list),
+                )
             updated = _merge_preserved_manual_subtitle_cues(snapshot, updated)
             summary = self.projects.get_summary(snapshot.id)
             self.projects.save(project_path=summary["path"], snapshot=updated)
@@ -5248,6 +6111,37 @@ class JobManagerService:
         self._subtitle_editors[snapshot.id] = SubtitleEditor(updated)
         self._timeline_editors[snapshot.id] = TimelineEditor(updated)
         return _json_value(asdict(updated))
+
+    @staticmethod
+    def _validate_ocr_scan_layout(snapshot: ProjectSnapshot, config: Mapping) -> None:
+        plan = config.get("scan_plan")
+        if isinstance(plan, Mapping) and thaw_json(plan) != build_scan_plan(snapshot):
+            raise ValueError(
+                "Timeline đã thay đổi sau khi bắt đầu OCR; không nhập kết quả lệch mốc"
+            )
+
+    @staticmethod
+    def _canonicalize_ocr_result(
+        snapshot: ProjectSnapshot, config: Mapping, *, watermarks_in_timeline: bool = False,
+    ) -> ProjectSnapshot:
+        plan = config.get("scan_plan")
+        if not isinstance(plan, Mapping):
+            return snapshot
+        # Repository job settings are recursively frozen mappings/tuples.
+        # Review imports use those settings directly, unlike final JSON IPC.
+        plan = thaw_json(plan)
+        source = tuple(replace(cue, range=TimeRange(
+            scan_time_to_base_us(plan, cue.range.start_us, "start"),
+            scan_time_to_base_us(plan, cue.range.end_us, "end"),
+        )) for cue in snapshot.source_cues)
+        tracks = SubtitleEditor(replace(snapshot, source_cues=source))._rebuild_subtitle_tracks(
+            source, snapshot.translated_cues)
+        overlays = tuple(replace(overlay, range=TimeRange(
+            scan_time_to_base_us(plan, overlay.range.start_us, "start"),
+            scan_time_to_base_us(plan, overlay.range.end_us, "end"),
+        )) if watermarks_in_timeline and overlay.tracking_mode == "ocr_watermark" else overlay
+            for overlay in snapshot.overlays)
+        return replace(snapshot, source_cues=source, tracks=tracks, overlays=overlays)
 
     def import_final_translation_srt(self, job_id: str, output_path: str) -> dict[str, Any]:
         job = self.jobs.get(job_id)
@@ -5418,11 +6312,43 @@ class JobManagerService:
             raise ValueError("OCR review QA report does not match the immutable review SRT")
         snapshot = self.projects.load(job.spec.project_id)
         updated = self.media_imports.import_srt(snapshot, str(artifact["uri"]), language="zh")
+        self._validate_ocr_scan_layout(snapshot, job.spec.provider_config)
         updated = _apply_ocr_cue_regions(updated, qa)
+        updated = self._canonicalize_ocr_result(
+            updated, job.spec.provider_config,
+            watermarks_in_timeline=isinstance(qa.get("watermark_regions"), list),
+        )
         updated = replace(
             updated,
             source_cues=tuple(replace(cue, source="ocr_review") for cue in updated.source_cues),
         )
+        from ducai_studio.application.subtitle_finalizer import (
+            collapse_partial_ocr_cues,
+            collapse_proven_ocr_cues,
+        )
+
+        raw_proofs = qa.get("suppressed_readings", [])
+        proofs = {
+            item["evidence_id"]: item["winner_evidence_id"]
+            for item in raw_proofs if isinstance(item, dict)
+            and isinstance(item.get("evidence_id"), str)
+            and isinstance(item.get("winner_evidence_id"), str)
+            and item.get("reason") == "same_frame_crop_cut"
+        } if isinstance(raw_proofs, list) else {}
+        collapse_cues = (
+            collapse_proven_ocr_cues
+            if qa.get("proof_only_collapse") is True else collapse_partial_ocr_cues
+        )
+        cleaned_cues = collapse_cues(updated.source_cues, suppressed_evidence=proofs)
+        if cleaned_cues != updated.source_cues:
+            by_id = {cue.id: cue for cue in cleaned_cues}
+            tracks = tuple(replace(track, clips=tuple(replace(clip,
+                timeline_range=by_id[clip.cue_id].range,
+                source_range=None, cue_index=by_id[clip.cue_id].index,
+                cue_text=by_id[clip.cue_id].text) for clip in track.clips
+                if clip.cue_id in by_id)) if track.kind is TrackKind.SUBTITLE else track
+                for track in updated.tracks)
+            updated = replace(updated, source_cues=cleaned_cues, tracks=tracks)
         updated = _merge_preserved_manual_subtitle_cues(snapshot, updated)
         summary = self.projects.get_summary(snapshot.id)
         self.projects.save(project_path=summary["path"], snapshot=updated)
