@@ -14,6 +14,38 @@ Item {
 
     property var appModel
     property string inspectorTab: appModel.uiStringValue("voiceInspectorTab", "voice")
+    property string referenceAudioError: ""
+    property string referenceVoiceId: ""
+    property string castingAudioError: ""
+    property var selectedCastingCueIds: []
+    property var castingPlaybackParts: []
+    property int castingPlaybackIndex: -1
+    property var castingCurrentPart: null
+    property bool castingPendingStart: false
+    property int castingPlaybackLoadGeneration: 0
+    property int voicePreviewReplayGeneration: 0
+    property bool voicePreviewPlaybackRequested: false
+    property bool castingViewportRestorePending: false
+    property string castingViewportCueId: ""
+    property int castingViewportIndex: -1
+    property real castingViewportOffset: 0
+    onVisibleChanged: {
+        if (!visible) {
+            root.voicePreviewPlaybackRequested = false
+            root.voicePreviewReplayGeneration += 1
+            previewPlayer.stop()
+            previewPlayer.source = ""
+            referencePlayer.stop()
+            castingPlayer.stop()
+            castingPlaybackParts = []
+            castingPlaybackIndex = -1
+            castingCurrentPart = null
+            castingPendingStart = false
+            castingPlaybackLoadGeneration += 1
+        } else if (appModel.currentProject.hasProject) {
+            appModel.refreshDialogueCasting()
+        }
+    }
     activeFocusOnTab: true
     Accessible.name: "Phòng thu giọng"
 
@@ -25,6 +57,28 @@ Item {
         onAccepted: root.appModel.setVieNeuReferenceAudio(selectedFile.toString())
     }
 
+    FileDialog {
+        id: castingReferenceDialog
+        property string role: ""
+        property string projectId: ""
+        title: "Chọn file giọng riêng cho phân vai"
+        fileMode: FileDialog.OpenFile
+        nameFilters: [
+            "Âm thanh (*.wav *.mp3 *.m4a *.flac *.ogg)",
+            "Tất cả file (*)"
+        ]
+        onAccepted: {
+            const currentProjectId = String(root.appModel.currentProject.projectId || "")
+            if (!root.appModel.currentProject.hasProject
+                    || !projectId || projectId !== currentProjectId
+                    || ["male", "female", "fallback"].indexOf(role) < 0)
+                return
+            root.appModel.setDialogueCastingReferenceAudio(
+                role, selectedFile.toString()
+            )
+        }
+    }
+
     function selectInspectorTab(value) {
         inspectorTab = value
         appModel.setUiStringValue("voiceInspectorTab", value)
@@ -33,6 +87,283 @@ Item {
     function selectedValue(key, fallback) {
         const value = appModel.selectedVoice[key]
         return value === undefined || value === null || value === "" ? fallback : value
+    }
+
+    function castingConfig() {
+        return (root.appModel.dialogueCasting || {}).config || {}
+    }
+
+    function castingVoiceId(role) {
+        const voice = castingConfig()[role + "_voice"] || {}
+        return String(voice.voice_id || "")
+    }
+
+    function castingReferencePath(role) {
+        const voice = castingConfig()[role + "_voice"] || {}
+        return String(voice.reference_audio_path || "")
+    }
+
+    function castingReferenceName(role) {
+        const path = root.castingReferencePath(role).replace(/\\/g, "/")
+        if (!path) return "Chưa chọn file riêng"
+        const parts = path.split("/")
+        return parts.length > 0 ? parts[parts.length - 1] : path
+    }
+
+    function openCastingReferenceDialog(role) {
+        if (!root.appModel.currentProject.hasProject) return
+        castingReferenceDialog.role = role
+        castingReferenceDialog.projectId = String(
+            root.appModel.currentProject.projectId || ""
+        )
+        castingReferenceDialog.open()
+    }
+
+    function castingVoiceIndex(role) {
+        const wanted = root.castingVoiceId(role)
+        if (!wanted) return -1
+        const model = root.appModel.voiceCatalogModel
+        for (let index = 0; index < model.count; index++) {
+            if (String(model.get(index).voice_id || "") === wanted) return index
+        }
+        return -1
+    }
+
+    function filteredCastingRows() {
+        const rows = (root.appModel.dialogueCasting || {}).rows || []
+        if (castingFilter.currentIndex === 1)
+            return rows.filter(row => row.label === "unknown")
+        if (castingFilter.currentIndex === 2)
+            return rows.filter(row => row.label === "male")
+        if (castingFilter.currentIndex === 3)
+            return rows.filter(row => row.label === "female")
+        return rows
+    }
+
+    function toggleCastingCue(cueId, checked) {
+        const next = root.selectedCastingCueIds.slice()
+        const index = next.indexOf(cueId)
+        if (checked && index < 0) next.push(cueId)
+        else if (!checked && index >= 0) next.splice(index, 1)
+        root.selectedCastingCueIds = next
+    }
+
+    function applyCastingLabel(cueIds, label) {
+        root.captureCastingViewport()
+        root.appModel.setDialogueCastingLabels(cueIds, label)
+        root.selectedCastingCueIds = []
+    }
+
+    function captureCastingViewport() {
+        const count = dialogueCastingRows.count
+        if (count <= 0) {
+            root.castingViewportRestorePending = false
+            return
+        }
+        let index = dialogueCastingRows.indexAt(
+            Math.max(1, dialogueCastingRows.width / 2),
+            Math.max(0, dialogueCastingRows.contentY) + 1
+        )
+        if (index < 0) {
+            const pitch = 126 + dialogueCastingRows.spacing
+            index = Math.max(0, Math.min(count - 1,
+                Math.floor(Math.max(0, dialogueCastingRows.contentY) / pitch)))
+        }
+        const rows = dialogueCastingRows.model
+        const row = rows && index < rows.length ? rows[index] : null
+        const item = dialogueCastingRows.itemAtIndex(index)
+        const anchorY = item ? item.y : index * (126 + dialogueCastingRows.spacing)
+        root.castingViewportCueId = String(row && row.id || "")
+        root.castingViewportIndex = index
+        root.castingViewportOffset = dialogueCastingRows.contentY - anchorY
+        root.castingViewportRestorePending = true
+    }
+
+    function restoreCastingViewport(finalRestore) {
+        if (!root.castingViewportRestorePending) return
+        const rows = dialogueCastingRows.model
+        const count = dialogueCastingRows.count
+        if (!rows || count <= 0) {
+            if (finalRestore) root.castingViewportRestorePending = false
+            return
+        }
+        let index = -1
+        for (let candidate = 0; candidate < count; candidate++) {
+            if (String(rows[candidate].id || "") === root.castingViewportCueId) {
+                index = candidate
+                break
+            }
+        }
+        if (index < 0)
+            index = Math.max(0, Math.min(count - 1, root.castingViewportIndex))
+        const restoreIndex = index
+        dialogueCastingRows.positionViewAtIndex(restoreIndex, ListView.Beginning)
+        Qt.callLater(function() {
+            if (!root.castingViewportRestorePending) return
+            const item = dialogueCastingRows.itemAtIndex(restoreIndex)
+            const anchorY = item
+                ? item.y : restoreIndex * (126 + dialogueCastingRows.spacing)
+            const maximumY = Math.max(
+                0, dialogueCastingRows.contentHeight - dialogueCastingRows.height
+            )
+            dialogueCastingRows.contentY = Math.max(
+                0,
+                Math.min(maximumY, anchorY + root.castingViewportOffset)
+            )
+            if (finalRestore && !root.appModel.dialogueCastingSaving)
+                root.castingViewportRestorePending = false
+        })
+    }
+
+    function pruneCastingSelection() {
+        const rows = (root.appModel.dialogueCasting || {}).rows || []
+        const available = {}
+        for (let index = 0; index < rows.length; index++)
+            available[String(rows[index].id || "")] = true
+        const next = root.selectedCastingCueIds.filter(
+            cueId => available[String(cueId)] === true
+        )
+        if (next.length !== root.selectedCastingCueIds.length)
+            root.selectedCastingCueIds = next
+    }
+
+    function castingLabelText(label) {
+        if (label === "male") return "Nam"
+        if (label === "female") return "Nữ"
+        return "Cần kiểm tra"
+    }
+
+    function castingLabelDetail(row) {
+        const source = row && row.manual ? "sửa tay" : "tự động"
+        return root.castingLabelText(row ? row.label : "unknown") + " · " + source
+    }
+
+    function castingReasonText(reason) {
+        const messages = {
+            "assigned": "Máy đã nhận diện",
+            "needs_analysis": "Chưa chạy nhận diện",
+            "no_speech": "Không phát hiện lời thoại",
+            "overlapping_speakers": "Có người nói chồng tiếng",
+            "overlapping_subtitles": "Các câu phụ đề bị chồng thời gian",
+            "multiple_speakers": "Có nhiều người nói trong câu",
+            "insufficient_speech": "Đoạn thoại quá ngắn hoặc quá ít tiếng nói",
+            "insufficient_speaker_reference": "Chưa đủ mẫu giọng của người nói",
+            "contradictory_speaker_evidence": "Bằng chứng giọng nói mâu thuẫn",
+            "low_confidence": "Độ tin cậy thấp",
+            "prior_review_conflict": "Mâu thuẫn với nhãn đã kiểm tra",
+            "discontinuous_or_long_source": "Nguồn âm thanh bị ngắt quãng hoặc quá dài"
+        }
+        return messages[String(reason || "")] || "Tự nhận diện"
+    }
+
+    function playCastingSource(row) {
+        const parts = row && row.parts ? row.parts : []
+        if (!parts || Number(parts.length || 0) <= 0) {
+            root.castingAudioError = "Câu này không còn đoạn âm thanh nguồn để phát."
+            return
+        }
+        previewPlayer.pause()
+        productionPlayer.pause()
+        referencePlayer.pause()
+        root.castingAudioError = ""
+        root.castingPlaybackLoadGeneration += 1
+        root.castingPlaybackParts = parts
+        root.castingPlaybackIndex = 0
+        root.playCastingPart()
+    }
+
+    function playCastingPart() {
+        if (root.castingPlaybackIndex < 0
+                || root.castingPlaybackIndex >= root.castingPlaybackParts.length) {
+            castingPlayer.stop()
+            castingPlayer.source = ""
+            root.castingPlaybackParts = []
+            root.castingPlaybackIndex = -1
+            root.castingCurrentPart = null
+            root.castingPendingStart = false
+            root.castingPlaybackLoadGeneration += 1
+            return
+        }
+        const part = root.castingPlaybackParts[root.castingPlaybackIndex]
+        if (!part || !part.source_url) {
+            castingPlayer.stop()
+            castingPlayer.source = ""
+            root.castingPlaybackParts = []
+            root.castingPlaybackIndex = -1
+            root.castingCurrentPart = null
+            root.castingPendingStart = false
+            root.castingAudioError = "Không tìm thấy file âm thanh nguồn của câu này."
+            return
+        }
+        root.castingCurrentPart = part
+        root.castingAudioError = ""
+        const sourceUrl = String(part.source_url)
+        const sourceReady = castingPlayer.mediaStatus === MediaPlayer.LoadedMedia
+            || castingPlayer.mediaStatus === MediaPlayer.BufferedMedia
+        if (String(castingPlayer.source) === sourceUrl && sourceReady) {
+            root.castingPendingStart = false
+            castingPlayer.stop()
+            castingPlayer.setPosition(Math.floor(Number(part.start_us || 0) / 1000))
+            castingPlayer.play()
+        } else {
+            const generation = root.castingPlaybackLoadGeneration + 1
+            root.castingPlaybackLoadGeneration = generation
+            root.castingPendingStart = true
+            castingPlayer.stop()
+            castingPlayer.source = ""
+            Qt.callLater(function() {
+                if (generation !== root.castingPlaybackLoadGeneration
+                        || !root.castingCurrentPart
+                        || String(root.castingCurrentPart.source_url || "") !== sourceUrl)
+                    return
+                castingPlayer.source = sourceUrl
+            })
+        }
+    }
+
+    function advanceCastingPart() {
+        if (root.castingPlaybackIndex < 0) return
+        root.castingPlaybackIndex += 1
+        root.playCastingPart()
+    }
+
+    function replayVoicePreviewSource() {
+        const nextSource = String(root.appModel.voicePreviewSource || "")
+        const generation = root.voicePreviewReplayGeneration + 1
+        root.voicePreviewReplayGeneration = generation
+        previewPlayer.source = ""
+        previewPlayer.stop()
+        root.voicePreviewPlaybackRequested = Boolean(nextSource) && root.visible
+        if (!root.voicePreviewPlaybackRequested) return
+        Qt.callLater(function() {
+            if (generation !== root.voicePreviewReplayGeneration
+                    || !root.voicePreviewPlaybackRequested
+                    || root.appModel.voiceCatalogPreviewSource
+                    || String(root.appModel.voicePreviewSource || "") !== nextSource)
+                return
+            previewPlayer.source = nextSource
+        })
+    }
+
+    function armVoicePreviewPlayback() {
+        root.voicePreviewPlaybackRequested = root.visible
+    }
+
+    function replayVoiceCatalogSource() {
+        const nextSource = String(root.appModel.voiceCatalogPreviewSource || "")
+        const generation = root.voicePreviewReplayGeneration + 1
+        root.voicePreviewReplayGeneration = generation
+        previewPlayer.stop()
+        previewPlayer.source = ""
+        root.voicePreviewPlaybackRequested = Boolean(nextSource) && root.visible
+        if (!root.voicePreviewPlaybackRequested) return
+        Qt.callLater(function() {
+            if (generation !== root.voicePreviewReplayGeneration
+                    || !root.voicePreviewPlaybackRequested
+                    || String(root.appModel.voiceCatalogPreviewSource || "") !== nextSource)
+                return
+            previewPlayer.source = nextSource
+        })
     }
 
     function timeLabel(milliseconds) {
@@ -214,12 +545,21 @@ Item {
 
     MediaPlayer {
         id: previewPlayer
-        source: root.appModel.voiceCatalogPreviewSource
-            ? root.appModel.voiceCatalogPreviewSource
-            : root.appModel.voicePreviewSource
+        objectName: "voicePreviewPlayer"
+        source: ""
         audioOutput: previewAudio
+        onPlaybackStateChanged: {
+            if (playbackState === MediaPlayer.PlayingState) {
+                referencePlayer.pause()
+                productionPlayer.pause()
+                castingPlayer.pause()
+            }
+        }
         onMediaStatusChanged: {
-            if (mediaStatus === MediaPlayer.LoadedMedia && source) {
+            if ((mediaStatus === MediaPlayer.LoadedMedia
+                    || mediaStatus === MediaPlayer.BufferedMedia)
+                    && source && root.voicePreviewPlaybackRequested) {
+                root.voicePreviewPlaybackRequested = false
                 productionPlayer.pause()
                 play()
             } else if (mediaStatus === MediaPlayer.EndOfMedia
@@ -236,9 +576,63 @@ Item {
 
     MediaPlayer {
         id: productionPlayer
+        objectName: "voiceProductionPlayer"
         source: root.appModel.voicePlaybackEnabled
             ? root.appModel.currentProject.voiceSource : ""
         audioOutput: productionAudio
+        onPlaybackStateChanged: {
+            if (playbackState === MediaPlayer.PlayingState) {
+                referencePlayer.pause()
+                previewPlayer.pause()
+                castingPlayer.pause()
+            }
+        }
+    }
+
+    MediaPlayer {
+        id: castingPlayer
+        objectName: "dialogueCastingSourcePlayer"
+        audioOutput: castingAudio
+        onPlaybackStateChanged: {
+            if (playbackState === MediaPlayer.PlayingState) {
+                referencePlayer.pause()
+                previewPlayer.pause()
+                productionPlayer.pause()
+            }
+        }
+        onMediaStatusChanged: {
+            if (root.castingPendingStart && root.castingCurrentPart
+                    && (mediaStatus === MediaPlayer.LoadedMedia
+                        || mediaStatus === MediaPlayer.BufferedMedia)) {
+                root.castingPendingStart = false
+                setPosition(Math.floor(Number(root.castingCurrentPart.start_us || 0) / 1000))
+                play()
+            } else if (mediaStatus === MediaPlayer.EndOfMedia) {
+                root.advanceCastingPart()
+            }
+        }
+        onErrorOccurred: function(_error, errorString) {
+            root.castingPendingStart = false
+            root.castingAudioError = "Không thể phát âm thanh nguồn: " + errorString
+            stop()
+        }
+    }
+
+    AudioOutput {
+        id: castingAudio
+        volume: 0.9
+    }
+
+    Timer {
+        id: castingPlaybackEndTimer
+        interval: 60
+        repeat: true
+        running: castingPlayer.playbackState === MediaPlayer.PlayingState
+        onTriggered: {
+            const part = root.castingCurrentPart
+            if (part && castingPlayer.position >= Math.floor(Number(part.end_us || 0) / 1000))
+                root.advanceCastingPart()
+        }
     }
 
     AudioOutput {
@@ -246,16 +640,54 @@ Item {
         volume: 0.9
     }
 
+    MediaPlayer {
+        id: referencePlayer
+        objectName: "cloneReferencePlayer"
+        source: root.appModel.vieneuReferenceSource
+        audioOutput: referenceAudio
+        onSourceChanged: {
+            stop()
+            root.referenceAudioError = ""
+        }
+        onPlaybackStateChanged: {
+            if (playbackState === MediaPlayer.PlayingState) {
+                previewPlayer.pause()
+                productionPlayer.pause()
+                castingPlayer.pause()
+            }
+        }
+        onErrorOccurred: (error, errorString) => {
+            root.referenceAudioError = "Không thể phát file mẫu: " + errorString
+            stop()
+        }
+    }
+
+    AudioOutput {
+        id: referenceAudio
+        volume: 0.9
+    }
+
     Connections {
         target: root.appModel
+        function onDialogueCastingChanged() {
+            root.pruneCastingSelection()
+            if (root.castingViewportRestorePending)
+                root.restoreCastingViewport(!root.appModel.dialogueCastingSaving)
+        }
+        function onVoiceSettingsChanged() {
+            if (root.referenceVoiceId !== root.appModel.selectedVoiceId) {
+                root.referenceVoiceId = root.appModel.selectedVoiceId
+                if (!Boolean(root.selectedValue("is_clone", false))) referencePlayer.stop()
+            }
+        }
         function onVoicePreviewChanged() {
-            if (!root.appModel.voiceCatalogPreviewSource)
-                previewPlayer.source = root.appModel.voicePreviewSource
+            if (root.appModel.voiceCatalogPreviewSource)
+                root.replayVoiceCatalogSource()
+            else
+                root.replayVoicePreviewSource()
         }
         function onVoiceCatalogPlaybackChanged() {
-            previewPlayer.source = root.appModel.voiceCatalogPreviewSource
-                ? root.appModel.voiceCatalogPreviewSource
-                : root.appModel.voicePreviewSource
+            root.replayVoiceCatalogSource()
         }
         function onVoicePlaybackEnabledChanged() {
             if (root.appModel.voicePlaybackEnabled) return
@@ -484,13 +916,19 @@ Item {
                         checked: root.inspectorTab === "history"
                         onClicked: root.selectInspectorTab("history")
                     }
+                    DsTabButton {
+                        text: "Phân vai"
+                        checked: root.inspectorTab === "casting"
+                        onClicked: root.selectInspectorTab("casting")
+                    }
                 }
 
                 StackLayout {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     currentIndex: root.inspectorTab === "mixer"
-                        ? 1 : (root.inspectorTab === "history" ? 2 : 0)
+                        ? 1 : (root.inspectorTab === "history" ? 2
+                            : (root.inspectorTab === "casting" ? 3 : 0))
 
                     ColumnLayout {
                         spacing: Theme.space8
@@ -653,10 +1091,11 @@ Item {
 
                         ColumnLayout {
                             Layout.fillWidth: true
-                            visible: Boolean(root.selectedValue("is_clone", false))
                             spacing: Theme.space4
                             Text {
-                                text: "Mẫu clone mới (để trống để dùng profile hiện có)"
+                                Layout.fillWidth: true
+                                text: "File mẫu clone VieNeu (để trống để dùng profile hiện có)"
+                                wrapMode: Text.Wrap
                                 color: Theme.textSecondary
                                 font.family: Theme.fontFamily
                                 font.pixelSize: 10
@@ -674,6 +1113,62 @@ Item {
                                     compact: true
                                     onClicked: referenceDialog.open()
                                 }
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                DsButton {
+                                    objectName: "cloneReferencePlayButton"
+                                    text: referencePlayer.playbackState === MediaPlayer.PlayingState
+                                        ? "Tạm dừng file mẫu" : "Nghe file mẫu"
+                                    compact: true
+                                    enabled: Boolean(root.appModel.vieneuReferenceSource)
+                                    disabledReason: "Hãy chọn file mẫu clone để nghe thử."
+                                    onClicked: {
+                                        root.referenceAudioError = ""
+                                        if (referencePlayer.playbackState === MediaPlayer.PlayingState)
+                                            referencePlayer.pause()
+                                        else
+                                            referencePlayer.play()
+                                    }
+                                }
+                                DsButton {
+                                    objectName: "cloneReferenceStopButton"
+                                    text: "Dừng"
+                                    compact: true
+                                    enabled: referencePlayer.playbackState !== MediaPlayer.StoppedState
+                                    onClicked: referencePlayer.stop()
+                                }
+                                Item { Layout.fillWidth: true }
+                                Text {
+                                    text: root.timeLabel(referencePlayer.position)
+                                        + " / " + root.timeLabel(referencePlayer.duration)
+                                    color: Theme.textMuted
+                                    font.family: Theme.timecodeFamily
+                                    font.pixelSize: 10
+                                }
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Slider {
+                                    objectName: "cloneReferenceSeekSlider"
+                                    Layout.fillWidth: true
+                                    from: 0
+                                    to: Math.max(1, referencePlayer.duration)
+                                    value: referencePlayer.position
+                                    enabled: referencePlayer.seekable
+                                        && referencePlayer.duration > 0
+                                    onMoved: referencePlayer.setPosition(value)
+                                    Accessible.name: "Tua file mẫu clone"
+                                }
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                text: root.referenceAudioError
+                                    || "Nghe trực tiếp file mẫu đã chọn; không tạo giọng hoặc gửi file đi."
+                                color: root.referenceAudioError ? Theme.error : Theme.textMuted
+                                font.family: Theme.fontFamily
+                                font.pixelSize: 10
+                                wrapMode: Text.Wrap
                             }
                             DsTextField {
                                 Layout.fillWidth: true
@@ -1274,6 +1769,406 @@ Item {
                             jobModel: root.appModel.voiceJobModel
                             title: "Piper / VieNeu"
                             emptyDescription: "Chưa có lịch sử tạo giọng."
+                        }
+                    }
+
+                    ColumnLayout {
+                        id: castingTab
+                        spacing: Theme.space8
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            SectionTitle { text: "Phân vai thoại" }
+                            Item { Layout.fillWidth: true }
+                            DsButton {
+                                text: "Làm mới"
+                                compact: true
+                                enabled: !root.appModel.dialogueCastingLoading
+                                onClicked: root.appModel.refreshDialogueCasting()
+                            }
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+                            text: "Thử nghiệm trên âm thanh gốc. Câu chưa chắc dùng giọng dự phòng; câu không phát hiện lời thoại được giữ ở Cần kiểm tra và chưa tạo giọng đến khi gán Nam/Nữ."
+                            color: Theme.textMuted
+                            font.family: Theme.fontFamily
+                            font.pixelSize: 10
+                            wrapMode: Text.Wrap
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Switch {
+                                id: dialogueCastingSwitch
+                                objectName: "dialogueCastingEnabledSwitch"
+                                text: "Bật phân vai trước khi tạo D1"
+                                checked: root.castingConfig().enabled === true
+                                enabled: root.appModel.currentProject.hasProject
+                                    && !root.appModel.dialogueCastingSaving
+                                    && !root.appModel.dialogueCastingBusy
+                                    && !root.appModel.ttsBusy
+                                onToggled: root.appModel.setDialogueCastingEnabled(checked)
+                            }
+                            Item { Layout.fillWidth: true }
+                        }
+
+                        Repeater {
+                            model: [
+                                { role: "male", title: "Giọng nam" },
+                                { role: "female", title: "Giọng nữ" },
+                                { role: "fallback", title: "Giọng dự phòng" }
+                            ]
+                            delegate: ColumnLayout {
+                                id: castingVoiceRole
+                                required property string role
+                                required property string title
+                                Layout.fillWidth: true
+                                spacing: Theme.space4
+
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: parent.title
+                                    color: Theme.textSecondary
+                                    font.family: Theme.fontFamily
+                                    font.pixelSize: 10
+                                    font.weight: Font.DemiBold
+                                }
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    ComboBox {
+                                        id: castingVoiceSelector
+                                        Layout.fillWidth: true
+                                        model: root.appModel.voiceCatalogModel
+                                        textRole: "voiceName"
+                                        valueRole: "voiceId"
+                                        currentIndex: root.castingVoiceIndex(castingVoiceRole.role)
+                                        Accessible.name: "Chọn " + castingVoiceRole.title.toLowerCase()
+                                        enabled: !root.appModel.dialogueCastingSaving
+                                            && !root.appModel.dialogueCastingBusy
+                                            && !root.appModel.ttsBusy
+                                        delegate: ItemDelegate {
+                                            required property string voiceName
+                                            required property bool installed
+                                            width: castingVoiceSelector.width
+                                            text: voiceName + (installed ? "" : " · Chưa cài")
+                                            enabled: installed
+                                        }
+                                        onActivated: root.appModel.setDialogueCastingVoice(
+                                            castingVoiceRole.role, currentValue
+                                        )
+                                    }
+                                    DsButton {
+                                        text: "Nghe thử"
+                                        compact: true
+                                        enabled: !root.appModel.ttsBusy
+                                            && !root.appModel.dialogueCastingBusy
+                                            && !root.appModel.dialogueCastingSaving
+                                            && Boolean(root.castingVoiceId(castingVoiceRole.role))
+                                        disabledReason: "Chọn một giọng đã cài trước."
+                                        onClicked: root.appModel.previewDialogueCastingVoice(
+                                            castingVoiceRole.role
+                                        )
+                                    }
+                                }
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    DsButton {
+                                        objectName: "dialogueCastingReferenceButton-"
+                                            + castingVoiceRole.role
+                                        text: root.appModel.dialogueCastingPreviewRole
+                                            === castingVoiceRole.role
+                                            ? "Đang tạo mẫu clone…" : "Chọn file giọng…"
+                                        compact: true
+                                        enabled: root.appModel.currentProject.hasProject
+                                            && !root.appModel.dialogueCastingSaving
+                                            && !root.appModel.dialogueCastingBusy
+                                            && !root.appModel.ttsBusy
+                                        disabledReason: "Mở project và chờ tác vụ phân vai hiện tại kết thúc."
+                                        onClicked: root.openCastingReferenceDialog(
+                                            castingVoiceRole.role
+                                        )
+                                    }
+                                    Text {
+                                        id: castingReferenceLabel
+                                        Layout.fillWidth: true
+                                        text: root.castingReferenceName(castingVoiceRole.role)
+                                        color: root.castingReferencePath(castingVoiceRole.role)
+                                            ? Theme.textSecondary : Theme.textMuted
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: 9
+                                        elide: Text.ElideMiddle
+                                        Accessible.name: castingVoiceRole.title
+                                            + ": " + text
+                                        HoverHandler { id: castingReferenceHover }
+                                        ToolTip.visible: castingReferenceHover.hovered
+                                            && Boolean(root.castingReferencePath(
+                                                castingVoiceRole.role))
+                                        ToolTip.text: root.castingReferencePath(
+                                            castingVoiceRole.role)
+                                        ToolTip.delay: 350
+                                    }
+                                }
+                            }
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+                            text: "Chọn file sẽ tự tạo và phát một câu bằng giọng clone. Lần đầu cần chờ nạp mẫu; bấm Nghe thử để nghe lại."
+                            color: Theme.textMuted
+                            font.family: Theme.fontFamily
+                            font.pixelSize: 10
+                            wrapMode: Text.Wrap
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            DsButton {
+                                Layout.fillWidth: true
+                                text: root.appModel.dialogueCastingBusy
+                                    ? (root.appModel.dialogueCastingJobState === "running"
+                                        ? "Tạm dừng nhận diện" : "Tiếp tục nhận diện")
+                                    : (root.appModel.dialogueCastingJobState === "succeeded"
+                                        ? "Cập nhật nhãn" : "Nhận diện thoại")
+                                operationState: root.appModel.dialogueCastingBusy
+                                    ? root.appModel.dialogueCastingJobState : "idle"
+                                runningText: "Đang nhận diện thoại…"
+                                startingText: "Đang chuẩn bị nhận diện…"
+                                pausedText: "Tiếp tục nhận diện"
+                                failedText: "Thử nhận diện lại"
+                                enabled: root.appModel.currentProject.hasProject
+                                    && !root.appModel.ttsBusy
+                                    && !root.appModel.dialogueCastingSaving
+                                onClicked: {
+                                    if (root.appModel.dialogueCastingJobState === "running")
+                                        root.appModel.pauseDialogueCasting()
+                                    else if (root.appModel.dialogueCastingBusy)
+                                        root.appModel.resumeDialogueCasting()
+                                    else
+                                        root.appModel.analyzeDialogueCasting()
+                                }
+                            }
+                            DsButton {
+                                text: "Hủy"
+                                danger: true
+                                visible: root.appModel.dialogueCastingBusy
+                                enabled: root.appModel.dialogueCastingJobState !== "cancel_requested"
+                                onClicked: root.appModel.cancelDialogueCasting()
+                            }
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Text {
+                                text: "Câu: " + String(((root.appModel.dialogueCasting || {}).rows || []).length)
+                                color: Theme.textMuted
+                                font.family: Theme.fontFamily
+                                font.pixelSize: 10
+                            }
+                            Item { Layout.fillWidth: true }
+                            ComboBox {
+                                id: castingFilter
+                                objectName: "dialogueCastingFilter"
+                                Layout.preferredWidth: 132
+                                model: ["Tất cả", "Cần kiểm tra", "Nam", "Nữ"]
+                                currentIndex: 0
+                                Accessible.name: "Lọc câu theo nhãn phân vai"
+                            }
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            visible: root.selectedCastingCueIds.length > 0
+                            Text {
+                                text: String(root.selectedCastingCueIds.length) + " câu đã chọn"
+                                color: Theme.textSecondary
+                                font.family: Theme.fontFamily
+                                font.pixelSize: 10
+                            }
+                            Item { Layout.fillWidth: true }
+                            DsButton {
+                                text: "Nam"
+                                compact: true
+                                enabled: !root.appModel.dialogueCastingSaving
+                                    && !root.appModel.dialogueCastingBusy
+                                onClicked: root.applyCastingLabel(root.selectedCastingCueIds, "male")
+                            }
+                            DsButton {
+                                text: "Nữ"
+                                compact: true
+                                enabled: !root.appModel.dialogueCastingSaving
+                                    && !root.appModel.dialogueCastingBusy
+                                onClicked: root.applyCastingLabel(root.selectedCastingCueIds, "female")
+                            }
+                            DsButton {
+                                text: "Kiểm tra"
+                                compact: true
+                                enabled: !root.appModel.dialogueCastingSaving
+                                    && !root.appModel.dialogueCastingBusy
+                                onClicked: root.applyCastingLabel(root.selectedCastingCueIds, "unknown")
+                            }
+                            DsButton {
+                                text: "Tự động"
+                                compact: true
+                                enabled: !root.appModel.dialogueCastingSaving
+                                    && !root.appModel.dialogueCastingBusy
+                                onClicked: root.applyCastingLabel(root.selectedCastingCueIds, "auto")
+                            }
+                        }
+
+                        Text {
+                            objectName: "dialogueCastingAudioError"
+                            Layout.fillWidth: true
+                            visible: Boolean(root.castingAudioError)
+                            text: root.castingAudioError
+                            color: Theme.danger
+                            font.family: Theme.fontFamily
+                            font.pixelSize: 10
+                            wrapMode: Text.Wrap
+                            Accessible.name: text
+                        }
+
+                        ListView {
+                            id: dialogueCastingRows
+                            objectName: "dialogueCastingRows"
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            clip: true
+                            spacing: Theme.space4
+                            model: root.filteredCastingRows()
+                            ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+                            Text {
+                                anchors.centerIn: parent
+                                width: Math.max(0, parent.width - Theme.space16)
+                                visible: dialogueCastingRows.count === 0
+                                text: root.appModel.dialogueCastingLoading
+                                    ? "Đang tải kết quả phân vai…"
+                                    : (castingFilter.currentIndex === 0
+                                        ? "Chưa có kết quả. Bấm Nhận diện thoại để bắt đầu."
+                                        : "Không có câu nào trong bộ lọc này.")
+                                color: Theme.textMuted
+                                font.family: Theme.fontFamily
+                                font.pixelSize: 11
+                                horizontalAlignment: Text.AlignHCenter
+                                wrapMode: Text.Wrap
+                            }
+
+                            delegate: Rectangle {
+                                id: castingRow
+                                required property var modelData
+                                width: ListView.view.width
+                                height: 126
+                                radius: Theme.radiusSmall
+                                color: Theme.surfaceRaised
+                                border.width: 1
+                                border.color: modelData.label === "unknown"
+                                    ? Theme.warningBorder : Theme.borderSubtle
+
+                                ColumnLayout {
+                                    anchors.fill: parent
+                                    anchors.margins: Theme.space4
+                                    spacing: 3
+
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        CheckBox {
+                                            checked: root.selectedCastingCueIds.indexOf(castingRow.modelData.id) >= 0
+                                            enabled: !root.appModel.dialogueCastingSaving
+                                                && !root.appModel.dialogueCastingBusy
+                                            onToggled: root.toggleCastingCue(castingRow.modelData.id, checked)
+                                            Accessible.name: "Chọn câu " + String(castingRow.modelData.index)
+                                        }
+                                        Text {
+                                            text: "#" + String(castingRow.modelData.index)
+                                                + " · " + root.timeLabel(Number(castingRow.modelData.start_us || 0) / 1000)
+                                                + "–" + root.timeLabel(Number(castingRow.modelData.end_us || 0) / 1000)
+                                            color: Theme.textMuted
+                                            font.family: Theme.timecodeFamily
+                                            font.pixelSize: 9
+                                        }
+                                        StatusPill {
+                                            text: root.castingLabelDetail(castingRow.modelData)
+                                            runtimeState: castingRow.modelData.label === "unknown" ? "starting" : "ready"
+                                            Accessible.name: "Phân vai: " + text
+                                        }
+                                        Item { Layout.fillWidth: true }
+                                        DsButton {
+                                            objectName: "dialogueCastingSourceListenButton"
+                                            text: "Nghe gốc"
+                                            compact: true
+                                            enabled: (castingRow.modelData.parts || []).length > 0
+                                            onClicked: root.playCastingSource(castingRow.modelData)
+                                        }
+                                    }
+
+                                    Text {
+                                        Layout.fillWidth: true
+                                        text: String(castingRow.modelData.translated_text
+                                            || castingRow.modelData.text || "")
+                                        color: Theme.textPrimary
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: 10
+                                        elide: Text.ElideRight
+                                    }
+
+                                    Text {
+                                        Layout.fillWidth: true
+                                        visible: Boolean(castingRow.modelData.manual
+                                            || castingRow.modelData.reason)
+                                        text: castingRow.modelData.tts_suppressed
+                                            ? "Không phát hiện lời thoại · chưa tạo giọng"
+                                            : (castingRow.modelData.manual
+                                                ? "Nhãn sửa tay"
+                                                : root.castingReasonText(castingRow.modelData.reason))
+                                        color: Theme.textMuted
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: 9
+                                        elide: Text.ElideRight
+                                    }
+
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: Theme.space4
+                                        DsButton {
+                                            Layout.fillWidth: true
+                                            text: "Nam"
+                                            compact: true
+                                            emphasized: castingRow.modelData.label === "male"
+                                            enabled: !root.appModel.dialogueCastingSaving
+                                                && !root.appModel.dialogueCastingBusy
+                                            onClicked: root.applyCastingLabel([castingRow.modelData.id], "male")
+                                        }
+                                        DsButton {
+                                            Layout.fillWidth: true
+                                            text: "Nữ"
+                                            compact: true
+                                            emphasized: castingRow.modelData.label === "female"
+                                            enabled: !root.appModel.dialogueCastingSaving
+                                                && !root.appModel.dialogueCastingBusy
+                                            onClicked: root.applyCastingLabel([castingRow.modelData.id], "female")
+                                        }
+                                        DsButton {
+                                            Layout.fillWidth: true
+                                            text: "Kiểm tra"
+                                            compact: true
+                                            emphasized: castingRow.modelData.label === "unknown"
+                                            enabled: !root.appModel.dialogueCastingSaving
+                                                && !root.appModel.dialogueCastingBusy
+                                            onClicked: root.applyCastingLabel([castingRow.modelData.id], "unknown")
+                                        }
+                                        DsButton {
+                                            Layout.fillWidth: true
+                                            text: "Tự động"
+                                            compact: true
+                                            emphasized: !castingRow.modelData.manual
+                                            enabled: !root.appModel.dialogueCastingSaving
+                                                && !root.appModel.dialogueCastingBusy
+                                            onClicked: root.applyCastingLabel([castingRow.modelData.id], "auto")
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }

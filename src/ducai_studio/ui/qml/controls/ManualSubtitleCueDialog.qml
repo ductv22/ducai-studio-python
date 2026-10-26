@@ -55,7 +55,7 @@ Dialog {
     }
 
     function backgroundIndex(value) {
-        const values = ["solid", "ink_splash", "ink_wash", "ink_cloud", "brush_stroke"]
+        const values = ["solid", "none", "blur", "ink_splash", "ink_wash", "ink_cloud", "brush_stroke"]
         return Math.max(0, values.indexOf(String(value || "solid")))
     }
 
@@ -425,9 +425,10 @@ Dialog {
                 ComboBox {
                     Layout.fillWidth: true
                     Layout.maximumWidth: 240
-                    enabled: root.cueRole !== "dialogue"
                     model: [
                         { text: "Nền phẳng", value: "solid" },
+                        { text: "Không nền", value: "none" },
+                        { text: "Nền mờ (blur)", value: "blur" },
                         { text: "Mực loang", value: "ink_splash" },
                         { text: "Mực đại mặc", value: "ink_wash" },
                         { text: "Mực tụ", value: "ink_cloud" },
@@ -436,7 +437,12 @@ Dialog {
                     textRole: "text"
                     valueRole: "value"
                     currentIndex: root.backgroundIndex(root.backgroundStyle)
-                    onActivated: root.backgroundStyle = currentValue
+                    onActivated: {
+                        root.backgroundStyle = currentValue
+                        if (currentValue === "blur") root.backgroundOpacity = 100
+                        if (currentValue !== "none" && currentValue !== "blur" && !root.backgroundColor)
+                            root.backgroundColor = "#000000"
+                    }
                     Accessible.name: "Kiểu nền chữ"
                 }
                 DsButton {
@@ -458,7 +464,7 @@ Dialog {
                     text: "Bỏ nền"
                     compact: true
                     tooltipText: "Bỏ màu nền của cue mới."
-                    onClicked: root.backgroundColor = ""
+                    onClicked: root.backgroundStyle = "none"
                 }
                 Item { Layout.fillWidth: true }
             }

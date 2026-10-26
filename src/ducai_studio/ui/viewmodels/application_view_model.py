@@ -9,6 +9,7 @@ import re
 import zlib
 from collections.abc import Callable, Mapping
 from contextlib import suppress
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
@@ -30,7 +31,7 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QColor, QImage
+from PySide6.QtGui import QColor, QDesktopServices, QImage
 from PySide6.QtNetwork import QLocalSocket
 
 from ducai_studio import __version__
@@ -905,6 +906,7 @@ class ApplicationViewModel(QObject):
     voiceConformChanged = Signal()
     geminiApiCredentialsStored = Signal()
     voiceSettingsChanged = Signal()
+    dialogueCastingChanged = Signal()
     ttsBusyChanged = Signal()
     voicePreviewChanged = Signal()
     voiceCatalogPlaybackChanged = Signal()
@@ -931,7 +933,9 @@ class ApplicationViewModel(QObject):
         self.multi_videos = MultiVideoListModel(self)
         self.jobs = JobListModel(self)
         self.subtitle_jobs = JobListModel(self, accepted_kinds=frozenset({"ocr", "translate"}))
-        self.voice_jobs = JobListModel(self, accepted_kinds=frozenset({"tts"}))
+        self.voice_jobs = JobListModel(
+            self, accepted_kinds=frozenset({"tts", "dialogue_casting"})
+        )
         self.export_jobs = JobListModel(self, accepted_kinds=frozenset({"export"}))
         self.project_state = ProjectStateModel(self)
         self.voice_catalog = VoiceCatalogModel(self)
@@ -1022,6 +1026,7 @@ class ApplicationViewModel(QObject):
             "ocr/sceneTextEnabled", True, type=bool
         )
         self._reloaded_ocr_jobs: set[str] = set()
+        self._casting_after_ocr_jobs: set[str] = set()
         self._translation_busy = False
         self._translation_catalog_generation = 0
         self._translation_catalog_models: list[str] = []
@@ -1079,6 +1084,26 @@ class ApplicationViewModel(QObject):
         self._tts_job_state = ""
         self._tts_job_purpose = ""
         self._pending_tts_start: dict[str, object] | None = None
+        self._dialogue_casting: dict[str, object] = {
+            "project_id": "",
+            "config": {
+                "enabled": False,
+                "male_voice": None,
+                "female_voice": None,
+                "fallback_voice": None,
+            },
+            "rows": [],
+            "experimental": True,
+        }
+        self._dialogue_casting_loading = False
+        self._dialogue_casting_saving = False
+        self._dialogue_casting_job_id = ""
+        self._dialogue_casting_job_state = ""
+        self._dialogue_casting_auto_tts = False
+        self._dialogue_casting_auto_tts_job_id = ""
+        self._dialogue_casting_terminal_markers: set[tuple[str, str]] = set()
+        self._observed_active_ocr_jobs: set[str] = set()
+        self._pending_casting_after_ocr: dict[str, str] | None = None
         self._voice_playback_enabled = True
         self._voice_timing_auto_repair_busy = False
         self._reloaded_tts_jobs: set[str] = set()
@@ -1133,6 +1158,10 @@ class ApplicationViewModel(QObject):
         self._voice_conform_estimate_generation = 0
         self._voice_conform_estimate_refresh_queued = False
         self._voice_preview_source = ""
+        self._voice_preview_job_id = ""
+        self._voice_preview_target_job_id: str | None = None
+        self._casting_preview_request_serial = 0
+        self._casting_preview_role = ""
         self._voice_catalog_preview_source = ""
         self._voice_catalog_preview_id = ""
         self._export_busy = False
@@ -1699,6 +1728,29 @@ class ApplicationViewModel(QObject):
     def ttsJobPurpose(self) -> str:
         return self._tts_job_purpose
 
+    @Property("QVariantMap", notify=dialogueCastingChanged)
+    def dialogueCasting(self) -> dict:
+        return deepcopy(self._dialogue_casting)
+
+    @Property(bool, notify=dialogueCastingChanged)
+    def dialogueCastingLoading(self) -> bool:
+        return self._dialogue_casting_loading
+
+    @Property(bool, notify=dialogueCastingChanged)
+    def dialogueCastingSaving(self) -> bool:
+        return self._dialogue_casting_saving
+
+    @Property(str, notify=dialogueCastingChanged)
+    def dialogueCastingJobState(self) -> str:
+        return self._dialogue_casting_job_state
+
+    @Property(bool, notify=dialogueCastingChanged)
+    def dialogueCastingBusy(self) -> bool:
+        return self._dialogue_casting_job_state in {
+            "queued", "start_requested", "running", "pause_requested",
+            "paused", "resume_requested", "cancel_requested",
+        }
+
     @Property(str, notify=voiceSettingsChanged)
     def selectedVoiceId(self) -> str:
         return self._selected_voice_id
@@ -1714,6 +1766,11 @@ class ApplicationViewModel(QObject):
     @Property(str, notify=voicePreviewChanged)
     def voicePreviewSource(self) -> str:
         return self._voice_preview_source
+
+    @Property(str, notify=ttsBusyChanged)
+    def dialogueCastingPreviewRole(self) -> str:
+        return (self._casting_preview_role
+                if self._tts_busy and self._tts_job_purpose == "preview" else "")
 
     @Property(str, notify=voiceCatalogPlaybackChanged)
     def voiceCatalogPreviewSource(self) -> str:
@@ -1874,6 +1931,21 @@ class ApplicationViewModel(QObject):
     def lastExportQaPath(self) -> str:
         return self._last_export_qa_path
 
+    @Property(bool, notify=exportPreviewChanged)
+    def canOpenExportFolder(self) -> bool:
+        path = QUrl(self._last_export_source).toLocalFile()
+        return bool(path and Path(path).is_file())
+
+    @Slot()
+    def openExportFolder(self) -> None:
+        path = QUrl(self._last_export_source).toLocalFile()
+        if not path or not Path(path).is_file():
+            self._set_status("Chưa có video xuất thành công hoặc file đã được di chuyển")
+            return
+        folder = Path(path).resolve().parent
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder))):
+            self._set_status("Không mở được thư mục xuất: " + str(folder))
+
     @Property("QVariantMap", notify=diagnosticsChanged)
     def runtimeDiagnostics(self) -> dict[str, object]:
         return self._runtime_diagnostics
@@ -1893,6 +1965,11 @@ class ApplicationViewModel(QObject):
     @Property(str, notify=voiceSettingsChanged)
     def vieneuReferenceAudio(self) -> str:
         return self.settings.value("voice/vieneuReferenceAudio", "", type=str)
+
+    @Property(str, notify=voiceSettingsChanged)
+    def vieneuReferenceSource(self) -> str:
+        path = self.vieneuReferenceAudio
+        return QUrl.fromLocalFile(path).toString() if path else ""
 
     @Property(str, notify=voiceSettingsChanged)
     def vieneuReferenceText(self) -> str:
@@ -1964,6 +2041,27 @@ class ApplicationViewModel(QObject):
     @Property(int, notify=selectedCueChanged)
     def selectedCueCount(self) -> int:
         return len(self._selected_cue_ids)
+
+    @Property(int, notify=selectedCueChanged)
+    def selectedSceneTextCueCount(self) -> int:
+        return sum(self.project_state.subtitle_cues.find(cue_id).get("cue_role") == "scene_text"
+                   for cue_id in self._selected_cue_ids)
+
+    @Property(bool, notify=selectedCueChanged)
+    def selectedTextCueEditingLocked(self) -> bool:
+        return self._text_cue_ids_locked(self._selected_cue_ids)
+
+    def _text_cue_ids_locked(self, cue_ids: list[str]) -> bool:
+        for cue_id in cue_ids:
+            cue = self.project_state.subtitle_cues.find(cue_id)
+            track_id = str(cue.get("subtitle_track_id") or (
+                "T1" if self.project_state.title_cues.find(cue_id)
+                else "S2" if cue.get("cue_role") == "scene_text" else "S1"
+            ))
+            track = self.project_state.track_info(track_id) or {}
+            if track.get("locked") is True:
+                return True
+        return False
 
     @Property("QVariantMap", notify=selectedCueChanged)
     def selectedCue(self) -> dict:
@@ -3016,6 +3114,417 @@ class ApplicationViewModel(QObject):
         self._voice_catalog_preview_source = ""
         self.voiceCatalogPlaybackChanged.emit()
 
+    def _replace_dialogue_casting(self, raw: object) -> None:
+        payload = dict(raw) if isinstance(raw, dict) else {}
+        rows = payload.get("rows", [])
+        prepared_rows = []
+        if isinstance(rows, list):
+            for raw_row in rows:
+                if not isinstance(raw_row, dict):
+                    continue
+                row = dict(raw_row)
+                parts = row.get("parts", [])
+                if isinstance(parts, list):
+                    prepared_parts = []
+                    for raw_part in parts:
+                        if not isinstance(raw_part, dict):
+                            continue
+                        part = dict(raw_part)
+                        media_path = str(part.get("media_path", "")).strip()
+                        if media_path:
+                            part["source_url"] = QUrl.fromLocalFile(
+                                str(Path(media_path).expanduser().resolve())
+                            ).toString()
+                        prepared_parts.append(part)
+                    row["parts"] = prepared_parts
+                prepared_rows.append(row)
+        payload["rows"] = prepared_rows
+        payload.setdefault("config", {
+            "enabled": False,
+            "male_voice": None,
+            "female_voice": None,
+            "fallback_voice": None,
+        })
+        payload["experimental"] = True
+        self._dialogue_casting = payload
+        self._dialogue_casting_loading = False
+        self.dialogueCastingChanged.emit()
+
+    def _set_dialogue_casting_job_state(self, value: str) -> None:
+        state = str(value or "")
+        if state == self._dialogue_casting_job_state:
+            return
+        self._dialogue_casting_job_state = state
+        self.dialogueCastingChanged.emit()
+
+    def _current_dialogue_casting_config(self) -> dict[str, object]:
+        config = self._dialogue_casting.get("config", {})
+        if isinstance(config, dict):
+            return {
+                key: deepcopy(config.get(key))
+                for key in ("enabled", "male_voice", "female_voice", "fallback_voice")
+            }
+        return {
+            "enabled": False,
+            "male_voice": None,
+            "female_voice": None,
+            "fallback_voice": None,
+        }
+
+    def _dialogue_casting_job_context(self, job_id: str) -> dict[str, object]:
+        return {
+            "job_kind": "dialogue_casting",
+            "project_id": self.project_state.projectId,
+            "job_id": job_id,
+        }
+
+    def _dialogue_casting_callback_is_current(self, context: object) -> bool:
+        if not isinstance(context, dict):
+            return False
+        project_id = str(context.get("project_id", ""))
+        job_id = str(context.get("job_id", ""))
+        return bool(
+            project_id
+            and job_id
+            and project_id == self.project_state.projectId
+            and job_id == self._dialogue_casting_job_id
+        )
+
+    def _dialogue_casting_voice(self, voice_id: str) -> dict[str, object] | None:
+        entry = self.voice_catalog.find(voice_id.strip())
+        if not entry or entry.get("installed") is not True:
+            return None
+        provider_id = str(entry.get("provider_id", ""))
+        voice = {"provider_id": provider_id, "voice_id": str(entry.get("voice_id", ""))}
+        if provider_id != "vieneu-3.8" or not entry.get("is_clone"):
+            return voice
+        profile_path = str(entry.get("profile_path", "")).strip()
+        if profile_path and Path(profile_path).is_file():
+            voice["profile_path"] = profile_path
+            return voice
+        reference_path = self.vieneuReferenceAudio
+        if reference_path:
+            voice.update({
+                "reference_audio_path": reference_path,
+                "reference_text": self.vieneuReferenceText,
+                "reference_denoise": self.vieneuReferenceDenoise,
+            })
+            return voice
+        self._set_status("Giọng clone chưa có profile; hãy chọn file mẫu hoặc tạo profile trước")
+        return None
+
+    def _save_dialogue_casting_config(
+        self, config: dict[str, object], *, preview_role: str = "",
+    ) -> None:
+        project_id = self.project_state.projectId
+        if not project_id or not self._backend_ready:
+            self._set_status("Hãy mở project và chờ Job Manager sẵn sàng trước khi lưu phân vai")
+            return
+        if self._dialogue_casting_saving:
+            return
+        self._dialogue_casting_saving = True
+        self.dialogueCastingChanged.emit()
+        context: dict[str, object] = {
+            "project_id": project_id, "dialogue_casting_config": True,
+        }
+        if preview_role:
+            context.update({
+                "import_preview_role": preview_role,
+                "import_preview_serial": self._casting_preview_request_serial,
+            })
+        self.runtime.request(
+            "configure_dialogue_casting",
+            {"project_id": project_id, "config": config},
+            context=context,
+        )
+
+    @Slot()
+    def refreshDialogueCasting(self) -> None:
+        project_id = self.project_state.projectId
+        if not project_id or not self._backend_ready or not self.runtime.ready:
+            return
+        self._dialogue_casting_loading = True
+        self.dialogueCastingChanged.emit()
+        self.runtime.request(
+            "get_dialogue_casting",
+            {"project_id": project_id},
+            context={"project_id": project_id},
+        )
+
+    @Slot(bool)
+    def setDialogueCastingEnabled(self, enabled: bool) -> None:
+        if not enabled:
+            self._pending_casting_after_ocr = None
+        config = self._current_dialogue_casting_config()
+        config["enabled"] = bool(enabled)
+        if enabled and config.get("fallback_voice") is None:
+            config["fallback_voice"] = self._dialogue_casting_voice(self._selected_voice_id)
+        self._save_dialogue_casting_config(config)
+
+    @Slot(str, str)
+    def setDialogueCastingVoice(self, role: str, voice_id: str) -> None:
+        key = role.strip()
+        if key not in {"male", "female", "fallback"}:
+            return
+        config = self._current_dialogue_casting_config()
+        voice = self._dialogue_casting_voice(voice_id) if voice_id.strip() else None
+        if voice_id.strip() and voice is None:
+            return
+        self._release_voice_preview()
+        config[f"{key}_voice"] = voice
+        self._save_dialogue_casting_config(config)
+
+    @Slot(str, str)
+    def setDialogueCastingReferenceAudio(self, role: str, value: str) -> None:
+        if role not in {"male", "female", "fallback"} or self._dialogue_casting_saving:
+            return
+        if not self.project_state.hasProject or not self._backend_ready:
+            self._set_status("Hãy mở project trước khi chọn file giọng")
+            return
+        if self._tts_busy or self.dialogueCastingBusy:
+            self._set_status("Hãy chờ tác vụ giọng hiện tại xong trước khi đổi file mẫu")
+            return
+        raw = value.strip()
+        raw = QUrl(raw).toLocalFile() if raw.casefold().startswith("file:") else raw
+        if not raw:
+            return
+        self._release_voice_preview()
+        path = Path(raw).expanduser().resolve()
+        if (not path.is_file() or path.suffix.casefold() not in {
+                ".wav", ".mp3", ".m4a", ".flac", ".ogg"} or path.stat().st_size == 0):
+            self._set_status("Hãy chọn file giọng WAV, MP3, M4A, FLAC hoặc OGG có dữ liệu")
+            return
+        clone = next((self.voice_catalog.get(row) for row in range(self.voice_catalog.count)
+                      if self.voice_catalog.get(row).get("is_clone") is True
+                      and self.voice_catalog.get(row).get("installed") is True), None)
+        if clone is None:
+            self._set_status("Cần cài runtime VieNeu để dùng file giọng riêng cho phân vai")
+            return
+        config = self._current_dialogue_casting_config()
+        config[role + "_voice"] = {
+            "provider_id": "vieneu-3.8", "voice_id": str(clone["voice_id"]),
+            "reference_audio_path": str(path), "reference_text": "", "reference_denoise": False,
+        }
+        self._save_dialogue_casting_config(config, preview_role=role)
+
+    @Slot("QVariantList", str)
+    def setDialogueCastingLabels(self, cue_ids: list, label: str) -> None:
+        project_id = self.project_state.projectId
+        normalized = list(
+            dict.fromkeys(str(value).strip() for value in cue_ids if str(value).strip())
+        )
+        if not project_id or not normalized or label not in {"male", "female", "unknown", "auto"}:
+            return
+        if self._dialogue_casting_saving:
+            return
+        self._dialogue_casting_saving = True
+        self.dialogueCastingChanged.emit()
+        self.runtime.request(
+            "set_dialogue_casting_labels",
+            {"project_id": project_id, "cue_ids": normalized, "label": label},
+            context={"project_id": project_id, "dialogue_casting_labels": True},
+        )
+
+    @Slot()
+    def analyzeDialogueCasting(self) -> None:
+        project_id = self.project_state.projectId
+        if not project_id or not self._backend_ready:
+            self._set_status("Hãy mở project có video trước khi nhận diện thoại")
+            return
+        if self.dialogueCastingBusy or self._tts_busy:
+            self._set_status("Chờ tác vụ phân vai hoặc tạo giọng hiện tại kết thúc trước")
+            return
+        self._dialogue_casting_job_id = ""
+        self._dialogue_casting_auto_tts = False
+        self._dialogue_casting_auto_tts_job_id = ""
+        self._set_dialogue_casting_job_state("start_requested")
+        self.runtime.request(
+            "create_dialogue_casting_job",
+            {"project_id": project_id},
+            context={"project_id": project_id, "automatic_tts": False},
+        )
+        self._set_status("Đang chuẩn bị nhận diện giọng thoại từ âm thanh gốc")
+
+    def _start_casting_after_ocr(self, snapshot: dict, context: dict) -> None:
+        job_id = str(context.get("ocr_job_id", ""))
+        project_id = str(context.get("project_id", ""))
+        state = snapshot.get("dialogue_casting")
+        if (context.get("ocr_succeeded") is not True
+                or context.get("ocr_live_completion") is False or not job_id
+                or not project_id or project_id != self.project_state.projectId
+                or job_id in self._casting_after_ocr_jobs
+                or not isinstance(state, dict) or state.get("enabled") is not True
+                or not self._backend_ready
+                or self._multi_batch.get("state") in {"running", "pause_requested", "paused"}
+                or not any(cue.get("role", "dialogue") == "dialogue"
+                           for cue in snapshot.get("source_cues", []))):
+            return
+        if self._tts_busy or self.dialogueCastingBusy:
+            self._pending_casting_after_ocr = {
+                "project_id": project_id,
+                "ocr_job_id": job_id,
+            }
+            return
+        self._casting_after_ocr_jobs.add(job_id)
+        self.analyzeDialogueCasting()
+
+    def _resume_pending_casting_after_ocr(self) -> None:
+        pending = self._pending_casting_after_ocr
+        if not isinstance(pending, dict):
+            return
+        if self._tts_busy or self.dialogueCastingBusy:
+            return
+        self._pending_casting_after_ocr = None
+        project_id = str(pending.get("project_id", ""))
+        job_id = str(pending.get("ocr_job_id", ""))
+        current_snapshot = self.project_state._canonical_snapshot
+        if (not project_id or project_id != self.project_state.projectId or not job_id
+                or job_id in self._casting_after_ocr_jobs or not self._backend_ready
+                or self._current_dialogue_casting_config().get("enabled") is not True
+                or self.dialogueCastingBusy
+                or self._multi_batch.get("state") in {"running", "pause_requested", "paused"}
+                or not any(cue.get("role", "dialogue") == "dialogue"
+                           for cue in current_snapshot.get("source_cues", []))):
+            return
+        self._casting_after_ocr_jobs.add(job_id)
+        self.analyzeDialogueCasting()
+
+    def _finish_dialogue_casting_job(self, job_id: str, state: str) -> None:
+        if not job_id:
+            return
+        marker = (job_id, state)
+        if marker in self._dialogue_casting_terminal_markers:
+            return
+        self._dialogue_casting_terminal_markers.add(marker)
+        self._set_dialogue_casting_job_state(state)
+        if state == "succeeded":
+            self.refreshDialogueCasting()
+            if self._dialogue_casting_auto_tts_job_id == job_id:
+                self._dialogue_casting_auto_tts_job_id = ""
+                self._continue_pending_tts_start()
+            self._resume_pending_casting_after_ocr()
+            return
+        if state not in {"failed", "cancelled", "interrupted"}:
+            return
+        if self._dialogue_casting_auto_tts_job_id != job_id:
+            self._resume_pending_casting_after_ocr()
+            return
+        self._dialogue_casting_auto_tts = False
+        self._dialogue_casting_auto_tts_job_id = ""
+        self._pending_tts_start = None
+        self._set_tts_job_state("failed" if state == "failed" else state)
+        self._set_voice_playback_enabled(True)
+        if state == "failed":
+            self._set_status(
+                "Phân vai thoại gặp lỗi; D1 cũ được giữ nguyên. Kiểm tra runtime và thử lại."
+            )
+        elif state == "cancelled":
+            self._set_status("Đã hủy phân vai thoại; chưa tạo hoặc thay D1.")
+        else:
+            self._set_status("Phân vai thoại bị gián đoạn; D1 cũ được giữ nguyên.")
+        self._set_tts_busy(False)
+        self._resume_pending_casting_after_ocr()
+
+    @Slot(str)
+    def previewDialogueCastingVoice(self, role: str) -> None:
+        normalized_role = role.strip()
+        if normalized_role not in {"male", "female", "fallback"}:
+            return
+        if self._tts_busy or self.dialogueCastingBusy or self._dialogue_casting_saving:
+            self._set_status("Chờ tác vụ giọng hiện tại kết thúc trước khi nghe thử")
+            return
+        config = self._current_dialogue_casting_config()
+        voice = config.get(f"{normalized_role}_voice")
+        if not isinstance(voice, dict):
+            self._set_status("Hãy chọn giọng cho vai này trước khi nghe thử")
+            return
+        options: dict[str, object] = {
+            "purpose": "preview",
+            "preview_text": "Xin chào, đây là mẫu nghe thử giọng trong DUCAI Studio.",
+            "batch_size": 1,
+        }
+        if (voice.get("provider_id") == "vieneu-3.8"
+                and not str(voice.get("voice_id", "")).startswith("preset:")):
+            for key in (
+                "profile_path",
+                "reference_audio_path",
+                "reference_text",
+                "reference_denoise",
+            ):
+                if voice.get(key):
+                    options[key] = voice[key]
+        self._release_voice_preview()
+        request_serial = self._casting_preview_request_serial
+        context = {
+            "tts_purpose": "preview",
+            "casting_preview_lookup": True,
+            "casting_preview_role": normalized_role,
+            "casting_preview_serial": request_serial,
+            "project_id": self.project_state.projectId,
+            "voice": dict(voice),
+            "provider_options": dict(options),
+        }
+        self.runtime.request(
+            "get_tts_voice_preview",
+            {
+                "provider_id": voice["provider_id"],
+                "voice_id": voice["voice_id"],
+                "provider_options": options,
+            },
+            context=context,
+        )
+        self._set_status("Đang mở mẫu nghe thử đã chuẩn bị")
+
+    def _casting_preview_lookup_is_current(self, context: object) -> bool:
+        return bool(
+            isinstance(context, dict)
+            and context.get("casting_preview_lookup") is True
+            and context.get("casting_preview_serial") == self._casting_preview_request_serial
+            and str(context.get("project_id", "")) == self.project_state.projectId
+        )
+
+    def _start_casting_preview_job(self, context: dict[str, object]) -> None:
+        if not self._casting_preview_lookup_is_current(context):
+            return
+        voice = context.get("voice")
+        options = context.get("provider_options")
+        if not isinstance(voice, dict) or not isinstance(options, dict):
+            return
+        if not self.project_state.hasProject:
+            self._set_status("Mẫu này chưa được chuẩn bị; hãy mở project để tạo mẫu nghe thử")
+            return
+        self._casting_preview_role = str(context.get("casting_preview_role", ""))
+        self._set_tts_job_purpose("preview")
+        self._set_tts_job_state("start_requested")
+        self._set_tts_busy(True)
+        self.runtime.request(
+            "create_tts_job",
+            {
+                "project_id": self.project_state.projectId,
+                "provider_id": voice["provider_id"],
+                "voice_id": voice["voice_id"],
+                "provider_options": dict(options),
+            },
+            context={
+                "tts_purpose": "preview",
+                "casting_preview_role": context.get("casting_preview_role", ""),
+                "casting_preview_serial": context["casting_preview_serial"],
+                "project_id": self.project_state.projectId,
+            },
+        )
+        self._set_status("Đang tạo mẫu nghe thử cho giọng phân vai")
+
+    def _release_voice_preview(self) -> None:
+        self._casting_preview_request_serial += 1
+        if self._casting_preview_role:
+            self._casting_preview_role = ""
+            self.ttsBusyChanged.emit()
+        self._voice_preview_target_job_id = ""
+        self.stopVoiceCatalogPreview()
+        if self._voice_preview_source:
+            self._voice_preview_source = ""
+            self.voicePreviewChanged.emit()
+
     @Slot(str)
     def installVoice(self, voice_id: str) -> None:
         if not self._features_available():
@@ -3517,6 +4026,62 @@ class ApplicationViewModel(QObject):
                 {"job_id": self._tts_job_id},
                 context={"job_kind": "tts"},
             )
+
+    @Slot()
+    def pauseDialogueCasting(self) -> None:
+        if self._dialogue_casting_job_id and self._dialogue_casting_job_state == "running":
+            job_id = self._dialogue_casting_job_id
+            self._set_dialogue_casting_job_state("pause_requested")
+            self.runtime.request(
+                "pause_job",
+                {"job_id": job_id},
+                context=self._dialogue_casting_job_context(job_id),
+            )
+
+    @Slot()
+    def resumeDialogueCasting(self) -> None:
+        job_id = self._dialogue_casting_job_id
+        if not job_id:
+            return
+        if self._dialogue_casting_job_state == "paused":
+            self._set_dialogue_casting_job_state("resume_requested")
+            self.runtime.request(
+                "resume_job", {"job_id": job_id},
+                context=self._dialogue_casting_job_context(job_id),
+            )
+        elif self._dialogue_casting_job_state in {"queued", "start_requested"}:
+            self._set_dialogue_casting_job_state("start_requested")
+            self._start_dialogue_casting_worker(job_id)
+        elif self._dialogue_casting_job_state in {"interrupted", "failed"}:
+            self._dialogue_casting_terminal_markers = {
+                marker for marker in self._dialogue_casting_terminal_markers
+                if marker[0] != job_id
+            }
+            self._set_dialogue_casting_job_state("resume_requested")
+            request_context = self._dialogue_casting_job_context(job_id)
+            request_context["resume_dialogue_casting"] = True
+            self.runtime.request(
+                "retry_job", {"job_id": job_id},
+                context=request_context,
+            )
+
+    @Slot()
+    def cancelDialogueCasting(self) -> None:
+        if not self._dialogue_casting_job_id or not self.dialogueCastingBusy:
+            return
+        job_id = self._dialogue_casting_job_id
+        if self._dialogue_casting_auto_tts_job_id == job_id:
+            self._dialogue_casting_auto_tts = False
+            self._dialogue_casting_auto_tts_job_id = ""
+            self._pending_tts_start = None
+            self._set_tts_busy(False)
+            self._set_tts_job_state("cancelled")
+        self._set_dialogue_casting_job_state("cancel_requested")
+        self.runtime.request(
+            "cancel_job",
+            {"job_id": job_id},
+            context=self._dialogue_casting_job_context(job_id),
+        )
 
     @Slot(str)
     def setExportOutputPath(self, value: str) -> None:
@@ -4020,6 +4585,25 @@ class ApplicationViewModel(QObject):
         if not selected or selected.get("installed") is not True:
             self._set_status("Hãy chọn một giọng đã cài và sẵn sàng")
             return
+        casting_config = self._current_dialogue_casting_config()
+        if purpose == "production" and casting_config.get("enabled") is True:
+            missing_roles = [
+                role
+                for key, role in (
+                    ("male_voice", "nam"),
+                    ("female_voice", "nữ"),
+                    ("fallback_voice", "dự phòng"),
+                )
+                if not isinstance(casting_config.get(key), dict)
+                or not str(casting_config[key].get("voice_id", "")).strip()
+                or not str(casting_config[key].get("provider_id", "")).strip()
+            ]
+            if missing_roles:
+                self._set_status(
+                    "Hãy chọn đủ giọng " + ", ".join(missing_roles)
+                    + " trong Phân vai thoại trước khi tạo giọng"
+                )
+                return
         provider_id = str(selected.get("provider_id", ""))
         options: dict[str, object] = {"purpose": purpose}
         if force_cue_ids:
@@ -4048,6 +4632,8 @@ class ApplicationViewModel(QObject):
         # the complete base-speed voice for the post-conform workflow.
         options["qa_non_blocking"] = True
         options["defer_timing_conform"] = False
+        if purpose == "preview":
+            self._release_voice_preview()
         self._set_tts_job_purpose(purpose)
         self._set_tts_job_state("start_requested")
         self._set_tts_busy(True)
@@ -4058,9 +4644,47 @@ class ApplicationViewModel(QObject):
                 "voice_id": self._selected_voice_id,
                 "provider_options": options,
             },
-            "context": {"tts_purpose": purpose},
+            "context": {
+                "tts_purpose": purpose,
+                "project_id": self.project_state.projectId,
+            },
             "force_cue_ids": list(force_cue_ids or []),
         }
+        if purpose == "production" and casting_config.get("enabled") is True:
+            if self.dialogueCastingBusy:
+                self._dialogue_casting_auto_tts = True
+                self._dialogue_casting_auto_tts_job_id = self._dialogue_casting_job_id
+                self._set_status("Đang chờ phân vai hiện tại xong để tạo D1; không nhận diện lại")
+                return
+            self._dialogue_casting_job_id = ""
+            self._set_dialogue_casting_job_state("start_requested")
+            self._dialogue_casting_auto_tts = True
+            self._dialogue_casting_auto_tts_job_id = ""
+            self.runtime.request(
+                "create_dialogue_casting_job",
+                {"project_id": self.project_state.projectId},
+                context={
+                    "project_id": self.project_state.projectId,
+                    "automatic_tts": True,
+                },
+            )
+            self._set_status("Đang nhận diện hoặc kiểm tra nhãn thoại trước khi tạo D1")
+            return
+        self._continue_pending_tts_start()
+
+    def _continue_pending_tts_start(self) -> None:
+        pending = self._pending_tts_start
+        if not isinstance(pending, dict):
+            self._set_tts_busy(False)
+            self._set_tts_job_state("failed")
+            self._set_status("Không tìm thấy cấu hình tạo giọng đang chờ")
+            return
+        pending_context = pending.get("context")
+        purpose = (
+            str(pending_context.get("tts_purpose", ""))
+            if isinstance(pending_context, dict)
+            else ""
+        )
         if purpose == "production" and self.project_state.hasVoiceTrack:
             # Drop the QML sources before asking the service to remove D1.  Qt
             # Multimedia otherwise keeps the stable WAV open on Windows and
@@ -4075,7 +4699,7 @@ class ApplicationViewModel(QObject):
                 "Đang gỡ D1 cũ và giải phóng file WAV trước khi tạo lại; cache vẫn được giữ"
             )
             return
-        self._dispatch_pending_tts_start(force_cue_ids=force_cue_ids)
+        self._dispatch_pending_tts_start()
 
     def _dispatch_pending_tts_start(
         self,
@@ -4279,6 +4903,20 @@ class ApplicationViewModel(QObject):
         self._selected_cue_id = values[-1] if values else ""
         self.selectedCueChanged.emit()
 
+    @Slot(str)
+    @Slot(str, bool)
+    def selectTimelineTrackCues(self, track_id: str, additive: bool = False) -> None:
+        track = self.project_state.track_info(track_id) or {}
+        if track.get("kind") not in {"subtitle", "text"}:
+            return
+        model = (self.project_state.title_cues if track.get("kind") == "text"
+                 else self.project_state.subtitle_cues)
+        cue_ids = [str(cue.get("cue_id", ""))
+                   for row in range(model.count)
+                   if (cue := model.get(row)).get(
+                       "subtitle_track_id") == track_id]
+        self.selectSubtitleCueIds(cue_ids, additive)
+
     @Slot()
     def selectAllSubtitleCues(self) -> None:
         if self.project_state.title_cues.find(self._selected_cue_id):
@@ -4430,6 +5068,9 @@ class ApplicationViewModel(QObject):
             cue_ids = [self._selected_cue_id]
         if not cue_ids:
             self._set_status("Hãy chọn ít nhất một cue chữ trước")
+            return
+        if self._text_cue_ids_locked(cue_ids):
+            self._set_status("Hãy mở khóa dòng chữ trước khi chỉnh kiểu chữ")
             return
         normalized_size = max(1, int(font_size))
         normalized_orientation = "vertical" if orientation == "vertical" else "horizontal"
@@ -5164,6 +5805,22 @@ class ApplicationViewModel(QObject):
             "accept_scene_text",
             cue_id=cue_id,
             status_context={"accepted_scene_text": True},
+        )
+
+    @Slot()
+    def acceptSelectedSceneTextCues(self) -> None:
+        cue_ids = [cue_id for cue_id in self._selected_cue_ids
+                   if self.project_state.subtitle_cues.find(cue_id).get("cue_role")
+                   == "scene_text"]
+        if not cue_ids:
+            self._set_status("Hãy chọn chữ trong cảnh cần chấp nhận")
+            return
+        if self._text_cue_ids_locked(cue_ids):
+            self._set_status("Hãy mở khóa dòng chữ trước khi chấp nhận")
+            return
+        self._send_subtitle_command(
+            "accept_scene_text", cue_id=cue_ids[-1], values={"cue_ids": cue_ids},
+            status_context={"accepted_scene_text": True, "accepted_scene_text_count": len(cue_ids)},
         )
 
     @Slot(str, float)
@@ -7598,6 +8255,42 @@ class ApplicationViewModel(QObject):
         self._runtime_state = value
         self.runtimeStateChanged.emit()
 
+    def _sync_dialogue_casting_job(self, raw_items: list[object]) -> None:
+        project_id = self.project_state.projectId
+        if not project_id:
+            return
+        casting_jobs = [
+            item for item in raw_items
+            if isinstance(item, dict)
+            and isinstance(item.get("spec"), dict)
+            and item["spec"].get("kind") == "dialogue_casting"
+            and item["spec"].get("project_id") == project_id
+        ]
+        active_states = {
+            "queued", "start_requested", "running", "pause_requested",
+            "paused", "resume_requested", "cancel_requested",
+        }
+        current = next(
+            (item for item in casting_jobs if str(item.get("state", "")) in active_states),
+            casting_jobs[0] if casting_jobs else None,
+        )
+        if current is None:
+            return
+        if (
+            self._dialogue_casting_job_state == "start_requested"
+            and not self._dialogue_casting_job_id
+            and str(current.get("state", "")) not in active_states
+        ):
+            return
+        job_id = str(current.get("id", ""))
+        if not job_id:
+            return
+        state = str(current.get("state", ""))
+        self._dialogue_casting_job_id = job_id
+        self._set_dialogue_casting_job_state(state)
+        if state in {"succeeded", "failed", "cancelled", "interrupted"}:
+            self._finish_dialogue_casting_job(job_id, state)
+
     @Slot(object)
     def _replace_jobs(self, raw_items: object) -> None:
         project_id = self.project_state.projectId
@@ -7612,6 +8305,14 @@ class ApplicationViewModel(QObject):
         self._set_ocr_busy(bool(active_id))
         if not isinstance(raw_items, list):
             return
+        self._observed_active_ocr_jobs.update(
+            str(item.get("id", "")) for item in raw_items
+            if isinstance(item, dict) and isinstance(item.get("spec"), dict)
+            and item["spec"].get("kind") == "ocr"
+            and item.get("state") in {"queued", "start_requested", "running", "pause_requested",
+                                     "paused", "resume_requested", "cancel_requested"}
+        )
+        self._sync_dialogue_casting_job(raw_items)
         superseded_before = len(self._superseded_job_ids)
         for item in raw_items:
             if not isinstance(item, dict):
@@ -7844,25 +8545,26 @@ class ApplicationViewModel(QObject):
             None,
         )
         current_tts = active_tts or latest_tts or latest_preview_tts
-        if current_tts is not None:
-            self._tts_job_id = str(current_tts.get("id", ""))
-            current_config = current_tts.get("spec", {}).get("provider_config", {})
-            current_config = current_config if isinstance(current_config, dict) else {}
-            current_purpose = (
-                "voice_conform"
-                if current_config.get("job_mode") == "voice_conform"
-                else str(current_config.get("purpose", ""))
-            )
-            self._set_tts_job_purpose(current_purpose)
-            current_state = str(current_tts.get("state", ""))
-            if current_tts.get("error_code") == "tts_review_required":
-                current_state = "review"
-            self._set_tts_job_state(current_state)
-        else:
-            self._tts_job_id = ""
-            self._set_tts_job_purpose("")
-            self._set_tts_job_state("")
-        self._set_tts_busy(bool(active_tts_id))
+        if not self._dialogue_casting_auto_tts:
+            if current_tts is not None:
+                self._tts_job_id = str(current_tts.get("id", ""))
+                current_config = current_tts.get("spec", {}).get("provider_config", {})
+                current_config = current_config if isinstance(current_config, dict) else {}
+                current_purpose = (
+                    "voice_conform"
+                    if current_config.get("job_mode") == "voice_conform"
+                    else str(current_config.get("purpose", ""))
+                )
+                self._set_tts_job_purpose(current_purpose)
+                current_state = str(current_tts.get("state", ""))
+                if current_tts.get("error_code") == "tts_review_required":
+                    current_state = "review"
+                self._set_tts_job_state(current_state)
+            else:
+                self._tts_job_id = ""
+                self._set_tts_job_purpose("")
+                self._set_tts_job_state("")
+            self._set_tts_busy(bool(active_tts_id))
         tts_state = str(latest_tts.get("state", "")) if latest_tts else ""
         if latest_tts and latest_tts.get("error_code") == "tts_review_required":
             tts_state = "review"
@@ -7973,6 +8675,8 @@ class ApplicationViewModel(QObject):
                 and item["spec"].get("kind") == "tts"
                 and item["spec"].get("project_id") == self.project_state.projectId
                 and item.get("state") == "succeeded"
+                and bool(self._voice_preview_target_job_id)
+                and item.get("id") == self._voice_preview_target_job_id
                 and isinstance(item.get("result"), dict)
                 and item["result"].get("purpose") == "preview"
             ),
@@ -7983,7 +8687,9 @@ class ApplicationViewModel(QObject):
             output_path = tts_result.get("output_path")
             if isinstance(output_path, str) and Path(output_path).is_file():
                 preview_source = QUrl.fromLocalFile(output_path).toString()
-                if preview_source != self._voice_preview_source:
+                preview_job_id = str(preview_tts.get("id", ""))
+                if preview_job_id != self._voice_preview_job_id:
+                    self._voice_preview_job_id = preview_job_id
                     self._voice_preview_source = preview_source
                     self.voicePreviewChanged.emit()
         active_export_id = self.export_jobs.active_job_id(self.project_state.projectId, "export")
@@ -8005,11 +8711,12 @@ class ApplicationViewModel(QObject):
         if not active_export_id and latest_export and export_state in {"interrupted", "failed"}:
             self._export_job_id = str(latest_export.get("id", ""))
         self._set_export_job_state(export_state)
-        if latest_export and isinstance(latest_export.get("result"), dict):
+        if (latest_export and export_state == "succeeded"
+                and isinstance(latest_export.get("result"), dict)):
             export_result = latest_export["result"]
             output_path = export_result.get("output_path")
             qa_path = export_result.get("qa_path")
-            if isinstance(output_path, str) and output_path:
+            if isinstance(output_path, str) and output_path and Path(output_path).is_file():
                 preview_source = QUrl.fromLocalFile(output_path).toString()
                 changed = preview_source != self._last_export_source
                 self._last_export_source = preview_source
@@ -8043,7 +8750,10 @@ class ApplicationViewModel(QObject):
                 self.runtime.request(
                     "get_project",
                     {"project_id": self.project_state.projectId},
-                    context={"ocr_completed": True, "ocr_job_id": job_id},
+                    context={"ocr_completed": True, "ocr_job_id": job_id,
+                             "ocr_succeeded": item.get("state") == "succeeded",
+                             "ocr_live_completion": job_id in self._observed_active_ocr_jobs,
+                             "project_id": self.project_state.projectId},
                 )
             # A production TTS review report does not modify the project: the
             # worker deliberately withholds the final WAV until timing/quality
@@ -8067,7 +8777,8 @@ class ApplicationViewModel(QObject):
                 self.runtime.request(
                     "get_project",
                     {"project_id": self.project_state.projectId},
-                    context={"tts_completed": True, "tts_job_id": job_id},
+                    context={"tts_completed": True, "tts_job_id": job_id,
+                             "project_id": self.project_state.projectId},
                 )
             is_translation_terminal = item.get("state") == "succeeded" or (
                 item.get("state") == "failed"
@@ -8283,6 +8994,22 @@ class ApplicationViewModel(QObject):
 
     @Slot(str, object, object)
     def _action_succeeded(self, action: str, result: object, context: object) -> None:
+        if action == "get_tts_voice_preview":
+            if not self._casting_preview_lookup_is_current(context):
+                return
+            descriptor = result if isinstance(result, dict) else {}
+            path = Path(str(descriptor.get("path", ""))).expanduser()
+            if descriptor.get("available") is True and path.is_file():
+                self._voice_preview_target_job_id = ""
+                self.stopVoiceCatalogPreview()
+                self._voice_preview_source = QUrl.fromLocalFile(str(path.resolve())).toString()
+                self.voicePreviewChanged.emit()
+                self._set_tts_job_purpose("preview")
+                self._set_tts_job_state("succeeded")
+                self._set_status("Đang phát mẫu nghe thử đúng giọng đã chọn")
+                return
+            self._start_casting_preview_job(context)
+            return
         if action == "list_translation_models":
             if (not isinstance(context, dict)
                     or context.get("catalog_generation") != self._translation_catalog_generation):
@@ -8299,6 +9026,70 @@ class ApplicationViewModel(QObject):
             return
         if action == "save_project_edits":
             self._project_save_finished(result, context)
+            return
+        if action in {
+            "get_dialogue_casting",
+            "configure_dialogue_casting",
+            "set_dialogue_casting_labels",
+        }:
+            request_context = context if isinstance(context, dict) else {}
+            if str(request_context.get("project_id", "")) != self.project_state.projectId:
+                return
+            if action in {"configure_dialogue_casting", "set_dialogue_casting_labels"}:
+                self._dialogue_casting_saving = False
+            self._replace_dialogue_casting(result)
+            if action == "configure_dialogue_casting":
+                self._set_status("Đã lưu cấu hình Phân vai thoại trong project")
+                role = request_context.get("import_preview_role", "")
+                if (role in {"male", "female", "fallback"}
+                        and request_context.get("import_preview_serial")
+                        == self._casting_preview_request_serial):
+                    self.previewDialogueCastingVoice(role)
+            elif action == "set_dialogue_casting_labels":
+                self._set_status("Đã lưu nhãn thoại và ghi đè thủ công trong project")
+            return
+        if action == "create_dialogue_casting_job":
+            request_context = context if isinstance(context, dict) else {}
+            if str(request_context.get("project_id", "")) != self.project_state.projectId:
+                return
+            automatic_tts = (request_context.get("automatic_tts") is True
+                             or (self._dialogue_casting_auto_tts
+                                 and isinstance(self._pending_tts_start, dict)))
+            if isinstance(result, dict) and result.get("ready") is True:
+                self._replace_dialogue_casting(result)
+                self._dialogue_casting_auto_tts = automatic_tts
+                self._dialogue_casting_auto_tts_job_id = ""
+                self._set_dialogue_casting_job_state("succeeded")
+                if automatic_tts:
+                    self._continue_pending_tts_start()
+                else:
+                    self._set_status("Nhãn thoại đã khớp âm thanh hiện tại")
+                self._resume_pending_casting_after_ocr()
+                return
+            job_id = str(result.get("id", "")) if isinstance(result, dict) else ""
+            if not job_id:
+                self._dialogue_casting_auto_tts = False
+                self._dialogue_casting_auto_tts_job_id = ""
+                self._set_dialogue_casting_job_state("failed")
+                if automatic_tts:
+                    self._pending_tts_start = None
+                    self._set_tts_busy(False)
+                    self._set_tts_job_state("failed")
+                self._set_status("Job Manager không trả về mã tác vụ phân vai thoại")
+                self._resume_pending_casting_after_ocr()
+                return
+            state = str(result.get("state", "queued"))
+            self._dialogue_casting_job_id = job_id
+            self._dialogue_casting_auto_tts = automatic_tts
+            self._dialogue_casting_auto_tts_job_id = job_id if automatic_tts else ""
+            self._set_dialogue_casting_job_state(state)
+            if state in {"queued", "start_requested"}:
+                self._start_dialogue_casting_worker(job_id)
+            elif state in {"succeeded", "failed", "cancelled", "interrupted"}:
+                self._finish_dialogue_casting_job(job_id, state)
+            self._set_status(
+                "Đang phân vai trước khi tạo D1" if automatic_tts else "Đang nhận diện giọng thoại"
+            )
             return
         if (action == "effect_command" and isinstance(context, dict)
                 and context.get("project_id")
@@ -9177,12 +9968,23 @@ class ApplicationViewModel(QObject):
             self._dispatch_pending_tts_start()
             return
         if action == "create_tts_job" and isinstance(result, dict):
+            if (isinstance(context, dict) and "casting_preview_serial" in context
+                    and context.get("casting_preview_serial")
+                    != self._casting_preview_request_serial):
+                return
+            if (isinstance(context, dict) and context.get("project_id")
+                    and context["project_id"] != self.project_state.projectId):
+                return
+            self._dialogue_casting_auto_tts = False
+            self._dialogue_casting_auto_tts_job_id = ""
             job_id = result.get("id")
             if not isinstance(job_id, str) or not job_id:
                 self._set_tts_busy(False)
                 self._set_status("Job Manager không trả về mã tác vụ giọng")
                 return
             self._tts_job_id = job_id
+            if isinstance(context, dict) and context.get("tts_purpose") == "preview":
+                self._voice_preview_target_job_id = job_id
             self.ttsBusyChanged.emit()
             self._start_tts_worker(job_id)
             purpose = context.get("tts_purpose") if isinstance(context, dict) else ""
@@ -9202,6 +10004,18 @@ class ApplicationViewModel(QObject):
             self.exportBusyChanged.emit()
             self._start_export_worker(job_id)
             self._set_status("Export chạy nền; chuyển tab không làm dừng FFmpeg")
+            return
+        if action == "retry_job" and isinstance(context, dict) and context.get(
+            "resume_dialogue_casting"
+        ):
+            if not self._dialogue_casting_callback_is_current(context):
+                return
+            job_id = str(result.get("id", "")) if isinstance(result, dict) else ""
+            job_id = job_id or str(context.get("job_id", ""))
+            if job_id:
+                self._dialogue_casting_job_id = job_id
+                self._set_dialogue_casting_job_state("start_requested")
+                self._start_dialogue_casting_worker(job_id)
             return
         if action == "retry_job" and isinstance(context, dict) and context.get("resume_ocr"):
             job_id = context.get("job_id")
@@ -9364,6 +10178,10 @@ class ApplicationViewModel(QObject):
             self._set_status("Đã xóa dự án nội bộ; media và SRT nguồn được giữ nguyên")
             return
         if action in {"start_job", "pause_job", "resume_job", "cancel_job"}:
+            if (isinstance(context, dict)
+                    and context.get("job_kind") == "dialogue_casting"
+                    and not self._dialogue_casting_callback_is_current(context)):
+                return
             self.runtime.request("list_jobs")
             if action == "cancel_job" and isinstance(result, dict):
                 self._complete_translation_switch([result])
@@ -9396,6 +10214,18 @@ class ApplicationViewModel(QObject):
             "effect_command",
         } and isinstance(result, dict):
             project_context = context if isinstance(context, dict) else {}
+            ocr_completed = (
+                action == "get_project" and project_context.get("ocr_completed") is True
+            )
+            tts_completed = (
+                action == "get_project" and project_context.get("tts_completed") is True
+            )
+            if ocr_completed or tts_completed:
+                requested_project_id = str(project_context.get("project_id", ""))
+                if (not requested_project_id
+                        or requested_project_id != self.project_state.projectId
+                        or str(result.get("id", "")) != requested_project_id):
+                    return
             timeline_reconcile = (
                 action == "get_project"
                 and project_context.get("timeline_reconcile") is True
@@ -9762,6 +10592,8 @@ class ApplicationViewModel(QObject):
                 self._dispatch_pending_manual_scene_text()
             self._observe_project_persistence(result)
             self._run_subtitle_flush_callbacks()
+            if action == "get_project" and project_context.get("ocr_completed") is True:
+                self._start_casting_after_ocr(result, project_context)
 
     @Slot(bool, object, object)
     def _timeline_patch_projected(
@@ -9832,6 +10664,13 @@ class ApplicationViewModel(QObject):
 
     @Slot(str, object, object)
     def _action_failed(self, action: str, error: object, context: object) -> None:
+        if action == "get_tts_voice_preview":
+            if not self._casting_preview_lookup_is_current(context):
+                return
+            self._set_status(
+                "Không thể xác minh mẫu nghe thử: " + self._format_action_error(error)
+            )
+            return
         if action == "list_translation_models":
             if (isinstance(context, dict)
                     and context.get("catalog_generation") == self._translation_catalog_generation):
@@ -9843,6 +10682,41 @@ class ApplicationViewModel(QObject):
             return
         if action == "save_project_edits":
             self._project_save_failed(error, context)
+            return
+        if action in {
+            "get_dialogue_casting",
+            "configure_dialogue_casting",
+            "set_dialogue_casting_labels",
+        }:
+            request_context = context if isinstance(context, dict) else {}
+            if str(request_context.get("project_id", "")) != self.project_state.projectId:
+                return
+            self._dialogue_casting_loading = False
+            self._dialogue_casting_saving = False
+            self.dialogueCastingChanged.emit()
+            message = self._format_action_error(error)
+            self._set_status(f"Không thể cập nhật Phân vai thoại: {message}")
+            return
+        if action == "create_dialogue_casting_job":
+            request_context = context if isinstance(context, dict) else {}
+            if str(request_context.get("project_id", "")) != self.project_state.projectId:
+                return
+            waiting_tts = (request_context.get("automatic_tts") is True
+                           or (self._dialogue_casting_auto_tts
+                               and isinstance(self._pending_tts_start, dict)))
+            self._dialogue_casting_auto_tts = False
+            self._dialogue_casting_auto_tts_job_id = ""
+            self._set_dialogue_casting_job_state("failed")
+            if waiting_tts:
+                self._pending_tts_start = None
+                self._set_tts_busy(False)
+                self._set_tts_job_state("failed")
+                self._set_voice_playback_enabled(True)
+            message = self._format_action_error(error)
+            self._set_status(
+                "Phân vai thoại chưa chạy được; D1 cũ vẫn được giữ nguyên: " + message
+            )
+            self._resume_pending_casting_after_ocr()
             return
         if (action == "effect_command" and isinstance(context, dict)
                 and context.get("project_id")
@@ -10135,6 +11009,8 @@ class ApplicationViewModel(QObject):
             return
         if action == "prepare_tts_rerun":
             self._pending_tts_start = None
+            self._dialogue_casting_auto_tts = False
+            self._dialogue_casting_auto_tts_job_id = ""
             self._set_voice_playback_enabled(True)
             self._set_tts_busy(False)
             self._set_tts_job_state("failed")
@@ -10156,7 +11032,18 @@ class ApplicationViewModel(QObject):
                 self._set_translation_busy(False)
                 self._set_translation_job_state("failed")
             elif action == "create_tts_job":
+                if (isinstance(context, dict) and "casting_preview_serial" in context
+                        and context.get("casting_preview_serial")
+                        != self._casting_preview_request_serial):
+                    return
+                if (isinstance(context, dict) and context.get("project_id")
+                        and context["project_id"] != self.project_state.projectId):
+                    return
+                self._pending_tts_start = None
+                self._dialogue_casting_auto_tts = False
+                self._dialogue_casting_auto_tts_job_id = ""
                 self._set_tts_busy(False)
+                self._set_tts_job_state("failed")
             elif action == "create_export_job":
                 self._set_export_busy(False)
             elif action == "store_credentials":
@@ -10247,8 +11134,13 @@ class ApplicationViewModel(QObject):
                     job_kind = "ocr"
                 elif context.get("resume_tts"):
                     job_kind = "tts"
+                elif context.get("resume_dialogue_casting"):
+                    job_kind = "dialogue_casting"
                 elif context.get("resume_export"):
                     job_kind = "export"
+            if (job_kind == "dialogue_casting"
+                    and not self._dialogue_casting_callback_is_current(context)):
+                return
             if action == "start_job" and job_kind == "translate":
                 self._set_translation_busy(False)
                 self._set_translation_job_state("failed")
@@ -10268,6 +11160,19 @@ class ApplicationViewModel(QObject):
                 self._set_translation_job_state("paused")
             elif action == "start_job" and job_kind == "tts":
                 self._set_tts_busy(False)
+            elif action in {"start_job", "retry_job"} and job_kind == "dialogue_casting":
+                self._set_dialogue_casting_job_state("failed")
+                if (
+                    self._dialogue_casting_auto_tts_job_id
+                    and self._dialogue_casting_auto_tts_job_id == self._dialogue_casting_job_id
+                ):
+                    self._finish_dialogue_casting_job(self._dialogue_casting_job_id, "failed")
+            elif action == "pause_job" and job_kind == "dialogue_casting":
+                self._set_dialogue_casting_job_state("running")
+            elif action == "resume_job" and job_kind == "dialogue_casting":
+                self._set_dialogue_casting_job_state("paused")
+            elif action == "cancel_job" and job_kind == "dialogue_casting":
+                self.runtime.request("list_jobs")
             elif action == "start_job" and job_kind == "export":
                 self._set_export_busy(False)
             elif action in {"create_ocr_job", "start_job"}:
@@ -10283,10 +11188,17 @@ class ApplicationViewModel(QObject):
                     else (
                         f"Xuất video không thể tiếp tục: {message}"
                         if job_kind == "export"
-                        else f"OCR không thể tiếp tục: {message}"
+                        else (
+                            f"Phân vai thoại không thể tiếp tục: {message}"
+                            if job_kind == "dialogue_casting"
+                            else f"OCR không thể tiếp tục: {message}"
+                        )
                     )
                 )
             )
+            if (job_kind == "dialogue_casting"
+                    and action in {"start_job", "retry_job"}):
+                self._resume_pending_casting_after_ocr()
             return
         if action not in {
             "create_project",
@@ -10341,6 +11253,7 @@ class ApplicationViewModel(QObject):
         previous_project_id = self.project_state.projectId
         incoming_project_id = snapshot.get("id", "")
         if previous_project_id and incoming_project_id != previous_project_id:
+            self._release_voice_preview()
             self._cancel_dependent_editor_changes()
             self._set_subtitle_busy(False)
             self._subtitle_save_timer.stop()
@@ -10367,6 +11280,34 @@ class ApplicationViewModel(QObject):
         conform_changed = conform_applied != self._voice_conform_applied
         self._voice_conform_applied = conform_applied
         if project_id != previous_project_id:
+            self._last_export_source = ""
+            self._last_export_qa_path = ""
+            self.exportPreviewChanged.emit()
+            self._dialogue_casting = {
+                "project_id": project_id,
+                "config": {
+                    "enabled": False,
+                    "male_voice": None,
+                    "female_voice": None,
+                    "fallback_voice": None,
+                },
+                "rows": [],
+                "experimental": True,
+            }
+            self._dialogue_casting_loading = False
+            self._dialogue_casting_saving = False
+            self._dialogue_casting_job_id = ""
+            self._dialogue_casting_auto_tts = False
+            self._dialogue_casting_auto_tts_job_id = ""
+            self._dialogue_casting_terminal_markers.clear()
+            self._set_dialogue_casting_job_state("")
+            self._pending_casting_after_ocr = None
+            self._pending_tts_start = None
+            self._set_tts_busy(False)
+            self._set_voice_playback_enabled(True)
+            self.dialogueCastingChanged.emit()
+            if project_id:
+                self.refreshDialogueCasting()
             self._voice_conform_job_id = ""
             self._voice_conform_parent_tts_job_id = ""
         if conform_applied:
@@ -10400,9 +11341,12 @@ class ApplicationViewModel(QObject):
                 self.translationCachesChanged.emit()
         for model in (self.jobs, self.subtitle_jobs, self.voice_jobs, self.export_jobs):
             model.setProjectFilter(project_id)
-        if project_id != previous_project_id and self._voice_preview_source:
-            self._voice_preview_source = ""
-            self.voicePreviewChanged.emit()
+        if project_id != previous_project_id:
+            self._voice_preview_job_id = ""
+            self._voice_preview_target_job_id = None
+            if self._voice_preview_source:
+                self._voice_preview_source = ""
+                self.voicePreviewChanged.emit()
         if self.project_state.clip_info(self._selected_clip_id) is None:
             self._selected_clip_id = ""
             self.selectedClipChanged.emit()
@@ -10753,6 +11697,8 @@ class ApplicationViewModel(QObject):
             return
         self._tts_busy = value
         self.ttsBusyChanged.emit()
+        if not value:
+            self._resume_pending_casting_after_ocr()
 
     def _set_voice_playback_enabled(self, value: bool) -> None:
         enabled = bool(value)
@@ -11262,6 +12208,23 @@ class ApplicationViewModel(QObject):
                 "resume_checkpoint_key": "latest",
             },
             context={"job_kind": "translate"},
+        )
+
+    def _start_dialogue_casting_worker(self, job_id: str) -> None:
+        self.runtime.request(
+            "start_job",
+            {
+                "job_id": job_id,
+                "program": str(runtime_program_path()),
+                "arguments": [
+                    "-m",
+                    "ducai_studio.workers.dialogue_casting_worker",
+                    job_id,
+                ],
+                "resume_stage_key": "dialogue_casting",
+                "resume_checkpoint_key": "latest",
+            },
+            context=self._dialogue_casting_job_context(job_id),
         )
 
     def _start_tts_worker(self, job_id: str) -> None:

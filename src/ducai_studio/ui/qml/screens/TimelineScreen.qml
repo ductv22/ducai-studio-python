@@ -1279,6 +1279,7 @@ Item {
                                             font.pixelSize: 10
                                         }
                                         DsButton {
+                                            id: addTimelineTitleButton
                                             objectName: "addTimelineTitleButton"
                                             visible: trackRow.model.kind === "text"
                                             text: "T + Thêm text"
@@ -1303,16 +1304,35 @@ Item {
                                 }
                                 MouseArea {
                                     objectName: "timelineTrackHeaderMouseArea"
+                                    property string trackId: String(trackRow.model.trackId || "")
                                     anchors.left: parent.left
                                     anchors.top: parent.top
                                     anchors.bottom: parent.bottom
                                     width: 188
                                     acceptedButtons: Qt.LeftButton | Qt.RightButton
                                     onClicked: function(mouse) {
-                                        if (trackRow.model.kind === "text" && mouse.button === Qt.LeftButton) {
-                                            if (trackRow.model.locked) return
+                                        const titleButtonPoint = addTimelineTitleButton.mapFromItem(
+                                            this, mouse.x, mouse.y
+                                        )
+                                        if (mouse.button === Qt.LeftButton
+                                                && addTimelineTitleButton.visible
+                                                && addTimelineTitleButton.enabled
+                                                && titleButtonPoint.x >= 0
+                                                && titleButtonPoint.y >= 0
+                                                && titleButtonPoint.x < addTimelineTitleButton.width
+                                                && titleButtonPoint.y < addTimelineTitleButton.height) {
                                             timelinePreview.pause()
                                             manualCueDialog.openForTitle(root.appModel.playheadUs)
+                                            return
+                                        }
+                                        const textTrack = trackRow.model.kind === "subtitle"
+                                            || trackRow.model.kind === "text"
+                                        if (textTrack && mouse.button === Qt.LeftButton) {
+                                            root.appModel.selectTimelineTrackCues(
+                                                trackRow.model.trackId,
+                                                Boolean(mouse.modifiers & Qt.ControlModifier)
+                                            )
+                                            root.selectInspectorTab("text")
                                             return
                                         }
                                         if (mouse.modifiers & Qt.ControlModifier)
@@ -2172,6 +2192,21 @@ Item {
                                                         Number(clipItem.model.startUs),
                                                         Number(clipItem.model.cueIndex)
                                                     )
+                                                }
+                                            }
+                                            DsContextButton {
+                                                objectName: "acceptSelectedSceneTextButton"
+                                                Layout.fillWidth: true
+                                                visible: clipItem.isSubtitleClip
+                                                    && root.appModel.selectedSceneTextCueCount > 0
+                                                enabled: !clipItem.model.trackLocked
+                                                    && !root.appModel.selectedTextCueEditingLocked
+                                                    && !root.appModel.subtitleBusy
+                                                    && !root.appModel.timelineBusy
+                                                text: "Chấp nhận chữ cảnh đã chọn"
+                                                onClicked: {
+                                                    clipMenu.close()
+                                                    root.appModel.acceptSelectedSceneTextCues()
                                                 }
                                             }
                                             DsContextButton {

@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from PySide6.QtCore import QObject, QTimer
 
-from ducai_studio.domain.jobs import JobState, assert_no_secret_fields
+from ducai_studio.domain.jobs import JobKind, JobState, assert_no_secret_fields
 from ducai_studio.domain.multi_video import (
     STAGES,
     MultiBatchState,
@@ -112,10 +112,13 @@ class MultiVideoCoordinator(QObject):
         if not selected:
             raise ValueError("Hãy chọn ít nhất một video trong Multi video")
         config = self._unattended_settings(settings)
-        assert_no_secret_fields(config)
         config["translation_preferences_by_project"] = self._validate_settings(
             config, selected
         )
+        casting_configs = self._capture_dialogue_casting_settings(selected)
+        if casting_configs:
+            config["dialogue_casting_by_project"] = casting_configs
+        assert_no_secret_fields(config)
         self._settings = config
         self._handled_terminal_jobs.clear()
         # A completed-with-errors run is resumed from its durable stage
@@ -300,6 +303,30 @@ class MultiVideoCoordinator(QObject):
             translation["provider_options"] = provider_options
         config["translation"] = translation
         return config
+
+    def _capture_dialogue_casting_settings(
+        self, selected_items: list[dict[str, object]]
+    ) -> dict[str, dict[str, object]]:
+        getter = getattr(self.service, "get_dialogue_casting", None)
+        if not callable(getter):
+            return {}
+        captured = {}
+        for item in selected_items:
+            project_id = str(item.get("project_id", ""))
+            result = getter(project_id)
+            raw = result.get("config") if isinstance(result, Mapping) else None
+            if not isinstance(raw, Mapping):
+                raise ValueError("Không thể đóng băng cấu hình Phân vai thoại của Multi video")
+            frozen = {
+                key: deepcopy(raw.get(key))
+                for key in ("enabled", "male_voice", "female_voice", "fallback_voice")
+            }
+            overrides = raw.get("overrides", [])
+            if not isinstance(overrides, list):
+                raise ValueError("Nhãn phân vai của project Multi video không hợp lệ")
+            frozen["overrides"] = deepcopy(overrides)
+            captured[project_id] = frozen
+        return captured
 
     def on_worker_event(self, job_id: str, kind: str, payload: Mapping[str, object]) -> bool:
         items = self.service.multi_videos.list_items()
@@ -960,11 +987,26 @@ class MultiVideoCoordinator(QObject):
                 stage_key = "translation"
             else:
                 options = dict(config.get("tts", {}))
-                result = self.service.create_tts_job(
+                provider_options = dict(options.get("provider_options", {}))
+                frozen_by_project = config.get("dialogue_casting_by_project", {})
+                frozen_casting = (
+                    frozen_by_project.get(project_id)
+                    if isinstance(frozen_by_project, Mapping)
+                    else None
+                )
+                if isinstance(frozen_casting, Mapping):
+                    provider_options["dialogue_casting"] = deepcopy(dict(frozen_casting))
+                prepare_voice_generation = getattr(
+                    self.service, "prepare_voice_generation", None
+                )
+                factory = prepare_voice_generation if callable(prepare_voice_generation) else (
+                    self.service.create_tts_job
+                )
+                result = factory(
                     project_id=project_id,
                     provider_id=str(options.get("provider_id", "piper")),
                     voice_id=str(options.get("voice_id", "")),
-                    provider_options=dict(options.get("provider_options", {})),
+                    provider_options=provider_options,
                     reuse_completed=True,
                 )
                 worker_module = "ducai_studio.workers.tts_worker"
@@ -999,15 +1041,30 @@ class MultiVideoCoordinator(QObject):
             )
             self._stage_succeeded(current)
             return
+        spec = result.get("spec")
+        job_kind = str(spec.get("kind", "")) if isinstance(spec, Mapping) else ""
+        is_dialogue_casting = job_kind == JobKind.DIALOGUE_CASTING.value
+        if is_dialogue_casting:
+            worker_module = "ducai_studio.workers.dialogue_casting_worker"
+            stage_key = JobKind.DIALOGUE_CASTING.value
         pass_number = int(self.service.multi_videos.get_batch().get("retry_pass", 0))
         attempt = self._next_attempt_number(
             project_id,
             stage.value,
             pass_number,
         )
+        current_item = next(
+            (
+                item
+                for item in self.service.multi_videos.list_items()
+                if str(item.get("project_id", "")) == project_id
+            ),
+            {},
+        )
+        is_retry = int(current_item.get("retry_count", 0) or 0) > 0
         self.service.multi_videos.update_item(
             project_id,
-            state=MultiItemState.RETRYING.value if attempt > 1 else MultiItemState.RUNNING.value,
+            state=MultiItemState.RETRYING.value if is_retry else MultiItemState.RUNNING.value,
             progress=stage_progress(stage.value, 0.0),
             child_job_id=job_id,
             error_code="",
@@ -1129,16 +1186,25 @@ class MultiVideoCoordinator(QObject):
                 child_job_id=job_id,
             )
             return
-        worker_module = {
-            MultiStage.OCR: "ducai_studio.workers.ocr_worker",
-            MultiStage.TRANSLATE: "ducai_studio.workers.translation_worker",
-            MultiStage.TTS: "ducai_studio.workers.tts_worker",
-        }[stage]
-        stage_key = {
-            MultiStage.OCR: "ocr",
-            MultiStage.TRANSLATE: "translation",
-            MultiStage.TTS: "tts",
-        }[stage]
+        try:
+            job = self.service.jobs.get(job_id)
+        except LookupError:
+            job = None
+        job_kind = getattr(getattr(job, "spec", None), "kind", None)
+        if job_kind is JobKind.DIALOGUE_CASTING or job_kind == JobKind.DIALOGUE_CASTING.value:
+            worker_module = "ducai_studio.workers.dialogue_casting_worker"
+            stage_key = JobKind.DIALOGUE_CASTING.value
+        else:
+            worker_module = {
+                MultiStage.OCR: "ducai_studio.workers.ocr_worker",
+                MultiStage.TRANSLATE: "ducai_studio.workers.translation_worker",
+                MultiStage.TTS: "ducai_studio.workers.tts_worker",
+            }[stage]
+            stage_key = {
+                MultiStage.OCR: "ocr",
+                MultiStage.TRANSLATE: "translation",
+                MultiStage.TTS: "tts",
+            }[stage]
         pass_number = int(self.service.multi_videos.get_batch().get("retry_pass", 0))
         attempt = self._next_attempt_number(
             project_id,
@@ -1438,6 +1504,29 @@ class MultiVideoCoordinator(QObject):
     def _stage_succeeded(self, item: Mapping[str, object]) -> None:
         project_id = str(item["project_id"])
         stage = MultiStage(str(item.get("stage", MultiStage.OCR.value)))
+        child_job_id = str(item.get("child_job_id", ""))
+        if stage is MultiStage.TTS and child_job_id:
+            try:
+                child = self.service.jobs.get(child_job_id)
+            except LookupError:
+                child = None
+            child_kind = getattr(getattr(child, "spec", None), "kind", None)
+            if (
+                child_kind is JobKind.DIALOGUE_CASTING
+                or child_kind == JobKind.DIALOGUE_CASTING.value
+            ):
+                self.service.multi_videos.update_item(
+                    project_id,
+                    state=MultiItemState.WAITING.value,
+                    progress=stage_progress(MultiStage.TTS.value, 0.0),
+                    child_job_id="",
+                    retry_count=0,
+                    final_pass=False,
+                    error_code="",
+                    error_payload={},
+                )
+                self._schedule_advance(0)
+                return
         next_stage = (
             STAGES[STAGES.index(stage) + 1] if stage is not MultiStage.TTS else MultiStage.DONE
         )

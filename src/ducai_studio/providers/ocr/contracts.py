@@ -40,6 +40,9 @@ DEFAULT_SUBTITLE_BANDS = (
     OcrBandProfile("lower", 0.08, 0.885, 0.92, 0.982, 0.75),
 )
 
+# Full-frame dialogue routing/placement box; not a limit on subtitle artwork.
+DEFAULT_DIALOGUE_REGION = (0.06, 0.765, 0.88, 0.217)
+
 
 @dataclass(frozen=True, slots=True)
 class OcrRequest:

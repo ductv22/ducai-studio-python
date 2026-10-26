@@ -5,6 +5,8 @@ import json
 import os
 import sys
 import unicodedata
+import wave
+from array import array
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
@@ -449,6 +451,56 @@ def _validate_piper_config(path: Path) -> bool:
         return False
 
 
+def inspect_voice_preview(path: Path) -> dict[str, int | float | bool]:
+    """Inspect a PCM audition without loading the whole file into memory."""
+
+    candidate = path.expanduser().resolve()
+    try:
+        with wave.open(str(candidate), "rb") as stream:
+            channels = stream.getnchannels()
+            sample_width = stream.getsampwidth()
+            sample_rate = stream.getframerate()
+            frame_count = stream.getnframes()
+            if (
+                stream.getcomptype() != "NONE"
+                or channels < 1
+                or sample_width != 2
+                or not 8_000 <= sample_rate <= 192_000
+                or frame_count < 1
+            ):
+                return {"valid": False, "non_silent": False}
+            non_silent = False
+            remaining = frame_count
+            bytes_per_frame = channels * sample_width
+            while remaining > 0:
+                chunk_frames = min(remaining, sample_rate)
+                samples = array("h")
+                raw = stream.readframes(chunk_frames)
+                # ``wave`` can return a short chunk for a truncated file
+                # without raising.  Do not offer a partially playable sample
+                # as an immediate audition; it must fall back to managed TTS.
+                if len(raw) != chunk_frames * bytes_per_frame:
+                    return {"valid": False, "non_silent": False}
+                samples.frombytes(raw)
+                non_silent = non_silent or any(sample != 0 for sample in samples)
+                remaining -= chunk_frames
+    except (OSError, EOFError, wave.Error, ValueError):
+        return {"valid": False, "non_silent": False}
+    return {
+        "valid": non_silent,
+        "non_silent": non_silent,
+        "channels": channels,
+        "sample_width": sample_width,
+        "sample_rate": sample_rate,
+        "frame_count": frame_count,
+        "duration_seconds": frame_count / sample_rate,
+    }
+
+
+def valid_voice_preview(path: Path) -> bool:
+    return inspect_voice_preview(path).get("valid") is True
+
+
 class VoiceCatalog:
     def __init__(
         self,
@@ -622,6 +674,16 @@ class VoiceCatalog:
                 )
             )
         return tuple(result)
+
+    def vieneu_profiles(self) -> tuple[Path, ...]:
+        """Return locally complete clone profiles in stable identity order."""
+
+        root = self.data_root / "vieneu_profiles"
+        return tuple(
+            profile.resolve()
+            for profile in sorted(root.glob("*.npz"), key=lambda item: item.name.casefold())
+            if profile.with_suffix(".json").is_file()
+        )
 
     def get(self, voice_id: str, *, require_installed: bool = False) -> VoiceCatalogEntry:
         entry = next((item for item in self.entries() if item.voice_id == voice_id), None)

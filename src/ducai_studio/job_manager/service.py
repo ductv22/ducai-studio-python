@@ -15,6 +15,7 @@ from typing import Any
 from uuid import uuid4
 
 from ducai_studio.application.checkpoint_commands import CommitCheckpointCommand
+from ducai_studio.application.dialogue_casting import casting_inputs, effective_labels
 from ducai_studio.application.effects_commands import EffectsEditor
 from ducai_studio.application.export_pipeline import (
     build_export_snapshot,
@@ -45,6 +46,14 @@ from ducai_studio.application.voice_pipeline import (
     measured_voice_timing_issues,
 )
 from ducai_studio.domain.artifacts import ArtifactState
+from ducai_studio.domain.dialogue_casting import (
+    CASTING_LABELS,
+    NO_SPEECH_TTS_SKIP_REASON,
+    CastingOverride,
+    CastingResult,
+    CastingVoice,
+    DialogueCastingState,
+)
 from ducai_studio.domain.effects import ExportSettings, SubtitleStyle, VideoFilterSettings
 from ducai_studio.domain.fingerprint import stable_fingerprint
 from ducai_studio.domain.jobs import (
@@ -113,6 +122,14 @@ from ducai_studio.infrastructure.database_optimizer import (
     finalize_verified_optimizer_backup,
     optimize_project_database,
 )
+from ducai_studio.infrastructure.dialogue_casting_runtime import (
+    CASTING_ANALYZER_ID,
+    engine_bundle_fingerprint,
+    media_identities,
+)
+from ducai_studio.infrastructure.dialogue_casting_runtime import (
+    runtime_config as casting_runtime_config,
+)
 from ducai_studio.infrastructure.job_repository import JobRepository, utc_now_text
 from ducai_studio.infrastructure.legacy_importer import LegacyProjectImporter
 from ducai_studio.infrastructure.multi_video_repository import MultiVideoRepository
@@ -127,13 +144,14 @@ from ducai_studio.infrastructure.whisper_runtime import (
     whisper_runtime_is_ready,
 )
 from ducai_studio.providers.media_probe import FfprobeProvider
-from ducai_studio.providers.ocr import DEFAULT_SUBTITLE_BANDS
+from ducai_studio.providers.ocr import DEFAULT_DIALOGUE_REGION, DEFAULT_SUBTITLE_BANDS
 from ducai_studio.providers.translation.openai_compatible import (
     OPENAI_COMPATIBLE_PROVIDER_IDS,
     preset_for,
     validate_base_url,
 )
 from ducai_studio.providers.tts import TtsCueRequest, VoiceCatalog, discover_data_root
+from ducai_studio.providers.tts.catalog import valid_voice_preview
 from ducai_studio.providers.tts.vieneu import profile_fingerprint
 
 TRANSLATION_API_PROVIDER_IDS = frozenset({"gemini-api", *OPENAI_COMPATIBLE_PROVIDER_IDS})
@@ -142,6 +160,9 @@ _TTS_INPUT_FINGERPRINT_SCHEMA = "ducai-tts-input-v2"
 _TTS_INPUT_SETTING_KEYS = (
     "voice_id",
     "voice_identity",
+    "cue_voice_identities",
+    "casting_audio_keys",
+    "casting_skipped_cues",
     "reference_denoise",
     "engine_speed",
     "voice_read_speed",
@@ -180,6 +201,7 @@ def _translation_cue_payload(cue: SubtitleCue) -> dict[str, object]:
         "orientation": cue.orientation,
         "style_hint": cue.style_hint,
         "panel_box": list(cue.panel_box) if cue.panel_box is not None else None,
+        "text_anchor": list(cue.text_anchor) if cue.text_anchor is not None else None,
         "background_color": cue.background_color,
         "text_color": cue.text_color,
         "review_state": cue.review_state,
@@ -230,6 +252,28 @@ def _tts_input_fingerprint(
     )
 
 
+def _casting_skipped_cue_ids(
+    snapshot: ProjectSnapshot,
+    config: Mapping[str, Any],
+) -> frozenset[str]:
+    raw_skipped = config.get("casting_skipped_cues", {})
+    if not isinstance(raw_skipped, Mapping) or any(
+        not isinstance(cue_id, str) or not cue_id or reason != NO_SPEECH_TTS_SKIP_REASON
+        for cue_id, reason in raw_skipped.items()
+    ):
+        raise ValueError("TTS casting skip list is invalid")
+    skipped = frozenset(raw_skipped)
+    if skipped - {cue.id for cue in snapshot.source_cues if cue.is_dialogue}:
+        raise ValueError("TTS casting skip list references a missing dialogue cue")
+    if skipped:
+        frozen_cues = config.get("cues", ())
+        if not isinstance(frozen_cues, (list, tuple)) or skipped - {
+            cue.get("id") for cue in frozen_cues if isinstance(cue, Mapping)
+        }:
+            raise ValueError("TTS casting skip list does not match the frozen dialogue input")
+    return skipped
+
+
 def _voice_subtitle_pairs(
     snapshot: ProjectSnapshot,
 ) -> tuple[tuple[SubtitleCue, SubtitleCue], ...]:
@@ -256,12 +300,14 @@ def _voice_subtitle_pairs(
 def _apply_ocr_cue_regions(
     snapshot: ProjectSnapshot,
     qa: Mapping[str, object],
+    *,
+    dialogue_region: object = None,
 ) -> ProjectSnapshot:
     """Attach OCR cue geometry and repeat-proven platform-mark masks."""
 
     def normalized_box(value: object) -> tuple[float, float, float, float] | None:
         if (
-            not isinstance(value, list)
+            not isinstance(value, (list, tuple))
             or len(value) != 4
             or not all(
                 isinstance(item, (int, float)) and not isinstance(item, bool)
@@ -295,6 +341,11 @@ def _apply_ocr_cue_regions(
             return fallback
         return max(minimum, min(maximum, value))
 
+    placement_region = (
+        normalized_box(dialogue_region) or snapshot.ocr_dialogue_region or DEFAULT_DIALOGUE_REGION
+    )
+    anchor = (placement_region[0] + placement_region[2] / 2,
+              placement_region[1] + placement_region[3] / 2)
     raw_regions = qa.get("cue_regions", [])
     if not isinstance(raw_regions, list):
         raw_regions = []
@@ -362,6 +413,9 @@ def _apply_ocr_cue_regions(
                     else cue.style_hint
                 ),
                 panel_box=panel_box if timestamps_match else cue.panel_box,
+                text_anchor=(anchor if timestamps_match and role == "dialogue"
+                             and panel_box is None and cue.panel_box is None
+                             else cue.text_anchor),
                 background_color=(
                     color_value(
                         region.get("background_color"),
@@ -768,6 +822,21 @@ def _file_sha256(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _tts_preview_key(provider_id: str, voice: Mapping[str, object], text: str) -> str:
+    return stable_fingerprint(
+        {
+            "provider": provider_id,
+            "provider_version": voice["provider_version"],
+            "model": voice["model_id"],
+            "voice": voice["voice_id"],
+            "voice_identity": voice["voice_identity"],
+            "reference_text": voice["reference_text"],
+            "reference_denoise": voice["reference_denoise"],
+            "text": text,
+        }
+    )[:20]
 
 
 def _same_storage_volume(source: Path, target: Path) -> bool:
@@ -1404,7 +1473,7 @@ class JobManagerService:
             # The scene-text pass owns only pixels outside this dialogue band.
             # Keeping one explicit full-frame box in the job fingerprint makes
             # the S1/S2 routing deterministic for legacy projects too.
-            dialogue_region = [0.06, 0.765, 0.88, 0.217]
+            dialogue_region = list(DEFAULT_DIALOGUE_REGION)
         provider_config: dict[str, Any] = {
             "media_path": str(media_path),
             "duration_us": asset.duration_us,
@@ -1838,6 +1907,532 @@ class JobManagerService:
             stage_output=True,
         )
 
+    def _casting_rows(self, snapshot: ProjectSnapshot) -> list[dict]:
+        return casting_inputs(snapshot, media_identities(snapshot))
+
+    def get_dialogue_casting(self, project_id: str) -> dict:
+        snapshot = self.projects.load(project_id)
+        rows = self._casting_rows(snapshot)
+        labels = effective_labels(rows, snapshot.dialogue_casting, CASTING_ANALYZER_ID)
+        translated = {cue.id: cue.text for cue in snapshot.translated_cues}
+        return {
+            "project_id": project_id, "revision": snapshot.revision,
+            "config": _json_value(asdict(snapshot.dialogue_casting or DialogueCastingState())),
+            "rows": [{**row, **labels[row["id"]],
+                      "translated_text": translated.get(row["id"], "")} for row in rows],
+            "experimental": True,
+        }
+
+    def configure_dialogue_casting(self, project_id: str, config: dict) -> dict:
+        self._ensure_no_active_stage(project_id, JobKind.TTS)
+        snapshot = self.projects.load(project_id)
+        state = snapshot.dialogue_casting or DialogueCastingState()
+        if set(config) - {"enabled", "male_voice", "female_voice", "fallback_voice"}:
+            raise ValueError("Cấu hình phân vai có trường không được hỗ trợ")
+        values = dict(config)
+        for key in ("male_voice", "female_voice", "fallback_voice"):
+            if key in values:
+                voice = CastingVoice(**values[key]) if values[key] is not None else None
+                values[key] = self._retain_casting_reference_audio(voice)
+        state = replace(state, **values)
+        changed = replace(snapshot, revision=snapshot.revision + 1, dialogue_casting=state)
+        self._store_editor_snapshot(changed, deferred=False)
+        return self.get_dialogue_casting(project_id)
+
+    @staticmethod
+    def _retain_casting_reference_audio(voice: CastingVoice | None) -> CastingVoice | None:
+        if voice is None or voice.provider_id != "vieneu-3.8" or not voice.reference_audio_path:
+            return voice
+        source = Path(voice.reference_audio_path).expanduser().resolve(strict=True)
+        if not source.is_file() or source.stat().st_size == 0:
+            raise ValueError("File giọng mẫu không có dữ liệu")
+        identity = _file_sha256(source)
+        directory = Path(discover_data_root()).resolve() / "vieneu_references" / identity
+        target = directory / source.name
+        if source != target and (not target.is_file() or _file_sha256(target) != identity):
+            directory.mkdir(parents=True, exist_ok=True)
+            temporary = directory / f"{uuid4().hex}.tmp"
+            try:
+                shutil.copyfile(source, temporary)
+                if _file_sha256(temporary) != identity:
+                    raise ValueError("File giọng mẫu thay đổi trong lúc nhập; hãy chọn lại file")
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
+        return replace(voice, reference_audio_path=str(target))
+
+    def set_dialogue_casting_labels(self, project_id: str, cue_ids: list[str], label: str) -> dict:
+        self._ensure_no_active_stage(project_id, JobKind.TTS)
+        if label not in {*CASTING_LABELS, "auto"} or not cue_ids:
+            raise ValueError("Hãy chọn câu và nhãn phân vai hợp lệ")
+        snapshot = self.projects.load(project_id)
+        rows = {row["id"]: row for row in self._casting_rows(snapshot)}
+        if set(cue_ids) - set(rows):
+            raise ValueError("Câu phân vai không còn trong phần thoại của dự án")
+        state = snapshot.dialogue_casting or DialogueCastingState()
+        overrides = {row.cue_id: row for row in state.overrides}
+        for cue_id in cue_ids:
+            if label == "auto":
+                overrides.pop(cue_id, None)
+            else:
+                overrides[cue_id] = CastingOverride(cue_id, rows[cue_id]["audio_key"], label)
+        changed = replace(snapshot, revision=snapshot.revision + 1,
+                          dialogue_casting=replace(state, overrides=tuple(overrides.values())))
+        self._store_editor_snapshot(changed, deferred=False)
+        return self.get_dialogue_casting(project_id)
+
+    def create_dialogue_casting_job(
+        self,
+        *,
+        project_id: str,
+        casting_state: DialogueCastingState | None = None,
+    ) -> dict:
+        self._ensure_no_active_stage(project_id, JobKind.DIALOGUE_CASTING)
+        snapshot = self.projects.load(project_id)
+        rows = self._casting_rows(snapshot)
+        effective_state = casting_state or snapshot.dialogue_casting
+        labels = effective_labels(rows, effective_state, CASTING_ANALYZER_ID)
+        pending = [row for row in rows if not labels[row["id"]]["ready"]]
+        if not pending:
+            return {"ready": True, **self.get_dialogue_casting(project_id)}
+        root = discover_data_root()
+        runtime = casting_runtime_config(root)
+        host = _engine_host_path("dialogue_casting_engine_host.py")
+        fingerprint = stable_fingerprint(
+            {
+                "analyzer": CASTING_ANALYZER_ID,
+                "cues": {row["id"]: row["audio_key"] for row in rows},
+            }
+        )
+        config = {
+            **runtime,
+            "cues": pending,
+            "all_audio_keys": {row["id"]: row["audio_key"] for row in rows},
+            "media_durations": {media.id: media.duration_us for media in snapshot.media},
+            "engine_host_path": str(host),
+            "engine_host_sha256": _file_sha256(host),
+            "engine_bundle_fingerprint": engine_bundle_fingerprint(host),
+            "ffmpeg": shutil.which("ffmpeg") or "ffmpeg", "analyzer_id": CASTING_ANALYZER_ID,
+        }
+        return self._create_or_reuse_completed_job({
+            "kind": "dialogue_casting", "project_id": project_id,
+            "input_revision": snapshot.revision, "provider_id": "sherpa-ecapa",
+            "provider_version": "1", "model_id": CASTING_ANALYZER_ID,
+            "input_fingerprint": fingerprint, "settings_fingerprint": stable_fingerprint(config),
+            "provider_config": config,
+        }, reuse_completed=False, stage_output=False)
+
+    def import_dialogue_casting(self, job_id: str, output_path: str) -> None:
+        job = self.jobs.get(job_id)
+        if job.spec.kind is not JobKind.DIALOGUE_CASTING:
+            raise ValueError("Tác vụ không phải phân vai thoại")
+        analyzer_id = job.spec.provider_config["analyzer_id"]
+        if analyzer_id != CASTING_ANALYZER_ID:
+            raise ValueError("Bộ nhận diện phân vai đã thay đổi; hãy chạy phân vai lại")
+        config = job.spec.provider_config
+        if engine_bundle_fingerprint(Path(config["engine_host_path"])) != config.get(
+            "engine_bundle_fingerprint"
+        ):
+            raise ValueError("Bộ nhận diện phân vai đã thay đổi; hãy chạy phân vai lại")
+        path = Path(output_path).resolve(strict=True)
+        if not path.is_relative_to(self.checkpoints.staging_root / job_id):
+            raise ValueError("Kết quả phân vai nằm ngoài thư mục tác vụ")
+        document = json.loads(path.read_text(encoding="utf-8"))
+        if document.get("signature") != job.spec.input_fingerprint:
+            raise ValueError("Kết quả phân vai không khớp tác vụ")
+        snapshot = self.projects.load(job.spec.project_id)
+        current_keys = {row["id"]: row["audio_key"] for row in self._casting_rows(snapshot)}
+        state = snapshot.dialogue_casting or DialogueCastingState()
+        results = (
+            {row.cue_id: row for row in state.results}
+            if state.analyzer_id == analyzer_id else {}
+        )
+        expected = {row["id"]: row["audio_key"] for row in job.spec.provider_config["cues"]}
+        received = [CastingResult(**row) for row in document["results"]]
+        received_keys = {row.cue_id: row.audio_key for row in received}
+        if len(received) != len(expected) or received_keys != expected:
+            raise ValueError("Kết quả phân vai thiếu câu hoặc không khớp âm thanh đầu vào")
+        if current_keys != dict(job.spec.provider_config["all_audio_keys"]):
+            raise ValueError("Âm thanh hoặc thời gian câu đã đổi; hãy chạy phân vai lại")
+        results.update({row.cue_id: row for row in received})
+        changed = replace(snapshot, revision=snapshot.revision + 1, dialogue_casting=replace(
+            state, results=tuple(results.values()), analyzer_id=analyzer_id))
+        self._store_editor_snapshot(changed, deferred=False)
+
+    def prepare_voice_generation(self, *, project_id: str, provider_id: str, voice_id: str,
+                                 provider_options: dict | None = None,
+                                 reuse_completed: bool = False) -> dict:
+        options = dict(provider_options or {})
+        frozen = options.pop("dialogue_casting", None)
+        snapshot = self.projects.load(project_id)
+        casting_state = self._casting_state_for_job(snapshot, frozen)
+        if options.get("purpose", "production") == "production" and casting_state.enabled:
+            if any(
+                getattr(casting_state, name) is None
+                for name in ("male_voice", "female_voice", "fallback_voice")
+            ):
+                raise ValueError("Hãy chọn đủ giọng nam, nữ và dự phòng trong Phân vai thoại")
+            result = self.create_dialogue_casting_job(
+                project_id=project_id,
+                casting_state=casting_state,
+            )
+            if not result.get("ready"):
+                return result
+        if frozen is not None:
+            options["dialogue_casting"] = frozen
+        return self.create_tts_job(project_id=project_id, provider_id=provider_id,
+                                   voice_id=voice_id, provider_options=options,
+                                   reuse_completed=reuse_completed)
+
+    @staticmethod
+    def _casting_state_for_job(
+        snapshot: ProjectSnapshot, config: object = None
+    ) -> DialogueCastingState:
+        state = snapshot.dialogue_casting or DialogueCastingState()
+        if config is None:
+            return state
+        if not isinstance(config, dict):
+            raise ValueError("Cấu hình phân vai đóng băng không hợp lệ")
+        allowed = {
+            "enabled", "male_voice", "female_voice", "fallback_voice", "overrides"
+        }
+        if set(config) - allowed:
+            raise ValueError("Cấu hình phân vai đóng băng có trường không được hỗ trợ")
+        values: dict[str, object] = {}
+        if "enabled" in config:
+            values["enabled"] = config["enabled"]
+        for name in ("male_voice", "female_voice", "fallback_voice"):
+            if name not in config:
+                continue
+            raw_voice = config[name]
+            if raw_voice is None:
+                values[name] = None
+            elif isinstance(raw_voice, dict):
+                values[name] = CastingVoice(**raw_voice)
+            else:
+                raise ValueError("Cấu hình giọng phân vai đóng băng không hợp lệ")
+        if "overrides" in config:
+            raw_overrides = config["overrides"]
+            if not isinstance(raw_overrides, list) or not all(
+                isinstance(row, dict) for row in raw_overrides
+            ):
+                raise ValueError("Nhãn phân vai đóng băng không hợp lệ")
+            values["overrides"] = tuple(CastingOverride(**row) for row in raw_overrides)
+        return replace(state, **values)
+
+    @staticmethod
+    def _casting_settings_snapshot(state: DialogueCastingState) -> dict[str, Any]:
+        return {
+            "enabled": state.enabled,
+            "male_voice": _json_value(asdict(state.male_voice)) if state.male_voice else None,
+            "female_voice": _json_value(asdict(state.female_voice)) if state.female_voice else None,
+            "fallback_voice": (
+                _json_value(asdict(state.fallback_voice)) if state.fallback_voice else None
+            ),
+            "overrides": [_json_value(asdict(override)) for override in state.overrides],
+        }
+
+    def _refresh_tts_casting_config(
+        self, snapshot: ProjectSnapshot, config: dict[str, Any]
+    ) -> dict[str, Any]:
+        frozen = config.get("dialogue_casting_config")
+        if "dialogue_casting_config" in config:
+            if not isinstance(frozen, Mapping):
+                raise ValueError("Cấu hình phân vai đã đóng băng không hợp lệ")
+            frozen = _json_value(frozen)
+        state = self._casting_state_for_job(snapshot, frozen)
+        refreshed = dict(config)
+        for key in (
+            "cue_voices",
+            "cue_voice_identities",
+            "casting_audio_keys",
+            "casting_skipped_cues",
+        ):
+            refreshed.pop(key, None)
+        if state.enabled and refreshed.get("purpose") == "production":
+            data_root = Path(
+                str(refreshed.get("data_root") or discover_data_root())
+            ).expanduser().resolve()
+            voice_map, audio_keys, skipped_cues = self._casting_voice_map(
+                snapshot, data_root, state
+            )
+            refreshed["cue_voices"] = voice_map
+            refreshed["cue_voice_identities"] = {
+                cue_id: {
+                    key: value[key]
+                    for key in (
+                        "provider_id",
+                        "provider_version",
+                        "model_id",
+                        "voice_identity",
+                        "reference_denoise",
+                    )
+                }
+                for cue_id, value in voice_map.items()
+            }
+            refreshed["casting_audio_keys"] = audio_keys
+            refreshed["casting_skipped_cues"] = skipped_cues
+        return refreshed
+
+    def _casting_voice_map(
+        self,
+        snapshot: ProjectSnapshot,
+        data_root: Path,
+        state: DialogueCastingState | None = None,
+    ) -> tuple[dict, dict, dict[str, str]]:
+        state = state or snapshot.dialogue_casting or DialogueCastingState()
+        rows = self._casting_rows(snapshot)
+        labels = effective_labels(rows, state, CASTING_ANALYZER_ID)
+        if any(not row["ready"] for row in labels.values()):
+            raise ValueError(
+                "Phân vai chưa khớp âm thanh hiện tại; hãy bấm Tạo giọng để phân tích lại"
+            )
+        selected = {
+            "male": state.male_voice,
+            "female": state.female_voice,
+            "unknown": state.fallback_voice,
+        }
+        voices: dict[str, dict] = {}
+        voice_map: dict[str, dict] = {}
+        skipped: dict[str, str] = {}
+        for cue_id, row in labels.items():
+            if row["tts_suppressed"]:
+                skipped[cue_id] = NO_SPEECH_TTS_SKIP_REASON
+                continue
+            label = row["label"]
+            voice = selected[label]
+            if voice is None:
+                raise ValueError("Hãy chọn đủ giọng nam, nữ và dự phòng trong Phân vai thoại")
+            if label not in voices:
+                options = {key: value for key, value in asdict(voice).items()
+                           if key not in {"provider_id", "voice_id"} and value}
+                resolved = self._resolve_tts_voice(
+                    voice.provider_id, voice.voice_id, options, data_root
+                )
+                if options:
+                    raise ValueError(f"Unknown TTS provider options: {sorted(options)}")
+                voices[label] = resolved
+            voice_map[cue_id] = voices[label]
+        return (
+            voice_map,
+            {row["id"]: row["audio_key"] for row in rows},
+            skipped,
+        )
+
+    @staticmethod
+    def _resolve_tts_voice(provider_id: str, voice_id: str, options: dict, data_root: Path) -> dict:
+        reference_audio_path = ""
+        reference_note = ""
+        reference_denoise_value = False
+        if provider_id == "piper":
+            catalog = VoiceCatalog(data_root)
+            entry = catalog.get(voice_id, require_installed=True)
+            runtime_python = (
+                Path(
+                    str(
+                        options.pop(
+                            "runtime_python",
+                            data_root / "piper_runtime" / ".venv" / "Scripts" / "python.exe",
+                        )
+                    )
+                )
+                .expanduser()
+                .resolve(strict=True)
+            )
+            voice_identity = f"{voice_id}:{entry.model_fingerprint}"
+            model_id = voice_id
+            provider_version = "piper-tts-1.6.0"
+            profile_path = ""
+        else:
+            runtime_root = data_root / "vieneu_3_8_runtime"
+            runtime_python = (
+                Path(
+                    str(
+                        options.pop(
+                            "runtime_python",
+                            runtime_root / ".venv" / "Scripts" / "python.exe",
+                        )
+                    )
+                )
+                .expanduser()
+                .resolve(strict=True)
+            )
+            selected_profile_raw = options.pop("profile_path", None)
+            selected_profile = (
+                str(selected_profile_raw).strip()
+                if selected_profile_raw is not None
+                else None
+            )
+            if not selected_profile:
+                selected_profile = None
+            reference_audio_raw = str(options.pop("reference_audio_path", "")).strip()
+            reference_note = str(options.pop("reference_text", "")).strip()
+            reference_denoise_value = options.pop("reference_denoise", False)
+            if type(reference_denoise_value) is not bool:
+                raise ValueError("VieNeu reference denoise option must be boolean")
+            if voice_id.startswith("preset:"):
+                preset = next(
+                    (
+                        entry
+                        for entry in VoiceCatalog(data_root).vieneu_presets(installed=True)
+                        if entry.voice_id == voice_id
+                    ),
+                    None,
+                )
+                if preset is None:
+                    raise LookupError(f"Unknown VieNeu preset: {voice_id}")
+                if (
+                    selected_profile is not None
+                    or reference_audio_raw
+                    or reference_note
+                    or reference_denoise_value
+                ):
+                    raise ValueError("VieNeu preset cannot use clone reference options")
+                voice_identity = f"{voice_id}:{preset.model_fingerprint}"
+                model_id = "v3turbo"
+                provider_version = "3.8.1"
+                profile_path = ""
+                reference_audio_path = ""
+            else:
+                reference_audio: Path | None = None
+                if reference_audio_raw:
+                    reference_audio = Path(reference_audio_raw).expanduser().resolve(strict=True)
+                    if not reference_audio.is_file():
+                        raise FileNotFoundError("VieNeu reference audio is missing")
+                if selected_profile is None and reference_audio is not None:
+                    reference_hash = _file_sha256(reference_audio)
+                    profile = data_root / "vieneu_profiles" / f"{reference_hash}.npz"
+                elif selected_profile is None:
+                    profiles = sorted((data_root / "vieneu_profiles").glob("*.npz"))
+                    if not profiles:
+                        raise FileNotFoundError("No VieNeu clone profile is installed")
+                    profile = profiles[0]
+                else:
+                    profile = Path(str(selected_profile)).expanduser().resolve(strict=True)
+                if profile.is_file() and not profile.with_suffix(".json").is_file():
+                    raise FileNotFoundError("VieNeu clone profile metadata is missing")
+                if profile.is_file():
+                    profile_identity = profile_fingerprint(profile)
+                elif reference_audio is not None:
+                    profile_identity = _file_sha256(reference_audio)
+                else:
+                    raise FileNotFoundError("VieNeu clone profile is unavailable")
+                voice_identity = f"{profile.stem}:{profile_identity}"
+                model_id = "v3turbo"
+                provider_version = "3.8.1"
+                profile_path = str(profile)
+                voice_id = profile.stem
+                reference_audio_path = str(reference_audio) if reference_audio is not None else ""
+        return {
+            "provider_id": provider_id, "provider_version": provider_version,
+            "model_id": model_id, "voice_id": voice_id, "voice_identity": voice_identity,
+            "runtime_python": str(runtime_python), "profile_path": profile_path,
+            "reference_audio_path": reference_audio_path, "reference_text": reference_note,
+            "reference_denoise": reference_denoise_value,
+        }
+
+    @staticmethod
+    def get_tts_voice_preview(
+        *,
+        provider_id: str,
+        voice_id: str,
+        provider_options: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Resolve an audition identity and return an existing matching WAV, if any."""
+
+        provider_id = provider_id.strip().casefold()
+        voice_id = voice_id.strip()
+        if provider_id not in {"piper", "vieneu-3.8"}:
+            raise ValueError("TTS provider must be Piper or VieNeu 3.8")
+        if not voice_id:
+            raise ValueError("TTS voice id is required")
+        options = dict(provider_options or {})
+        purpose = str(options.pop("purpose", "preview")).strip().casefold()
+        if purpose != "preview":
+            raise ValueError("Prepared voice lookup only accepts preview requests")
+        preview_text = str(
+            options.pop(
+                "preview_text",
+                "Đây là bản nghe thử giọng đọc của DUCAI Studio hai.",
+            )
+        ).strip()
+        if not preview_text:
+            raise ValueError("TTS preview text cannot be empty")
+        batch_size = options.pop("batch_size", 1)
+        if type(batch_size) is not int or not 1 <= batch_size <= 32:
+            raise ValueError("TTS batch size must be between 1 and 32")
+        data_root = Path(str(options.pop("data_root", discover_data_root()))).expanduser().resolve()
+        voice = JobManagerService._resolve_tts_voice(provider_id, voice_id, options, data_root)
+        if options:
+            raise ValueError(f"Unknown TTS provider options: {sorted(options)}")
+
+        preview_key = _tts_preview_key(provider_id, voice, preview_text)
+        cache_path = data_root / "voice_previews" / f"{provider_id}-{preview_key}.wav"
+        catalog = VoiceCatalog(data_root)
+        bundled_path: Path | None = None
+        if provider_id == "piper":
+            bundled_path = Path(catalog.get(voice_id, require_installed=True).preview_path)
+        elif voice_id.startswith("preset:"):
+            preset = next(
+                (
+                    entry
+                    for entry in catalog.vieneu_presets(installed=True)
+                    if entry.voice_id == voice_id
+                ),
+                None,
+            )
+            if preset is None:
+                raise LookupError(f"Unknown VieNeu preset: {voice_id}")
+            bundled_path = Path(preset.preview_path)
+
+        if bundled_path is not None and valid_voice_preview(bundled_path):
+            selected_path = bundled_path.resolve()
+            source = "bundled"
+            available = True
+        else:
+            selected_path = cache_path.resolve()
+            source = "cache" if valid_voice_preview(selected_path) else "missing"
+            available = source == "cache"
+            # The first enrollment creates the profile during synthesis. Reuse
+            # its audition only when QA binds it to the now-existing profile.
+            reference_raw = str(voice.get("reference_audio_path", ""))
+            if not available and provider_id == "vieneu-3.8" and reference_raw:
+                reference_hash = _file_sha256(Path(reference_raw))
+                profile = Path(str(voice["profile_path"]))
+                if profile.stem == reference_hash and profile.is_file():
+                    provisional_key = _tts_preview_key(provider_id, {
+                        **voice, "voice_identity": f"{profile.stem}:{reference_hash}",
+                    }, preview_text)
+                    provisional = data_root / "voice_previews" / (
+                        f"{provider_id}-{provisional_key}.wav")
+                    qa_path = provisional.with_name(provisional.stem + "_QA.json")
+                    try:
+                        qa = json.loads(qa_path.read_text(encoding="utf-8"))
+                        matches = (
+                            isinstance(qa, dict) and qa.get("status") == "PASS"
+                            and qa.get("preview_profile_fingerprint")
+                            == profile_fingerprint(profile)
+                            and provisional.is_file()
+                            and qa.get("output_sha256") == _file_sha256(provisional)
+                        )
+                    except (OSError, ValueError):
+                        matches = False
+                    if matches and valid_voice_preview(provisional):
+                        selected_path = provisional.resolve()
+                        preview_key = provisional_key
+                        source, available = "cache", True
+        return {
+            "available": available,
+            "path": str(selected_path),
+            "source": source,
+            "preview_key": preview_key,
+            "preview_text": preview_text,
+            "provider_id": provider_id,
+            "voice_id": voice["voice_id"],
+            "voice_identity": voice["voice_identity"],
+            "profile_path": voice["profile_path"],
+        }
+
     def create_tts_job(
         self,
         *,
@@ -1861,8 +2456,11 @@ class JobManagerService:
         self._ensure_no_active_stage(project_id, JobKind.TTS)
         options = dict(provider_options or {})
         purpose = str(options.pop("purpose", "production")).strip().casefold()
+        casting_config = options.pop("dialogue_casting", None)
         if purpose not in {"production", "preview"}:
             raise ValueError("TTS purpose must be production or preview")
+        if purpose == "preview" and casting_config is not None:
+            raise ValueError("TTS preview cannot use production dialogue-casting settings")
         raw_force_cue_ids = options.pop("force_cue_ids", [])
         if not isinstance(raw_force_cue_ids, list) or not all(
             isinstance(value, str) and value.strip() for value in raw_force_cue_ids
@@ -1878,6 +2476,7 @@ class JobManagerService:
         video = videos[0]
         data_root = Path(str(options.pop("data_root", discover_data_root()))).expanduser().resolve()
         host = _engine_host_path("tts_engine_host.py")
+        preview_text = ""
         if purpose == "preview":
             preview_text = str(
                 options.pop(
@@ -1896,10 +2495,6 @@ class JobManagerService:
                     "text": preview_text,
                 }
             ]
-            preview_key = stable_fingerprint(
-                {"provider": provider_id, "voice": voice_id, "text": preview_text}
-            )[:20]
-            output_path = data_root / "voice_previews" / f"{provider_id}-{preview_key}.wav"
             media_duration_us = 30_000_000
         else:
             cues = self._tts_cues_for_snapshot(snapshot)
@@ -1954,98 +2549,18 @@ class JobManagerService:
             voice_read_speed=voice_read_speed,
             adaptive_timing=adaptive_timing,
         )
-        reference_audio_path = ""
-        reference_note = ""
-        reference_denoise_value = False
-        if provider_id == "piper":
-            catalog = VoiceCatalog(data_root)
-            entry = catalog.get(voice_id, require_installed=True)
-            runtime_python = (
-                Path(
-                    str(
-                        options.pop(
-                            "runtime_python",
-                            data_root / "piper_runtime" / ".venv" / "Scripts" / "python.exe",
-                        )
-                    )
-                )
-                .expanduser()
-                .resolve(strict=True)
-            )
-            voice_identity = f"{voice_id}:{entry.model_fingerprint}"
-            model_id = voice_id
-            provider_version = "piper-tts-1.6.0"
-            profile_path = ""
-        else:
-            runtime_root = data_root / "vieneu_3_8_runtime"
-            runtime_python = (
-                Path(
-                    str(
-                        options.pop(
-                            "runtime_python",
-                            runtime_root / ".venv" / "Scripts" / "python.exe",
-                        )
-                    )
-                )
-                .expanduser()
-                .resolve(strict=True)
-            )
-            selected_profile = options.pop("profile_path", None)
-            reference_audio_raw = str(options.pop("reference_audio_path", "")).strip()
-            reference_note = str(options.pop("reference_text", "")).strip()
-            reference_denoise_value = options.pop("reference_denoise", False)
-            if type(reference_denoise_value) is not bool:
-                raise ValueError("VieNeu reference denoise option must be boolean")
-            if voice_id.startswith("preset:"):
-                preset = next(
-                    (
-                        entry
-                        for entry in VoiceCatalog(data_root).vieneu_presets(installed=True)
-                        if entry.voice_id == voice_id
-                    ),
-                    None,
-                )
-                if preset is None:
-                    raise LookupError(f"Unknown VieNeu preset: {voice_id}")
-                if selected_profile is not None or reference_audio_raw:
-                    raise ValueError("VieNeu preset cannot use clone reference options")
-                voice_identity = f"{voice_id}:{preset.model_fingerprint}"
-                model_id = "v3turbo"
-                provider_version = "3.8.1"
-                profile_path = ""
-                reference_audio_path = ""
-            else:
-                reference_audio: Path | None = None
-                if reference_audio_raw:
-                    reference_audio = Path(reference_audio_raw).expanduser().resolve(strict=True)
-                    if not reference_audio.is_file():
-                        raise FileNotFoundError("VieNeu reference audio is missing")
-                if selected_profile is None and reference_audio is not None:
-                    reference_hash = _file_sha256(reference_audio)
-                    profile = data_root / "vieneu_profiles" / f"{reference_hash}.npz"
-                elif selected_profile is None:
-                    profiles = sorted((data_root / "vieneu_profiles").glob("*.npz"))
-                    if not profiles:
-                        raise FileNotFoundError("No VieNeu clone profile is installed")
-                    profile = profiles[0]
-                else:
-                    profile = Path(str(selected_profile)).expanduser().resolve(strict=True)
-                if profile.is_file() and not profile.with_suffix(".json").is_file():
-                    raise FileNotFoundError("VieNeu clone profile metadata is missing")
-                if profile.is_file():
-                    profile_identity = profile_fingerprint(profile)
-                elif reference_audio is not None:
-                    profile_identity = _file_sha256(reference_audio)
-                else:
-                    raise FileNotFoundError("VieNeu clone profile is unavailable")
-                voice_identity = f"{profile.stem}:{profile_identity}"
-                model_id = "v3turbo"
-                provider_version = "3.8.1"
-                profile_path = str(profile)
-                voice_id = profile.stem
-                reference_audio_path = str(reference_audio) if reference_audio is not None else ""
+        voice = self._resolve_tts_voice(provider_id, voice_id, options, data_root)
+        provider_version, model_id = voice["provider_version"], voice["model_id"]
+        voice_id, voice_identity = voice["voice_id"], voice["voice_identity"]
+        runtime_python, profile_path = voice["runtime_python"], voice["profile_path"]
+        reference_audio_path = voice["reference_audio_path"]
+        reference_note = voice["reference_text"]
+        reference_denoise_value = voice["reference_denoise"]
         if options:
             raise ValueError(f"Unknown TTS provider options: {sorted(options)}")
+        if purpose == "preview":
+            preview_key = _tts_preview_key(provider_id, voice, preview_text)
+            output_path = data_root / "voice_previews" / f"{provider_id}-{preview_key}.wav"
         output_path.parent.mkdir(parents=True, exist_ok=True)
         qa_path = output_path.with_name(output_path.stem + "_QA.json")
         common_config: dict[str, Any] = {
@@ -2077,6 +2592,23 @@ class JobManagerService:
             "qa_non_blocking": qa_non_blocking,
             "defer_timing_conform": defer_timing_conform,
         }
+        casting_state = self._casting_state_for_job(snapshot, casting_config)
+        if casting_config is not None:
+            common_config["dialogue_casting_config"] = self._casting_settings_snapshot(
+                casting_state
+            )
+        if purpose == "production" and casting_state.enabled:
+            voice_map, audio_keys, skipped_cues = self._casting_voice_map(
+                snapshot, data_root, casting_state
+            )
+            common_config["cue_voices"] = voice_map
+            common_config["cue_voice_identities"] = {
+                cue_id: {key: value[key] for key in ("provider_id", "provider_version", "model_id",
+                                                    "voice_identity", "reference_denoise")}
+                for cue_id, value in voice_map.items()
+            }
+            common_config["casting_audio_keys"] = audio_keys
+            common_config["casting_skipped_cues"] = skipped_cues
         tts_input_fingerprint = _tts_input_fingerprint(
             cues,
             provider_id=provider_id,
@@ -2155,7 +2687,11 @@ class JobManagerService:
             return None
         snapshot = self.projects.load(job.spec.project_id)
         current_cues = self._tts_cues_for_snapshot(snapshot)
-        if self._tts_fingerprint_for_job(job, current_cues) == job.spec.input_fingerprint:
+        config = self._refresh_tts_casting_config(snapshot, config)
+        if (
+            self._tts_fingerprint_for_job(job, current_cues, provider_config=config)
+            == job.spec.input_fingerprint
+        ):
             return None
         active = self.jobs.active_id(
             project_id=job.spec.project_id,
@@ -2213,8 +2749,13 @@ class JobManagerService:
         }
 
     @staticmethod
-    def _tts_fingerprint_for_job(job: Any, cues: list[dict[str, Any]]) -> str:
-        config = job.spec.provider_config
+    def _tts_fingerprint_for_job(
+        job: Any,
+        cues: list[dict[str, Any]],
+        *,
+        provider_config: Mapping[str, Any] | None = None,
+    ) -> str:
+        config = provider_config if provider_config is not None else job.spec.provider_config
         if config.get("tts_input_fingerprint_schema") != _TTS_INPUT_FINGERPRINT_SCHEMA:
             # Jobs created before a121 used the cue-only input hash. Keep them
             # resumable and only rebase when those original semantic cues differ.
@@ -2244,7 +2785,16 @@ class JobManagerService:
             return False
         snapshot = self.projects.load(job.spec.project_id)
         current_cues = self._tts_cues_for_snapshot(snapshot)
-        return self._tts_fingerprint_for_job(job, current_cues) != job.spec.input_fingerprint
+        try:
+            current_config = self._refresh_tts_casting_config(snapshot, dict(config))
+        except (LookupError, OSError, ValueError):
+            return True
+        return (
+            self._tts_fingerprint_for_job(
+                job, current_cues, provider_config=current_config
+            )
+            != job.spec.input_fingerprint
+        )
 
     def estimate_voice_conform(
         self,
@@ -2423,16 +2973,19 @@ class JobManagerService:
         snapshot = self.projects.load(project_id)
         state = snapshot.voice_conform
         cue_timing: tuple[Mapping[str, object], ...] | None = None
+        excluded_cue_ids: frozenset[str] = frozenset()
         if state is not None:
             try:
                 parent = self.jobs.get(state.parent_tts_job_id)
             except LookupError:
                 parent = None
             if parent is not None:
+                excluded_cue_ids = _casting_skipped_cue_ids(snapshot, parent.spec.provider_config)
                 coverage = self._load_voice_qa_coverage(parent)
                 rows = self._voice_timing_timeline_rows(parent, coverage) if coverage else []
                 source_keys = {
-                    (cue.id, cue.index) for cue in snapshot.source_cues if cue.is_dialogue
+                    (cue.id, cue.index) for cue in snapshot.source_cues
+                    if cue.is_dialogue and cue.id not in excluded_cue_ids
                 }
                 row_keys = {(str(row.get("cue_id", "")).strip(), row.get("index")) for row in rows}
                 if rows and row_keys == source_keys:
@@ -2447,9 +3000,12 @@ class JobManagerService:
                         }
                         for row in rows
                     )
+                elif excluded_cue_ids:
+                    raise ValueError("TTS ledger does not match the dialogue casting skip list")
         updated = self.media_imports.reset_voice_conform(
             snapshot,
             cue_timing=cue_timing,
+            excluded_cue_ids=tuple(sorted(excluded_cue_ids)),
         )
         summary = self.projects.get_summary(project_id)
         self.projects.save(project_path=summary["path"], snapshot=updated)
@@ -2544,10 +3100,19 @@ class JobManagerService:
         raw_entries = ledger.get("entries") if isinstance(ledger, Mapping) else None
         if not isinstance(raw_entries, Mapping):
             raise ValueError("Ledger TTS nền không có danh sách WAV hợp lệ.")
+        parent = self.jobs.get(parent_tts_job_id)
+        skipped_ids = _casting_skipped_cue_ids(snapshot, parent.spec.provider_config)
+        ineligible = ledger.get("ineligible", {})
+        if skipped_ids and (
+            not isinstance(ineligible, Mapping)
+            or any(ineligible.get(cue_id) != NO_SPEECH_TTS_SKIP_REASON for cue_id in skipped_ids)
+            or skipped_ids.intersection(raw_entries)
+        ):
+            raise ValueError("TTS ledger does not match the dialogue casting skip list")
         cues: list[VoiceConformCueInput] = []
         entries: list[dict[str, Any]] = []
         for source_cue, translated_cue in _voice_subtitle_pairs(snapshot):
-            if not source_cue.is_dialogue:
+            if not source_cue.is_dialogue or source_cue.id in skipped_ids:
                 continue
             raw = raw_entries.get(source_cue.id)
             if not isinstance(raw, Mapping):
@@ -2567,7 +3132,12 @@ class JobManagerService:
                 or not isinstance(cache_sha256, str)
             ):
                 raise ValueError(f"Cache WAV nền cue {source_cue.index} thiếu bằng chứng QA.")
-            cache_path = Path(cache_path_raw).expanduser().resolve(strict=True)
+            try:
+                cache_path = Path(cache_path_raw).expanduser().resolve(strict=True)
+            except OSError as exc:
+                raise ValueError(
+                    f"Cache WAV nền cue {source_cue.index} không còn tồn tại."
+                ) from exc
             if _file_sha256(cache_path) != cache_sha256:
                 raise ValueError(f"Cache WAV nền cue {source_cue.index} không còn toàn vẹn.")
             cues.append(
@@ -2679,6 +3249,7 @@ class JobManagerService:
         )
         source_paths = {
             render_snapshot.video.path,
+            *(clip.path for clip in render_snapshot.video_segments),
             *(clip.path for clip in render_snapshot.audio),
             *(overlay.asset_path for overlay in render_snapshot.overlays if overlay.asset_path),
         }
@@ -3497,6 +4068,16 @@ class JobManagerService:
             )
         except (KeyError, TypeError, ValueError):
             return []
+        skipped_cues = config.get("casting_skipped_cues", {})
+        if not isinstance(skipped_cues, Mapping) or any(
+            not isinstance(cue_id, str)
+            or not cue_id
+            or reason != NO_SPEECH_TTS_SKIP_REASON
+            for cue_id, reason in skipped_cues.items()
+        ):
+            return []
+        skipped_ids = set(skipped_cues)
+        cues = tuple(cue for cue in cues if cue.cue_id not in skipped_ids)
         ledger: Mapping[str, Any] | None = None
         checkpoint = self.load_worker_checkpoint(
             job.id,
@@ -4875,9 +5456,7 @@ class JobManagerService:
                     raise ValueError("Subtitle text must be a string")
                 updated = editor.update_text(cue_id, text, language=language)
             elif command == "accept_scene_text":
-                if cue_id is None:
-                    raise ValueError("accept_scene_text requires cue_id")
-                updated = editor.accept_scene_text(cue_id)
+                updated = editor.accept_scene_text_many(selected_cue_ids())
             elif command == "set_scene_text_font_scale":
                 if cue_id is None:
                     raise ValueError("Chưa chọn cue chữ trong cảnh cần chỉnh kích thước")
@@ -5880,8 +6459,12 @@ class JobManagerService:
         source_keys = {
             (cue.id, cue.index) for cue in snapshot.source_cues if cue.is_dialogue
         }
+        excluded_cue_ids = _casting_skipped_cue_ids(snapshot, config)
+        expected_voice_keys = {
+            key for key in source_keys if key[0] not in excluded_cue_ids
+        }
         row_keys = {(str(row.get("cue_id", "")).strip(), row.get("index")) for row in rows}
-        if rows and row_keys == source_keys:
+        if row_keys == expected_voice_keys:
             cue_timing = tuple(
                 {
                     "cue_id": str(row["cue_id"]),
@@ -5905,6 +6488,8 @@ class JobManagerService:
                 }
                 for row in rows
             )
+        elif excluded_cue_ids:
+            raise ValueError("TTS ledger does not match the dialogue casting skip list")
         promotion_pairs = ((target, active),)
         if qa_path.is_file():
             promotion_pairs = (*promotion_pairs, (qa_path, active_qa))
@@ -5913,6 +6498,7 @@ class JobManagerService:
                 snapshot,
                 active,
                 cue_timing=cue_timing,
+                excluded_cue_ids=tuple(sorted(excluded_cue_ids)),
             )
             summary = self.projects.get_summary(snapshot.id)
             self.projects.save(project_path=summary["path"], snapshot=updated)
@@ -5953,11 +6539,14 @@ class JobManagerService:
         if snapshot.revision != job.spec.input_revision:
             raise ValueError("Project changed while voice conform was running")
         parent_tts_job_id = str(config.get("parent_tts_job_id", ""))
+        parent = self.jobs.get(parent_tts_job_id)
+        excluded_cue_ids = _casting_skipped_cue_ids(snapshot, parent.spec.provider_config)
         updated = self.media_imports.apply_voice_conform_media(
             snapshot,
             target,
             plan=plan,
             parent_tts_job_id=parent_tts_job_id,
+            excluded_cue_ids=tuple(sorted(excluded_cue_ids)),
         )
         summary = self.projects.get_summary(snapshot.id)
         self.projects.save(project_path=summary["path"], snapshot=updated)
@@ -6074,7 +6663,8 @@ class JobManagerService:
             raise ValueError("OCR project no longer has a video")
         candidate_snapshot = self.media_imports.import_srt(snapshot, target, language="zh")
         if method != "whisper_audio":
-            candidate_snapshot = _apply_ocr_cue_regions(candidate_snapshot, qa)
+            candidate_snapshot = _apply_ocr_cue_regions(
+                candidate_snapshot, qa, dialogue_region=config.get("dialogue_region"))
             candidate_snapshot = self._canonicalize_ocr_result(
                 candidate_snapshot, config,
                 watermarks_in_timeline=isinstance(qa.get("watermark_regions"), list),
@@ -6099,7 +6689,8 @@ class JobManagerService:
                     ),
                 )
             else:
-                updated = _apply_ocr_cue_regions(updated, qa)
+                updated = _apply_ocr_cue_regions(
+                    updated, qa, dialogue_region=config.get("dialogue_region"))
                 updated = self._canonicalize_ocr_result(
                     updated, config,
                     watermarks_in_timeline=isinstance(qa.get("watermark_regions"), list),
@@ -6313,7 +6904,8 @@ class JobManagerService:
         snapshot = self.projects.load(job.spec.project_id)
         updated = self.media_imports.import_srt(snapshot, str(artifact["uri"]), language="zh")
         self._validate_ocr_scan_layout(snapshot, job.spec.provider_config)
-        updated = _apply_ocr_cue_regions(updated, qa)
+        updated = _apply_ocr_cue_regions(
+            updated, qa, dialogue_region=job.spec.provider_config.get("dialogue_region"))
         updated = self._canonicalize_ocr_result(
             updated, job.spec.provider_config,
             watermarks_in_timeline=isinstance(qa.get("watermark_regions"), list),

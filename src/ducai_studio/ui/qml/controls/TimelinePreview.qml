@@ -41,6 +41,7 @@ Item {
     signal regionDrawn(string mode, real x, real y, real width, real height)
     property string errorText: ""
     property var activeDescriptor: ({"available": false})
+    property var activeVoiceDescriptor: ({"voiceAvailable": false})
     property real pendingSourcePositionMs: -1
     property bool pendingPlay: false
     property bool applyingTimelineSeek: false
@@ -98,12 +99,37 @@ Item {
         const stored = root.appModel.currentProject.overlay("overlay-default-blur")
         return Object.assign({id: "overlay-default-blur", kind: "blur",
             range: {start_us: 0, end_us: root.appModel.currentProject.durationUs},
-            blur_radius: 22, opacity: 1, padding_x: 0.012, padding_y: 0.008,
+            blur_radius: 46, opacity: 1, padding_x: 0.012, padding_y: 0.008,
             concealment_mode: "blur"}, stored, {
             enabled: root.appModel.exportSubtitleBackgroundEnabled
                 && root.appModel.exportSubtitleBackgroundMode === "blur",
             tracking_mode: "source_subtitle"
         })
+    }
+    readonly property var cueBlurItems: {
+        if (!root.visible || !root.showProjectOverlays) return []
+        const result = []
+        const dialogue = root.appModel.exportSubtitleEnabled ? root.activeSubtitleRegions : []
+        const scenes = root.appModel.exportSubtitleEnabled ? root.activeSceneTexts : []
+        const cues = dialogue.concat(scenes, root.activeTitleTexts)
+        for (const cue of cues) {
+            if (String(cue.cue_role || "dialogue") !== "dialogue"
+                    && String(cue.review_state || "accepted") !== "accepted") continue
+            const mode = String(cue.background_style || "solid")
+            if (mode === "none") continue
+            if (mode === "blur") {
+                result.push({cue: cue, overlay: {
+                    enabled: true, tracking_mode: "source_subtitle", blur_radius: 46,
+                    concealment_mode: "blur", padding_x: 0, padding_y: 0,
+                    opacity: Number(cue.background_opacity_percent ?? 90) / 100
+                        * root.sceneFadeOpacity(cue)
+                }})
+            } else if (String(cue.cue_role || "dialogue") === "dialogue"
+                       && root.blurOverlay.enabled && root.overlayActive(root.blurOverlay)) {
+                result.push({cue: cue, overlay: root.blurOverlay})
+            }
+        }
+        return result
     }
     property var logoOverlay: {
         const revision = root.appModel.currentProject.revision
@@ -563,7 +589,7 @@ Item {
         if (!activeDescriptor.available) seekTimeline(root.positionMs, true)
         else {
             player.play()
-            if (activeDescriptor.voiceAvailable) voicePlayer.play()
+            if (activeVoiceDescriptor.voiceAvailable) voicePlayer.play()
         }
     }
     function pause() {
@@ -647,6 +673,9 @@ Item {
             player.pause()
             voicePlayer.pause()
             root.activeDescriptor = descriptor
+            root.activeVoiceDescriptor = ({"voiceAvailable": false})
+            root.pendingVoicePositionMs = -1
+            root.pendingVoicePlay = false
             root.appModel.setPlayheadMs(milliseconds)
             return
         }
@@ -676,9 +705,16 @@ Item {
     }
 
     function syncVoice(descriptor, resumePlayback) {
-        if (!root.appModel.voicePlaybackEnabled || !descriptor.voiceAvailable) {
-            voicePlayer.pause()
+        root.activeVoiceDescriptor = descriptor
+        if (!root.appModel.voicePlaybackEnabled) {
+            voicePlayer.stop()
             voicePlayer.source = ""
+            pendingVoicePositionMs = -1
+            pendingVoicePlay = false
+            return
+        }
+        if (!descriptor.voiceAvailable) {
+            voicePlayer.pause()
             pendingVoicePositionMs = -1
             pendingVoicePlay = false
             return
@@ -694,6 +730,56 @@ Item {
         pendingVoicePositionMs = descriptor.voicePositionMs
         pendingVoicePlay = resumePlayback
         voicePlayer.source = descriptor.voiceSourceUrl
+    }
+
+    function refreshVoiceForPlayback(timelineMs, videoPositionMs) {
+        const descriptor = root.appModel.currentProject.previewDescriptor(
+            Math.max(0, Math.round(timelineMs * 1000))
+        )
+        if (!descriptor.available) return
+
+        const previous = root.activeVoiceDescriptor
+        const wasAvailable = Boolean(previous.voiceAvailable)
+        const isAvailable = Boolean(descriptor.voiceAvailable)
+        const sourceChanged = isAvailable && (
+            !wasAvailable
+            || String(previous.voiceSourceUrl || "")
+                !== String(descriptor.voiceSourceUrl || "")
+            || Number(previous.voicePlaybackRate || 1)
+                !== Number(descriptor.voicePlaybackRate || 1)
+        )
+        root.activeVoiceDescriptor = descriptor
+        root.applyMonitorVolumes(descriptor)
+
+        if (!root.appModel.voicePlaybackEnabled || !isAvailable) {
+            if (wasAvailable || voicePlayer.playbackState === MediaPlayer.PlayingState)
+                root.syncVoice(descriptor, false)
+            return
+        }
+
+        const expectedVoiceMs = root.expectedVoicePositionMs(descriptor, videoPositionMs)
+        if (sourceChanged) {
+            root.syncVoice(
+                descriptor,
+                player.playbackState === MediaPlayer.PlayingState
+            )
+            return
+        }
+
+        voicePlayer.playbackRate = descriptor.voicePlaybackRate
+        if (player.playbackState === MediaPlayer.PlayingState
+                && voicePlayer.playbackState !== MediaPlayer.PlayingState) {
+            if (root.pendingVoicePositionMs >= 0) {
+                root.pendingVoicePositionMs = expectedVoiceMs
+                root.pendingVoicePlay = true
+            } else {
+                voicePlayer.setPosition(expectedVoiceMs)
+                voicePlayer.play()
+            }
+        } else if (player.playbackState === MediaPlayer.PlayingState
+                && Math.abs(voicePlayer.position - expectedVoiceMs) > 200) {
+            voicePlayer.setPosition(expectedVoiceMs)
+        }
     }
 
     function advanceAfterClip() {
@@ -767,15 +853,7 @@ Item {
                 Math.min(root.activeDescriptor.timelineEndUs / 1000, timelineMs)
             )
             root.updatingPlayheadFromPlayer = false
-            if (root.activeDescriptor.voiceAvailable) {
-                const expectedVoiceMs = root.expectedVoicePositionMs(
-                    root.activeDescriptor, position
-                )
-                if (playbackState === MediaPlayer.PlayingState
-                        && voicePlayer.playbackState === MediaPlayer.PlayingState
-                        && Math.abs(voicePlayer.position - expectedVoiceMs) > 200)
-                    voicePlayer.setPosition(expectedVoiceMs)
-            }
+            root.refreshVoiceForPlayback(timelineMs, position)
             if (playbackState === MediaPlayer.PlayingState
                     && position >= root.activeDescriptor.sourceEndMs) {
                 root.advanceAfterClip()
@@ -835,7 +913,7 @@ Item {
             )
         }
         function onPreviewMasterVolumeChanged() {
-            root.applyMonitorVolumes(root.activeDescriptor)
+            root.applyMonitorVolumes(root.activeVoiceDescriptor)
         }
         function onVoicePlaybackEnabledChanged() {
             if (root.appModel.voicePlaybackEnabled) return
@@ -1361,16 +1439,12 @@ Item {
             // Each active dialogue cue supplies its final Vietnamese layout.
             // The list retains overlapping cues rather than a single OCR box.
             Repeater {
-                model: root.showProjectOverlays
-                    && Boolean(root.blurOverlay && root.blurOverlay.enabled)
-                    && root.blurOverlay.tracking_mode === "source_subtitle"
-                    && root.overlayActive(root.blurOverlay)
-                    ? root.activeSubtitleRegions : []
+                model: root.cueBlurItems
                 delegate: Rectangle {
                     id: trackedBlurFrame
                     required property var modelData
                     readonly property var displayedOverlay:
-                        root.trackedSubtitleBlur(root.blurOverlay, modelData)
+                        root.trackedSubtitleBlur(modelData.overlay, modelData.cue)
 
                     x: root.overlayX(displayedOverlay)
                     y: root.overlayY(displayedOverlay)
@@ -1379,48 +1453,51 @@ Item {
                     color: "transparent"
                     z: 40
 
-                    ShaderEffectSource {
-                        id: trackedBlurSource
-                        width: Math.max(1, trackedBlurFrame.width)
-                        height: Math.max(1, trackedBlurFrame.height)
-                        visible: false
-                        live: true
-                        recursive: true
-                        sourceItem: filteredVideo
-                        sourceRect: Qt.rect(
-                            trackedBlurFrame.x - filteredVideo.x,
-                            trackedBlurFrame.y - filteredVideo.y,
-                            width,
-                            height
-                        )
-                    }
-
-                    MultiEffect {
+                    Item {
                         anchors.fill: parent
-                        visible: width > 0 && height > 0
-                        source: trackedBlurSource
-                        blurEnabled: true
-                        // blur_radius is stored in output pixels. Scale the
-                        // preview kernel with the rendered canvas so preview
-                        // and the FFmpeg result have the same relative blur.
-                        blurMax: 64
-                        blur: Math.max(0.01, Math.min(
-                            1.0,
-                            root.overlayNumber(
-                                root.blurOverlay,
-                                "blur_radius",
-                                root.blurOverlay.concealment_mode === "cover" ? 46 : 22
-                            ) * root.subtitleScale()
-                                * (root.blurOverlay.concealment_mode === "cover"
-                                    ? Math.SQRT2 : 1.0) / 64
-                        ))
-                        opacity: root.overlayNumber(root.blurOverlay, "opacity", 1.0)
-                        autoPaddingEnabled: false
+                        clip: true
+
+                        // Sample surrounding video before clipping the effect
+                        // to the cue, matching the export's full-frame mask.
+                        ShaderEffectSource {
+                            id: trackedBlurSource
+                            readonly property real samplePadding: Math.ceil(2 * trackedBlurEffect.radius)
+                            readonly property real sampleX: Math.max(0, trackedBlurFrame.x - filteredVideo.x - samplePadding)
+                            readonly property real sampleY: Math.max(0, trackedBlurFrame.y - filteredVideo.y - samplePadding)
+                            width: Math.max(1, Math.min(filteredVideo.width, trackedBlurFrame.x - filteredVideo.x + trackedBlurFrame.width + samplePadding) - sampleX)
+                            height: Math.max(1, Math.min(filteredVideo.height, trackedBlurFrame.y - filteredVideo.y + trackedBlurFrame.height + samplePadding) - sampleY)
+                            visible: false
+                            live: true
+                            recursive: true
+                            sourceItem: filteredVideo
+                            sourceRect: Qt.rect(sampleX, sampleY, width, height)
+                        }
+
+                        MultiEffect {
+                            id: trackedBlurEffect
+                            readonly property real radius: root.overlayNumber(
+                                trackedBlurFrame.displayedOverlay, "blur_radius", 46
+                            ) * root.subtitleScale() * Math.SQRT2
+                            x: trackedBlurSource.sampleX + filteredVideo.x - trackedBlurFrame.x
+                            y: trackedBlurSource.sampleY + filteredVideo.y - trackedBlurFrame.y
+                            width: trackedBlurSource.width
+                            height: trackedBlurSource.height
+                            visible: width > 0 && height > 0
+                            source: trackedBlurSource
+                            blurEnabled: true
+                            // Keep the output-pixel kernel at larger viewport
+                            // sizes, beyond MultiEffect's 64-pixel blur range.
+                            blurMax: 64
+                            blurMultiplier: Math.max(0, radius / 64 - 1)
+                            blur: Math.max(0.01, Math.min(1.0, radius / 64))
+                            opacity: root.overlayNumber(trackedBlurFrame.displayedOverlay, "opacity", 1.0)
+                            autoPaddingEnabled: false
+                        }
                     }
 
                     Rectangle {
                         anchors.fill: parent
-                        visible: root.blurOverlay.concealment_mode === "cover"
+                        visible: trackedBlurFrame.displayedOverlay.concealment_mode === "cover"
                         color: "#000000"
                         opacity: 0.90
                     }

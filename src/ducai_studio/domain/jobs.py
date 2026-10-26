@@ -179,6 +179,7 @@ def thaw_json(value: JsonValue) -> JsonValue:
 
 
 class JobKind(StrEnum):
+    DIALOGUE_CASTING = "dialogue_casting"
     OCR = "ocr"
     TRANSLATE = "translate"
     TTS = "tts"

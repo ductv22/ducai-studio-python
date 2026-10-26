@@ -73,6 +73,7 @@ _DATABASE_MAINTENANCE_READ_ACTIONS = frozenset(
         "get_database_optimization",
         "get_job",
         "get_project",
+        "get_tts_voice_preview",
         "get_translation_preview",
         "get_update_install_eligibility",
         "inspect_media_usage",
@@ -628,11 +629,35 @@ class JobManagerServer(QObject):
                 provider_options=provider_options,
                 reuse_completed=bool(params.get("reuse_completed", False)),
             )
-        if action == "create_tts_job":
+        if action == "get_dialogue_casting":
+            return self.service.get_dialogue_casting(_required_string(params, "project_id"))
+        if action == "configure_dialogue_casting":
+            return self.service.configure_dialogue_casting(
+                _required_string(params, "project_id"), dict(params.get("config", {})))
+        if action == "set_dialogue_casting_labels":
+            return self.service.set_dialogue_casting_labels(
+                _required_string(params, "project_id"), list(params.get("cue_ids", [])),
+                _required_string(params, "label"))
+        if action == "create_dialogue_casting_job":
+            self.licensing.require_active()
+            return self.service.create_dialogue_casting_job(
+                project_id=_required_string(params, "project_id"))
+        if action == "get_tts_voice_preview":
             provider_options = params.get("provider_options", {})
             if not isinstance(provider_options, dict):
                 raise ValueError("provider_options must be an object")
-            return self.service.create_tts_job(
+            return self.service.get_tts_voice_preview(
+                provider_id=_required_string(params, "provider_id"),
+                voice_id=_required_string(params, "voice_id"),
+                provider_options=provider_options,
+            )
+        if action in {"create_tts_job", "prepare_voice_generation"}:
+            provider_options = params.get("provider_options", {})
+            if not isinstance(provider_options, dict):
+                raise ValueError("provider_options must be an object")
+            factory = (self.service.prepare_voice_generation if action == "prepare_voice_generation"
+                       else self.service.create_tts_job)
+            return factory(
                 project_id=_required_string(params, "project_id"),
                 provider_id=_required_string(params, "provider_id"),
                 voice_id=_required_string(params, "voice_id"),
@@ -1163,10 +1188,16 @@ class JobManagerServer(QObject):
             raise ValueError("resume_stage_key must be a non-empty string")
         if not isinstance(resume_checkpoint_key, str) or not resume_checkpoint_key.strip():
             raise ValueError("resume_checkpoint_key must be a non-empty string")
-        if job.spec.kind in {JobKind.OCR, JobKind.TTS}:
+        if job.spec.kind in {JobKind.OCR, JobKind.TTS, JobKind.DIALOGUE_CASTING}:
             self.service.checkpoints.ensure_worker_capacity(
                 stage_label=(
-                    "trích xuất SRT" if job.spec.kind is JobKind.OCR else "lồng tiếng"
+                    "trích xuất SRT"
+                    if job.spec.kind is JobKind.OCR
+                    else (
+                        "phân vai thoại"
+                        if job.spec.kind is JobKind.DIALOGUE_CASTING
+                        else "lồng tiếng"
+                    )
                 )
             )
         command_id, _record = self.service.jobs.request_control(
@@ -1215,12 +1246,15 @@ class JobManagerServer(QObject):
                         },
                     )
         try:
-            if job.spec.kind is JobKind.OCR:
+            if job.spec.kind in {JobKind.OCR, JobKind.DIALOGUE_CASTING} or (
+                job.spec.kind is JobKind.TTS and job.spec.provider_config.get("cue_voices")
+            ):
                 self._warm_tts.discard_idle()
             elif (
                 job.spec.kind is JobKind.TTS
                 and job.spec.provider_id == "vieneu-3.8"
                 and job.spec.provider_config.get("job_mode") != "voice_conform"
+                and not job.spec.provider_config.get("cue_voices")
             ):
                 config = job.spec.provider_config
                 current_host = _engine_host_path("tts_engine_host.py").resolve()
@@ -1692,6 +1726,11 @@ class JobManagerServer(QObject):
                 job_id, stage_key="translation", checkpoint_key="review"
             )
             self.service.import_review_translation_srt(job_id, checkpoint)
+
+        if message.kind == "succeeded" and current_job.spec.kind is JobKind.DIALOGUE_CASTING:
+            if message.payload.get("status") != "PASS":
+                raise ValueError("Phân vai chưa hoàn tất")
+            self.service.import_dialogue_casting(job_id, str(message.payload["output_path"]))
 
         if message.kind == "succeeded" and self.service.jobs.get(job_id).spec.kind.value == "ocr":
             status = message.payload.get("status")

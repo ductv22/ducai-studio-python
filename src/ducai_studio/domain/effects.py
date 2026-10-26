@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from .project import CUE_BACKGROUND_STYLES
+from .project import CUE_BACKGROUND_STYLES, normalized_text_anchor
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,8 +162,11 @@ class RenderSubtitle:
     background_opacity_percent: int = 90
     background_padding_x: int = 20
     background_padding_y: int = 10
+    text_anchor: tuple[float, float] | None = None
+    background_style: str = "solid"
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "text_anchor", normalized_text_anchor(self.text_anchor))
         if not self.cue_id or self.index <= 0 or self.end_us <= self.start_us:
             raise ValueError("Subtitle identity and time range are invalid")
         if not self.text.strip():
@@ -172,6 +175,8 @@ class RenderSubtitle:
             raise ValueError("Subtitle font size is invalid")
         if self.orientation not in {"horizontal", "vertical"}:
             raise ValueError("Subtitle orientation is invalid")
+        if self.background_style not in CUE_BACKGROUND_STYLES:
+            raise ValueError("Subtitle background style is invalid")
         if any(
             type(value) is not int or value < 0
             for value in (
@@ -231,6 +236,8 @@ class RenderSubtitleBlur:
     tracking_mode: str = "source_subtitle"
     padding_x: float = 0.012
     padding_y: float = 0.008
+    fade_enabled: bool = False
+    fade_duration_ms: int = 300
 
     def __post_init__(self) -> None:
         if not self.cue_id or self.index <= 0 or self.end_us <= self.start_us:
@@ -239,6 +246,10 @@ class RenderSubtitleBlur:
             raise ValueError("Subtitle blur region source is invalid")
         if self.tracking_mode not in {"source_subtitle", "translated_text", "ocr_watermark"}:
             raise ValueError("Subtitle blur tracking mode is invalid")
+        if type(self.fade_enabled) is not bool:
+            raise TypeError("Subtitle blur fade flag is invalid")
+        if type(self.fade_duration_ms) is not int or not 50 <= self.fade_duration_ms <= 2_000:
+            raise ValueError("Subtitle blur fade duration is invalid")
         if not 0 <= self.padding_x <= 0.5 or not 0 <= self.padding_y <= 0.5:
             raise ValueError("Subtitle blur padding is invalid")
         if type(self.blur_radius) is not int or not 1 <= self.blur_radius <= 100:

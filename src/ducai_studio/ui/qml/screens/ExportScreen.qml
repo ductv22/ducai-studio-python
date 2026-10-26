@@ -37,6 +37,13 @@ Item {
             SectionTitle { text: root.queueOnly ? "Hàng đợi" : "Xuất video" }
             Item { Layout.fillWidth: true }
             DsButton {
+                objectName: "openExportFolderButton"
+                text: "Mở thư mục"
+                compact: true
+                visible: root.appModel.canOpenExportFolder
+                onClicked: root.appModel.openExportFolder()
+            }
+            DsButton {
                 text: "Thiết lập trong Timeline"
                 compact: true
                 tooltipText: "Chỉnh chất lượng, chữ, nền, hiệu ứng và âm thanh trước khi xuất."
@@ -50,6 +57,15 @@ Item {
             font.family: Theme.fontFamily
             font.pixelSize: 11
             elide: Text.ElideMiddle
+        }
+        Text {
+            Layout.fillWidth: true
+            visible: !root.queueOnly
+            text: "Có thể xuất trực tiếp video đã cắt/sửa; không bắt buộc OCR, dịch hoặc tạo giọng."
+            color: Theme.textMuted
+            font.family: Theme.fontFamily
+            font.pixelSize: 11
+            wrapMode: Text.Wrap
         }
         Panel {
             id: outputPreviewPanel

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import queue
 import shutil
@@ -36,6 +35,7 @@ from ducai_studio.application.voice_pipeline import (
     read_pcm16_mono,
     write_pcm16_mono,
 )
+from ducai_studio.domain.dialogue_casting import NO_SPEECH_TTS_SKIP_REASON
 from ducai_studio.domain.fingerprint import stable_fingerprint
 from ducai_studio.domain.voice_conform import (
     VoiceConformPlan,
@@ -50,6 +50,7 @@ from ducai_studio.providers.tts.contracts import (
 )
 from ducai_studio.providers.tts.host_client import EngineHostError
 from ducai_studio.providers.tts.postprocess_client import WavPreparationPool
+from ducai_studio.providers.tts.vieneu import profile_fingerprint
 from ducai_studio.providers.tts.wav_preparation import (
     ArtifactApproval,
     PreparedVoice,
@@ -66,6 +67,26 @@ class WorkerStopped(RuntimeError):
 
 def _tts_failure_payload(exc: Exception) -> dict[str, object]:
     if isinstance(exc, EngineHostError):
+        reference_errors = {
+            "vieneu_reference_decode_failed": (
+                "Không đọc được file giọng mẫu. Hãy kiểm tra file có phát được âm thanh "
+                "hoặc chọn lại một file WAV, MP3, M4A, FLAC hay OGG hợp lệ."
+            ),
+            "LibsndfileError": (
+                "Bộ clone không đọc được dữ liệu âm thanh trong file giọng mẫu. "
+                "Hãy chọn lại file hoặc chuyển sang WAV rồi nghe thử lại."
+            ),
+            "vieneu_reference_decoder_missing": (
+                "Không tìm thấy FFmpeg để giải mã file giọng mẫu. "
+                "Hãy kiểm tra bộ FFmpeg đã cài trong tool."
+            ),
+            "vieneu_reference_decode_timeout": (
+                "Giải mã file giọng mẫu quá thời gian cho phép. "
+                "Hãy chọn một đoạn mẫu ngắn hơn rồi nghe thử lại."
+            ),
+        }
+        if exc.code in reference_errors:
+            return {"code": exc.code, "message": reference_errors[exc.code]}
         return {
             "code": exc.code,
             "message": (
@@ -149,6 +170,7 @@ class TtsWorker:
         self._wav_staging_directories: set[Path] = set()
         self.cues: tuple[TtsCueRequest, ...] = ()
         self.force_cue_ids: frozenset[str] = frozenset()
+        self.casting_skipped_cues: dict[str, str] = {}
         self._legacy_request_fingerprints: dict[str, str] = {}
         self._a36_request_fingerprints: dict[str, str] = {}
         self._allowed_prior_raw_signatures: frozenset[str] = frozenset()
@@ -253,6 +275,20 @@ class TtsWorker:
         raw_cues = config.get("cues")
         if not isinstance(raw_cues, list) or not raw_cues:
             raise ValueError("tts_cues_missing")
+        raw_casting_skips = config.get("casting_skipped_cues", {})
+        if not isinstance(raw_casting_skips, dict) or any(
+            not isinstance(cue_id, str)
+            or not cue_id
+            or reason != NO_SPEECH_TTS_SKIP_REASON
+            for cue_id, reason in raw_casting_skips.items()
+        ):
+            raise ValueError("tts_casting_skips_invalid")
+        raw_cue_ids = {
+            str(raw.get("id", "")) for raw in raw_cues if isinstance(raw, dict)
+        }
+        if set(raw_casting_skips) - raw_cue_ids:
+            raise ValueError("tts_casting_skip_cue_missing")
+        self.casting_skipped_cues = dict(raw_casting_skips)
         raw_force_cue_ids = config.get("force_cue_ids", [])
         if not isinstance(raw_force_cue_ids, list) or not all(
             isinstance(value, str) and value.strip() for value in raw_force_cue_ids
@@ -261,6 +297,9 @@ class TtsWorker:
         self.force_cue_ids = frozenset(value.strip() for value in raw_force_cue_ids)
         self.spec = spec
         self.config = config
+        self.cue_voices = config.get("cue_voices", {})
+        if not isinstance(self.cue_voices, dict):
+            raise ValueError("tts_cue_voices_invalid")
         # New UI jobs treat semantic/timing findings as advisory.  Keep this
         # explicit at the worker boundary so legacy specs that omit it retain
         # their historical strict review behavior.
@@ -288,17 +327,17 @@ class TtsWorker:
         a36_pipeline.pop("adaptive_timing", None)
         a36_pipeline.pop("voice_read_speed", None)
         voice_identity = str(config.get("voice_identity", ""))
-        synthesis_speed = (
-            1.0
-            if str(spec.get("provider_id", "")) == "vieneu-3.8"
-            else float(config.get("engine_speed", 1.0))
-        )
         prepared: list[TtsCueRequest] = []
         for raw in raw_cues:
             if not isinstance(raw, dict):
                 raise ValueError("tts_cue_invalid")
-            eligibility = classify_cue(str(raw.get("text", "")))
             cue_id = str(raw.get("id", ""))
+            if cue_id in self.casting_skipped_cues:
+                if not cue_id:
+                    raise ValueError("tts_cue_id_missing")
+                self.ineligible[cue_id] = self.casting_skipped_cues[cue_id]
+                continue
+            eligibility = classify_cue(str(raw.get("text", "")))
             if not eligibility.eligible:
                 if not cue_id:
                     raise ValueError("tts_cue_id_missing")
@@ -311,38 +350,52 @@ class TtsWorker:
                 "end_us": int(raw["end_us"]),
                 "text": eligibility.text,
             }
+            voice = self.cue_voices.get(cue_id, {})
+            cue_voice_identity = str(voice.get("voice_identity", voice_identity))
+            cue_provider = str(voice.get("provider_id", spec.get("provider_id", "")))
+            cue_synthesis_speed = (1.0 if cue_provider == "vieneu-3.8"
+                                   else float(config.get("engine_speed", 1.0)))
             fingerprint = cue_request_fingerprint(
                 cue_value,
-                provider_id=str(spec.get("provider_id", "")),
-                provider_version=str(spec.get("provider_version", "")),
-                model_id=str(spec.get("model_id", "")),
-                voice_identity=voice_identity,
+                provider_id=str(voice.get("provider_id", spec.get("provider_id", ""))),
+                provider_version=str(
+                    voice.get("provider_version", spec.get("provider_version", ""))
+                ),
+                model_id=str(voice.get("model_id", spec.get("model_id", ""))),
+                voice_identity=cue_voice_identity,
                 settings=self.settings,
-                synthesis_speed=synthesis_speed,
+                synthesis_speed=cue_synthesis_speed,
             )
             self._legacy_request_fingerprints[cue_id] = cue_request_fingerprint(
                 cue_value,
-                provider_id=str(spec.get("provider_id", "")),
-                provider_version=str(spec.get("provider_version", "")),
-                model_id=str(spec.get("model_id", "")),
-                voice_identity=voice_identity,
+                provider_id=str(voice.get("provider_id", spec.get("provider_id", ""))),
+                provider_version=str(
+                    voice.get("provider_version", spec.get("provider_version", ""))
+                ),
+                model_id=str(voice.get("model_id", spec.get("model_id", ""))),
+                voice_identity=cue_voice_identity,
                 settings=legacy_strict_settings,
-                synthesis_speed=synthesis_speed,
+                synthesis_speed=cue_synthesis_speed,
                 include_timing_policy=True,
             )
             self._a36_request_fingerprints[cue_id] = stable_fingerprint(
                 {
                     "schema": "ducai-voice-cue-v1",
                     "cue": cue_value,
-                    "provider": str(spec.get("provider_id", "")),
-                    "provider_version": str(spec.get("provider_version", "")),
-                    "model": str(spec.get("model_id", "")),
-                    "voice": voice_identity,
+                    "provider": str(voice.get("provider_id", spec.get("provider_id", ""))),
+                    "provider_version": str(
+                        voice.get("provider_version", spec.get("provider_version", ""))
+                    ),
+                    "model": str(voice.get("model_id", spec.get("model_id", ""))),
+                    "voice": cue_voice_identity,
                     "pipeline": a36_pipeline,
                 }
             )
             prepared.append(TtsCueRequest(request_fingerprint=fingerprint, **cue_value))
-        if not prepared:
+        all_cues_skipped_by_casting = bool(self.casting_skipped_cues) and (
+            set(self.casting_skipped_cues) == raw_cue_ids
+        )
+        if not prepared and not all_cues_skipped_by_casting:
             raise ValueError("tts_no_eligible_cues")
         if [cue.index for cue in prepared] != sorted(cue.index for cue in prepared):
             raise ValueError("tts_cue_order_invalid")
@@ -512,18 +565,19 @@ class TtsWorker:
         }
         self.provider = None
 
-    def _provider_from_config(self) -> TtsProvider:
+    def _provider_from_config(self, voice_config: dict | None = None) -> TtsProvider:
+        config = voice_config if voice_config is not None else self.config
         if self.provider_factory is not None:
-            return self.provider_factory(self.config)
-        provider_id = str(self.spec.get("provider_id", ""))
-        runtime_python = Path(str(self.config["runtime_python"]))
-        data_root = Path(str(self.config["data_root"]))
+            return self.provider_factory(config)
+        provider_id = str(config.get("provider_id", self.spec.get("provider_id", "")))
+        runtime_python = Path(str(config["runtime_python"]))
+        data_root = Path(str(config["data_root"]))
         managed_host = os.environ.get("DUCAI_TTS_ENGINE_HOST_MANAGED", "") == "1"
         runtime_host = (
             os.environ.get("DUCAI_TTS_ENGINE_HOST_PATH", "").strip() if managed_host else ""
         )
         host_script = (
-            Path(runtime_host or str(self.config["engine_host_path"])).expanduser().resolve()
+            Path(runtime_host or str(config["engine_host_path"])).expanduser().resolve()
         )
         runtime_host_hash = (
             os.environ.get("DUCAI_TTS_ENGINE_HOST_SHA256", "").strip() if managed_host else ""
@@ -539,23 +593,23 @@ class TtsWorker:
                 runtime_python=runtime_python,
                 data_root=data_root,
                 host_script=host_script,
-                timeout_seconds=float(self.config.get("provider_timeout_seconds", 300)),
+                timeout_seconds=float(config.get("provider_timeout_seconds", 300)),
             )
         if provider_id == "vieneu-3.8":
-            profile_path = str(self.config.get("profile_path", "")).strip()
+            profile_path = str(config.get("profile_path", "")).strip()
             return VieNeuTtsProvider(
                 runtime_python=runtime_python,
                 data_root=data_root,
                 profile_path=Path(profile_path) if profile_path else None,
                 reference_audio_path=(
-                    Path(str(self.config["reference_audio_path"]))
-                    if self.config.get("reference_audio_path")
+                    Path(str(config["reference_audio_path"]))
+                    if config.get("reference_audio_path")
                     else None
                 ),
-                reference_denoise=self.config.get("reference_denoise") is True,
+                reference_denoise=config.get("reference_denoise") is True,
                 host_script=host_script,
-                timeout_seconds=float(self.config.get("provider_timeout_seconds", 1_800)),
-                batch_size=int(self.config.get("batch_size", 32)),
+                timeout_seconds=float(config.get("provider_timeout_seconds", 1_800)),
+                batch_size=int(config.get("batch_size", 32)),
                 progress_callback=self._provider_progress,
             )
         raise ValueError("tts_provider_not_supported")
@@ -688,47 +742,57 @@ class TtsWorker:
         self._synthesis_started = time.monotonic()
         self._synthesis_baseline_terminal = terminal
         self._phase_detail = f"Đã dò cache; còn {len(missing)} cue cần tổng hợp"
-        provider_limit = 32
-        batch_size = max(1, min(provider_limit, int(self.config.get("batch_size", 16))))
-        provider_speed = (
-            1.0
-            if str(self.spec.get("provider_id", "")) == "vieneu-3.8"
-            else float(self.config.get("engine_speed", 1.0))
-        )
-        if missing:
-            self._phase = "model_loading"
-            self._phase_detail = "Đang nạp bộ máy giọng nói sau khi đã kiểm tra cache"
-            self._send_stage_progress(
-                "model_loading",
-                phase_current=0,
-                phase_total=len(missing),
-                eta_ms=None,
-                extra={"phase_detail": self._phase_detail},
-            )
-            self.provider = self._provider_from_config()
-        assert self.provider is not None or not missing
-        for offset in range(0, len(missing), batch_size):
+        voice_groups: dict[str, tuple[dict, list[TtsCueRequest]]] = {}
+        for cue in missing:
+            voice_config = {**self.config, **self.cue_voices.get(cue.cue_id, {})}
+            key = stable_fingerprint({name: voice_config.get(name, self.spec.get(name))
+                                      for name in ("provider_id", "provider_version", "model_id",
+                                                   "voice_identity", "reference_denoise")})
+            if key not in voice_groups:
+                voice_groups[key] = (voice_config, [])
+            voice_groups[key][1].append(cue)
+        batches = []
+        for voice_key, (voice_config, voice_cues) in voice_groups.items():
+            limit = max(1, min(32, int(voice_config.get("batch_size", 16))))
+            for offset in range(0, len(voice_cues), limit):
+                batches.append((voice_key, voice_config, tuple(voice_cues[offset:offset+limit])))
+        active_voice_key = None
+        for batch_index, (voice_key, voice_config, group) in enumerate(batches):
             self._control_point()
-            group = tuple(missing[offset : offset + batch_size])
+            batch_size = max(1, min(32, int(voice_config.get("batch_size", 16))))
+            provider_id = str(voice_config.get("provider_id", self.spec.get("provider_id", "")))
+            provider_speed = (1.0 if provider_id == "vieneu-3.8"
+                              else float(voice_config.get("engine_speed", 1.0)))
+            if active_voice_key != voice_key:
+                if self.provider is not None:
+                    self.provider.close()
+                    self.provider = None
+                self._phase = "model_loading"
+                self._phase_detail = f"Đang nạp giọng {voice_config['voice_id']}"
+                self._send_progress()
+                self.provider = self._provider_from_config(voice_config)
+                active_voice_key = voice_key
+            assert self.provider is not None
+            offset = batch_index * 32
             batch_started = time.monotonic()
             batch_terminal_before = self._terminal_cue_count()
-            first_warm_batch = offset == 0 and not self._warm_batch_rates
+            first_warm_batch = batch_index == 0 and not self._warm_batch_rates
             self._phase = "warmup" if first_warm_batch else "synthesis"
             provider_label = (
                 "VieNeu ở 1,00×"
-                if str(self.spec.get("provider_id", "")) == "vieneu-3.8"
+                if provider_id == "vieneu-3.8"
                 else f"Piper ở {provider_speed:.2f}×"
             )
             phase_action = "Đang làm nóng bằng batch đầu" if first_warm_batch else "Đang tổng hợp"
             self._phase_detail = (
-                f"{phase_action} {provider_label} · batch {offset // batch_size + 1}/"
-                f"{max(1, math.ceil(len(missing) / batch_size))}"
+                f"{phase_action} {provider_label} · batch {batch_index + 1}/"
+                f"{len(batches)}"
             )
             self._send_progress()
             result = self.provider.synthesize_batch(
                 request_id=f"{self.job_id}-{offset}",
                 cues=group,
-                voice_id=str(self.config["voice_id"]),
+                voice_id=str(voice_config["voice_id"]),
                 output_dir=self.raw_root,
                 speed=provider_speed,
                 batch_size=batch_size,
@@ -750,7 +814,7 @@ class TtsWorker:
                 retry = self.provider.synthesize_batch(
                     request_id=f"{self.job_id}-{offset}-retry",
                     cues=tuple(retry_cues),
-                    voice_id=str(self.config["voice_id"]),
+                    voice_id=str(voice_config["voice_id"]),
                     output_dir=self.raw_root / "retry",
                     speed=provider_speed,
                     batch_size=min(batch_size, len(retry_cues)),
@@ -1972,6 +2036,52 @@ class TtsWorker:
                 },
             )
             return
+        if not self.cues and self.casting_skipped_cues:
+            output_path = (
+                Path(str(self.config.get("staging_output_path", self.config["output_path"])))
+                .expanduser()
+                .resolve()
+            )
+            mix = assemble_voice_timeline(
+                (),
+                output_path,
+                total_duration_us=int(self.config["media_duration_us"]),
+                sample_rate=self.settings.sample_rate,
+                pcm_sink=lambda _chunk: self._control_point(),
+            )
+            coverage.update(
+                {
+                    "status": "PASS",
+                    "output_path": str(output_path),
+                    "output_sha256": file_sha256(output_path),
+                    "mix": mix,
+                    "master": {"status": "not_required", "reason": "no_speech"},
+                }
+            )
+            output_stat = output_path.stat()
+            coverage["output_size"] = output_stat.st_size
+            coverage["output_mtime_ns"] = output_stat.st_mtime_ns
+            atomic_write_json(qa_path, coverage)
+            self.send(
+                "succeeded",
+                {
+                    "status": "PASS",
+                    "purpose": str(self.config.get("purpose", "production")),
+                    "output_path": str(output_path),
+                    "qa_path": str(qa_path),
+                    "cue_count": 0,
+                    "coverage_ratio": coverage["coverage_ratio"],
+                    "voice_read_speed": self.settings.voice_read_speed,
+                    "cue_max_total_speed": self.settings.max_absolute_speed,
+                    "adjusted_cue_count": 0,
+                    "maximum_total_speed_applied": self.settings.voice_read_speed,
+                    "maximum_additional_factor": 1.0,
+                    "unresolved_timing_cue_count": 0,
+                    "timing_warning_count": 0,
+                    "qa_non_blocking": self.qa_non_blocking,
+                },
+            )
+            return
         clips: list[VoiceClip] = []
         occupied_until_us = 0
         shifted_cues = 0
@@ -2254,6 +2364,12 @@ class TtsWorker:
         output_stat = output_path.stat()
         coverage["output_size"] = output_stat.st_size
         coverage["output_mtime_ns"] = output_stat.st_mtime_ns
+        profile = Path(str(self.config.get("profile_path", "")))
+        if (self.config.get("purpose") == "preview"
+                and self.spec.get("provider_id") == "vieneu-3.8"
+                and self.config.get("reference_audio_path")
+                and profile.is_file() and profile.with_suffix(".json").is_file()):
+            coverage["preview_profile_fingerprint"] = profile_fingerprint(profile)
         atomic_write_json(qa_path, coverage)
         self.send(
             "succeeded",

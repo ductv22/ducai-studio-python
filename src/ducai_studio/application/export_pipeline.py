@@ -229,7 +229,7 @@ def build_export_snapshot(
                 0.8,
                 0.1,
                 tracking_mode="source_subtitle",
-                blur_radius=22,
+                blur_radius=46,
             )
             effective_overlays.append(automatic)
         effective_overlays = [
@@ -251,6 +251,8 @@ def build_export_snapshot(
             continue
         if overlay.kind is OverlayKind.BLUR and overlay.tracking_mode == "source_subtitle":
             for cue in dialogue_cues(project.translated_cues or project.source_cues):
+                if cue.background_style in {"none", "blur"}:
+                    continue
                 cue_start = max(
                     content_start_us,
                     overlay.range.start_us,
@@ -351,8 +353,6 @@ def build_export_snapshot(
         )
 
     raw_cues = project.translated_cues if project.translated_cues else project.source_cues
-    if settings.subtitle_style.enabled and not raw_cues and not project.title_cues:
-        raise ValueError("Subtitle burn-in is enabled but the project has no subtitles")
     subtitles = []
     scene_texts: list[RenderSceneText] = []
     source_start_us = video_clips[0].timeline_range.start_us
@@ -388,6 +388,8 @@ def build_export_snapshot(
                 cue.background_opacity_percent,
                 cue.background_padding_x,
                 cue.background_padding_y,
+                text_anchor=cue.text_anchor,
+                background_style=cue.background_style,
             )
         )
     render_width = int(settings.output_width or probe.width)
@@ -419,6 +421,20 @@ def build_export_snapshot(
         if title_track_visible and cue.range.end_us > source_start_us
         and cue.range.start_us < source_end_us
     )
+    # Explicit cue blur works independently of the default dialogue background.
+    # The provider replaces these seed bounds with the measured text bounds.
+    blur_cues = [*subtitles, *(cue for cue in scene_texts if cue.review_state == "accepted")]
+    for cue in (*(blur_cues if style.enabled else ()), *title_texts):
+        if cue.background_style != "blur":
+            continue
+        subtitle_blurs.append(RenderSubtitleBlur(
+            cue.cue_id, cue.index, cue.start_us, cue.end_us,
+            .1, .1, .8, .8, blur_radius=46,
+            opacity=cue.background_opacity_percent / 100,
+            tracking_mode="translated_text", padding_x=0, padding_y=0,
+            fade_enabled=getattr(cue, "fade_enabled", False),
+            fade_duration_ms=getattr(cue, "fade_duration_ms", 300),
+        ))
     return ExportSnapshot(
         5 if title_texts else (4 if scene_texts else (3 if subtitle_blurs else
                                                    (2 if conform_segments else 1))),

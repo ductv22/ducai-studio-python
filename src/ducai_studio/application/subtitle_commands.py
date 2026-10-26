@@ -295,30 +295,37 @@ class SubtitleEditor:
         return self._commit(replace(candidate, tracks=tuple(tracks)))
 
     def accept_scene_text(self, cue_id: str) -> ProjectSnapshot:
-        source = list(self.snapshot.source_cues)
-        source_index = self._index(tuple(source), cue_id)
-        cue = source[source_index]
-        if not cue.is_scene_text:
-            raise SubtitleEditError("Only scene-text cues can be accepted")
-        source[source_index] = replace(
-            cue,
-            review_state="accepted",
-            revision=cue.revision + 1,
-        )
-        translated = list(self.snapshot.translated_cues)
-        for index, translated_cue in enumerate(translated):
-            if translated_cue.id == cue_id:
-                translated[index] = replace(
-                    translated_cue,
-                    review_state="accepted",
-                    revision=translated_cue.revision + 1,
-                )
-                break
+        return self.accept_scene_text_many((cue_id,))
+
+    def accept_scene_text_many(self, cue_ids: Iterable[str]) -> ProjectSnapshot:
+        selected = set(cue_ids)
+        if not selected:
+            raise SubtitleEditError("Hãy chọn chữ trong cảnh cần chấp nhận")
+        cues = {cue.id: cue for cue in self.snapshot.source_cues}
+        if selected - cues.keys():
+            raise SubtitleEditError("Chữ trong cảnh đã chọn không còn trong dự án")
+        locked = {track.id for track in self.snapshot.tracks if track.locked}
+        for cue_id in selected:
+            cue = cues[cue_id]
+            if not cue.is_scene_text:
+                raise SubtitleEditError("Only scene-text cues can be accepted")
+            if (cue.subtitle_track_id or "S2") in locked:
+                raise SubtitleEditError("Hãy mở khóa dòng chữ trước khi chấp nhận")
+
+        def accepted(cue: SubtitleCue) -> SubtitleCue:
+            return replace(cue, review_state="accepted", revision=cue.revision + 1)
+
+        selected_indices = {cues[cue_id].index for cue_id in selected}
+        source_ids = set(cues)
         return self._commit(
             replace(
                 self.snapshot,
-                source_cues=tuple(source),
-                translated_cues=tuple(translated),
+                source_cues=tuple(accepted(cue) if cue.id in selected else cue
+                                  for cue in self.snapshot.source_cues),
+                translated_cues=tuple(accepted(cue) if cue.id in selected or (
+                    cue.id not in source_ids and cue.index in selected_indices
+                ) else cue
+                                      for cue in self.snapshot.translated_cues),
             )
         )
 
@@ -755,6 +762,12 @@ class SubtitleEditor:
             if dialogue_template is not None
             else None
         )
+        inherited_anchor = (
+            dialogue_template.text_anchor
+            if cue_role == "dialogue" and dialogue_template is not None
+            and visual_box is None and dialogue_template.panel_box is None
+            else None
+        )
         resolved_box = visual_box or inherited_box or (
             (0.10, 0.74, 0.80, 0.16)
             if cue_role == "dialogue"
@@ -940,7 +953,8 @@ class SubtitleEditor:
             "role": cue_role,
             "orientation": resolved_orientation,
             "style_hint": resolved_style_hint,
-            "panel_box": (x, y, width, height),
+            "panel_box": None if inherited_anchor is not None else (x, y, width, height),
+            "text_anchor": inherited_anchor,
             "background_color": color,
             "text_color": foreground,
             "review_state": "accepted",
@@ -1112,6 +1126,7 @@ class SubtitleEditor:
                 if visual is not None
                 else "",
                 panel_box=next_panel,
+                text_anchor=None,
                 revision=cue.revision + 1,
             )
 

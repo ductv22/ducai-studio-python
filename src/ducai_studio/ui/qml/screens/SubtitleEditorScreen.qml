@@ -664,16 +664,34 @@ Item {
                             onClicked: root.appModel.cancelOcr()
                         }
                     }
-                    CheckBox {
-                        objectName: "sceneOcrToggle"
-                        visible: !root.whisperExtraction
-                        text: "OCR chữ trong cảnh (S2…)"
-                        checked: root.appModel.ocrSceneTextEnabled
-                        enabled: !root.appModel.ocrBusy
-                        Accessible.name: text
-                        onToggled: root.appModel.setOcrSceneTextEnabled(checked)
-                        ToolTip.visible: hovered
-                        ToolTip.text: "Tắt để lần trích xuất mới chỉ quét thoại. Không xóa chữ cảnh đã có; Multi dùng cùng lựa chọn."
+                    RowLayout {
+                        Layout.fillWidth: true
+                        CheckBox {
+                            objectName: "sceneOcrToggle"
+                            visible: !root.whisperExtraction
+                            text: "OCR chữ trong cảnh (S2…)"
+                            checked: root.appModel.ocrSceneTextEnabled
+                            enabled: !root.appModel.ocrBusy
+                            Accessible.name: text
+                            onToggled: root.appModel.setOcrSceneTextEnabled(checked)
+                            ToolTip.visible: hovered
+                            ToolTip.text: "Tắt để lần trích xuất mới chỉ quét thoại. Không xóa chữ cảnh đã có; Multi dùng cùng lựa chọn."
+                        }
+                        CheckBox {
+                            objectName: "castingAfterOcrToggle"
+                            text: "Phân vai thoại sau trích xuất"
+                            checked: ((root.appModel.dialogueCasting || {}).config || {}).enabled === true
+                            enabled: root.appModel.currentProject.hasProject
+                                && !root.appModel.ocrBusy && !root.appModel.ttsBusy
+                                && !root.appModel.dialogueCastingBusy
+                                && !root.appModel.dialogueCastingSaving
+                                && !root.appModel.dialogueCastingLoading
+                            Accessible.name: text
+                            onToggled: root.appModel.setDialogueCastingEnabled(checked)
+                            ToolTip.visible: hovered
+                            ToolTip.text: "Tự nhận diện Nam/Nữ sau khi trích xuất thành công. Tạo giọng dùng lại kết quả; chọn giọng và sửa nhãn trong Phòng thu giọng."
+                        }
+                        Item { Layout.fillWidth: true }
                     }
                     RowLayout {
                         Layout.fillWidth: true

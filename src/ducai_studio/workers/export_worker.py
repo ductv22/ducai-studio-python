@@ -170,6 +170,8 @@ class ExportWorker:
         font_assets = {path.name: file_sha256(path) for path in sorted(directory.iterdir())
                        if path.suffix.casefold() in {".ttf", ".otf"}} if directory else {}
         signature = stable_fingerprint({**signature_input,
+            "render_contract": "cue-background-blur-v5", "font_assets": font_assets})
+        system_fonts_signature = stable_fingerprint({**signature_input,
             "render_contract": "subtitle-system-fonts-v4", "font_assets": font_assets})
         background_signature = stable_fingerprint({**signature_input,
             "render_contract": "subtitle-background-layers-v3", "font_assets": font_assets})
@@ -180,6 +182,7 @@ class ExportWorker:
             previous_signature=previous_signature,
             readable_signature=readable_signature,
             background_signature=background_signature,
+            system_fonts_signature=system_fonts_signature,
         )
         self.ledger = restored or {
             "schema_version": 1,
@@ -196,6 +199,7 @@ class ExportWorker:
         previous_signature: str | None = None,
         readable_signature: str | None = None,
         background_signature: str | None = None,
+        system_fonts_signature: str | None = None,
     ) -> dict[str, Any] | None:
         if not isinstance(checkpoint, dict):
             return None
@@ -213,6 +217,7 @@ class ExportWorker:
                 previous_signature,
                 readable_signature,
                 background_signature,
+                system_fonts_signature,
             }
             - {None, signature}
         ):

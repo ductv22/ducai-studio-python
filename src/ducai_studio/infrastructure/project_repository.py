@@ -8,6 +8,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
+from ducai_studio.domain.dialogue_casting import decode_casting
 from ducai_studio.domain.project import (
     MediaAsset,
     MediaKind,
@@ -48,6 +49,8 @@ def _json_value(value: Any) -> Any:
 
 def encode_project_snapshot(snapshot: ProjectSnapshot) -> tuple[str, str]:
     payload = _json_value(asdict(snapshot))
+    if snapshot.dialogue_casting is None:
+        payload.pop("dialogue_casting", None)
     # Keep byte-for-byte compatibility for legacy projects that never had
     # timeline bookmarks.  The decoder treats a missing field as empty; only
     # an actual user mark needs to be written to the snapshot.
@@ -145,6 +148,7 @@ def _cue(value: Any) -> SubtitleCue:
         ),
         style_hint=_string(raw.get("style_hint", "standard"), "cue.style_hint"),
         panel_box=_optional_box(raw.get("panel_box"), "cue.panel_box"),
+        text_anchor=raw.get("text_anchor"),
         background_color=_string(
             raw.get("background_color", ""), "cue.background_color"
         ),
@@ -342,6 +346,7 @@ def decode_project_snapshot(value: Any) -> ProjectSnapshot:
         )
     )
     snapshot = ProjectSnapshot(
+        dialogue_casting=decode_casting(raw.get("dialogue_casting")),
         id=_string(raw.get("id"), "id"),
         name=_string(raw.get("name"), "name"),
         revision=_integer(raw.get("revision"), "revision"),

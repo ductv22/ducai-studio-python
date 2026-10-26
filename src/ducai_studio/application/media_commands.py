@@ -250,6 +250,7 @@ class MediaImportService:
                         orientation=source.orientation,
                         style_hint=source.style_hint,
                         panel_box=source.panel_box,
+                        text_anchor=source.text_anchor,
                         background_color=source.background_color,
                         text_color=source.text_color,
                         review_state=source.review_state,
@@ -367,7 +368,19 @@ class MediaImportService:
         media_path: str | Path,
         *,
         cue_timing: tuple[Mapping[str, object], ...] | None = None,
+        excluded_cue_ids: tuple[str, ...] = (),
     ) -> ProjectSnapshot:
+        excluded_ids = frozenset(excluded_cue_ids)
+        dialogue = dialogue_cues(snapshot.source_cues)
+        dialogue_ids = {cue.id for cue in dialogue}
+        expected_cues = self._expected_voice_cues(snapshot, excluded_cue_ids)
+        if cue_timing is not None and not cue_timing:
+            if not excluded_ids or excluded_ids != dialogue_ids:
+                raise ValueError(
+                    "An empty voice timeline requires every dialogue cue to be excluded"
+                )
+            updated = self._without_voice(snapshot)
+            return replace(updated, revision=snapshot.revision + 1)
         path = Path(media_path).expanduser().resolve()
         result = self.probe.probe(path)
         if result.has_video or not result.has_audio:
@@ -402,7 +415,7 @@ class MediaImportService:
             result.duration_us,
             cue_timing,
             fallback_range=source_range,
-            expected_cues=dialogue_cues(snapshot.source_cues),
+            expected_cues=expected_cues,
         )
         tracks.append(TimelineTrack("D1", TrackKind.VOICE, "Thuyết minh", clips))
         return replace(
@@ -577,6 +590,19 @@ class MediaImportService:
                 )
         return tuple(clips)
 
+    @staticmethod
+    def _expected_voice_cues(
+        snapshot: ProjectSnapshot,
+        excluded_cue_ids: tuple[str, ...],
+    ) -> tuple[SubtitleCue, ...]:
+        excluded_ids = frozenset(excluded_cue_ids)
+        if any(not isinstance(cue_id, str) or not cue_id for cue_id in excluded_ids):
+            raise ValueError("Excluded voice cue ids must be non-empty strings")
+        dialogue = dialogue_cues(snapshot.source_cues)
+        if excluded_ids - {cue.id for cue in dialogue}:
+            raise ValueError("Excluded voice cue does not exist in the dialogue subtitles")
+        return tuple(cue for cue in dialogue if cue.id not in excluded_ids)
+
     def apply_voice_conform_media(
         self,
         snapshot: ProjectSnapshot,
@@ -584,7 +610,9 @@ class MediaImportService:
         *,
         plan: VoiceConformPlan,
         parent_tts_job_id: str,
+        excluded_cue_ids: tuple[str, ...] = (),
     ) -> ProjectSnapshot:
+        expected_cues = self._expected_voice_cues(snapshot, excluded_cue_ids)
         if not plan.applicable:
             raise ValueError("Voice conform plan still has unresolved cues")
         path = Path(media_path).expanduser().resolve()
@@ -667,7 +695,7 @@ class MediaImportService:
                 result.duration_us,
                 cue_timing,
                 fallback_range=output_range,
-                expected_cues=dialogue_cues(snapshot.source_cues),
+                expected_cues=expected_cues,
             )
         )
         tracks = [track for track in snapshot.tracks if track.id != "D1"]
@@ -705,7 +733,9 @@ class MediaImportService:
         snapshot: ProjectSnapshot,
         *,
         cue_timing: tuple[Mapping[str, object], ...] | None = None,
+        excluded_cue_ids: tuple[str, ...] = (),
     ) -> ProjectSnapshot:
+        expected_cues = self._expected_voice_cues(snapshot, excluded_cue_ids)
         state = snapshot.voice_conform
         if state is None:
             raise ValueError("Project has no applied voice conform plan")
@@ -750,7 +780,7 @@ class MediaImportService:
             base.duration_us,
             cue_timing,
             fallback_range=base_range,
-            expected_cues=dialogue_cues(snapshot.source_cues),
+            expected_cues=expected_cues,
         )
         clips = tuple(
             replace(clip, volume=voice_track.clips[0].volume)

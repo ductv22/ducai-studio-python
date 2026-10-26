@@ -19,6 +19,8 @@ Rectangle {
     readonly property bool hasCue: cueId.length > 0
     readonly property var classification: root.appModel.selectedCueClassification || ({})
     readonly property bool canConvert: Boolean(classification.can_convert)
+    readonly property bool selectionLocked:
+        Boolean(root.appModel.selectedTextCueEditingLocked)
     readonly property bool isSceneText:
         String(cue.cue_role || "dialogue") !== "dialogue"
     readonly property string editedCueId: String(
@@ -27,7 +29,7 @@ Rectangle {
     readonly property string editedLanguage:
         String(cue.translation_cue_id || "").length > 0 ? "translated" : "source"
 
-    enabled: !root.appModel.timelineBusy
+    enabled: !root.appModel.timelineBusy && !root.selectionLocked
     implicitHeight: root.inspectorMode ? 620 : 196
     color: Theme.surfaceRaised
     border.width: 1
@@ -38,7 +40,8 @@ Rectangle {
     component TextNumber: DsSpinBox { emphasized: true }
 
     function convertSelection(role) {
-        if (!root.canConvert || root.appModel.subtitleBusy || root.appModel.timelineBusy) return
+        if (!root.canConvert || root.selectionLocked
+                || root.appModel.subtitleBusy || root.appModel.timelineBusy) return
         if (!root.commitText()) return
         textInput.focus = false
         root.appModel.setSelectedCueRole(role)
@@ -49,7 +52,8 @@ Rectangle {
     }
 
     function applyCurrent(values) {
-        if (!root.hasCue || root.appModel.subtitleBusy || root.appModel.timelineBusy) return
+        if (!root.hasCue || root.selectionLocked
+                || root.appModel.subtitleBusy || root.appModel.timelineBusy) return
         const overrides = values || ({})
         root.appModel.setSelectedSubtitleTextFormat(
             Math.max(1, Number(root.overrideValue(
@@ -94,6 +98,14 @@ Rectangle {
         )
     }
 
+    function chooseBackground(value) {
+        const changes = {"backgroundStyle": value}
+        if (value === "blur") changes.backgroundOpacity = 100
+        if (value !== "none" && value !== "blur" && !root.cue.background_color)
+            changes.backgroundColor = "#000000"
+        root.applyCurrent(changes)
+    }
+
     function applyPickedColor(target, colorValue) {
         const color = String(colorValue || "").toUpperCase()
         if (!/^#[0-9A-F]{6}$/.test(color)) return
@@ -129,6 +141,12 @@ Rectangle {
         onAccepted: root.applyCurrent({
             "textColor": selectedColor.toString().slice(0, 7)
         })
+    }
+
+    ColorDialog {
+        id: outlineColorDialog
+        title: "Chọn màu viền chữ"
+        onAccepted: root.appModel.setExportSubtitleOutlineColor(selectedColor.toString().slice(0, 7))
     }
 
 
@@ -401,7 +419,53 @@ Rectangle {
                 }
             }
 
-            SectionTitle { text: "Nền" }
+            SectionTitle { text: "Viền phụ đề thoại" }
+            GridLayout {
+                Layout.fillWidth: true
+                columns: 2
+                Text { text: "Độ dày (px)"; color: Theme.textSecondary; font.pixelSize: 11 }
+                TextNumber {
+                    objectName: "textOutlineWidthSpin"
+                    Layout.fillWidth: true
+                    from: 0; to: 12
+                    value: root.appModel.exportSubtitleOutlineWidth
+                    accessibleName: "Độ dày viền chữ, 0 là không viền"
+                    onValueModified: root.appModel.setExportSubtitleOutlineWidth(value)
+                }
+                Text { text: "Màu viền"; color: Theme.textSecondary; font.pixelSize: 11 }
+                RowLayout {
+                    Rectangle {
+                        Layout.preferredWidth: 24; Layout.preferredHeight: 24
+                        color: root.appModel.exportSubtitleOutlineColor
+                        border.color: Theme.borderSubtle; border.width: 1
+                    }
+                    TextAction {
+                        objectName: "textOutlineColorButton"
+                        text: "Chọn màu"; compact: true
+                        onClicked: {
+                            outlineColorDialog.selectedColor = root.appModel.exportSubtitleOutlineColor
+                            outlineColorDialog.open()
+                        }
+                    }
+                }
+            }
+            SectionTitle { text: "Nền mặc định cho thoại" }
+            ComboBox {
+                objectName: "subtitleBackgroundMode"
+                Layout.fillWidth: true
+                model: ["Không nền", "Nền đen", "Nền mờ (blur)"]
+                palette.dark: Theme.textSecondary
+                currentIndex: !root.appModel.exportSubtitleBackgroundEnabled ? 0
+                    : (root.appModel.exportSubtitleBackgroundMode === "blur" ? 2 : 1)
+                onActivated: {
+                    const choice = currentIndex
+                    root.appModel.setExportSubtitleBackgroundEnabled(choice !== 0)
+                    if (choice !== 0)
+                        root.appModel.setExportSubtitleBackgroundMode(choice === 2 ? "blur" : "black")
+                }
+                Accessible.name: "Nền mặc định cho thoại"
+            }
+            SectionTitle { text: "Nền câu đang chọn" }
             GridLayout {
                 Layout.fillWidth: true
                 columns: root.inspectorMode ? 2 : 6
@@ -415,7 +479,13 @@ Rectangle {
                     objectName: "backgroundStyleBox"
                     Layout.fillWidth: true
                     Layout.minimumWidth: 0
-                    model: [{text: "Nền phẳng", value: "solid"},{text: "Mực loang", value: "ink_splash"},{text: "Mực đại mặc", value: "ink_wash"},{text: "Mực tụ", value: "ink_cloud"},{text: "Nét cọ", value: "brush_stroke"}]
+                    model: [{text: "Nền phẳng", value: "solid"},
+                        {text: "Không nền", value: "none"},
+                        {text: "Nền mờ (blur)", value: "blur"},
+                        {text: "Mực loang", value: "ink_splash"},
+                        {text: "Mực đại mặc", value: "ink_wash"},
+                        {text: "Mực tụ", value: "ink_cloud"},
+                        {text: "Nét cọ", value: "brush_stroke"}]
                     textRole: "text"; valueRole: "value"
                     font.family: Theme.fontFamily
                     font.pixelSize: 12
@@ -429,7 +499,7 @@ Rectangle {
                     currentIndex: Math.max(0, model.findIndex(function(item) {
                         return item.value === String(root.cue.background_style || "solid")
                     }))
-                    onActivated: root.applyCurrent({"backgroundStyle": currentValue})
+                    onActivated: root.chooseBackground(currentValue)
                 }
 
                 Text { text: "Nền ngang (%)"; color: Theme.textSecondary; font.family: Theme.fontFamily; font.pixelSize: 11 }
@@ -471,7 +541,7 @@ Rectangle {
                 }
                 Text { text: "Tùy chọn"; color: Theme.textSecondary; font.family: Theme.fontFamily; font.pixelSize: 11 }
                 RowLayout {
-                    TextAction { text: "Bỏ nền"; compact: true; tooltipText: "Bỏ màu nền của các cue đang chọn."; onClicked: root.applyCurrent({"backgroundColor": ""});  }
+                    TextAction { objectName: "removeCueBackgroundButton"; text: "Bỏ nền"; compact: true; tooltipText: "Tắt nền và blur tự động của các câu đang chọn."; onClicked: root.chooseBackground("none"); }
                     TextAction { text: "Mực tàu"; compact: true; tooltipText: "Áp dụng kiểu chữ và nền mực tàu cho các cue đang chọn."; onClicked: root.applyInkPreset();  }
                 }
             }

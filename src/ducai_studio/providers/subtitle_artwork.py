@@ -92,22 +92,54 @@ def path_from_drawing(drawing: str) -> QPainterPath:
     return path
 
 
-def _lines(text: str, metrics: QFontMetricsF, available: float, wrap: bool) -> list[str]:
-    result = []
-    for line in text.splitlines() or [text]:
-        if not wrap or len(line) < 70:
-            result.append(line)
+def _split_overlong_word(word: str, metrics: QFontMetricsF, available: float) -> list[str]:
+    """Keep every glyph when one word is wider than the requested line."""
+
+    chunks: list[str] = []
+    current = ""
+    for character in word:
+        candidate = current + character
+        if current and metrics.horizontalAdvance(candidate) > available + 1:
+            chunks.append(current)
+            current = character
+        else:
+            current = candidate
+    if current or not chunks:
+        chunks.append(current)
+    return chunks
+
+
+def _lines(text: str, metrics: QFontMetricsF, available: float) -> list[str]:
+    """Word-wrap at the selected font size while preserving explicit newlines."""
+
+    result: list[str] = []
+    for paragraph in text.split("\n"):
+        if not paragraph:
+            result.append("")
             continue
         current = ""
-        for word in line.split():
-            candidate = (current + " " + word).strip()
-            if current and metrics.horizontalAdvance(candidate) > available:
-                result.append(current)
-                current = word
-            else:
-                current = candidate
+        for word in paragraph.split():
+            pieces = _split_overlong_word(word, metrics, available)
+            for index, piece in enumerate(pieces):
+                candidate = (current + " " + piece).strip()
+                if current and metrics.horizontalAdvance(candidate) > available + 1:
+                    result.append(current)
+                    current = piece
+                else:
+                    current = candidate
+                if index < len(pieces) - 1:
+                    result.append(current)
+                    current = ""
         result.append(current)
-    return result
+    return result or [""]
+
+
+def _columns(text: str, metrics: QFontMetricsF, available: float) -> list[list[str]]:
+    """Flow vertical text into additional columns without changing font size."""
+
+    rows = text.split("\n") or [text]
+    rows_per_column = max(1, int(available // max(1.0, metrics.lineSpacing())))
+    return [rows[index : index + rows_per_column] for index in range(0, len(rows), rows_per_column)]
 
 
 def _readable_color(foreground: str, background: str, opacity: int) -> str:
@@ -134,6 +166,7 @@ def layout_json(payload_json: str, include_paths: bool = True) -> dict:
     scene = payload["kind"] == "scene"
     cue = RenderSceneText(**payload["cue"]) if scene else RenderSubtitle(**payload["cue"])
     style = SubtitleStyle(**payload["style"])
+    anchored = not scene and cue.panel_x < 0 and cue.text_anchor is not None
     if scene or cue.panel_x >= 0:
         panel = (
             cue.panel_x * width,
@@ -142,7 +175,8 @@ def layout_json(payload_json: str, include_paths: bool = True) -> dict:
             cue.panel_height * height,
         )
     else:
-        panel = (40, 0, max(1, width - 80), max(1, height - style.margin_bottom))
+        panel = (40, 0, max(1, width - 80),
+                 max(1, height if anchored else height - style.margin_bottom))
     font = QFont(cue.font_family or style.font_family)
     font.setPixelSize(max(1, cue.font_size or style.font_size))
     font.setWeight(
@@ -155,58 +189,116 @@ def layout_json(payload_json: str, include_paths: bool = True) -> dict:
         QFont.SpacingType.AbsoluteSpacing, font.pixelSize() * cue.letter_spacing_percent / 100
     )
     outline = 1 if scene else style.outline_width
-    # A short sentence stays on one line. Longer dialogue may wrap; both are
-    # measured and fitted to the final placement area before concealment.
-    while True:
-        metrics = QFontMetricsF(font)
-        pad_x = font.pixelSize() * cue.background_padding_x / 100
-        pad_y = font.pixelSize() * cue.background_padding_y / 100
-        if not scene and style.background_mode == "legacy":
-            pad_x = max(pad_x, width * 0.012, font.pixelSize() * 0.4)
-            pad_y = max(pad_y, height * 0.008, font.pixelSize() * 0.25)
-        lines = _lines(cue.text, metrics, max(1, panel[2] - 2 * (outline + pad_x)), not scene)
-        text_width = max(metrics.horizontalAdvance(line) for line in lines)
-        text_height = metrics.lineSpacing() * len(lines)
+    metrics = QFontMetricsF(font)
+    pad_x = font.pixelSize() * cue.background_padding_x / 100
+    pad_y = font.pixelSize() * cue.background_padding_y / 100
+    if not scene and style.background_mode == "legacy":
+        pad_x = max(pad_x, width * 0.012, font.pixelSize() * 0.4)
+        pad_y = max(pad_y, height * 0.008, font.pixelSize() * 0.25)
+    available_width = max(1, panel[2] - 2 * (outline + pad_x))
+    available_height = max(1, panel[3] - 2 * (outline + pad_y))
+    columns = _columns(cue.text, metrics, available_height) if cue.orientation == "vertical" else []
+    lines = _lines(cue.text, metrics, available_width) if not columns else []
+    column_gap = max(1.0, font.pixelSize() * 0.2)
+    column_widths = [
+        max((metrics.horizontalAdvance(line) for line in column), default=0.0)
+        for column in columns
+    ]
+    if columns:
+        panel_flow_width = sum(column_widths) + column_gap * max(0, len(columns) - 1)
+        frame_height = max(1, height - 2 * (outline + pad_y))
+        if panel_flow_width + 2 * (outline + pad_x) > width and frame_height > available_height:
+            columns = _columns(cue.text, metrics, frame_height)
+            column_widths = [
+                max((metrics.horizontalAdvance(line) for line in column), default=0.0)
+                for column in columns
+            ]
+    else:
+        frame_width = max(1, width - 2 * (outline + pad_x))
         if (
-            scene
-            or font.pixelSize() <= 1
-            or (
-                text_width + 2 * (outline + pad_x) <= panel[2] + 0.001
-                and text_height + 2 * (outline + pad_y) <= panel[3] + 0.001
-            )
+            metrics.lineSpacing() * len(lines) + 2 * (outline + pad_y) > height
+            and frame_width > available_width
         ):
-            break
-        font.setPixelSize(font.pixelSize() - 1)
-        font.setLetterSpacing(
-            QFont.SpacingType.AbsoluteSpacing, font.pixelSize() * cue.letter_spacing_percent / 100
-        )
+            lines = _lines(cue.text, metrics, frame_width)
+    text_width = (
+        sum(column_widths) + column_gap * max(0, len(columns) - 1)
+        if columns
+        else max(metrics.horizontalAdvance(line) for line in lines)
+    )
+    text_height = (
+        max((metrics.lineSpacing() * len(column) for column in columns), default=0.0)
+        if columns
+        else metrics.lineSpacing() * len(lines)
+    )
     path = QPainterPath()
     path.setFillRule(Qt.FillRule.WindingFill)
-    centered = scene or cue.panel_x >= 0
+    centered = scene or cue.panel_x >= 0 or anchored
     top = (
         panel[1] + (panel[3] - text_height) / 2
         if centered
         else panel[1] + panel[3] - text_height - outline - pad_y
     )
-    line_bounds = QRectF()
-    for index, line in enumerate(lines):
-        line_width = metrics.horizontalAdvance(line)
-        alignment = 2 if scene else style.alignment
-        x = panel[0] + (panel[2] - line_width) / 2
-        if alignment == 1:
-            x = panel[0] + outline + pad_x
-        elif alignment == 3:
-            x = panel[0] + panel[2] - line_width - outline - pad_x
-        line_bounds = line_bounds.united(
-            QRectF(x, top + index * metrics.lineSpacing(), line_width, metrics.lineSpacing())
+    if text_height + 2 * (outline + pad_y) <= height:
+        top = max(
+            outline + pad_y,
+            min(height - text_height - outline - pad_y, top),
         )
-        if include_paths:
-            path.addText(
-                QPointF(x, top + metrics.ascent() + index * metrics.lineSpacing()), font, line
+    line_bounds = QRectF()
+    if columns:
+        left = panel[0] + (panel[2] - text_width) / 2
+        if text_width + 2 * (outline + pad_x) <= width:
+            left = max(outline + pad_x, min(width - text_width - outline - pad_x, left))
+        for column, column_width in zip(columns, column_widths, strict=True):
+            column_top = panel[1] + (panel[3] - metrics.lineSpacing() * len(column)) / 2
+            if metrics.lineSpacing() * len(column) + 2 * (outline + pad_y) <= height:
+                column_top = max(
+                    outline + pad_y,
+                    min(
+                        height - metrics.lineSpacing() * len(column) - outline - pad_y,
+                        column_top,
+                    ),
+                )
+            for index, line in enumerate(column):
+                line_width = metrics.horizontalAdvance(line)
+                x = left + (column_width - line_width) / 2
+                y = column_top + index * metrics.lineSpacing()
+                line_bounds = line_bounds.united(
+                    QRectF(x, y, line_width, metrics.lineSpacing())
+                )
+                if include_paths:
+                    path.addText(QPointF(x, y + metrics.ascent()), font, line)
+            left += column_width + column_gap
+    else:
+        for index, line in enumerate(lines):
+            line_width = metrics.horizontalAdvance(line)
+            alignment = 2 if scene else style.alignment
+            x = panel[0] + (panel[2] - line_width) / 2
+            if alignment == 1:
+                x = panel[0] + outline + pad_x
+            elif alignment == 3:
+                x = panel[0] + panel[2] - line_width - outline - pad_x
+            if line_width + 2 * (outline + pad_x) <= width:
+                x = max(outline + pad_x, min(width - line_width - outline - pad_x, x))
+            line_bounds = line_bounds.united(
+                QRectF(x, top + index * metrics.lineSpacing(), line_width, metrics.lineSpacing())
             )
+            if include_paths:
+                path.addText(
+                    QPointF(x, top + metrics.ascent() + index * metrics.lineSpacing()), font, line
+                )
     placement = line_bounds.adjusted(
         -outline - pad_x, -outline - pad_y, outline + pad_x, outline + pad_y
     )
+    if anchored:
+        # The OCR rectangle supplies a centre, never a font/line-width limit.
+        # Only move off an edge when the finished label would leave the frame.
+        dx = cue.text_anchor[0] * width - placement.center().x()
+        dy = cue.text_anchor[1] * height - placement.center().y()
+        dx = max(-placement.left(), min(width - placement.right(), dx))
+        dy = max(-placement.top(), min(height - placement.bottom(), dy))
+        placement.translate(dx, dy)
+        line_bounds.translate(dx, dy)
+        path.translate(dx, dy)
     if not include_paths:
         return {
             "placement_rect": [placement.x(), placement.y(), placement.width(), placement.height()],
@@ -222,7 +314,9 @@ def layout_json(payload_json: str, include_paths: bool = True) -> dict:
     background = QPainterPath()
     background_color = cue.background_color
     background_opacity = cue.background_opacity_percent
-    if not scene:
+    if cue.background_style in {"none", "blur"}:
+        background_color = ""
+    elif not scene:
         if not style.background_enabled or style.background_mode == "blur":
             background_color = ""
         elif style.background_mode == "black":
@@ -281,7 +375,7 @@ def layout_json(payload_json: str, include_paths: bool = True) -> dict:
         "background_rect": background_coordinates,
         "concealment_rect": (
             background_coordinates
-            if not scene
+            if not scene or cue.background_style == "blur"
             else [bounds.x(), bounds.y(), bounds.width(), bounds.height()]
         ),
         "font_size": font.pixelSize(),
@@ -315,6 +409,7 @@ def editor_payload(cue: dict, width: int, height: int, style: SubtitleStyle) -> 
             "orientation",
             "style_hint",
             "panel_box",
+            "text_anchor",
             "background_color",
             "text_color",
             "review_state",
@@ -374,6 +469,8 @@ def editor_payload(cue: dict, width: int, height: int, style: SubtitleStyle) -> 
             domain_cue.background_opacity_percent,
             domain_cue.background_padding_x,
             domain_cue.background_padding_y,
+            text_anchor=domain_cue.text_anchor,
+            background_style=domain_cue.background_style,
         )
     return artwork_payload(rendered, width, height, style)
 

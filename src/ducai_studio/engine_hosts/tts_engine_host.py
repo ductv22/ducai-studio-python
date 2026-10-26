@@ -6,7 +6,11 @@ import contextlib
 import hashlib
 import importlib.metadata
 import json
+import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import wave
 from pathlib import Path
 
@@ -18,6 +22,46 @@ def _wav_info(path):
         sample_rate = stream.getframerate()
         frames = stream.getnframes()
     return sample_rate, int(round(frames * 1_000_000 / sample_rate))
+
+
+@contextlib.contextmanager
+def _enrollment_reference(reference):
+    """VieNeu reads PCM WAV; compressed inputs need decoding before enrollment."""
+    native_pcm = False
+    try:
+        with wave.open(str(reference), "rb") as stream:
+            native_pcm = stream.getnframes() > 0 and stream.getcomptype() == "NONE"
+    except (wave.Error, EOFError):
+        pass
+    if native_pcm:
+        yield reference
+        return
+    executable = shutil.which("ffmpeg")
+    if not executable:
+        raise ValueError("vieneu_reference_decoder_missing")
+    with tempfile.TemporaryDirectory(prefix="ducai-reference-") as directory:
+        decoded = Path(directory) / "reference.wav"
+        try:
+            result = subprocess.run(
+                [executable, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                 "-i", str(reference), "-map", "0:a:0", "-vn", "-ac", "1",
+                 "-c:a", "pcm_s16le", str(decoded)],
+                capture_output=True, timeout=120, check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ValueError("vieneu_reference_decode_timeout") from exc
+        except OSError as exc:
+            raise ValueError("vieneu_reference_decoder_missing") from exc
+        if result.returncode != 0 or not decoded.is_file():
+            raise ValueError("vieneu_reference_decode_failed")
+        try:
+            _sample_rate, duration_us = _wav_info(decoded)
+        except (wave.Error, EOFError) as exc:
+            raise ValueError("vieneu_reference_decode_failed") from exc
+        if duration_us <= 0:
+            raise ValueError("vieneu_reference_decode_failed")
+        yield decoded
 
 
 def _profile_receipt(path):
@@ -156,9 +200,9 @@ class TtsEngineHost:
         reference = Path(payload["reference_audio_path"]).expanduser().resolve(strict=True)
         output = Path(payload["profile_path"]).expanduser().resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
-        with contextlib.redirect_stdout(sys.stderr):
+        with _enrollment_reference(reference) as readable, contextlib.redirect_stdout(sys.stderr):
             speaker, codes = self.engine.encode_reference(
-                reference, denoise=payload.get("denoise") is True
+                readable, denoise=payload.get("denoise") is True
             )
         speaker = np.asarray(speaker, dtype=np.float32).reshape(-1)
         codes = np.asarray(codes, dtype=np.int64)

@@ -718,7 +718,7 @@ def materialize_export_chunk(
     for blur in active_subtitle_blurs:
         key = (blur.blur_radius, blur.concealment_mode == "cover")
         blur_groups.setdefault(key, []).append(blur)
-    for group_number, ((requested_radius, strong_blur), group) in enumerate(
+    for group_number, ((requested_radius, _strong_blur), group) in enumerate(
         sorted(blur_groups.items())
     ):
         base_label = f"vsubblur{group_number}base"
@@ -727,7 +727,7 @@ def materialize_export_chunk(
         radius = max(1, min(requested_radius, output_width // 2, output_height // 2))
         chroma_radius = max(1, min(6, radius // 2))
         blurred_label = f"vsubblur{group_number}full"
-        power = 2 if strong_blur else 1
+        power = 2
         graph.append(
             f"[{source_label}]boxblur=luma_radius={radius}:luma_power={power}:"
             f"chroma_radius={chroma_radius}:chroma_power={power}[{blurred_label}]"
@@ -745,6 +745,8 @@ def materialize_export_chunk(
                     height,
                     "#FFFFFF",
                     max(0, min(100, round(blur.opacity * 100))),
+                    fade_enabled=blur.fade_enabled,
+                    fade_duration_ms=blur.fade_duration_ms,
                 )
             )
         mask_path = work_dir / f"subtitle-mask-{index:05d}-{group_number:02d}.ass"
@@ -759,10 +761,13 @@ def materialize_export_chunk(
         mask_label = f"vsubblur{group_number}mask"
         graph.append(
             f"color=c=black:s={output_width}x{output_height}:r={snapshot.settings.fps}:"
-            f"d={duration_s},ass=filename='{mask_path.name}',format=gray[{mask_label}]"
+            f"d={duration_s},format=yuv420p,ass=filename='{mask_path.name}',"
+            f"scale=in_range=limited:out_range=full,format=gray[{mask_label}]"
         )
         next_label = f"vsubblur{group_number}out"
-        graph.append(f"[{base_label}][{blurred_label}][{mask_label}]maskedmerge[{next_label}]")
+        masked_label = f"vsubblur{group_number}alpha"
+        graph.append(f"[{blurred_label}][{mask_label}]alphamerge[{masked_label}]")
+        graph.append(f"[{base_label}][{masked_label}]overlay=shortest=1[{next_label}]")
         current_label = next_label
         covered = [blur for blur in group if blur.concealment_mode == "cover"]
         if covered:
@@ -836,10 +841,13 @@ def materialize_export_chunk(
         mask_label = f"vscene{group_number}mask"
         graph.append(
             f"color=c=black:s={output_width}x{output_height}:r={snapshot.settings.fps}:"
-            f"d={duration_s},ass=filename='{mask_path.name}',format=gray[{mask_label}]"
+            f"d={duration_s},format=yuv420p,ass=filename='{mask_path.name}',"
+            f"scale=in_range=limited:out_range=full,format=gray[{mask_label}]"
         )
         next_label = f"vscene{group_number}merged"
-        graph.append(f"[{base_label}][{blurred_label}][{mask_label}]maskedmerge[{next_label}]")
+        masked_label = f"vscene{group_number}alpha"
+        graph.append(f"[{blurred_label}][{mask_label}]alphamerge[{masked_label}]")
+        graph.append(f"[{base_label}][{masked_label}]overlay=shortest=1[{next_label}]")
         current_label = next_label
         fill_rectangles: list[_AssRectangle] = []
         for cue in group:
@@ -1667,6 +1675,15 @@ class _AssRectangle:
     height: int
     color: str
     opacity_percent: int
+    fade_enabled: bool = False
+    fade_duration_ms: int = 300
+
+
+def _ass_cue_fade(cue, chunk_start_us: int, chunk_end_us: int) -> str:
+    fade_ms = min(cue.fade_duration_ms, max(0, (cue.end_us - cue.start_us) // 2_000))
+    fade_in = fade_ms if cue.start_us >= chunk_start_us else 0
+    fade_out = fade_ms if cue.end_us <= chunk_end_us else 0
+    return f"\\fad({fade_in},{fade_out})" if fade_in or fade_out else ""
 
 
 def _write_rectangle_ass(
@@ -1712,6 +1729,8 @@ def _write_rectangle_ass(
             r"{\an7\pos(0,0)\p1\bord0\shad0"
             + _ass_primary_override(rectangle.color)
             + _ass_alpha_override(rectangle.opacity_percent)
+            + (_ass_cue_fade(rectangle, chunk_start_us, chunk_end_us)
+               if rectangle.fade_enabled else "")
             + "}"
         )
         lines.append(
@@ -1752,7 +1771,7 @@ def _write_ass(
                 {
                     (cue.background_color, cue.background_opacity_percent)
                     for cue in cues
-                    if cue.background_color
+                    if cue.background_color and cue.background_style not in {"none", "blur"}
                 }
             ),
             start=1,
@@ -1866,9 +1885,11 @@ def _write_ass(
         override_values.append(r"\b1" if cue.font_bold else r"\b0")
         override_values.append(r"\i1" if cue.font_italic else r"\i0")
         override_values.append(_ass_alpha_override(cue.text_opacity_percent))
-        if cue.panel_x >= 0:
-            position_x = round((cue.panel_x + cue.panel_width / 2) * width)
-            position_y = round((cue.panel_y + cue.panel_height / 2) * height)
+        if cue.panel_x >= 0 or cue.text_anchor is not None:
+            center = ((cue.panel_x + cue.panel_width / 2, cue.panel_y + cue.panel_height / 2)
+                      if cue.panel_x >= 0 else cue.text_anchor)
+            position_x = round(center[0] * width)
+            position_y = round(center[1] * height)
             override_values.extend(
                 (
                     r"\an5\q2",

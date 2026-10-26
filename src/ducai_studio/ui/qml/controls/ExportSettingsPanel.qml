@@ -67,13 +67,6 @@ ScrollView {
         )
     }
 
-    ColorDialog {
-        id: effectsSubtitleOutlineColorDialog
-        title: "Chọn màu viền phụ đề"
-        onAccepted: root.appModel.setExportSubtitleOutlineColor(
-            selectedColor.toString()
-        )
-    }
 
 
     function overlayNumber(overlay, key, fallback) {
@@ -197,6 +190,13 @@ ColumnLayout {
         onClicked: root.appModel.setExportOverwrite(checked)
         Accessible.name: text
     }
+    DsButton {
+        objectName: "openExportFolderFromTimelineButton"
+        Layout.fillWidth: true
+        text: "Mở thư mục video đã xuất"
+        visible: root.appModel.canOpenExportFolder
+        onClicked: root.appModel.openExportFolder()
+    }
 
     Rectangle {
         Layout.fillWidth: true
@@ -204,23 +204,6 @@ ColumnLayout {
         color: Theme.borderSubtle
     }
     SectionTitle { id: effectsSubtitleTitle; text: "Phụ đề Việt" }
-    CheckBox {
-        objectName: "subtitleBackgroundToggle"
-        text: "Bật nền phụ đề"
-        checked: root.appModel.exportSubtitleBackgroundEnabled
-        onClicked: root.appModel.setExportSubtitleBackgroundEnabled(checked)
-        Accessible.name: text
-    }
-    ComboBox {
-        objectName: "subtitleBackgroundMode"
-        Layout.fillWidth: true
-        model: ["Nền đen", "Nền blur/mờ"]
-        palette.dark: Theme.textSecondary
-        currentIndex: root.appModel.exportSubtitleBackgroundMode === "blur" ? 1 : 0
-        enabled: root.appModel.exportSubtitleBackgroundEnabled
-        onActivated: root.appModel.setExportSubtitleBackgroundMode(currentIndex === 1 ? "blur" : "black")
-        Accessible.name: "Kiểu nền phụ đề"
-    }
     CheckBox {
         text: "Đóng cứng phụ đề vào video"
         checked: root.appModel.exportSubtitleEnabled
@@ -258,25 +241,6 @@ ColumnLayout {
                     = root.appModel.exportSubtitlePrimaryColor
                 effectsSubtitleTextColorDialog.open()
             }
-        }
-        Text { text: "Màu viền"; color: Theme.textSecondary; font.family: Theme.fontFamily; font.pixelSize: 11 }
-        DsButton {
-            Layout.fillWidth: true
-            compact: true
-            text: root.appModel.exportSubtitleOutlineColor
-            onClicked: {
-                effectsSubtitleOutlineColorDialog.selectedColor
-                    = root.appModel.exportSubtitleOutlineColor
-                effectsSubtitleOutlineColorDialog.open()
-            }
-        }
-        Text { text: "Độ dày viền"; color: Theme.textSecondary; font.family: Theme.fontFamily; font.pixelSize: 11 }
-        DsSpinBox {
-            Layout.fillWidth: true
-            accessibleName: "Độ dày viền phụ đề"
-            from: 0; to: 12
-            value: root.appModel.exportSubtitleOutlineWidth
-            onValueModified: root.appModel.setExportSubtitleOutlineWidth(value)
         }
         Text { text: "Độ mờ (%)"; color: Theme.textSecondary; font.family: Theme.fontFamily; font.pixelSize: 11 }
         DsSpinBox {

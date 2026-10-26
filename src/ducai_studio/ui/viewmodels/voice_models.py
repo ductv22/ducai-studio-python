@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from pathlib import Path
 
 from PySide6.QtCore import Property, QAbstractListModel, QModelIndex, QObject, Qt, Signal, Slot
 
@@ -154,7 +155,6 @@ class VoiceCatalogModel(QAbstractListModel):
             )
             piper_items.append(item)
         vieneu = VieNeuTtsProvider()
-        profile = vieneu.profile_path
         vieneu_ready = catalog.vieneu_runtime_installed()
         preset_items: list[dict] = []
         for entry in catalog.vieneu_presets(installed=vieneu_ready):
@@ -173,44 +173,72 @@ class VoiceCatalogModel(QAbstractListModel):
                 f"{entry.rights_label} • {state}"
             )
             preset_items.append(item)
-        profile_ready = profile.is_file() and profile.with_suffix(".json").is_file()
-        if vieneu_ready and profile_ready:
-            clone_summary = "VieNeu 3 Turbo 3.8.1 đã cài và có profile clone cục bộ"
-        elif vieneu_ready:
-            clone_summary = "VieNeu 3 Turbo 3.8.1 đã cài; hãy chọn file mẫu để tạo giọng clone"
-        else:
-            clone_summary = "Thiếu hoặc hỏng runtime VieNeu 3.8.1"
-        clone_item = {
-            "voice_id": profile.stem,
-            "provider_id": vieneu.provider_id,
-            "name": "Giọng clone của bạn",
-            "source": "VieNeu-TTS v3 Turbo 3.8.1",
-            "description": "Clone cục bộ chất lượng cao; CUDA Graph tăng tốc theo batch",
-            "rights_label": "Chỉ dùng khi bạn có quyền với giọng mẫu",
-            "rights_state": "permission_required",
-            "installed": vieneu_ready,
-            "recommended": False,
-            "summary": clone_summary,
-            "profile_path": str(profile),
-            "preset_name": "",
-            "preview_source": "",
-            "preview_text": "",
-            "preview_available": False,
-            "installable": False,
-            "install_state": "installed" if vieneu_ready else "runtime_missing",
-            "install_progress": 100 if vieneu_ready else 0,
-            "install_error": "",
-            "download_bytes": 0,
-            "download_files": (),
-            "is_clone": True,
-        }
-        items = [clone_item, *preset_items, *piper_items]
+        profiles = catalog.vieneu_profiles()
+        if not profiles:
+            profiles = (vieneu.profile_path,)
+        clone_items = [
+            self._clone_item(
+                profile,
+                provider_id=vieneu.provider_id,
+                runtime_ready=vieneu_ready,
+                position=index,
+                profile_count=len(profiles),
+            )
+            for index, profile in enumerate(profiles, 1)
+        ]
+        items = [*clone_items, *preset_items, *piper_items]
         if items == self._items:
             return
         self.beginResetModel()
         self._items = items
         self.endResetModel()
         self.countChanged.emit()
+
+    @staticmethod
+    def _clone_item(
+        profile: Path,
+        *,
+        provider_id: str,
+        runtime_ready: bool,
+        position: int,
+        profile_count: int,
+    ) -> dict:
+        profile_ready = profile.is_file() and profile.with_suffix(".json").is_file()
+        if runtime_ready and profile_ready:
+            summary = "VieNeu 3 Turbo 3.8.1 đã cài và có profile clone cục bộ"
+        elif runtime_ready:
+            summary = "VieNeu 3 Turbo 3.8.1 đã cài; hãy chọn file mẫu để tạo giọng clone"
+        else:
+            summary = "Thiếu hoặc hỏng runtime VieNeu 3.8.1"
+        name = (
+            "Giọng clone của bạn"
+            if profile_count == 1
+            else f"Giọng clone {position} · {profile.stem[:8]}"
+        )
+        return {
+            "voice_id": profile.stem,
+            "provider_id": provider_id,
+            "name": name,
+            "source": "VieNeu-TTS v3 Turbo 3.8.1",
+            "description": "Clone cục bộ chất lượng cao; CUDA Graph tăng tốc theo batch",
+            "rights_label": "Chỉ dùng khi bạn có quyền với giọng mẫu",
+            "rights_state": "permission_required",
+            "installed": runtime_ready,
+            "recommended": False,
+            "summary": summary,
+            "profile_path": str(profile.resolve()),
+            "preset_name": "",
+            "preview_source": "",
+            "preview_text": "Xin chào, đây là mẫu nghe thử giọng trong DUCAI Studio.",
+            "preview_available": False,
+            "installable": False,
+            "install_state": "installed" if runtime_ready else "runtime_missing",
+            "install_progress": 100 if runtime_ready else 0,
+            "install_error": "",
+            "download_bytes": 0,
+            "download_files": (),
+            "is_clone": True,
+        }
 
     def set_install_state(
         self,

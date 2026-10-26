@@ -101,6 +101,7 @@ def _dispatch_frozen_module(argv: list[str]) -> int | None:
         sys.argv = [sys.argv[0], *arguments]
         return target()
     worker_modules = {
+        "ducai_studio.workers.dialogue_casting_worker": "dialogue_casting",
         "ducai_studio.workers.translation_worker": "translation",
         "ducai_studio.workers.tts_worker": "tts",
         "ducai_studio.workers.export_worker": "export",
@@ -109,7 +110,9 @@ def _dispatch_frozen_module(argv: list[str]) -> int | None:
     if worker is None:
         return None
     sys.argv = [sys.argv[0], *arguments]
-    if worker == "translation":
+    if worker == "dialogue_casting":
+        from ducai_studio.workers.dialogue_casting_worker import main as target
+    elif worker == "translation":
         from ducai_studio.workers.translation_worker import main as target
     elif worker == "tts":
         from ducai_studio.workers.tts_worker import main as target

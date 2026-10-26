@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 
+from .dialogue_casting import DialogueCastingState
 from .timebase import SpeedRatio, TimeRange, TimeUs
 from .voice_conform import VoiceConformPlan
 
@@ -14,7 +15,15 @@ TRANSLATION_STYLE_PRESETS = frozenset(
 CUE_ROLES = frozenset({"dialogue", "scene_text", "title_text"})
 CUE_ORIENTATIONS = frozenset({"horizontal", "vertical"})
 CUE_BACKGROUND_STYLES = frozenset(
-    {"solid", "ink_splash", "ink_wash", "ink_cloud", "brush_stroke"}
+    {
+        "solid",
+        "none",
+        "blur",
+        "ink_splash",
+        "ink_wash",
+        "ink_cloud",
+        "brush_stroke",
+    }
 )
 CUE_STYLE_HINTS = frozenset(
     {
@@ -73,6 +82,18 @@ def grow_dialogue_panel_for_font(box, previous_size: int, next_size: int):
     return (max(0., min(1. - new_width, x + (width - new_width) / 2)),
             max(0., min(1. - new_height, y + (height - new_height) / 2)),
             new_width, new_height)
+
+
+def normalized_text_anchor(value: object) -> tuple[float, float] | None:
+    """Validate a placement point independently of source crop or panel size."""
+    if value is None:
+        return None
+    if not isinstance(value, (tuple, list)) or len(value) != 2:
+        raise ValueError("Text anchor requires two normalized coordinates")
+    if not all(isinstance(item, (int, float)) and not isinstance(item, bool)
+               and math.isfinite(item) and 0 <= item <= 1 for item in value):
+        raise ValueError("Text anchor must stay inside the frame")
+    return float(value[0]), float(value[1])
 
 
 class MediaKind(StrEnum):
@@ -171,6 +192,9 @@ class SubtitleCue:
     # Preview/Export clamp the requested fade to at most half the cue.
     fade_enabled: bool = False
     fade_duration_ms: int = 300
+    # OCR supplies only a centre point for dialogue placement, not a fitting
+    # rectangle. An explicitly edited panel_box takes precedence over it.
+    text_anchor: tuple[float, float] | None = None
 
     def __post_init__(self) -> None:
         if not self.id.strip() or self.index <= 0:
@@ -183,6 +207,7 @@ class SubtitleCue:
             raise ValueError("Cue confidence must be between 0 and 1")
         _validate_normalized_box(self.visual_box, label="Cue visual box")
         _validate_normalized_box(self.panel_box, label="Cue panel box")
+        object.__setattr__(self, "text_anchor", normalized_text_anchor(self.text_anchor))
         if self.visual_box is not None:
             if self.visual_box_source not in {"ocr", "estimated"}:
                 raise ValueError("Cue visual box source must be OCR or estimated")
@@ -583,6 +608,7 @@ class ProjectSnapshot:
     # Editor-authored labels are not OCR/translation/TTS input. Keeping this
     # collection separate preserves channel/film titles across stage reruns.
     title_cues: tuple[SubtitleCue, ...] = ()
+    dialogue_casting: DialogueCastingState | None = None
 
     def __post_init__(self) -> None:
         if not self.id.strip() or not self.name.strip():
