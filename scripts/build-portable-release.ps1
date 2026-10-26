@@ -211,7 +211,10 @@ New-Item -ItemType Directory -Path $portableRoot -Force | Out-Null
 Copy-Tree $releaseRoot $portableRoot -KeepBytecode `
     -ExtraExcluded @("src", "DUCAI_STUDIO_DATA") `
     -ExtraExcludedFiles @("*.py", "*.pyw", "*.whl", "*.pem", "*.key", ".env", ".env.*", "manifest.json")
-foreach ($hostName in @("ocr_engine_host", "tts_engine_host", "whisper_engine_host")) {
+foreach ($hostName in @(
+    "ocr_engine_host", "tts_engine_host", "whisper_engine_host",
+    "dialogue_casting_engine_host"
+)) {
     if (-not (Test-Path -LiteralPath (Join-Path $portableRoot "engine_hosts\$hostName.pyc"))) {
         throw "Thiếu engine host đã biên dịch: $hostName.pyc"
     }

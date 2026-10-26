@@ -1,0 +1,77 @@
+{
+  "schema": "ducai-dialogue-casting-model-lock-v1",
+  "sample_rate": 16000,
+  "label_order": ["female", "male"],
+  "artifacts": [
+    {
+      "id": "segmentation",
+      "filename": "pyannote.tar.bz2",
+      "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2",
+      "size": 6958444,
+      "sha256": "24615ee884c897d9d2ba09bb4d30da6bb1b15e685065962db5b02e76e4996488",
+      "license": "MIT",
+      "license_source": "https://huggingface.co/pyannote/segmentation-3.0",
+      "members": [
+        {
+          "member": "sherpa-onnx-pyannote-segmentation-3-0/model.int8.onnx",
+          "path": "segmentation/model.int8.onnx",
+          "size": 1540506,
+          "sha256": "d582f4b4c6b48205de7e0643c57df0df5615a3c176189be3fc461e9d18827b5d"
+        },
+        {
+          "member": "sherpa-onnx-pyannote-segmentation-3-0/LICENSE",
+          "path": "licenses/pyannote-MIT.txt",
+          "size": 1061,
+          "sha256": "14d7016ad68e7394d6e6b78d96cc2ae431c905287b89674cfdf021e79e62b8ba"
+        }
+      ]
+    },
+    {
+      "id": "embedding",
+      "filename": "embedding.onnx",
+      "path": "embedding/eres2net.onnx",
+      "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx",
+      "size": 39593761,
+      "sha256": "1a331345f04805badbb495c775a6ddffcdd1a732567d5ec8b3d5749e3c7a5e4b",
+      "license": "Apache-2.0",
+      "license_source": "https://modelscope.cn/models/iic/speech_eres2net_base_sv_zh-cn_3dspeaker_16k",
+      "upstream_revision": "v1.0.1"
+    },
+    {
+      "id": "gender",
+      "filename": "gender-quantized.onnx",
+      "path": "gender/model_quantized.onnx",
+      "url": "https://huggingface.co/Xenova/wav2vec2-large-xlsr-53-gender-recognition-librispeech/resolve/6bea1eddcfca9842add425123f4955d5b4f153f7/onnx/model_quantized.onnx",
+      "size": 318834205,
+      "sha256": "fe0839b5193b48df82fc7e6f16325999a61a80dba960dfd4716ff3497e093a01",
+      "license": "Apache-2.0",
+      "license_source": "https://huggingface.co/alefiury/wav2vec2-large-xlsr-53-gender-recognition-librispeech",
+      "revision": "6bea1eddcfca9842add425123f4955d5b4f153f7",
+      "license_note": "Derived ONNX conversion identifies alefiury as upstream; the original model card declares Apache-2.0. Xenova does not supply a separate license file."
+    },
+    {
+      "id": "gender-config",
+      "filename": "gender-config.json",
+      "path": "gender/config.json",
+      "url": "https://huggingface.co/Xenova/wav2vec2-large-xlsr-53-gender-recognition-librispeech/resolve/6bea1eddcfca9842add425123f4955d5b4f153f7/config.json",
+      "size": 2227,
+      "sha256": "f333147e7bf2fc413216d68bb2883062f526638e5d44213313127f8267da5fa0"
+    },
+    {
+      "id": "gender-preprocessor",
+      "filename": "gender-preprocessor.json",
+      "path": "gender/preprocessor_config.json",
+      "url": "https://huggingface.co/Xenova/wav2vec2-large-xlsr-53-gender-recognition-librispeech/resolve/6bea1eddcfca9842add425123f4955d5b4f153f7/preprocessor_config.json",
+      "size": 212,
+      "sha256": "a2254a5b58f72cd4de3632f8eee64f3f098b7c1402128d2f419e7d00ae13e335"
+    },
+    {
+      "id": "embedding-model-card",
+      "filename": "embedding-model-card.md",
+      "path": "licenses/embedding-model-card.md",
+      "url": "https://modelscope.cn/api/v1/models/iic/speech_eres2net_base_sv_zh-cn_3dspeaker_16k/repo?Revision=v1.0.1&FilePath=README.md",
+      "size": 6021,
+      "sha256": "05efb9d9b31433be92260e3811c929b4d5980dd18889220b37dbcd5b973ff6f8"
+    }
+  ]
+}

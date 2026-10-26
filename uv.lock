@@ -99,7 +99,7 @@ wheels = [
 
 [[package]]
 name = "ducai-studio"
-version = "2.0.0a156"
+version = "2.0.0a164"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },

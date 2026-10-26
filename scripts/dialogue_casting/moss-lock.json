@@ -1,0 +1,196 @@
+{
+  "schema": "ducai-moss-runtime-v1",
+  "model_id": "OpenMOSS-Team/MOSS-Transcribe-Diarize",
+  "model_revision": "704aa4a9c304e8520be88901e0d1960158ef5b15",
+  "source_revision": "79c675f0670cc2f824bcbcdd98263704f40f1f7e",
+  "license": "Apache-2.0",
+  "runtime": {
+    "torch": "2.8.0+cu128",
+    "transformers": "5.20.2",
+    "numpy": "2.5.4"
+  },
+  "model_files": [
+    {
+      "path": "README.md",
+      "size": 13985,
+      "sha256": "0d87aefa6a5cbe31b4d93ebe7942fe2480722923675623e4504ce4148f695bfb",
+      "url": "https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize/resolve/704aa4a9c304e8520be88901e0d1960158ef5b15/README.md"
+    },
+    {
+      "path": "added_tokens.json",
+      "size": 707,
+      "sha256": "c0284b582e14987fbd3d5a2cb2bd139084371ed9acbae488829a1c900833c680",
+      "url": "https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize/resolve/704aa4a9c304e8520be88901e0d1960158ef5b15/added_tokens.json"
+    },
+    {
+      "path": "chat_template.jinja",
+      "size": 4762,
+      "sha256": "8641466a16b184ebaf7c4903391e607cfd532ab937e81a64120628ab79d827f4",
+      "url": "https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize/resolve/704aa4a9c304e8520be88901e0d1960158ef5b15/chat_template.jinja"
+    },
+    {
+      "path": "config.json",
+      "size": 2335,
+      "sha256": "2b2b7a6e61334152bdd7ecf8a4da3073b4940a097e193d1d2b22093e77535234",
+      "url": "https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize/resolve/704aa4a9c304e8520be88901e0d1960158ef5b15/config.json"
+    },
+    {
+      "path": "configuration_moss_transcribe_diarize.py",
+      "size": 2663,
+      "sha256": "b4d12b0f4609af69b61c2fe3aa5fbaf476af22278369e4540745bc47d1d37892",
+      "url": "https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize/resolve/704aa4a9c304e8520be88901e0d1960158ef5b15/configuration_moss_transcribe_diarize.py"
+    },
+    {
+      "path": "generation_config.json",
+      "size": 107,
+      "sha256": "e53a4b3ce4f944230cf1ca8fed0c42f4ff0d8c1443eaf98b5315d987334dd9e4",
+      "url": "https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize/resolve/704aa4a9c304e8520be88901e0d1960158ef5b15/generation_config.json"
+    },
+    {
+      "path": "merges.txt",
+      "size": 1671853,
+      "sha256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5",
+      "url": "https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize/resolve/704aa4a9c304e8520be88901e0d1960158ef5b15/merges.txt"
+    },
+    {
+      "path": "model-00000-of-00001.safetensors",
+      "size": 1817113576,
+      "sha256": "9a0ceb4ab7330357db3ff583dba8d83625d5b733b00e1d55d6970e11b07026c4",
+      "url": "https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize/resolve/704aa4a9c304e8520be88901e0d1960158ef5b15/model-00000-of-00001.safetensors"
+    },
+    {
+      "path": "model.safetensors.index.json",
+      "size": 65401,
+      "sha256": "0345ac5d8f360abe4e9adadb5fecd38e7730052b75f64bb58182818b1544cc36",
+      "url": "https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize/resolve/704aa4a9c304e8520be88901e0d1960158ef5b15/model.safetensors.index.json"
+    },
+    {
+      "path": "modeling_moss_transcribe_diarize.py",
+      "size": 15101,
+      "sha256": "a01da90fe1f7cb88942b8c56f443e7b4ecd307ed4b4c356ac08d7503dd7422c1",
+      "url": "https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize/resolve/704aa4a9c304e8520be88901e0d1960158ef5b15/modeling_moss_transcribe_diarize.py"
+    },
+    {
+      "path": "preprocessor_config.json",
+      "size": 315,
+      "sha256": "ba2e601484abc80f4cded977f9a4fd4a53175b7d35c2f2511f0cfc3a32ad2499",
+      "url": "https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize/resolve/704aa4a9c304e8520be88901e0d1960158ef5b15/preprocessor_config.json"
+    },
+    {
+      "path": "processing_moss_transcribe_diarize.py",
+      "size": 10975,
+      "sha256": "6f228d22d9379e2f6a6830b18ce7336b22da8267547e96e65545d871d7f48766",
+      "url": "https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize/resolve/704aa4a9c304e8520be88901e0d1960158ef5b15/processing_moss_transcribe_diarize.py"
+    },
+    {
+      "path": "processor_config.json",
+      "size": 292,
+      "sha256": "a978c2dd54a65b576c3dae4b654fe9bcbac1184c6db2df0afb2c90fcdc872ae7",
+      "url": "https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize/resolve/704aa4a9c304e8520be88901e0d1960158ef5b15/processor_config.json"
+    },
+    {
+      "path": "special_tokens_map.json",
+      "size": 613,
+      "sha256": "76862e765266b85aa9459767e33cbaf13970f327a0e88d1c65846c2ddd3a1ecd",
+      "url": "https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize/resolve/704aa4a9c304e8520be88901e0d1960158ef5b15/special_tokens_map.json"
+    },
+    {
+      "path": "tokenizer.json",
+      "size": 11423222,
+      "sha256": "bcf03774334462d6e34b5005cb11120a62275f146ee2953e68731ecdbce84fbb",
+      "url": "https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize/resolve/704aa4a9c304e8520be88901e0d1960158ef5b15/tokenizer.json"
+    },
+    {
+      "path": "tokenizer_config.json",
+      "size": 503,
+      "sha256": "61d04c96104177240688396655ae3f7cf38ce2ea036db867a1d2b6883e27c3d5",
+      "url": "https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize/resolve/704aa4a9c304e8520be88901e0d1960158ef5b15/tokenizer_config.json"
+    },
+    {
+      "path": "vocab.json",
+      "size": 2776833,
+      "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+      "url": "https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize/resolve/704aa4a9c304e8520be88901e0d1960158ef5b15/vocab.json"
+    }
+  ],
+  "source_files": [
+    {
+      "path": "LICENSE",
+      "size": 11558,
+      "sha256": "1eb85fc97224598dad1852b5d6483bbcf0aa8608790dcc657a5a2a761ae9c8c6",
+      "url": "https://raw.githubusercontent.com/OpenMOSS/MOSS-Transcribe-Diarize/79c675f0670cc2f824bcbcdd98263704f40f1f7e/LICENSE"
+    },
+    {
+      "path": "moss_transcribe_diarize/__init__.py",
+      "size": 1340,
+      "sha256": "01f5cdc53e3588c2f3eef24f2be10992847829fe0cd79327c61dd9a548ede691",
+      "url": "https://raw.githubusercontent.com/OpenMOSS/MOSS-Transcribe-Diarize/79c675f0670cc2f824bcbcdd98263704f40f1f7e/moss_transcribe_diarize/__init__.py"
+    },
+    {
+      "path": "moss_transcribe_diarize/app/model_runner.py",
+      "size": 7061,
+      "sha256": "feaf28bf1fcb8e202daf1e2c100f90dd0367672528e4ebf7c3ee89bd00999794",
+      "url": "https://raw.githubusercontent.com/OpenMOSS/MOSS-Transcribe-Diarize/79c675f0670cc2f824bcbcdd98263704f40f1f7e/moss_transcribe_diarize/app/model_runner.py"
+    },
+    {
+      "path": "moss_transcribe_diarize/configuration_moss_transcribe_diarize.py",
+      "size": 2730,
+      "sha256": "d3d1a911c79d9b2b4a08e0456c5f5286dc6fb03f5869d46c384a02cb8e5dc906",
+      "url": "https://raw.githubusercontent.com/OpenMOSS/MOSS-Transcribe-Diarize/79c675f0670cc2f824bcbcdd98263704f40f1f7e/moss_transcribe_diarize/configuration_moss_transcribe_diarize.py"
+    },
+    {
+      "path": "moss_transcribe_diarize/inference_utils.py",
+      "size": 9026,
+      "sha256": "51266b42cb7eb44cdf6726e09c5ac5f72ac98aa8796ce1c7374c1047f54d9857",
+      "url": "https://raw.githubusercontent.com/OpenMOSS/MOSS-Transcribe-Diarize/79c675f0670cc2f824bcbcdd98263704f40f1f7e/moss_transcribe_diarize/inference_utils.py"
+    },
+    {
+      "path": "moss_transcribe_diarize/modeling_moss_transcribe_diarize.py",
+      "size": 15708,
+      "sha256": "77706c59b38e6d8542fbac87dcaae318e498706879074dc18eeef6addf4c5f7a",
+      "url": "https://raw.githubusercontent.com/OpenMOSS/MOSS-Transcribe-Diarize/79c675f0670cc2f824bcbcdd98263704f40f1f7e/moss_transcribe_diarize/modeling_moss_transcribe_diarize.py"
+    },
+    {
+      "path": "moss_transcribe_diarize/processing_moss_transcribe_diarize.py",
+      "size": 11328,
+      "sha256": "665bdf18b57766d940b8ee41fbe04d384599eb4512f2f99bf730a8c5943a4e71",
+      "url": "https://raw.githubusercontent.com/OpenMOSS/MOSS-Transcribe-Diarize/79c675f0670cc2f824bcbcdd98263704f40f1f7e/moss_transcribe_diarize/processing_moss_transcribe_diarize.py"
+    },
+    {
+      "path": "moss_transcribe_diarize/subtitle/__init__.py",
+      "size": 662,
+      "sha256": "242f44e794f44228b0214816129e975c5d2e3c26dd807bfe10042901b7895da4",
+      "url": "https://raw.githubusercontent.com/OpenMOSS/MOSS-Transcribe-Diarize/79c675f0670cc2f824bcbcdd98263704f40f1f7e/moss_transcribe_diarize/subtitle/__init__.py"
+    },
+    {
+      "path": "moss_transcribe_diarize/subtitle/export.py",
+      "size": 5254,
+      "sha256": "0196eec1fb50bce80a6a6b508f8cdab889cad8070750c56cf7ed515e606828dc",
+      "url": "https://raw.githubusercontent.com/OpenMOSS/MOSS-Transcribe-Diarize/79c675f0670cc2f824bcbcdd98263704f40f1f7e/moss_transcribe_diarize/subtitle/export.py"
+    },
+    {
+      "path": "moss_transcribe_diarize/subtitle/layout.py",
+      "size": 1123,
+      "sha256": "f2af4c6d017265e551009aa0d9c5ad719fc102e4fb276c8c458c3d69878d6be8",
+      "url": "https://raw.githubusercontent.com/OpenMOSS/MOSS-Transcribe-Diarize/79c675f0670cc2f824bcbcdd98263704f40f1f7e/moss_transcribe_diarize/subtitle/layout.py"
+    },
+    {
+      "path": "moss_transcribe_diarize/subtitle/models.py",
+      "size": 2239,
+      "sha256": "091911cae64c19cd4ee0f3c7736f10738de7abef5a891c9bbeefbc6b46a071dc",
+      "url": "https://raw.githubusercontent.com/OpenMOSS/MOSS-Transcribe-Diarize/79c675f0670cc2f824bcbcdd98263704f40f1f7e/moss_transcribe_diarize/subtitle/models.py"
+    },
+    {
+      "path": "moss_transcribe_diarize/subtitle/postprocess.py",
+      "size": 8365,
+      "sha256": "24a1c2213e22feb9617bf537dc62d6e332704d20fa853eabe8fba8171de18420",
+      "url": "https://raw.githubusercontent.com/OpenMOSS/MOSS-Transcribe-Diarize/79c675f0670cc2f824bcbcdd98263704f40f1f7e/moss_transcribe_diarize/subtitle/postprocess.py"
+    },
+    {
+      "path": "moss_transcribe_diarize/transcript_parser.py",
+      "size": 9157,
+      "sha256": "dbcfa66102937989660de586eda9343400dba263f6ad564e3c27549896020af6",
+      "url": "https://raw.githubusercontent.com/OpenMOSS/MOSS-Transcribe-Diarize/79c675f0670cc2f824bcbcdd98263704f40f1f7e/moss_transcribe_diarize/transcript_parser.py"
+    }
+  ]
+}

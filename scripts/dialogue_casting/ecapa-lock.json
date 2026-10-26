@@ -1,0 +1,17 @@
+{
+  "schema": "ducai-ecapa-experiment-lock-v1",
+  "model_id": "JaesungHuh/voice-gender-classifier",
+  "revision": "db1222153bd60337e900be22add7af180452adc0",
+  "code_revision": "49bcbecfd929ba5a043bde645fdff1a375eb79c7",
+  "license": "MIT",
+  "sample_rate": 16000,
+  "label_order": ["male", "female"],
+  "runtime": {"torch": "2.8.0+cu128", "torchaudio": "2.8.0+cu128", "safetensors": "0.8.0", "huggingface-hub": "0.36.2"},
+  "files": [
+    {"path": "model.safetensors", "size": 61907512, "sha256": "2d8e0be1fdf159d60d5087416e6f6277c5e30ce9e33a61c767a9a409e6c503c5", "url": "https://huggingface.co/JaesungHuh/voice-gender-classifier/resolve/db1222153bd60337e900be22add7af180452adc0/model.safetensors"},
+    {"path": "config.json", "size": 15, "sha256": "e7b95bff037d352af7822e2c2210a3304f38bb2c017c925388440478f334179a", "url": "https://huggingface.co/JaesungHuh/voice-gender-classifier/resolve/db1222153bd60337e900be22add7af180452adc0/config.json"},
+    {"path": "README.md", "size": 2357, "sha256": "606bc63dc3c489c82fe339e2b29027cd91c92bfbe7529fc6e99419c52048e631", "url": "https://huggingface.co/JaesungHuh/voice-gender-classifier/resolve/db1222153bd60337e900be22add7af180452adc0/README.md"},
+    {"path": "model.py", "size": 6160, "sha256": "fb9f21d3cd89977decc427b7d29bf02dccecef202ca8badeb7efdc44c59c24f9", "url": "https://raw.githubusercontent.com/JaesungHuh/voice-gender-classifier/49bcbecfd929ba5a043bde645fdff1a375eb79c7/model.py"},
+    {"path": "LICENSE", "size": 1067, "sha256": "c28e50e8399aae34896cbbf1947066828aea1853088e91f351477ed04f9986ce", "url": "https://raw.githubusercontent.com/JaesungHuh/voice-gender-classifier/49bcbecfd929ba5a043bde645fdff1a375eb79c7/LICENSE"}
+  ]
+}

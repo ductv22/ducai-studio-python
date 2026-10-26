@@ -1,5 +1,8 @@
 param(
     [string]$OutputRoot = "",
+    [string]$DataRoot = "",
+    [string]$DeploymentRoot = "",
+    [string]$BuildArtifactsRoot = "",
     [switch]$SkipTests,
     [switch]$Clean,
     [switch]$ReuseExistingDeployment
@@ -16,7 +19,23 @@ if (-not $OutputRoot) {
     $OutputRoot = Join-Path $projectRoot "..\..\outputs"
 }
 $outputRootPath = [IO.Path]::GetFullPath($OutputRoot)
+if (-not $DataRoot) {
+    $DataRoot = Join-Path $outputRootPath "DUCAI_STUDIO_DATA"
+}
+$dataRootPath = [IO.Path]::GetFullPath($DataRoot)
+if (-not $BuildArtifactsRoot) {
+    $BuildArtifactsRoot = Join-Path $projectRoot "dist"
+}
+$buildArtifactsRootPath = [IO.Path]::GetFullPath($BuildArtifactsRoot)
 $releaseRoot = Join-Path $outputRootPath "DUCAI-STUDIO-$version-win64"
+$customDeploymentRoot = -not [string]::IsNullOrWhiteSpace($DeploymentRoot)
+if ($customDeploymentRoot) {
+    $deploymentRoot = [IO.Path]::GetFullPath($DeploymentRoot)
+} else {
+    $deploymentRoot = Join-Path $projectRoot "deployment\DucaiStudio2.dist"
+}
+$deploymentIdentity = Join-Path $deploymentRoot "DUCAI_BUILD_VERSION"
+$temporaryDeployConfig = ""
 
 if (Test-Path -LiteralPath $releaseRoot) {
     if (-not $Clean) {
@@ -35,6 +54,14 @@ if (Test-Path -LiteralPath $releaseRoot) {
 
 Push-Location $projectRoot
 try {
+    if (-not (Test-Path -LiteralPath $dataRootPath -PathType Container)) {
+        throw "DUCAI_STUDIO_DATA is missing: $dataRootPath"
+    }
+    if ($customDeploymentRoot -and -not $ReuseExistingDeployment -and
+        (Test-Path -LiteralPath $deploymentRoot)) {
+        throw "Custom deployment target already exists; choose a new isolated path: $deploymentRoot"
+    }
+    New-Item -ItemType Directory -Path $buildArtifactsRootPath -Force | Out-Null
     & $python (Join-Path $PSScriptRoot "check-license-release.py")
     if ($LASTEXITCODE -ne 0) { throw "Licensing trust root validation failed." }
     if (-not $SkipTests) {
@@ -50,12 +77,10 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "QML lint gate failed." }
     }
 
-    Remove-Item -LiteralPath (Join-Path $projectRoot "dist\DucaiStudio2.exe") -Force -ErrorAction SilentlyContinue
-    uv build --wheel --out-dir (Join-Path $projectRoot "dist")
+    Remove-Item -LiteralPath (Join-Path $buildArtifactsRootPath "DucaiStudio2.exe") -Force -ErrorAction SilentlyContinue
+    uv build --wheel --out-dir $buildArtifactsRootPath
     if ($LASTEXITCODE -ne 0) { throw "Wheel build failed." }
 
-    $deploymentRoot = Join-Path $projectRoot "deployment\DucaiStudio2.dist"
-    $deploymentIdentity = Join-Path $deploymentRoot "DUCAI_BUILD_VERSION"
     $executablePath = ""
     if ($ReuseExistingDeployment) {
         if (
@@ -76,7 +101,32 @@ try {
         $env:PYTHONPATH = Join-Path $projectRoot "src"
         $env:NUITKA_ASSUME_YES_FOR_DOWNLOADS = "yes"
         $buildStartedUtc = [DateTime]::UtcNow
-        & $deploy -f --name DucaiStudio2 --mode standalone --nuitka-version 4.1.1 --extra-ignore-dirs DucaiStudio2.dist,deployment --extra-modules QtMultimedia,QtNetwork src/ducai_studio/__main__.py
+        $deployConfigArguments = @()
+        if ($customDeploymentRoot) {
+            $specPath = Join-Path $projectRoot "src\ducai_studio\pysidedeploy.spec"
+            $sourceProjectRoot = Join-Path $projectRoot "src\ducai_studio"
+            $deploymentParent = Split-Path -Path $deploymentRoot -Parent
+            $configText = Get-Content -LiteralPath $specPath -Raw
+            $configText = [regex]::Replace(
+                $configText,
+                '(?m)^project_dir\s*=\s*\.\s*$',
+                "project_dir = $sourceProjectRoot"
+            )
+            $configText = [regex]::Replace(
+                $configText,
+                '(?m)^exec_directory\s*=\s*deployment\s*$',
+                "exec_directory = $deploymentParent"
+            )
+            $temporaryDeployConfig = Join-Path ([IO.Path]::GetTempPath()) `
+                "ducai-pysidedeploy-$PID-$([guid]::NewGuid().ToString('N')).spec"
+            [IO.File]::WriteAllText(
+                $temporaryDeployConfig,
+                $configText,
+                [Text.UTF8Encoding]::new($false)
+            )
+            $deployConfigArguments = @("--config-file", $temporaryDeployConfig)
+        }
+        & $deploy -f --name DucaiStudio2 @deployConfigArguments --mode standalone --nuitka-version 4.1.1 --extra-ignore-dirs DucaiStudio2.dist,deployment --extra-modules QtMultimedia,QtNetwork src/ducai_studio/__main__.py
         if ($LASTEXITCODE -ne 0) { throw "pyside6-deploy failed." }
         if (-not (Test-Path -LiteralPath $deploymentRoot -PathType Container)) {
             throw "Deployment directory is missing after pyside6-deploy."
@@ -141,7 +191,7 @@ try {
         }
         Copy-Item -LiteralPath $runtimePath -Destination $releaseRoot -Force
     }
-    $wheel = Get-ChildItem (Join-Path $projectRoot "dist") -File -Filter "ducai_studio-*.whl" |
+    $wheel = Get-ChildItem $buildArtifactsRootPath -File -Filter "ducai_studio-*.whl" |
         Sort-Object LastWriteTime -Descending |
         Select-Object -First 1
     if ($null -eq $wheel) { throw "DUCAI STUDIO wheel was not found." }
@@ -184,7 +234,7 @@ try {
     }
     $engineHostRoot = Join-Path $releaseRoot "engine_hosts"
     New-Item -ItemType Directory -Path $engineHostRoot -Force | Out-Null
-    $sharedDataRoot = Join-Path $outputRootPath "DUCAI_STUDIO_DATA"
+    $sharedDataRoot = $dataRootPath
     $ocrRuntimePython = Join-Path $sharedDataRoot "paddle_runtime\.venv\Scripts\python.exe"
     if (-not (Test-Path -LiteralPath $ocrRuntimePython -PathType Leaf)) {
         throw "Paddle Python 3.11 is required to compile the public OCR host bytecode."
@@ -201,11 +251,61 @@ try {
     & $compileHost $ocrRuntimePython "ocr_engine_host"
     & $compileHost $python "whisper_engine_host"
     & $compileHost $python "tts_engine_host"
+    & $compileHost $python "dialogue_casting_engine_host"
+
+    $castingSourceRoot = Join-Path $projectRoot "scripts\dialogue_casting"
+    $castingPackageRoot = Join-Path $engineHostRoot "dialogue_casting"
+    New-Item -ItemType Directory -Path $castingPackageRoot -Force | Out-Null
+    foreach ($moduleName in @(
+        "__init__", "analysis", "assets", "cli", "corpus", "demo", "ecapa",
+        "evaluation", "inference", "srt_demo", "speaker_consistency", "asr_crosscheck", "moss"
+    )) {
+        $source = Join-Path $castingSourceRoot "$moduleName.py"
+        $target = Join-Path $castingPackageRoot "$moduleName.pyc"
+        & $python -c "import py_compile,sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], dfile='engine_hosts/dialogue_casting/'+sys.argv[3]+'.py', doraise=True)" $source $target $moduleName
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $target -PathType Leaf)) {
+            throw "Could not compile dialogue-casting module: $moduleName"
+        }
+    }
+    foreach ($runtimeFile in @(
+        "model-lock.json", "ecapa-lock.json", "requirements.txt", "moss-lock.json",
+        "moss-requirements.txt"
+    )) {
+        Copy-Item -LiteralPath (Join-Path $castingSourceRoot $runtimeFile) `
+            -Destination (Join-Path $castingPackageRoot $runtimeFile) -Force
+    }
+
+    # Ship one curated, executable setup surface. Python implementation and
+    # launchers remain compiled; only PowerShell setup entry points are source.
+    $installerRoot = Join-Path $releaseRoot "scripts"
+    $installerPackageRoot = Join-Path $installerRoot "dialogue_casting"
+    New-Item -ItemType Directory -Path $installerPackageRoot -Force | Out-Null
+    foreach ($setupFile in @(
+        "setup-dialogue-casting-runtime.ps1",
+        "setup-dialogue-casting-moss.ps1"
+    )) {
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot $setupFile) `
+            -Destination (Join-Path $installerRoot $setupFile) -Force
+    }
+    foreach ($launcher in @("dialogue-casting", "dialogue-casting-moss")) {
+        $source = Join-Path $PSScriptRoot "$launcher.py"
+        $target = Join-Path $installerRoot "$launcher.pyc"
+        & $python -c "import py_compile,sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], dfile='scripts/'+sys.argv[3]+'.py', doraise=True)" $source $target $launcher
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $target -PathType Leaf)) {
+            throw "Could not compile dialogue-casting installer launcher: $launcher"
+        }
+    }
+    Copy-Item -Path (Join-Path $castingPackageRoot "*") `
+        -Destination $installerPackageRoot -Recurse -Force
+    $uvSource = (Get-Command uv -ErrorAction Stop).Source
+    Copy-Item -LiteralPath $uvSource -Destination (Join-Path $installerRoot "uv.exe") -Force
 
     @"
 DUCAI_STUDIO_DATA stays outside the GUI package so models and caches can update independently.
 Set DUCAI_STUDIO_DATA_ROOT to move the shared data directory.
 Run Diagnostics in the app before producing the first video.
+Install or repair dialogue casting with:
+  powershell -ExecutionPolicy Bypass -File scripts\setup-dialogue-casting-runtime.ps1
 "@ | Set-Content -LiteralPath (Join-Path $releaseRoot "DUCAI_STUDIO_DATA.README.txt") -Encoding UTF8
 
     & $python (Join-Path $PSScriptRoot "check-license-release.py") --release $releaseRoot
@@ -231,6 +331,7 @@ Run Diagnostics in the app before producing the first video.
             "Whisper external runtime and optional large-v3 model",
             "Piper 1.6 runtime and ONNX voices",
             "VieNeu-TTS v3 Turbo 3.8.1 runtime and clone profiles",
+            "Experimental dialogue casting (external pinned runtimes and models required)",
             "FFmpeg/ffprobe",
             "Chrome or Edge for Gemini Web"
         )
@@ -240,5 +341,8 @@ Run Diagnostics in the app before producing the first video.
     Write-Output $releaseRoot
 }
 finally {
+    if ($temporaryDeployConfig -and (Test-Path -LiteralPath $temporaryDeployConfig)) {
+        Remove-Item -LiteralPath $temporaryDeployConfig -Force
+    }
     Pop-Location
 }

@@ -1,0 +1,7 @@
+torch==2.8.0+cu128
+torchaudio==2.8.0+cu128
+transformers==5.20.2
+numpy==2.5.4
+librosa==1.0.0
+soundfile==0.14.0
+safetensors==0.8.0

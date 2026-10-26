@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DUCAI — Nghe và gán nhãn</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#11151c;color:#edf0f7}
+body{max-width:900px;margin:auto;padding:30px 22px}h1{font-size:27px;margin-bottom:8px}
+p{line-height:1.6;color:#b9c4d5}section{background:#1b2330;border:1px solid #364155;border-radius:12px;padding:22px;margin:18px 0}
+input,select,button,textarea{font:inherit;border-radius:7px;border:1px solid #586981;background:#252f40;color:inherit;padding:10px}
+button{cursor:pointer}button:hover,button:focus-visible{border-color:#72aaff}button[aria-pressed=true]{background:#265db4;border-color:#8fbdff}
+button:disabled{opacity:.4;cursor:default}label{display:block;margin:12px 0}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+audio,textarea{width:100%;box-sizing:border-box;margin:12px 0}progress{width:100%;height:9px;accent-color:#81b0ff}
+small,#status{color:#a8b9d2}.labels button{min-width:120px;flex:1}.marker{color:#ffdf8b;font-weight:600}
+#message{min-height:1.5em;color:#ffd58a}#filmChecks label{line-height:1.5}a{color:#9bc3ff}
+</style></head><body>
+<h1>Nghe và gán nhãn thoại</h1>
+<p>Chọn theo <strong>chất giọng nghe được</strong>. Mỗi câu cần một nhãn độc lập.
+Nếu không rõ, giữ nhãn Không rõ. Trang này không hiển thị dự đoán của model.</p>
+<section>
+<label>Tên người nghe <input id="annotator" autocomplete="name" placeholder="Tên hoặc bí danh"></label>
+<details><summary>Xác nhận nguồn phim</summary><p>Chỉ đánh dấu khi bạn xác nhận đây là âm thanh gốc tiếng Trung
+của phim hoạt hình và các phim có tên khác nhau thực sự là các tác phẩm khác nhau.</p><div id="filmChecks"></div></details>
+<div class="row"><button id="export">Xuất nhãn JSON</button><label>Nhập nhãn đã lưu <input type="file" id="import" accept=".json"></label></div>
+<small>Bản nháp được lưu trong trình duyệt nếu được hỗ trợ. Hãy xuất JSON trước khi đóng.</small>
+</section>
+<progress id="progress"></progress><p id="status" role="status"></p>
+<section>
+<div class="row"><button id="previous">← Câu trước</button><select id="jump" aria-label="Chọn câu"></select>
+<button id="next">Câu tiếp →</button><button id="unlabelled">Câu chưa gán</button></div>
+<p id="cueInfo"></p><p class="marker" id="target"></p>
+<audio id="audio" controls preload="none"></audio>
+<div class="row"><button id="replay">Nghe phần câu</button><small>Space: nghe/tạm dừng · ←/→: chuyển câu</small></div>
+<p>Phần trước/sau mốc vàng chỉ là ngữ cảnh. Gán nhãn cho lời trong phần câu.</p>
+<div class="row labels" id="labels"></div>
+<label>Ghi chú (nhạc lớn, giọng trẻ em, câu lệch mốc, tiếng hét…)
+<textarea id="notes" rows="2"></textarea></label>
+<button id="clear">Bỏ nhãn câu này</button>
+</section><p id="message" role="alert"></p>
+<script id="corpus" type="application/json">__CORPUS_DATA__</script>
+<script>
+'use strict';
+const corpus=JSON.parse(document.getElementById('corpus').textContent);
+const $=id=>document.getElementById(id), labels={}, verified=new Set();
+const names={male:'1 · Nam',female:'2 · Nữ',mixed:'3 · Nhiều người nói',unclear:'4 · Không rõ'};
+const storageKey='ducai-listening:'+corpus.corpus_id;
+let index=0;
+const byId=new Map(corpus.cues.map(c=>[c.id,c]));
+function snapshot(){return {schema:'ducai-dialogue-casting-labels-v1',corpus_id:corpus.corpus_id,
+label_source:'human-listening',annotator:$('annotator').value.trim(),created_at:new Date().toISOString(),
+verified_film_ids:[...verified],labels:Object.values(labels)}}
+function save(){try{localStorage.setItem(storageKey,JSON.stringify(snapshot()))}catch(e){$('message').textContent='Trình duyệt không lưu nháp được. Hãy dùng Xuất nhãn JSON.'}}
+function load(doc,strict){
+ if(doc.schema!=='ducai-dialogue-casting-labels-v1'||doc.label_source!=='human-listening'||!Array.isArray(doc.labels))throw Error('Không phải tệp nhãn nghe hợp lệ.');
+ if(strict&&doc.corpus_id!==corpus.corpus_id)throw Error('Bản nháp thuộc bộ nghe khác.');
+ let count=0, rejected=0;const seen=new Set();
+ for(const row of doc.labels){const c=byId.get(row.cue_id);
+  if(seen.has(row.cue_id))throw Error('Tệp chứa nhãn lặp.');seen.add(row.cue_id);
+  if(c&&c.clip_sha256===row.clip_sha256&&Object.hasOwn(names,row.label)){
+   labels[c.id]={cue_id:c.id,clip_sha256:c.clip_sha256,label:row.label,notes:String(row.notes||'')};count++;
+  }else rejected++;
+ }
+ $('annotator').value=doc.annotator||'';
+ for(const film of corpus.films)if((doc.verified_film_ids||[]).includes(film.id))verified.add(film.id);
+ $('message').textContent=`Đã nhập ${count} nhãn; ${rejected} câu không khớp được giữ ngoài bộ hiện tại.`;
+ renderChecks();render();
+}
+function renderChecks(){
+ $('filmChecks').replaceChildren();
+ for(const film of corpus.films){const line=document.createElement('label'),check=document.createElement('input');
+  check.type='checkbox';check.checked=verified.has(film.id);check.onchange=()=>{check.checked?verified.add(film.id):verified.delete(film.id);save()};
+  line.append(check,document.createTextNode(' '+film.title));$('filmChecks').append(line);
+ }
+}
+function render(){
+ const c=corpus.cues[index], item=labels[c.id];$('audio').pause();$('audio').src=c.clip_path;
+ $('cueInfo').textContent=`Câu ${index+1}/${corpus.cues.length} · ${c.id}`;
+ const begin=Math.min(.5,c.start_us/1e6),end=begin+(c.end_us-c.start_us)/1e6;
+ $('target').textContent=`Phần câu: ${begin.toFixed(2)} → ${end.toFixed(2)} giây trong clip`;
+ $('notes').value=item?.notes||'';$('labels').replaceChildren();
+ for(const [label,title]of Object.entries(names)){const button=document.createElement('button');button.textContent=title;
+  button.setAttribute('aria-pressed',String(item?.label===label));button.onclick=()=>choose(label);$('labels').append(button)}
+ $('jump').value=String(index);$('previous').disabled=index===0;$('next').disabled=index===corpus.cues.length-1;
+ const done=Object.keys(labels).length;$('progress').max=corpus.cues.length;$('progress').value=done;
+ $('status').textContent=`Đã gán ${done}/${corpus.cues.length} câu · ${corpus.films.length} phim nguồn (nghiệm thu cần ít nhất 3 phim và 200 câu kiểm tra)`;
+}
+function choose(label){const c=corpus.cues[index];labels[c.id]={cue_id:c.id,clip_sha256:c.clip_sha256,label,notes:$('notes').value};save();render()}
+function move(step){index=Math.max(0,Math.min(corpus.cues.length-1,index+step));render()}
+for(let i=0;i<corpus.cues.length;i++){const o=document.createElement('option');o.value=String(i);o.textContent='Câu '+(i+1);$('jump').append(o)}
+$('jump').onchange=()=>{index=Number($('jump').value);render()};$('previous').onclick=()=>move(-1);$('next').onclick=()=>move(1);
+$('unlabelled').onclick=()=>{for(let offset=1;offset<=corpus.cues.length;offset++){const next=(index+offset)%corpus.cues.length;if(!labels[corpus.cues[next].id]){index=next;render();return}}$('message').textContent='Đã gán tất cả câu.'};
+$('clear').onclick=()=>{delete labels[corpus.cues[index].id];save();render()};$('annotator').oninput=save;
+$('notes').oninput=()=>{const item=labels[corpus.cues[index].id];if(item){item.notes=$('notes').value;save()}};
+$('replay').onclick=()=>{const audio=$('audio');audio.currentTime=Math.min(.5,corpus.cues[index].start_us/1e6);audio.play().catch(e=>$('message').textContent='Không phát được clip: '+e.message)};
+$('audio').onerror=()=>$('message').textContent='Không mở được WAV. Kiểm tra thư mục clips cạnh tệp HTML.';
+$('export').onclick=()=>{if(!$('annotator').value.trim()){$('message').textContent='Điền tên người nghe trước khi xuất.';$('annotator').focus();return}
+ const url=URL.createObjectURL(new Blob([JSON.stringify(snapshot(),null,2)],{type:'application/json'}));
+ const link=document.createElement('a');link.href=url;link.download='DUCAI-nhan-nghe-'+corpus.corpus_id.slice(0,8)+'.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);save();};
+$('import').onchange=async()=>{try{load(JSON.parse(await $('import').files[0].text()),false);save()}catch(e){$('message').textContent=e.message}};
+document.addEventListener('keydown',e=>{if(['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName))return;
+ if('1234'.includes(e.key)&&e.key.length===1){e.preventDefault();choose(Object.keys(names)[Number(e.key)-1])}
+ if(e.key==='ArrowLeft'){e.preventDefault();move(-1)}if(e.key==='ArrowRight'){e.preventDefault();move(1)}
+ if(e.code==='Space'&&!['BUTTON','AUDIO'].includes(document.activeElement.tagName)){e.preventDefault();$('audio').paused?$('replay').click():$('audio').pause()}});
+try{const draft=localStorage.getItem(storageKey);if(draft)load(JSON.parse(draft),true)}catch(e){$('message').textContent='Không đọc được bản nháp: '+e.message}
+renderChecks();render();
+</script></body></html>

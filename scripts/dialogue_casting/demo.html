@@ -1,0 +1,447 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DUCAI · Thử phân vai thoại</title>
+<style>
+:root {
+  color-scheme: dark;
+  --bg: oklch(18% .008 250); --panel: oklch(23% .008 250);
+  --raised: oklch(29% .009 250); --line: oklch(52% .012 250);
+  --ink: oklch(95% .008 250); --muted: oklch(79% .012 250);
+  --accent: oklch(78% .14 57); --accent-ink: oklch(20% .03 57);
+  --review: oklch(85% .10 85); --error: oklch(82% .10 30);
+  --body: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  --display: Bahnschrift, 'Segoe UI', sans-serif;
+  --s1: .25rem; --s2: .5rem; --s3: .75rem; --s4: 1rem;
+  --s6: 1.5rem; --s8: 2rem; --s12: 3rem;
+  --small: .875rem; --normal: 1rem; --medium: 1.2rem; --large: 1.75rem;
+  --radius: .5rem; --target: 2.75rem;
+  --ease: cubic-bezier(.25,1,.5,1);
+  background: var(--bg); color: var(--ink); font: 400 var(--normal)/1.6 var(--body);
+  font-variant-numeric: tabular-nums;
+}
+* { box-sizing: border-box; }
+body { margin: 0; }
+header, main { max-width: 90rem; margin: auto; padding: var(--s6) var(--s8); }
+header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--s4); border-bottom: 1px solid var(--line); }
+h1 { font: 600 var(--large)/1.2 var(--display); margin: 0; text-wrap: balance; }
+h2 { font: 600 var(--medium)/1.3 var(--display); margin: 0 0 var(--s3); }
+p { margin: 0 0 var(--s4); text-wrap: pretty; }
+small, .muted { color: var(--muted); font-size: var(--small); }
+button, select, input, textarea, .file-button { font: inherit; color: var(--ink); background: var(--raised); border: 1px solid var(--line); border-radius: var(--radius); }
+button, select, .file-button, input[type=search] { min-height: var(--target); padding: var(--s2) var(--s3); }
+button, .file-button, summary { cursor: pointer; }
+button, .file-button { transition: transform 150ms var(--ease), border-color 150ms var(--ease); }
+button:hover:not(:disabled), .file-button:hover { transform: translateY(-1px); border-color: var(--accent); }
+button:active:not(:disabled), .file-button:active { transform: translateY(1px); }
+button:disabled { color: var(--muted); cursor: default; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: var(--s1); }
+button.primary { color: var(--accent-ink); background: var(--accent); border-color: var(--accent); font-weight: 600; }
+button[aria-pressed=true] { border-color: var(--accent); color: var(--accent); }
+label { display: flex; flex-direction: column; gap: var(--s1); }
+textarea { width: 100%; padding: var(--s3); resize: vertical; min-height: 6rem; }
+input[type=checkbox] { width: var(--s4); height: var(--s4); accent-color: var(--accent); }
+.check-label { min-width: var(--target); min-height: var(--target); display: inline-flex; flex-direction: row; align-items: center; gap: var(--s2); cursor: pointer; }
+.check-label:hover { color: var(--accent); }
+.file-button { display: inline-flex; align-items: center; }
+.hidden-file { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+.file-button:focus-within { outline: 2px solid var(--accent); outline-offset: var(--s1); }
+.row { display: flex; gap: var(--s2); align-items: center; flex-wrap: wrap; }
+.intro { max-width: 80ch; color: var(--muted); }
+.toolbar { display: grid; grid-template-columns: 2fr 1.4fr 1fr; gap: var(--s4); margin: var(--s6) 0; }
+.toolbar > * { min-width: 0; }
+.metrics { display: flex; flex-wrap: wrap; gap: var(--s6); padding-bottom: var(--s4); }
+.metrics strong { color: var(--ink); }
+.workspace { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); border: 1px solid var(--line); border-radius: var(--radius); overflow: clip; }
+.list-panel { border-right: 1px solid var(--line); background: var(--panel); min-width: 0; }
+.list-tools { padding: var(--s3) var(--s4); border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: var(--s2); }
+.cue-list { max-height: 38rem; min-height: 20rem; overflow: auto; }
+.cue { display: grid; grid-template-columns: var(--target) minmax(0, 1fr); border-bottom: 1px solid var(--line); }
+.cue:last-child { border-bottom: 0; }
+.cue.active { background: var(--raised); border-left: var(--s1) solid var(--accent); }
+.cue .check-label { justify-content: center; }
+.cue-open { border: 0; border-radius: 0; background: transparent; text-align: left; padding: var(--s3); min-width: 0; width: 100%; }
+.cue-top { display: flex; gap: var(--s2); justify-content: space-between; align-items: flex-start; }
+.cue-text { color: var(--muted); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; display: block; font-size: var(--small); line-height: 1.8; }
+.tag { font-size: var(--small); white-space: nowrap; color: var(--ink); }
+.tag.review { color: var(--review); }
+.tag.edited { color: var(--accent); }
+.batch { border-top: 1px solid var(--line); padding: var(--s3) var(--s4); }
+.detail { padding: var(--s6); min-width: 0; }
+.detail > section + section { border-top: 1px solid var(--line); margin-top: var(--s6); padding-top: var(--s6); }
+audio { width: 100%; display: block; margin: var(--s4) 0; }
+.machine { font-size: var(--medium); margin-bottom: var(--s2); }
+.choices { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--s2); margin: var(--s3) 0; }
+.transcript { line-height: 1.9; overflow-wrap: anywhere; padding-left: var(--s3); border-left: 2px solid var(--line); margin: var(--s2) 0 var(--s4); min-height: var(--s8); }
+.difference { color: var(--review); }
+.status { min-height: var(--s8); margin: var(--s3) 0; color: var(--muted); }
+.status.error { color: var(--error); }
+.empty { padding: var(--s8); color: var(--muted); }
+details { border-top: 1px solid var(--line); padding-top: var(--s4); margin-top: var(--s6); }
+summary { min-height: var(--target); color: var(--muted); }
+summary:hover { color: var(--ink); }
+.transcript-label { font-weight: 600; }
+[hidden] { display: none !important; }
+@media (max-width: 55rem) {
+  header, main { padding: var(--s4); }
+  .workspace, .toolbar { grid-template-columns: minmax(0, 1fr); }
+  .list-panel { border-right: 0; border-bottom: 1px solid var(--line); }
+  .cue-list { min-height: 0; max-height: 20rem; }
+  .detail { padding: var(--s4); }
+  .metrics { gap: var(--s3) var(--s6); }
+}
+@media (prefers-reduced-motion: reduce) { button, .file-button { transition: none; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>DUCAI · Phân vai thoại</h1>
+  <div class="row">
+    <label class="file-button">Nhập kết quả<input class="hidden-file" id="import" type="file" accept=".json"></label>
+    <button id="export" class="primary">Xuất kết quả JSON</button>
+  </div>
+</header>
+<main>
+  <p class="intro">Nghe tiếng gốc, xem máy gán Nam/Nữ và sửa những câu chưa đúng.
+    Bản thử này phát <strong>âm thanh gốc</strong>; phần tạo giọng Việt chưa có trong demo.</p>
+  <p class="intro" id="srtNotice" hidden></p>
+  <div class="toolbar">
+    <label>Bộ thử<select id="dataset"></select></label>
+    <label>Nguồn âm thanh<select id="film"><option value="all">Tất cả nguồn</option></select></label>
+    <label>Lọc câu<select id="filter">
+      <option value="all">Tất cả</option><option value="unknown">Máy cần kiểm tra</option>
+      <option value="mismatch">Lệch nhãn nghe cũ</option><option value="male">Máy gán Nam</option>
+      <option value="female">Máy gán Nữ</option><option value="edited">Đã sửa tay</option>
+      <option value="feedback-conflict">Khác nhãn bạn đã sửa</option>
+      <option value="pending-review">Cần kiểm tra, chưa đánh dấu</option>
+      <option value="model-changed">Máy khác bản đối chiếu</option>
+      <option value="unreviewed">Chưa kiểm tra</option>
+    </select></label>
+  </div>
+  <div class="metrics muted" id="metrics"></div>
+  <div class="workspace">
+    <section class="list-panel" aria-label="Danh sách thoại">
+      <div class="list-tools">
+        <label class="check-label"><input id="selectAll" type="checkbox">Chọn các câu đang lọc</label>
+        <span class="muted" id="count"></span>
+      </div>
+      <div class="cue-list" id="cueList"></div>
+      <div class="batch">
+        <div class="row">
+          <select id="bulkLabel" aria-label="Nhãn áp dụng hàng loạt">
+            <option value="male">Nam</option><option value="female">Nữ</option>
+            <option value="unknown">Cần kiểm tra</option><option value="auto">Tự động</option>
+          </select>
+          <button id="bulkApply" disabled>Áp dụng cho 0 câu</button>
+          <button id="undo" disabled>Hoàn tác</button>
+        </div>
+      </div>
+    </section>
+    <article class="detail" id="detail">
+      <section>
+        <h2 id="cueTitle"></h2><p class="muted" id="cueInfo"></p>
+        <audio id="audio" controls preload="metadata"></audio>
+        <div class="row">
+          <button id="replay">Nghe phần câu</button><button id="whole">Nghe cả clip</button>
+          <button id="previous" aria-label="Câu trước">← Trước</button>
+          <button id="next" aria-label="Câu tiếp">Tiếp →</button>
+        </div>
+        <p class="muted" id="target"></p>
+      </section>
+      <section>
+        <p class="machine" id="machine"></p><p class="muted" id="reason"></p>
+        <p class="muted" id="evidenceScope" hidden></p>
+        <p class="muted" id="comparison" hidden></p>
+        <p class="difference" id="priorNotes" hidden></p>
+        <p class="difference" id="human"></p>
+        <span>Nhãn sử dụng cho câu này</span>
+        <div class="choices" id="choices">
+          <button data-label="auto">0 · Tự động</button><button data-label="male">1 · Nam</button>
+          <button data-label="female">2 · Nữ</button><button data-label="unknown">3 · Cần kiểm tra</button>
+        </div>
+        <label class="check-label"><input id="reviewed" type="checkbox">Đã kiểm tra câu này</label>
+        <label>Ghi chú<textarea id="notes" rows="2" placeholder="Ví dụ: giọng trẻ em, nhạc lớn, câu có hai người nói"></textarea></label>
+      </section>
+      <section>
+        <h2>Đối chiếu chữ nghe được</h2>
+        <p class="muted">Hai model dùng cùng thiết lập. Chữ dưới đây do máy nhận, chưa có bản chép lời chuẩn để tính độ chính xác.</p>
+        <div id="srtReference" hidden><div class="transcript-label">SRT gốc để đối chiếu</div><p class="transcript" id="textSrt" lang="zh"></p></div>
+        <div class="transcript-label">Whisper large-v3 hiện tại</div><p class="transcript" id="textBase" lang="zh"></p>
+        <div class="transcript-label">Belle Whisper tinh chỉnh tiếng Trung</div><p class="transcript" id="textBelle" lang="zh"></p>
+        <small id="textScope"></small>
+      </section>
+      <details id="continuous">
+        <summary>Nghe nguyên đoạn liên tục của nguồn này</summary>
+        <p class="muted" id="excerptInfo"></p><audio id="excerptAudio" controls preload="none"></audio>
+        <p class="muted">Dùng đoạn này để nghe lỗi kéo dài qua nhiều câu. Bộ 30 câu lấy mẫu rải rác không đo được chuỗi lỗi liên tục.</p>
+      </details>
+    </article>
+    <div class="empty" id="empty" hidden>Không có câu phù hợp. Hãy đổi bộ thử hoặc bộ lọc.</div>
+  </div>
+  <p class="status" id="status" role="status" aria-live="polite"></p>
+  <p class="muted">Bản nháp lưu trong trình duyệt. Xuất JSON để gửi lại hoặc giữ trước khi đổi máy.
+    Phím tắt: Space nghe/dừng, ←/→ chuyển câu, 0/1/2/3 chọn nhãn.</p>
+  <details>
+    <summary>Phạm vi bản thử và cách đọc kết quả</summary>
+    <p class="muted">30 câu đối chiếu sử dụng nhãn nghe bạn đã gửi, giữ riêng với sửa tay trong demo.
+      Hai đoạn liên tục dùng mốc từ do từng model Whisper tạo, chia lại theo mốc đổi người nói,
+      khoảng nghỉ và độ dài câu rồi ghép với cùng bộ nhận diện chất giọng.
+      Số câu có thể khác nhau giữa hai model. Các đoạn này là mẫu khám phá, có thể trùng bộ nghe, chưa phải tập kiểm tra độc lập.</p>
+    <p class="muted">Nhãn dựa vào chất giọng nghe được. Câu không chắc dùng nhóm Cần kiểm tra/giọng dự phòng.
+      Whisper nhận chữ và thời gian; bộ nhận diện chất giọng vẫn là mô hình đang thử.
+      Demo chạy offline sau khi có đủ tệp. Không tải âm thanh lên mạng.</p>
+    <p class="muted" id="srtHelp" hidden>Bộ mới giữ nguyên khoảng từng câu SRT, cho hai Whisper nghe toàn câu và ưu tiên mẫu giọng nằm trong câu.
+      Mốc SRT có thể lệch hoặc chứa nhiều người nói. Bản mới chưa chứng minh chính xác hơn.
+      Các sửa tay cũ chỉ được giữ ở những câu cũ còn nguyên âm thanh và mốc câu.</p>
+  </details>
+  <noscript>Hãy bật JavaScript để nghe và sửa nhãn trong bản demo.</noscript>
+</main>
+<script id="demoData" type="application/json">__DEMO_DATA__</script>
+<script>
+'use strict';
+__REVIEW_LOGIC__
+const data = JSON.parse(document.getElementById('demoData').textContent);
+const $ = id => document.getElementById(id);
+const names = {male:'Nam', female:'Nữ', unknown:'Cần kiểm tra', unclear:'Không rõ', mixed:'Nhiều người nói'};
+const reasons = {
+  assigned:'Máy đã tự gán nhóm.', no_speech:'Chưa tìm được tiếng nói đủ rõ trong mốc câu.',
+  overlapping_speakers:'Có tiếng người nói chồng nhau.', multiple_speakers:'Có nhiều người nói trong cùng câu.',
+  insufficient_speech:'Phần tiếng nói quá ngắn hoặc chiếm quá ít câu.',
+  insufficient_speaker_reference:'Chưa có mẫu giọng đủ dài của người nói này.',
+  contradictory_speaker_evidence:'Các mẫu cùng nhóm người nói cho bằng chứng mâu thuẫn.',
+  low_confidence:'Điểm model chưa qua ngưỡng đang thử.',
+  overlapping_subtitles:'Mốc SRT của câu này trùng với câu khác. Cần nghe kiểm tra.',
+  prior_review_conflict:'Máy nhận giọng khác nhãn bạn đã sửa ở phần âm thanh giao nhau. Mốc câu đã đổi, cần nghe lại.'
+};
+const films = new Map(data.films.map(f => [f.id, f]));
+const all = new Map(data.datasets.flatMap(d => d.cues).map(c => [c.id, c]));
+const storageKey = 'ducai-casting-demo:' + data.demo_id;
+let reviews = structuredClone(data.carried_reviews || {}), selected = new Set(), visible = [], active = null, undoState = null;
+let playWhole = false, playbackTimer = null;
+let pendingStatus = data.review_notice || (data.carried_reviews
+  ? `Đã giữ ${Object.keys(data.carried_reviews).length} dấu kiểm tra/sửa tay ở các câu cũ. Các câu SRT mới cần nghe lại theo mốc mới.` : '');
+
+function tell(message, error=false) {
+  $('status').textContent = message;
+  $('status').classList.toggle('error', error);
+}
+function time(us) {
+  const total = Math.floor(us/1e6), h = Math.floor(total/3600), m = Math.floor(total/60)%60, s = total%60;
+  return (h ? h+':' : '') + String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');
+}
+function snapshot() {
+  return snapshotDemoReview(data, all, reviews);
+}
+function preciseTime(us) {
+  return time(us)+'.'+String(Math.floor(us/1000)%1000).padStart(3,'0');
+}
+function validated(doc) {
+  return validateDemoReview(doc, data, all);
+}
+function save() {
+  try { localStorage.setItem(storageKey, JSON.stringify(snapshot())); return true; }
+  catch (_) { tell('Trình duyệt không lưu được bản nháp. Hãy xuất JSON để giữ thay đổi.', true); return false; }
+}
+function stop() {
+  $('audio').pause(); $('excerptAudio').pause(); clearTimeout(playbackTimer); playbackTimer = null;
+}
+function effective(cue) { return reviews[cue.id]?.override || cue.machine.label; }
+function updateReview(id, values) {
+  reviews[id] = {override:null, reviewed:false, notes:'', ...reviews[id], ...values};
+}
+function setLabel(label) {
+  if (!active) return;
+  undoState = structuredClone(reviews);
+  updateReview(active.id, {override:label === 'auto' ? null : label, reviewed:true});
+  const saved=save(); render(); if(saved)tell('Đã lưu nhãn câu. Tự động sẽ dùng lại nhãn máy.');
+}
+function dataset() { return data.datasets.find(d => d.id === $('dataset').value); }
+function matches(cue) {
+  if ($('film').value !== 'all' && cue.film_id !== $('film').value) return false;
+  const filter = $('filter').value;
+  if (filter === 'unknown' || filter === 'male' || filter === 'female') return cue.machine.label === filter;
+  if (filter === 'mismatch') return cue.human && ['male','female'].includes(cue.machine.label) && cue.human !== cue.machine.label;
+  if (filter === 'edited') return !!reviews[cue.id]?.override;
+  if (filter === 'unreviewed') return !reviews[cue.id]?.reviewed;
+  if (filter === 'feedback-conflict') return cue.machine.reason === 'prior_review_conflict';
+  if (filter === 'pending-review') return pendingDemoReview(cue, reviews);
+  if (filter === 'model-changed') return changedDemoMachine(cue);
+  return true;
+}
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+function renderMetrics() {
+  const cues = dataset().cues.filter(c => $('film').value === 'all' || c.film_id === $('film').value);
+  const auto = cues.filter(c => ['male','female'].includes(c.machine.label));
+  const reference = auto.filter(c => c.human);
+  $('metrics').replaceChildren();
+  for (const text of [`Máy tự gán: ${auto.length}/${cues.length}`, `Cần kiểm tra: ${cues.length-auto.length}`,
+    reference.length ? `Khớp nhãn nghe cũ: ${reference.filter(c=>c.human===c.machine.label).length}/${reference.length}`
+      : `Đã kiểm tra: ${cues.filter(c=>reviews[c.id]?.reviewed).length}/${cues.length}`])
+    $('metrics').append(el('span', '', text));
+}
+function renderSelection() {
+  $('bulkApply').disabled = !selected.size;
+  $('bulkApply').textContent = `Áp dụng cho ${selected.size} câu`;
+  $('selectAll').checked = !!visible.length && visible.every(c=>selected.has(c.id));
+  $('selectAll').indeterminate = selected.size > 0 && !$('selectAll').checked;
+  $('selectAll').disabled = !visible.length;
+  $('undo').disabled = !undoState;
+}
+function render() {
+  visible = dataset().cues.filter(matches);
+  const visibleIds = new Set(visible.map(c=>c.id));
+  selected = new Set([...selected].filter(id=>visibleIds.has(id)));
+  if (!active || !visibleIds.has(active.id)) active = visible[0] || null;
+  $('cueList').replaceChildren();
+  for (const cue of visible) {
+    const line = el('div', 'cue' + (cue.id === active?.id ? ' active' : ''));
+    const label = el('label', 'check-label'), check = document.createElement('input');
+    check.type = 'checkbox'; check.checked = selected.has(cue.id);
+    check.setAttribute('aria-label', 'Chọn '+cue.title);
+    check.onchange = () => { check.checked ? selected.add(cue.id) : selected.delete(cue.id); renderSelection(); };
+    label.append(check);
+    const open = el('button', 'cue-open');
+    const top = el('span', 'cue-top');
+    top.append(el('span', '', `${cue.title} · ${time(cue.start_us)}`));
+    top.append(el('span', 'tag '+(reviews[cue.id]?.override ? 'edited' : cue.machine.label==='unknown' ? 'review' : ''),
+      (reviews[cue.id]?.override ? 'Đã sửa · ' : '')+names[effective(cue)]));
+    open.append(top, el('span', 'cue-text', cue.srt_text || cue.transcripts['belle-zh'] || cue.transcripts['large-v3'] || 'Không nhận được chữ trong clip.'));
+    open.setAttribute('aria-current', String(cue.id === active?.id));
+    open.onclick = () => { stop(); active = cue; render(); };
+    line.append(label, open); $('cueList').append(line);
+  }
+  if (!visible.length) $('cueList').append(el('p', 'empty', 'Không có câu phù hợp bộ lọc.'));
+  $('count').textContent = visible.length+' câu';
+  $('detail').hidden = !active; $('empty').hidden = !!active;
+  renderMetrics(); renderSelection();
+  if (active) renderDetail(); else stop();
+}
+function renderDetail() {
+  const cue = active, review = reviews[cue.id];
+  $('cueTitle').textContent = cue.title;
+  $('cueInfo').textContent = `${films.get(cue.film_id).title} · ${preciseTime(cue.start_us)} → ${preciseTime(cue.end_us)}`;
+  if ($('audio').getAttribute('src') !== cue.clip_path) { stop(); $('audio').src = cue.clip_path; playWhole = false; }
+  $('target').textContent = `Phần câu trong clip: ${(cue.target_start_us/1e6).toFixed(2)} → ${(cue.target_end_us/1e6).toFixed(2)} giây.`;
+  $('machine').textContent = 'Máy nhận: '+names[cue.machine.label]+(data.casting_backend && dataset().id==='srt' ? ' · '+data.casting_backend : '');
+  $('reason').textContent = data.review_origins && cue.machine.reason==='prior_review_conflict'
+    ? 'Máy mới khác nhãn bạn đã sửa ở phần âm thanh này. Nhãn sửa tay vẫn được giữ.'
+    : reasons[cue.machine.reason] || cue.machine.reason;
+  $('evidenceScope').hidden = !cue.evidence_scope;
+  $('evidenceScope').textContent = {
+    inside_srt:'Mẫu phân tích giọng nằm trong khoảng câu SRT này.',
+    speaker_reference:'Câu thiếu mẫu giọng rõ dài 1 giây. Đang tham khảo nhóm người nói trong đoạn gốc.',
+    none:'Chưa có mẫu giọng riêng đủ điều kiện cho câu này.'
+  }[cue.evidence_scope] || '';
+  $('comparison').hidden = !cue.comparison_machine;
+  $('comparison').textContent = cue.comparison_machine
+    ? (cue.comparison_title || 'Cùng mốc SRT, cách dùng mẫu giọng theo nhóm trước đây: ')+names[cue.comparison_machine.label]+'. '+(reasons[cue.comparison_machine.reason] || '') : '';
+  $('priorNotes').hidden = !cue.prior_feedback?.length;
+  $('priorNotes').textContent = (cue.prior_feedback || []).map(note=>
+    note.title+(data.review_origins ? ' bản trước: ' : ' bản cũ (mốc khác): ')+(note.override ? 'bạn chọn '+names[note.override]+'. ' : '')+note.notes
+  ).join(' ')+(cue.machine.reason === 'prior_review_conflict' ? ' Bộ nhận giọng thuần trả về '+names[cue.acoustic_machine.label]+'.' : '');
+  $('human').textContent = cue.human ? 'Nhãn bạn đã nghe trước đây: '+names[cue.human] : 'Đoạn mới: chưa có nhãn nghe độc lập.';
+  for (const button of $('choices').querySelectorAll('button'))
+    button.setAttribute('aria-pressed', String(button.dataset.label === (review?.override || 'auto')));
+  $('reviewed').checked = !!review?.reviewed;
+  $('notes').value = review?.notes || '';
+  $('textBase').textContent = cue.transcripts['large-v3'] || 'Không nhận được chữ.';
+  $('textBelle').textContent = cue.transcripts['belle-zh'] || 'Không nhận được chữ.';
+  $('srtReference').hidden = !Object.hasOwn(cue, 'srt_text');
+  $('textSrt').textContent = cue.srt_text || '';
+  $('textScope').textContent = dataset().id === 'srt'
+    ? 'Hai Whisper nghe đúng toàn khoảng SRT này, không thêm câu bên cạnh. Chữ SRT chỉ để đối chiếu; nhãn Nam/Nữ dựa vào âm thanh.'
+    : dataset().id === 'calibration'
+    ? 'Text từ toàn clip, gồm khoảng 0,5 giây ngữ cảnh trước và sau câu.'
+    : 'Model đang chọn quyết định mốc câu. Text của model còn lại được ghép theo phần thời gian giao nhau, có thể khác ranh giới câu.';
+  $('previous').disabled = visible.indexOf(cue) === 0;
+  $('next').disabled = visible.indexOf(cue) === visible.length-1;
+  const excerpt = data.excerpts.find(e=>e.film_id===cue.film_id);
+  if ($('excerptAudio').getAttribute('src') !== excerpt.path) $('excerptAudio').src = excerpt.path;
+  $('excerptInfo').textContent = `Âm thanh gốc ${time(excerpt.start_us)} → ${time(excerpt.end_us)}. `+(dataset().id === 'srt'
+    ? 'Mốc câu mới giữ nguyên theo SRT. Hai người chồng tiếng trong cùng mốc vẫn cần kiểm tra.'
+    : 'Mỗi model có thể chia câu khác nhau.');
+}
+function navigate(delta) {
+  const index = visible.indexOf(active)+delta;
+  if (index < 0 || index >= visible.length) return;
+  stop(); active=visible[index]; render();
+  $('cueList').querySelector('.active')?.scrollIntoView({block:'nearest'});
+}
+function armStop() {
+  clearTimeout(playbackTimer);
+  if (!active || playWhole || $('audio').paused) return;
+  const end = active.target_end_us/1e6;
+  if ($('audio').currentTime >= end) { $('audio').pause(); return; }
+  playbackTimer = setTimeout(() => { if (!playWhole) $('audio').pause(); },
+    Math.max(0, (end-$('audio').currentTime)/$('audio').playbackRate*1000));
+}
+async function play(whole=false) {
+  if (!active) return;
+  $('excerptAudio').pause(); playWhole=whole;
+  $('audio').currentTime=whole ? 0 : active.target_start_us/1e6;
+  try { await $('audio').play(); armStop(); } catch (_) { tell('Không phát được clip. Hãy giải nén đủ thư mục clips bên cạnh trang HTML.', true); }
+}
+for (const d of data.datasets) $('dataset').append(new Option(d.title, d.id));
+$('srtHelp').hidden = !data.datasets.some(d=>d.id==='srt');
+const srtDataset = data.datasets.find(d=>d.id==='srt');
+$('srtNotice').hidden = !srtDataset;
+$('srtNotice').textContent = srtDataset
+  ? data.srt_notice || `${srtDataset.cues.length} câu mới bám mốc SRT. Chỉ nghe khoảng có SRT; tiếng ngoài mốc không tham gia. Các sửa tay trước đây được giữ trong bộ cũ.` : '';
+for (const f of data.films) $('film').append(new Option(f.title, f.id));
+for (const id of ['dataset','film','filter']) $(id).onchange=()=>{stop(); selected.clear(); active=null; render();};
+$('choices').onclick=e=>{if (e.target.matches('button[data-label]')) setLabel(e.target.dataset.label);};
+$('replay').onclick=()=>play(false); $('whole').onclick=()=>play(true);
+$('previous').onclick=()=>navigate(-1); $('next').onclick=()=>navigate(1);
+$('reviewed').onchange=()=>{
+  if (!active) return;
+  undoState=structuredClone(reviews); updateReview(active.id,{reviewed:$('reviewed').checked}); save(); render();
+};
+$('notes').oninput=()=>{if(active){updateReview(active.id,{notes:$('notes').value});save();}};
+$('audio').onplay=()=>{$('excerptAudio').pause();armStop();};
+$('audio').onpause=()=>clearTimeout(playbackTimer);
+$('audio').ontimeupdate=armStop; $('audio').onratechange=armStop; $('audio').onseeked=armStop;
+$('audio').onerror=()=>tell('Clip bị thiếu hoặc không đọc được. Hãy giải nén đủ thư mục demo.',true);
+$('excerptAudio').onplay=()=>{$('audio').pause();};
+$('selectAll').onchange=()=>{selected=$('selectAll').checked?new Set(visible.map(c=>c.id)):new Set();render();};
+$('bulkApply').onclick=()=>{
+  if (!selected.size) return;
+  undoState=structuredClone(reviews);
+  const value=$('bulkLabel').value, count=selected.size;
+  for(const id of selected) updateReview(id,{override:value==='auto'?null:value,reviewed:true});
+  selected.clear();const saved=save();render();if(saved)tell(`Đã áp dụng cho ${count} câu. Có thể Hoàn tác.`);
+};
+$('undo').onclick=()=>{if(undoState){const old=undoState;undoState=null;reviews=old;const saved=save();render();if(saved)tell('Đã hoàn tác lần đổi nhãn gần nhất.');}};
+$('export').onclick=()=>{
+  const url=URL.createObjectURL(new Blob([JSON.stringify(snapshot(),null,2)],{type:'application/json'}));
+  const link=document.createElement('a');link.href=url;link.download='DUCAI-test-phan-vai-'+data.demo_id.slice(0,8)+'.json';
+  link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);tell('Đã xuất JSON. Gửi tệp này lại trong chat sau khi kiểm tra.');
+};
+$('import').onchange=async()=>{
+  const file=$('import').files[0]; if(!file)return;
+  try{
+    if(file.size>2_000_000)throw Error('Tệp quá lớn cho kết quả demo.');
+    const incoming=validated(JSON.parse(await file.text()));
+    undoState=structuredClone(reviews); reviews={...reviews,...incoming};const saved=save();render();
+    if(saved)tell(`Đã nhập ${Object.keys(incoming).length} câu. Có thể Hoàn tác.`);
+  }catch(e){tell(e.message,true);}finally{$('import').value='';}
+};
+document.addEventListener('keydown',e=>{
+  if(e.target.closest('input,textarea,select,button,summary,a,audio,[contenteditable=true]')||e.altKey||e.ctrlKey||e.metaKey)return;
+  if(e.code==='Space'){e.preventDefault();$('audio').paused?play(false):$('audio').pause();}
+  else if(e.key==='ArrowLeft'){e.preventDefault();navigate(-1);}
+  else if(e.key==='ArrowRight'){e.preventDefault();navigate(1);}
+  else if(['0','1','2','3'].includes(e.key))setLabel(['auto','male','female','unknown'][Number(e.key)]);
+});
+try { const stored=localStorage.getItem(storageKey);if(stored){reviews=validated(JSON.parse(stored));pendingStatus='Đã khôi phục bản nháp của đúng bộ thử này.';} }
+catch(_){pendingStatus='Không đọc được bản nháp. Có thể nhập lại JSON đã xuất.';}
+render();if(pendingStatus)tell(pendingStatus);
+</script>
+</body>
+</html>

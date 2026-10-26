@@ -1,0 +1,4 @@
+# Deliberately independent of the GUI environment. CPU, Windows x64 / Python 3.12.
+sherpa-onnx==1.13.8
+onnxruntime==1.31.0
+numpy==2.5.4
