@@ -2,11 +2,11 @@
 
 ## Trước khi bắt đầu
 
-Mở **Cài đặt → Chẩn đoán runtime** và chỉ chạy phim khi các mục bắt buộc đều
-`ready`: Python GUI 3.12, FFmpeg/ffprobe, PaddleOCR, một transport dịch (Gemini,
-DeepSeek, Hy3/TokenHub, Qwen, GLM hoặc API tương thích), Piper và VieNeu 3.8 nếu
-dùng clone. NVENC có thể ở trạng thái không khả dụng; tool sẽ dùng CPU khi
-backend là `auto`.
+Mở **Cài đặt → Chẩn đoán runtime** để kiểm tra bộ máy cho chức năng cần dùng.
+Chỉ cắt/sửa và xuất video thì không cần OCR, dịch, model giọng hay phụ đề;
+nhập video, sửa trong Timeline rồi mở **Xuất video**. Xuất cần FFmpeg/ffprobe;
+PaddleOCR, transport dịch và Piper/VieNeu chỉ cần cho bước AI tương ứng.
+NVENC có thể ở trạng thái không khả dụng; tool sẽ dùng CPU khi backend là `auto`.
 
 Chẩn đoán Paddle không chỉ kiểm tra đã cài package: nó thử phép toán CUDA và
 cuDNN nhỏ, ghi nhận GPU, phiên bản CUDA/cuDNN và compute capability. `degraded`
@@ -299,6 +299,12 @@ portable dùng vùng staging trong LocalAppData để không tự ghi gói tải
    các họ OFL có nét gần những mẫu thư pháp Việt; tool hiển thị tên thật thay vì
    giả danh các font VNI/HL/UVN/SVN không có giấy phép phân phối rõ ràng.
    **Preset mực tàu** tạo nền mực bất quy tắc dưới chữ. Danh sách nền cho phép
+   chọn **Không nền** hoặc **Nền mờ (blur)** ngay trong **Text → Nền câu đang chọn**.
+   **Bỏ nền** tương đương **Không nền**: tắt cả nền màu và blur tự động của câu đã
+   chọn, kể cả khi nền mặc định đang bật. Chọn nhiều câu để áp dụng cùng lúc;
+   lựa chọn được lưu trong dự án. Blur riêng ôm theo khung chữ mới, mặc định
+   dùng bán kính 46 và độ đục 100%; chỉnh **Đục nền (%)** nếu muốn trong hơn.
+   Vùng blur thủ công và watermark vẫn độc lập với lựa chọn này. Danh sách còn
    chọn **Mực loang**, **Mực đại mặc**, **Mực tụ** hoặc **Nét cọ**. Hai đầu cọ giữ
    tỷ lệ theo bề dày, chỉ thân giữa co giãn nên nền không bị kéo méo với chữ ngắn
     hoặc dài; **Nền ngang/Nền dọc** tiếp tục điều chỉnh kích thước bao quanh chữ.
@@ -306,7 +312,8 @@ portable dùng vùng staging trong LocalAppData để không tự ghi gói tải
     **Bút lông Comforter**, cỡ chữ **40** ngay khi OCR nhập vào project (không chỉ
     ở cửa sổ thêm tay), chữ trắng, nền đen **Mực loang** với độ đục 100%; cue cũ
     giữ nguyên định dạng đã lưu. Chữ cảnh mới tự bật **Mờ vào/ra 300 ms**. Cue được
-    thêm thủ công hoặc do OCR tạo đều chỉ vẽ nền/chữ mới, không thêm blur phía sau.
+    thêm thủ công hoặc do OCR tạo mặc định chỉ vẽ nền/chữ mới; chỉ thêm blur khi
+    người dùng chọn **Nền mờ (blur)**.
     Nền mực có thể không phủ hết chữ Trung; có thể thêm vùng blur thủ công nếu cần.
     Blur S1 và vùng blur thủ công vẫn độc lập. Các nút định dạng và bộ nhập số hiển thị mô tả khi
     trỏ chuột; dấu giảm, giá trị và dấu tăng luôn được tách thành ba vùng rõ ràng.
@@ -360,6 +367,14 @@ portable dùng vùng staging trong LocalAppData để không tự ghi gói tải
    trừ luôn có ưu tiên cao hơn hai lượt quét. Nếu không cấu hình vùng hội thoại,
    tool dùng các dải phụ đề mặc định hiện có; nếu không có vùng loại trừ thì không
    che vùng nào. Nút đặt lại xóa toàn bộ cấu hình tùy chỉnh này.
+
+   Thoại OCR mới đặt tâm chữ ở tâm vùng hội thoại đã chọn khi bắt đầu lượt OCR;
+   không chọn vùng riêng thì dùng tâm vùng thoại mặc định. Vùng khoanh chỉ xác
+   định vị trí, không giới hạn độ rộng/cỡ chữ của câu dịch: câu dài có thể vượt
+   vùng khoanh, nhưng được giữ trong khung video. Vị trí theo cue qua dịch và
+   lưu/mở lại; kéo hoặc đặt khung chữ thủ công sẽ ưu tiên vị trí bạn sửa.
+   Cue đã lưu ở bản cũ không bị tự di chuyển khi mở dự án. SRT thuần không chứa
+   vị trí/font; các thuộc tính này được lưu trong dự án và dùng khi xuất MP4.
 
    Hội thoại một chữ xuất hiện rất nhanh như `爹` hoặc `娘` được lấy thêm một
    burst cục bộ quanh thời điểm chuyển cảnh. Vẫn cần hai quan sát rõ ở cùng vị
@@ -492,12 +507,89 @@ portable dùng vùng staging trong LocalAppData để không tự ghi gói tải
    **Đã cài** sau khi kiểm tra xong. VieNeu v3 Turbo có 25 preset dựng sẵn để chọn
    trực tiếp, ngoài mục **Giọng clone của bạn**. Các preset VieNeu và VIVOS mang
    giấy phép phi thương mại, vì vậy cần kiểm tra quyền trước khi xuất bản nội dung.
+   Trong Phòng thu → **Giọng**, mục **File mẫu clone VieNeu** cho chọn file rồi
+   **Nghe file mẫu**, tạm dừng, tua hoặc **Dừng** ngay trong tool. Nghe file không
+   cần tạo project, tải model hay tổng hợp giọng, không gửi file lên dịch vụ.
+   Chọn file không tự phát; đổi file hoặc rời Phòng thu dừng bản đang nghe.
+   File hỏng/không giải mã được có thông báo ngay dưới nút nghe. File này chỉ
+   được dùng làm mẫu lồng tiếng khi bạn chọn chức năng clone VieNeu tương ứng.
    Piper là lựa chọn nhanh. VieNeu-TTS v3 Turbo 3.8.1 dùng profile
    clone 192D và reference codes, ưu tiên chất lượng. VieNeu gửi tối đa 32 cue
    trong một batch, tự hạ batch nếu GPU hết VRAM và giữ host/model nóng. Đường
    fused CUDA Graph do chính VieNeu 3.8.1 cung cấp; tool không còn vá API nội bộ
    của runtime. Profile 3.3 được giữ nguyên trên đĩa và chỉ bỏ frame pad cũ trong
    RAM khi bind vào engine mới.
+
+   **Phân vai thoại (thử nghiệm):** Cài bộ nhận diện một lần bằng thao tác rõ ràng
+   trong PowerShell: `scripts/setup-dialogue-casting-runtime.ps1 -DataRoot
+   '<DUCAI_STUDIO_DATA>'`. Script cài runtime và model đã ghim vào data root;
+   ứng dụng không tự tải model. Nếu chưa cài hoặc checksum sai, tác vụ báo lỗi
+   cài đặt thay vì ghi nhãn “Cần kiểm tra” giả.
+   Bộ cài gồm MOSS để nghe mạch người nói, cùng bộ tách người nói và nhận chất
+   giọng. Sau khi cài xong, bước phân vai chạy offline. Nếu đã chuẩn bị đủ cache
+   model và dependency trên máy, thêm `-Offline` khi cài; dùng `-DownloadCache`
+   để chỉ thư mục cache model. Cache thiếu hoặc không khớp checksum sẽ báo lỗi.
+   Xem [script cài đặt](../scripts/setup-dialogue-casting-runtime.ps1) để biết
+   các tham số được hỗ trợ.
+
+   Có thể bật **Phân vai thoại sau trích xuất** ngay ở màn hình OCR/Whisper.
+   Sau khi trích xuất thành công, tool tự nhận diện từ âm thanh và SRT gốc;
+   bạn vẫn có thể dịch trong lúc chờ. Khi bấm **Tạo giọng**, tool dùng lại kết
+   quả còn khớp hoặc chờ lượt nhận diện đang chạy, không mở lượt trùng.
+   Multi giữ luồng tuần tự và tự phân vai trước TTS theo cấu hình của lượt chạy.
+   Mở lại ứng dụng hoặc vào Phòng thu chỉ nạp kết quả đã lưu; lịch sử OCR đã
+   hoàn thành không tự khởi động lượt nhận diện mới. Bấm Tạo giọng sẽ kiểm tra
+   lại độ khớp với âm thanh/thời gian hiện tại và chỉ phân tích câu còn thiếu.
+
+   Trong **Phòng thu giọng**, bật chức năng,
+   chọn và nghe thử giọng Nam, Nữ và Dự phòng. Khi bấm **Tạo giọng**, DUCAI phân
+   tích âm thanh gốc trước, gán nhãn theo từng câu rồi dùng giọng tương ứng để
+   tạo D1. Câu chồng tiếng, quá ngắn hoặc chưa đủ bằng chứng dùng giọng Dự phòng.
+   Bạn có thể sửa nhãn ở danh sách thoại; nhãn sửa tay được lưu trong project.
+   **Nghe gốc** phát đúng khoảng âm thanh nguồn của câu. Sửa từng câu hoặc nhiều
+   câu giữ vị trí danh sách; nếu câu rời khỏi bộ lọc, danh sách ở gần vị trí đó.
+   Các giọng đã cài có mẫu nghe được chuẩn bị sẵn, gồm từng profile clone hoàn
+   chỉnh trên máy. Bấm nghe phát mẫu đúng giọng ngay; giọng clone mới hoặc mẫu
+   thiếu/hỏng sẽ được tạo bằng tác vụ nghe thử và lưu lại cho lần sau.
+   Ứng dụng phát mẫu khi bạn bấm nghe hoặc nhập file giọng mới; mở lại tool,
+   mở project hay làm mới thư viện không tự phát. Mỗi vai có nút **Chọn file giọng…**
+   để dùng WAV, MP3, M4A, FLAC hoặc OGG riêng qua VieNeu; tool sao chép mẫu vào
+   kho giọng được quản lý rồi lưu riêng cho vai đó, không thay mẫu của các vai
+   khác. Nhập thành công sẽ tự tạo một câu bằng giọng clone rồi phát để bạn kiểm
+   tra; đây là giọng được tổng hợp, không phải phát lại bản ghi gốc. Lần đầu cần
+   chờ nạp model và tạo mẫu; lần sau dùng mẫu đã lưu nếu còn khớp. Nút **Nghe thử**
+   cho phép nghe lại. File lỗi hoặc nhập thất bại không phát mẫu giọng cũ.
+   Sau khi nhập thành công, chuyển hoặc xóa file gốc không làm mất giọng
+   đã nhập. VieNeu 3 Turbo không bắt buộc lời
+   mẫu. Chọn lại giọng trong danh sách để thay file mẫu riêng bằng giọng đó.
+   File nén như AAC/M4A được giải mã sang WAV tạm khi tạo profile; file gốc và
+   bản sao đã nhập được giữ nguyên. Nếu file hỏng, thiếu FFmpeg hoặc giải mã quá
+   lâu, tool báo lỗi file giọng cụ thể để bạn xử lý.
+
+   Riêng câu máy không phát hiện lời thoại giữ nhãn **Cần kiểm tra** và chưa tạo
+   giọng. Gán **Nam** hoặc **Nữ** nếu bạn xác nhận câu đó có thoại; chọn **Tự
+   động** để trả về kết quả máy và bỏ clip cũ khỏi D1 khi tạo lại. Các lý do
+   chưa chắc khác vẫn dùng giọng Dự phòng.
+   Mở lại dự án, **Khớp giọng** hoặc đặt lại D1 chỉ xử lý các câu đã được tạo
+   giọng; câu không có thoại vẫn được giữ trong phụ đề và danh sách kiểm tra.
+
+   MOSS nghe từng khối âm thanh gốc và đối chiếu mốc người nói với SRT gốc.
+   Một câu chưa rõ chỉ được gán thêm khi có các đoạn giọng rõ, độc lập và nhất
+   quán của cùng người nói. MOSS và nội dung chữ trong SRT không tự quyết định
+   nhãn Nam/Nữ; câu liền kề cũng không phải bằng chứng cho nhãn này.
+   Tool kiểm tra thêm các đoạn âm thanh nằm trọn trong một lượt nói rõ của
+   MOSS. Câu từng bị đánh dấu nhiều người nói hoặc bằng chứng mâu thuẫn chỉ
+   được tự gán khi chính câu đó và ít nhất hai đoạn độc lập bên ngoài câu cùng
+   xác nhận một chất giọng; bằng chứng trái chiều vẫn giữ câu để kiểm tra.
+   Tạm dừng/tiếp tục giữ các bước phân tích đã xong; bước đang nghe sẽ chạy lại.
+   Trong mỗi bước, model được giữ để xử lý các khối tiếp theo; chuyển bước sẽ
+   giải phóng engine trước. Thời gian còn phụ thuộc độ dài và mật độ lời thoại.
+   Tác vụ phân vai cũ không tương thích checkpoint mới cần được tạo lại.
+   Khi bộ nhận diện đổi phiên bản, kết quả tự động cũ cần được phân tích lại
+   trước khi dùng; nhãn sửa tay vẫn được giữ. Đây là tính năng thử nghiệm:
+   độ chính xác trên hoạt hình Trung Quốc chưa qua cổng
+   đánh giá độc lập và vẫn cần nghe lại các câu được máy tự gán.
+
    Sau khi dịch, bạn có thể sửa nội dung tiếng Việt, thời gian, thêm/xóa cue hoặc
    cắt video rồi bấm **Tạo giọng** mà không phải dịch lại. Tool chờ lưu toàn bộ
    chỉnh sửa mới nhất trước khi tạo tác vụ; cue nằm hoàn toàn trong phần đã cắt
@@ -661,7 +753,7 @@ portable dùng vùng staging trong LocalAppData để không tự ghi gói tải
    che hoặc tranh chuột với logo/blur;
    bốn góc neo có vùng bắt chuột lớn và tự chọn góc phục hồi khi overlay quá nhỏ.
    **Che theo phụ đề Việt** bám thời gian và vùng chữ của bản dịch cuối cùng,
-   kể cả sau khớp giọng. Chữ thoại tự thu nhỏ để vừa vùng đặt chữ; vùng che ôm
+   kể cả sau khớp giọng. Chữ thoại giữ cỡ chữ đã chọn và tự xuống dòng; vùng che ôm
    chữ Việt cộng padding, không còn chạy theo box chữ Trung. Hai cue cùng thời
    điểm được che đồng thời. Project mới dùng blur mạnh với
    bán kính 46 và padding rộng hơn. Nút **Che kín** phủ thêm lớp tối 90% đúng
@@ -669,12 +761,18 @@ portable dùng vùng staging trong LocalAppData để không tự ghi gói tải
    Việt ở lớp trên; tắt Che kín vẫn giữ blur tự động. Có thể chỉnh padding và bán kính,
    còn **Blur thủ công** vẫn thêm/xóa, kéo, resize và đặt khoảng thời gian độc lập.
    Nền màu của thoại S1 là hình chữ nhật phẳng, có khoảng đệm hai bên và trên/dưới,
-   tự co giãn theo độ dài bản dịch. Chữ được thu nhỏ nếu vùng đặt chữ quá hẹp.
+   tự co giãn theo độ dài bản dịch. Chữ thoại và chữ cảnh không tự giảm cỡ khi
+   bản dịch dài; preview và bản xuất dùng cùng cách xuống dòng ở cỡ đã chọn.
    Màu chữ trắng trên nền đen luôn được tô phía trên viền; nếu màu chữ gần trùng
    nền màu (độ đục nền từ 50% trở lên), Preview/export tự chọn trắng hoặc đen dễ
    đọc hơn mà không sửa dữ liệu cue. Các màu vốn đủ tương phản vẫn giữ nguyên.
    Chữ và nền vẫn có độ trong riêng; nền mực của chữ cảnh không bị đổi thành nền thoại.
-   Trong **Thiết lập → Phụ đề**, có thể bật/tắt nền hoặc chọn **Nền đen** / **Blur**.
+   Trong **Text → Nền mặc định cho thoại**, chọn **Không nền**, **Nền đen** hoặc
+   **Nền mờ (blur)** cho các câu đang dùng thiết lập chung. **Viền phụ đề thoại**
+   cũng nằm trong **Text**: chọn màu và độ dày 0–12 px, giá trị 0 tắt viền. Đây là
+   thiết lập chung đã có, không thay đổi cách áp dụng. Blur tự bám được xử lý hai
+   lượt cho mờ hơn; Preview và MP4 dùng cùng vùng, thời gian, độ đục và mức mờ
+   tương ứng. Phóng to/thu nhỏ Preview vẫn giữ mức mờ theo tỷ lệ video.
    Nền mới dùng hình chữ nhật nhỏ hơn, có padding; chữ cảnh mới có giá trị cỡ chữ
    mặc định 40. Preview và bản xuất lấy cùng font đã đóng gói và cùng nét chữ đo
    được; nén MP4/khử răng cưa vẫn có thể làm pixel ở mép hơi khác.
@@ -697,7 +795,9 @@ portable dùng vùng staging trong LocalAppData để không tự ghi gói tải
    playhead/thời lượng và mở thanh âm lượng khi rê vào biểu tượng loa. Blur/logo
    chỉ tác động lớp video; phụ đề Việt preview và ASS xuất cuối luôn nằm trên blur.
 7. **Xuất video:** dùng backend `auto`, đặt âm lượng A1/D1, kiểm tra logo/blur,
-   style phụ đề và filter rồi xuất. Các preset Không filter, Ấm điện ảnh, Lạnh,
+   style phụ đề và filter rồi xuất. Khi xuất thành công, nút **Mở thư mục**
+   mở đúng thư mục chứa MP4 vừa tạo; nút cũng có trong Thiết lập của Timeline.
+   Các preset Không filter, Ấm điện ảnh, Lạnh,
    Đen trắng cùng cường độ/sáng/tương phản/bão hòa được biên dịch thành filter
    FFmpeg thật. Hàng đợi hiển thị đoạn đang render/tổng số đoạn, thời lượng đã
    xử lý/tổng, phần trăm, thời gian đã chạy, ETA còn lại và giờ dự kiến xong từ
@@ -1109,7 +1209,12 @@ góc dưới phải có **Xuất video / Tạm dừng / Tiếp tục** theo tr�
   File SRT, media và cache không bị xóa. Bảng **QA bản dịch** xuất hiện ở cả Dịch thuật và Biên tập phụ đề;
   khi sửa hết chữ Hán/CJK, cảnh báo đỏ và đánh dấu cue được gỡ ngay. Evidence QA
   cũ từ job không được phép ghi đè lại một cue Việt đã sửa hợp lệ.
-- Trên **Timeline**, chỉ vùng đầu dòng `V1/A1/D1/S1…` chọn toàn bộ track. Click
+- Trên **Timeline**, bấm đầu dòng `S1/S2…` hoặc `T1…` chọn toàn bộ cue chữ của
+  dòng đó để sửa cỡ, hướng, nền và các kiểu chữ trong tab **Text**. Giữ Ctrl
+  để thêm các dòng cùng loại vào nhóm; dòng đã khóa phải mở khóa trước khi sửa.
+  Bôi chọn hoặc chọn đầu dòng có chữ cảnh, rồi chuột phải → **Chấp nhận chữ
+  cảnh đã chọn** để duyệt cả nhóm; thao tác không duyệt nhầm thoại và có thể
+  hoàn tác một lần. Đầu dòng `V1/A1/D1…` vẫn chọn toàn bộ track. Click
   một clip/cue trong phần nội dung sẽ bỏ lựa chọn track trước đó và chuyển về
   điều khiển riêng clip, nên speed, volume và kéo mép không bị khoá sau khi đã
   dùng Chọn tất cả. Với phụ đề, lựa chọn được giữ theo cue ID ổn định nên editor

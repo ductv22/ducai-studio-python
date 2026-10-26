@@ -65,6 +65,12 @@ preview/export time map; Timeline can visualize and apply timestamped per-cue
 voice-speed decisions directly on D1. Logo/blur, mixer,
 resumable FFmpeg export, guarded final MP4, one-way
 0.1.99 migration and runtime diagnostics are now implemented for release QA.
+Experimental dialogue casting assigns selected male/female/fallback voices to
+spoken cues, preserves manual corrections and reuses acoustic checkpoints.
+Imported clone references can generate an audition before a full dubbing run.
+The Timeline Text inspector also contains the existing dialogue outline and
+default background settings, plus explicit per-cue None/Blur choices shared by
+preview and MP4 export.
 The Multi video workspace catalogs every existing video project and also routes
 one or more imports from its dedicated video picker into per-media projects,
 reusing an existing owner for duplicate media, and processes selected projects
@@ -135,6 +141,18 @@ Install or repair the isolated VieNeu CUDA runtime explicitly with:
 The installer pins VieNeu 3.8.1, PyTorch/Torchaudio CUDA 12.8 and validates a
 CUDA-capable NVIDIA device. Existing 3.3 clone NPZ files are normalized only in
 memory; their files, model cache and prior voice cache are not rewritten.
+
+After installing VieNeu, install the optional dialogue-casting runtime explicitly:
+
+```powershell
+./scripts/setup-dialogue-casting-runtime.ps1 -DataRoot '<local DUCAI_STUDIO_DATA>'
+```
+
+This installs the pinned recognizers and MOSS runtime outside the GUI environment.
+Models, local voice profiles and user projects are not included in this source
+repository. See the [casting runtime and recognition guide](scripts/dialogue_casting/README.md)
+and the [user guide](docs/user-guide.md) for installation, review labels and
+accuracy limits; the independent multi-film accuracy gate remains unevaluated.
 
 The Paddle runtime can be selected through the application setting or the
 `DUCAI_PADDLE_PYTHON` environment variable. OCR jobs fingerprint that runtime,

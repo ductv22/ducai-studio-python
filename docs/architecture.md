@@ -742,6 +742,14 @@ without a product cap of 100),
 opacity and an optional stable display-track ID. Legacy snapshots decode these
 new fields to the former solid, non-spaced, non-styled appearance. Legacy S2
 snapshots retain their saved size; newly recognized scene cues use size `40`.
+Dialogue placement can additionally use an optional normalized `text_anchor`.
+This separates recognition geometry from Vietnamese layout: a narrow source
+crop is evidence, not a fitting rectangle. The frozen job dialogue region owns
+the initial centre; explicit manual panels take priority. Legacy snapshots omit
+the field and keep their previous placement, without a SQLite migration.
+The executable owners are `_apply_ocr_cue_regions` in
+[`job_manager/service.py`](../src/ducai_studio/job_manager/service.py) and
+[`providers/subtitle_artwork.py`](../src/ducai_studio/providers/subtitle_artwork.py).
 The OCR QA `cue_regions` optionally carries `text_font_size` because SRT cannot
 encode typography. PASS and REVIEW imports accept only positive integers on
 timestamp-matching rows. Older QA without this field uses `40` when classifying
@@ -1107,6 +1115,11 @@ The catalog reports the real install/readiness state and preserves explicit
 rights warnings instead of downloading community or real-person-labelled voices
 silently.
 
+Reference-file audition is separate from enrollment/synthesis. The local Qt
+player in [`VoiceStudioScreen.qml`](../src/ducai_studio/ui/qml/screens/VoiceStudioScreen.qml)
+requires neither a model nor a project; it does not upload the selected file.
+It shares playback exclusivity with catalog/generated/production voice previews.
+
 Production synthesis is fingerprinted and cached per cue. Batching optimizes
 transport only: QA, retry, onset repair, fit and blockers remain cue-scoped. A
 resume reuses approved cache entries; an explicit “regenerate selected cue”
@@ -1265,6 +1278,121 @@ artifact and rerun post-processing/fit without inference; explicit cue
 regeneration bypasses this path. The legacy strict timing signature is
 recognized so an in-flight a36 job remains useful after upgrading.
 
+## Experimental dialogue casting boundary
+
+`DialogueCastingState` is an optional project field keyed by stable subtitle cue
+IDs. Acoustic results and user overrides retain separate provenance and bind to
+an audio key derived from the source media identity, source-time mapping, cue
+interval and overlapping dialogue. Text and visual style edits do not invalidate
+these labels; changes to audio, time or cuts do. The existing cue `role` remains
+reserved for dialogue versus scene text.
+
+Analyzer identity also invalidates automatic evidence. It fingerprints the
+actual host, helper and model-lock files plus checkpoint/window policy, so
+changing thresholds, parser, model provenance or helper code invalidates old
+automatic results. Matching manual male/female overrides remain usable, while
+manual `unknown` requires a current
+machine result. Importing a new analyzer's partial results discards older
+machine evidence while preserving overrides; an outdated analyzer job must be
+rerun. Resetting a retained manual label to Automatic therefore cannot revive
+an older analyzer's classification.
+
+The managed `DIALOGUE_CASTING` worker analyzes only spoken cues against original
+audio, using the timeline's source-time map and original source-cue text. Each
+source blocks run by stage: sherpa diarization for all blocks, then ECAPA acoustic
+classification, then MOSS transcription/diarization, then bounded ECAPA refinement
+on MOSS-clear speaker and cue-local crops. Each stage reuses one pinned
+host and loaded model through sequential JSON-line requests, with atomic result
+files. A stage change or pause releases the owned host before another engine
+loads. Asset checksums are verified on initial load; size/mtime guards detect
+subsequent changes. Each MOSS window resets the same deterministic seeds and
+retains the pinned model, precision and inference policy. MOSS provides
+speech boundaries and anonymous speaker IDs, not gender labels. Source blocks
+use 60-second buckets with five-second context; a cue crossing a bucket boundary
+extends that block to contain its complete source interval. Discontinuous,
+multi-part or over-20-second source mappings retain their existing fallback.
+Uncertain, overlapping or unsuitable segments remain `unknown` and use the
+selected fallback voice. The exception is `no_speech`: it remains reviewable and
+is omitted from TTS/D1 while its effective
+label is unknown. A manual male/female override makes it eligible for that
+voice; returning to Automatic suppresses it again. D1 replacement omits the
+corresponding clip, and an all-skipped result removes the active D1 track. TTS
+stores resolved provider, model and voice identity per cue plus the skip list in
+its settings fingerprint, so changing a role voice or override invalidates only
+the affected cue assignments. Multi captures casting settings and manual
+overrides at batch start and uses that snapshot for both analysis scope and TTS
+assignment.
+
+When enabled in the OCR/Whisper screen, successful extraction reloads its
+project snapshot and requests casting automatically. A preview/TTS already in
+progress defers this request until idle; project and job context reject stale
+callbacks. Voice generation joins existing casting or uses valid stored results.
+It does not start a duplicate analysis, and OCR completion alone never requests
+TTS. Multi retains its coordinator-owned casting-before-TTS sequence.
+
+After block analysis, the worker pools evidence separately for each source media
+item. Composite window IDs contain media identity and exact source-time bounds;
+MOSS speaker IDs remain local to one window. For each cue the cross-check uses a
+complete containing window with the largest edge margin. Original source-SRT
+text similarity is an advisory diagnostic, never a gender decision.
+
+The cross-check may rescue only `low_confidence`,
+`insufficient_speaker_reference` or `insufficient_speech` baseline results when
+MOSS shows sufficient single-speaker speech. It requires at least two disjoint
+one-second acoustic anchors at confidence 0.95 or above. Contradictory samples
+at confidence 0.8 or above prevent rescue. A separate restricted rescue path
+accepts `multiple_speakers` and `contradictory_speaker_evidence` only when clear
+MOSS geometry, a fresh cue-local crop at confidence >=0.95 and two disjoint fresh
+speaker references outside that cue agree. Clean opposite evidence at >=0.8
+vetoes it. The sample planner retains original turn boundaries, removes competing
+speech and limits each speaker to three one-to-five-second references. Assigned
+labels, actual overlap and `no_speech` remain unchanged. Only raw acoustic evidence and the original
+local machine decision are used; previous consensus rescues, subtitle text,
+adjacent cues and manual labels never become gender evidence. The external host
+projects the final decision into the existing `CastingResult` schema and keeps
+full analysis/decision diagnostics in separate technical artifacts.
+
+Checkpoint schema 2 stores completed `diarize`, `classify`, `moss` and `refine` stages by
+composite window ID, together with input/settings signatures and final cue results.
+Each stage carries media/window bounds, analyzer/bundle identity, pinned MOSS
+provenance and its request digest. Classification is bound to the exact saved
+diarization payload; refinement is bound to the exact MOSS and classification
+payloads. Restored turns, sample provenance/bounds, decisions and probabilities are validated
+before entering the final evidence pool.
+Resume validates stored stages, reuses completed work and recomputes the final
+per-media cross-check from the original evidence. An interrupted host stage is
+restarted. Older results-only checkpoints fail with an instruction to create a
+new job. Pause, cancel, timeout and exceptions close the owned host process tree.
+
+The explicit [runtime installer](../scripts/setup-dialogue-casting-runtime.ps1)
+calls the dedicated MOSS installer. The
+[MOSS lock](../scripts/dialogue_casting/moss-lock.json) owns model/source revisions,
+required-file checksums, license and verified runtime versions; the hashed
+requirements file owns dependency installation. Runtime discovery uses the
+canonical `dialogue_casting_runtime/moss` directory. The explicit installer can
+seed it from a verified legacy experiment snapshot and synchronizes dependency
+versions even when a Python executable already exists. Runtime verification
+is separate from inference. Inference is forced offline, uses greedy SDPA
+generation and rejects truncated or malformed
+output. Missing/corrupt assets and incompatible runtime versions remain explicit
+errors rather than unknown labels. Heavy engines are never loaded in the GUI
+or together in a host.
+
+Casting voice auditions use the read-only `get_tts_voice_preview` IPC resolver
+before creating synthesis jobs. Preset/Piper samples are bundled with the EXE;
+complete local clone profiles have distinct prepared WAVs in the data root.
+Lookup and managed preview synthesis share the resolved provider/model/profile
+identity and preview-text/options cache key. Missing or invalid PCM falls back to
+managed TTS. Request serial/project guards and an explicit preview-job sentinel
+prevent stale lookups or historical completed jobs from replacing the selected
+sample. PCM validation reads all frames in bounded chunks, rejecting truncated
+or silent assets.
+
+This path is experimental. The gender classifier has not passed an independent
+accuracy and coverage gate for Chinese animation; integrations and test-video
+results do not establish production accuracy. Existing projects remain disabled
+unless users enable casting explicitly.
+
 ## Post-dubbing voice conform boundary
 
 Voice conform is a cache-only stage after a production D1 has passed. The
@@ -1278,6 +1406,16 @@ invokes the TTS provider. Variant publication is serialized per fingerprint and
 uses a unique temporary WAV plus atomic replacement. Each variant is padded or
 trimmed to the exact absolute sample boundaries in the plan before QA, preventing
 microsecond/sample rounding from creating a false overlap.
+
+For a casting-enabled parent TTS job, conform estimate, apply and reset share
+the parent's frozen no-speech exclusion set. Every excluded cue must belong to
+the current dialogue and frozen parent inputs, carry exactly
+`dialogue_casting_no_speech`, and have matching ledger `ineligible` evidence
+without a contradictory WAV entry. Current casting labels do not reinterpret
+that completed parent. Excluded cues need no base WAV or D1 clip; source and
+translated subtitle tuples remain intact. Any other absent WAV, invalid skip
+evidence or cache-integrity failure remains an explicit error. D1 timing
+coverage is checked against the same eligible set during import and reset.
 
 Source/output point queries binary-search the validated monotonic segment ends;
 the serialized plan, fingerprint, interpolation and boundary rules stay unchanged.
@@ -1496,6 +1634,9 @@ optimistic local patch and roll back to the last value on failure. Per-overlay
 generations prevent an older acknowledgement from replacing newer geometry,
 and effect acknowledgements never trigger project, cache or preview rehydration.
 
+Export is independent of the AI pipeline: OCR, translation, TTS and subtitles
+are optional, including when the subtitle style is enabled but has no cues.
+The same path preserves source audio and edits for ordinary video-only projects.
 Starting an export compiles an immutable projected snapshot with ordered video
 segments, audio tracks, subtitles and overlays. Legacy one-video snapshots remain
 readable. Sequential segments are trimmed, retimed and joined through the same
