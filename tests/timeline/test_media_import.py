@@ -73,6 +73,17 @@ def test_voice_replacement_preserves_media_referenced_outside_d1(tmp_path):
         assert next(t for t in result.tracks if t.id == "M1").clips[0].media_id == "shared"
 
 
+def test_translated_srt_import_keeps_ocr_dialogue_anchor(tmp_path):
+    cue = SubtitleCue("c", 1, TimeRange(0, SECOND), "字幕", "zh", text_anchor=(.5, .335))
+    translated = tmp_path / "translated.srt"
+    translated.write_text("1\n00:00:00,000 --> 00:00:01,000\nXin chào.\n", encoding="utf-8")
+    service = MediaImportService(FakeProbe(MediaProbeResult(SECOND, False, True)))
+    project = service.import_srt(ProjectSnapshot("p", "Anchor", 1, source_cues=(cue,)),
+                                 translated, language="vi")
+    assert project.translated_cues[0].text_anchor == cue.text_anchor
+    assert project.translated_cues[0].panel_box is None
+
+
 class FakeProbe:
     def __init__(self, result: MediaProbeResult) -> None:
         self.result = result

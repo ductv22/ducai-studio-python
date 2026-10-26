@@ -85,6 +85,7 @@ def test_export_renderer_change_does_not_adopt_old_chunks_or_delete_cache(tmp_pa
     reference = {"artifact": {"uri": str(checkpoint)}}
     assert worker._restore_checkpoint(reference, "new", legacy_signature="legacy") is None
     assert worker._restore_checkpoint(reference, "new", previous_signature="legacy") is None
+    assert worker._restore_checkpoint(reference, "new", system_fonts_signature="legacy") is None
     assert old_chunk.read_bytes() == b"old renderer cache"
     with pytest.raises(ValueError, match="signature_mismatch"):
         worker._restore_checkpoint(reference, "new", legacy_signature="unrelated")
@@ -477,6 +478,66 @@ def test_real_multi_segment_export_preserves_join_frames_audio_and_duration(
 
     assert estimated_frequency(0.2, 0.8) == pytest.approx(330, abs=15)
     assert estimated_frequency(1.2, 2.2) == pytest.approx(990, abs=20)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+                    reason="Real plain-video export requires FFmpeg")
+def test_real_import_split_delete_speed_export_without_ai(tmp_path, monkeypatch):
+    from ducai_studio.domain.project import TrackKind
+
+    ffmpeg = shutil.which("ffmpeg")
+    source = tmp_path / "source.mp4"
+    subprocess.run([
+        ffmpeg, "-v", "error", "-f", "lavfi", "-i", "color=red:s=320x180:r=24:d=1",
+        "-f", "lavfi", "-i", "color=green:s=320x180:r=24:d=1",
+        "-f", "lavfi", "-i", "color=blue:s=320x180:r=24:d=2",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=4",
+        "-filter_complex", "[0:v][1:v][2:v]concat=n=3:v=1:a=0[v]",
+        "-map", "[v]", "-map", "3:a", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-y", str(source),
+    ], check=True, capture_output=True, timeout=20, **_hidden_subprocess_kwargs())
+    original_hash = file_sha256(source)
+    service = JobManagerService(database_path=tmp_path / "state.db",
+                                artifact_root=tmp_path / "artifacts", media_probe=FfprobeProvider())
+    project = service.create_project(project_path=str(tmp_path / "project.ducai"), name="No AI")
+    project_id = project["id"]
+    service.import_media(project_id=project_id, media_path=str(source))
+    for point in (1_000_000, 2_000_000):
+        service.timeline_command(project_id=project_id, command="split_video", timeline_us=point)
+    split = service.projects.load(project_id)
+    clips = next(track.clips for track in split.tracks if track.kind is TrackKind.VIDEO)
+    blue = next(clip for clip in clips if clip.timeline_range.start_us == 2_000_000)
+    middle = next(clip for clip in clips if clip.timeline_range.start_us == 1_000_000)
+    service.timeline_command(project_id=project_id, command="speed", clip_id=blue.id, value=200)
+    service.timeline_command(
+        project_id=project_id, command="delete_video_segment", clip_id=middle.id)
+    edited = service.projects.load(project_id)
+    assert not edited.source_cues and not edited.translated_cues
+    output = tmp_path / "plain-final.mp4"
+    job = service.create_export_job(project_id=project_id, output_path=str(output),
+        export_options={"backend": "cpu", "data_root": str(tmp_path / "data")})
+    render = job["spec"]["provider_config"]["snapshot"]
+    assert render["subtitles"] == [] and render["timeline_end_us"] == 2_000_000
+    monkeypatch.setenv("DUCAI_ARTIFACT_STAGING_ROOT", str(tmp_path / "staging"))
+    worker = ExportWorker(job["id"])
+    events = []
+    worker.send = lambda kind, payload: events.append((kind, payload))
+    worker._configure({"job": job["spec"]})
+    worker._execute()
+    assert events[-1][0] == "succeeded"
+    qa = service.validate_final_export(job["id"], str(output))
+    assert qa["status"] == "PASS"
+    probe = FfprobeProvider().probe(output)
+    assert probe.has_video and probe.has_audio
+    assert abs(probe.duration_us - 2_000_000) <= 100_000
+    for at, channel in (("0.5", 0), ("1.5", 2)):
+        frame = subprocess.run([
+            ffmpeg, "-v", "error", "-ss", at, "-i", str(output), "-frames:v", "1",
+            "-vf", "scale=1:1", "-pix_fmt", "rgb24", "-f", "rawvideo", "-",
+        ], check=True, capture_output=True, timeout=10, **_hidden_subprocess_kwargs()).stdout
+        assert frame[channel] > 180 and frame[1] < 80
+    assert file_sha256(source) == original_hash
+    assert {item["spec"]["kind"] for item in service.list_jobs()} == {"export"}
 
 
 def test_export_resume_eta_ignores_instantly_restored_cache(tmp_path: Path, monkeypatch) -> None:

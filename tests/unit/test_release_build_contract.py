@@ -63,6 +63,40 @@ def test_public_update_assets_are_signed_and_source_free() -> None:
     assert 'EndsWith("-UPDATE")' in wrapper
 
 
+def test_release_compiles_and_packages_the_dialogue_casting_host() -> None:
+    build_script = (PROJECT_ROOT / "scripts" / "build-release.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert '"dialogue_casting_engine_host"' in build_script
+    assert '"srt_demo"' in build_script
+    assert '"evaluation"' in build_script
+    assert '"model-lock.json", "ecapa-lock.json", "requirements.txt"' in build_script
+    assert (
+        '"Experimental dialogue casting (external pinned runtimes and models required)"'
+        in build_script
+    )
+
+
+def test_release_can_use_isolated_build_outputs_without_touching_default_deployment() -> None:
+    build_script = (PROJECT_ROOT / "scripts" / "build-release.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert '[string]$DataRoot = ""' in build_script
+    assert '[string]$DeploymentRoot = ""' in build_script
+    assert '[string]$BuildArtifactsRoot = ""' in build_script
+    assert '"--config-file", $temporaryDeployConfig' in build_script
+    assert 'Join-Path $deploymentRoot "DUCAI_BUILD_VERSION"' in build_script
+    assert 'Join-Path $projectRoot "src\\ducai_studio"' in build_script
+    assert 'Split-Path -Path $deploymentRoot -Parent' in build_script
+    assert '--extra-ignore-dirs DucaiStudio2.dist,deployment' in build_script
+    assert (
+        'Get-ChildItem $buildArtifactsRootPath -File -Filter "ducai_studio-*.whl"'
+        in build_script
+    )
+
+
 def test_release_always_bundles_the_licensed_scene_text_font() -> None:
     build_script = (PROJECT_ROOT / "scripts" / "build-release.ps1").read_text(
         encoding="utf-8"
@@ -162,6 +196,7 @@ def test_portable_manifest_hashes_bundled_engine_runtimes() -> None:
         '"python_runtime_312"',
     ):
         assert critical_root in build_script
+    assert '"dialogue_casting_engine_host"' in build_script
 
 
 def test_portable_whisper_runtime_and_model_are_explicitly_opt_in() -> None:

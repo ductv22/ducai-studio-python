@@ -61,6 +61,26 @@ class MemorySettings:
         self.values[key] = value
 
 
+def test_clone_reference_source_is_local_and_does_not_start_a_voice_job(tmp_path, monkeypatch):
+    QCoreApplication.instance() or QCoreApplication([])
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    MemorySettings.values = {}
+    model = ApplicationViewModel()
+    calls = []
+    model.runtime.request = lambda *args, **kwargs: calls.append(args)
+    reference = tmp_path / "giọng mẫu #1.wav"
+    reference.touch()
+    model.setVieNeuReferenceAudio(reference.as_uri())
+    assert Path(QUrl(model.vieneuReferenceSource).toLocalFile()) == reference.resolve()
+    assert model.vieneuReferenceAudio == str(reference.resolve())
+    model.setVieNeuReferenceAudio(str(tmp_path / "missing.wav"))
+    assert model.vieneuReferenceAudio == str(reference.resolve())
+    assert "không tồn tại" in model.statusMessage
+    model.setVieNeuReferenceAudio("")
+    assert model.vieneuReferenceSource == ""
+    assert calls == []
+
+
 @pytest.mark.parametrize("override", ["exists", "missing", "unset"])
 def test_ocr_runtime_override_matches_diagnostics_without_overwriting_saved_choice(
     tmp_path, monkeypatch, override,
@@ -987,6 +1007,41 @@ def test_voice_catalog_refresh_does_not_run_blocking_vieneu_health_probe(
     model.refresh()
 
     assert model.count >= 1
+
+
+def test_voice_catalog_exposes_every_complete_local_clone_profile(
+    tmp_path, monkeypatch,
+) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    monkeypatch.setenv("DUCAI_STUDIO_DATA_ROOT", str(tmp_path))
+    runtime = tmp_path / "vieneu_3_8_runtime"
+    runtime_python = runtime / ".venv" / "Scripts" / "python.exe"
+    runtime_python.parent.mkdir(parents=True)
+    runtime_python.write_bytes(b"runtime")
+    (runtime / "ducai_runtime.json").write_text('{"version":"3.8.1"}', encoding="utf-8")
+    presets = (
+        runtime
+        / ".venv"
+        / "Lib"
+        / "site-packages"
+        / "vieneu"
+        / "assets"
+        / "voices_v3_turbo.json"
+    )
+    presets.parent.mkdir(parents=True)
+    presets.write_text('{"presets":{"Mai Anh":{}}}', encoding="utf-8")
+    profiles = tmp_path / "vieneu_profiles"
+    profiles.mkdir()
+    for stem in ("clone-c", "clone-a", "clone-b"):
+        (profiles / f"{stem}.npz").write_bytes(stem.encode())
+        (profiles / f"{stem}.json").write_text("{}", encoding="utf-8")
+
+    model = VoiceCatalogModel()
+    clones = [model.get(index) for index in range(model.count) if model.get(index)["is_clone"]]
+
+    assert [item["voice_id"] for item in clones] == ["clone-a", "clone-b", "clone-c"]
+    assert len({item["profile_path"] for item in clones}) == 3
+    assert all(item["installed"] is True for item in clones)
 
 
 def test_job_runtime_never_queues_a_second_job_poll_while_one_is_pending(
@@ -6548,6 +6603,696 @@ def test_voice_generation_waits_for_latest_edit_revision_to_be_saved(monkeypatch
     QCoreApplication.processEvents()
     assert starts == [("production", 3)]
     assert not model.projectDirty
+
+
+def test_enabled_dialogue_casting_requires_all_three_voices_before_analysis(monkeypatch):
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model._set_backend_ready(True)
+    model.project_state.replace({"id": "casting-preflight", "name": "Phim", "revision": 1})
+    model._selected_voice_id = "vi_VN-vais1000-medium"
+    model._dialogue_casting["config"] = {
+        "enabled": True,
+        "male_voice": None,
+        "female_voice": {"provider_id": "piper", "voice_id": "vi_VN-vivos-x_low"},
+        "fallback_voice": {"provider_id": "piper", "voice_id": "vi_VN-vais1000-medium"},
+    }
+    monkeypatch.setattr(
+        model.voice_catalog,
+        "find",
+        lambda _voice_id: {
+            "voice_id": "vi_VN-vais1000-medium",
+            "provider_id": "piper",
+            "installed": True,
+        },
+    )
+    requests = []
+    monkeypatch.setattr(
+        model.runtime,
+        "request",
+        lambda action, payload=None, context=None: requests.append((action, payload, context)),
+    )
+
+    model.startVoiceGeneration()
+
+    assert requests == []
+    assert model.ttsBusy is False
+    assert model.dialogueCastingJobState == ""
+    assert "giọng nam" in model.statusMessage
+
+
+@pytest.mark.parametrize("clone", [False, True])
+def test_casting_audition_omits_empty_profile_and_uses_frozen_voice(
+    monkeypatch, tmp_path, clone,
+):
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {"voice/vieneuReferenceAudio": "another-global-reference.wav"}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model.project_state.replace({"id": "audition", "name": "Phim", "revision": 1})
+    voice = {"provider_id": "vieneu-3.8", "voice_id": "clone" if clone else "preset:Mai Anh",
+             "profile_path": "", "reference_audio_path": "", "reference_text": "",
+             "reference_denoise": False}
+    if clone:
+        voice.update(reference_audio_path=str(tmp_path / "frozen-reference.wav"),
+                     reference_text="Mẫu đã chọn", reference_denoise=True)
+    model._dialogue_casting["config"] = {"female_voice": voice}
+    calls = []
+    monkeypatch.setattr(model.runtime, "request",
+                        lambda a, p=None, context=None: calls.append((a, p, context)))
+    model.previewDialogueCastingVoice("female")
+    assert len(calls) == 1 and calls[0][0] == "get_tts_voice_preview"
+    options = calls[0][1]["provider_options"]
+    assert "profile_path" not in options
+    if clone:
+        assert options["reference_audio_path"] == voice["reference_audio_path"]
+        assert options["reference_text"] == "Mẫu đã chọn"
+        assert options["reference_denoise"] is True
+    else:
+        assert not any(key.startswith("reference_") for key in options)
+
+
+def test_casting_audition_plays_prepared_sample_without_project_or_tts_job(
+    monkeypatch, tmp_path,
+) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    voice = {"provider_id": "vieneu-3.8", "voice_id": "preset:Mai Anh"}
+    model._dialogue_casting["config"] = {"female_voice": voice}
+    sample = tmp_path / "prepared.wav"
+    sample.touch()
+    calls = []
+    monkeypatch.setattr(
+        model.runtime,
+        "request",
+        lambda action, payload=None, context=None: calls.append((action, payload, context)),
+    )
+    replays = []
+    model.voicePreviewChanged.connect(lambda: replays.append(model.voicePreviewSource))
+
+    model.previewDialogueCastingVoice("female")
+    lookup_context = calls[-1][2]
+    descriptor = {"available": True, "path": str(sample), "source": "bundled"}
+    model._action_succeeded("get_tts_voice_preview", descriptor, lookup_context)
+    model.previewDialogueCastingVoice("female")
+    second_context = calls[-1][2]
+    model._action_succeeded("get_tts_voice_preview", descriptor, second_context)
+
+    assert [call[0] for call in calls] == [
+        "get_tts_voice_preview",
+        "get_tts_voice_preview",
+    ]
+    audible_replays = [source for source in replays if source]
+    assert len(audible_replays) == 2
+    assert audible_replays[0] == audible_replays[1] == QUrl.fromLocalFile(
+        str(sample.resolve())
+    ).toString()
+    assert model.ttsBusy is False
+
+
+def test_prepared_casting_audition_ignores_historical_completed_preview_job(
+    monkeypatch, tmp_path,
+) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model.project_state.replace({"id": "audition", "name": "Phim", "revision": 1})
+    model._dialogue_casting["config"] = {
+        "female_voice": {"provider_id": "vieneu-3.8", "voice_id": "preset:Mai Anh"}
+    }
+    selected = tmp_path / "selected.wav"
+    historical = tmp_path / "historical.wav"
+    selected.touch()
+    historical.touch()
+    requests = []
+    monkeypatch.setattr(
+        model.runtime, "request",
+        lambda action, payload=None, context=None: requests.append((action, payload, context)),
+    )
+    model.previewDialogueCastingVoice("female")
+    model._action_succeeded(
+        "get_tts_voice_preview",
+        {"available": True, "path": str(selected), "source": "bundled"},
+        requests[-1][2],
+    )
+
+    model._replace_jobs([{
+        "id": "historical-preview", "state": "succeeded",
+        "spec": {"kind": "tts", "project_id": "audition",
+                 "provider_config": {"purpose": "preview"}},
+        "result": {"purpose": "preview", "output_path": str(historical)},
+    }])
+
+    assert model.voicePreviewSource == QUrl.fromLocalFile(str(selected.resolve())).toString()
+    assert [item[0] for item in requests] == ["get_tts_voice_preview"]
+
+
+def test_missing_prepared_casting_audition_falls_back_to_managed_tts_job(
+    monkeypatch,
+) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model.project_state.replace({"id": "audition", "name": "Phim", "revision": 1})
+    model._dialogue_casting["config"] = {
+        "female_voice": {"provider_id": "vieneu-3.8", "voice_id": "preset:Mai Anh"}
+    }
+    calls = []
+    monkeypatch.setattr(
+        model.runtime,
+        "request",
+        lambda action, payload=None, context=None: calls.append((action, payload, context)),
+    )
+
+    model.previewDialogueCastingVoice("female")
+    model._action_succeeded(
+        "get_tts_voice_preview",
+        {"available": False, "path": "missing.wav", "source": "missing"},
+        calls[0][2],
+    )
+
+    assert [call[0] for call in calls] == ["get_tts_voice_preview", "create_tts_job"]
+    assert calls[1][1]["provider_options"] == calls[0][1]["provider_options"]
+    assert model.ttsBusy is True
+
+
+def test_stale_casting_preview_lookup_cannot_play_or_start_a_job(monkeypatch, tmp_path) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model.project_state.replace({"id": "project-a", "name": "A", "revision": 1})
+    model._dialogue_casting["config"] = {
+        "female_voice": {"provider_id": "vieneu-3.8", "voice_id": "preset:Mai Anh"}
+    }
+    calls = []
+    monkeypatch.setattr(
+        model.runtime,
+        "request",
+        lambda action, payload=None, context=None: calls.append((action, payload, context)),
+    )
+    sample = tmp_path / "late.wav"
+    sample.touch()
+
+    model.previewDialogueCastingVoice("female")
+    stale_context = calls[0][2]
+    model._apply_project({"id": "project-b", "name": "B", "revision": 1})
+    model._action_succeeded(
+        "get_tts_voice_preview",
+        {"available": True, "path": str(sample), "source": "bundled"},
+        stale_context,
+    )
+
+    assert model.voicePreviewSource == ""
+    assert [call[0] for call in calls] == ["get_tts_voice_preview"]
+
+
+def test_new_preview_job_replays_same_url_once_and_clears_catalog_override(monkeypatch, tmp_path):
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model.project_state.replace({"id": "audition", "name": "Phim", "revision": 1})
+    monkeypatch.setattr(model.runtime, "request", lambda *_a, **_k: None)
+    audio = tmp_path / "preview.wav"
+    audio.touch()
+    job = {"id": "preview-1", "state": "succeeded",
+           "spec": {"kind": "tts", "project_id": "audition",
+                    "provider_config": {"purpose": "preview"}},
+           "result": {"purpose": "preview", "output_path": str(audio)}}
+    events = []
+    model.voicePreviewChanged.connect(lambda: events.append(model.voicePreviewSource))
+    model._voice_preview_target_job_id = "preview-1"
+    model._replace_jobs([job])
+    model._replace_jobs([job])
+    assert len(events) == 1
+    model._voice_preview_target_job_id = "preview-2"
+    model._replace_jobs([{**job, "id": "preview-2"}, job])
+    assert len(events) == 2 and events[0] == events[1]
+    model._voice_catalog_preview_source = "file:///other-catalog.wav"
+    model._voice_catalog_preview_id = "catalog"
+    model._dialogue_casting["config"] = {
+        "female_voice": {"provider_id": "vieneu-3.8", "voice_id": "preset:Mai Anh"}}
+    model.previewDialogueCastingVoice("female")
+    assert model.voiceCatalogPreviewSource == ""
+    assert model.voicePreviewSource == ""
+    model._replace_jobs([{**job, "id": "preview-2"}, job])
+    assert model.voicePreviewSource == "", "An old completed job must not reload a locked WAV"
+
+
+def test_requested_preview_never_plays_an_older_success_while_waiting_or_failed(
+    monkeypatch, tmp_path,
+):
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model.project_state.replace({"id": "audition", "name": "Phim", "revision": 1})
+    monkeypatch.setattr(model.runtime, "request", lambda *_a, **_k: None)
+    monkeypatch.setattr(model, "_start_tts_worker", lambda _id: None)
+    old_audio = tmp_path / "older-preview.wav"
+    old_audio.touch()
+    old = {"id": "old", "state": "succeeded",
+           "spec": {"kind": "tts", "project_id": "audition",
+                    "provider_config": {"purpose": "preview"}},
+           "result": {"purpose": "preview", "output_path": str(old_audio)}}
+    model._dialogue_casting["config"] = {
+        "female_voice": {"provider_id": "vieneu-3.8", "voice_id": "preset:Mai Anh"}}
+    model.previewDialogueCastingVoice("female")
+    model._replace_jobs([old])
+    assert model.voicePreviewSource == ""
+    model._action_succeeded("create_tts_job", {"id": "new"}, {"tts_purpose": "preview"})
+    model._replace_jobs([{**old, "id": "new", "state": "failed", "result": {}}, old])
+    assert model.voicePreviewSource == ""
+
+
+@pytest.mark.parametrize("enabled,succeeded,expected", [(True, True, 1), (False, True, 0),
+                                                       (True, False, 0)])
+def test_ocr_completion_starts_enabled_casting_once_without_tts(
+    monkeypatch, enabled, succeeded, expected,
+):
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model._set_backend_ready(True)
+    project = {"id": "ocr-casting", "name": "Phim", "revision": 2,
+               "dialogue_casting": {"enabled": enabled},
+               "source_cues": [{"id": "cue-1", "index": 1, "text": "你好",
+                                "range": {"start_us": 0, "end_us": 1_000_000}}]}
+    model._apply_project(project)
+    calls = []
+    monkeypatch.setattr(model.runtime, "request",
+                        lambda a, p=None, context=None: calls.append((a, p, context)))
+    context = {"ocr_completed": True, "ocr_job_id": "ocr-1", "ocr_succeeded": succeeded,
+               "project_id": "ocr-casting"}
+    model._action_succeeded("get_project", deepcopy(project), context)
+    model._action_succeeded("get_project", deepcopy(project), context)
+    casting = [c for c in calls if c[0] == "create_dialogue_casting_job"]
+    assert len(casting) == expected
+    assert not any(c[0] == "create_tts_job" for c in calls)
+
+
+def _ocr_casting_project(project_id: str, *, enabled: bool = True) -> dict:
+    return {
+        "id": project_id,
+        "name": "Phim",
+        "revision": 2,
+        "dialogue_casting": {"enabled": enabled},
+        "source_cues": [{
+            "id": "cue-1",
+            "index": 1,
+            "text": "你好",
+            "range": {"start_us": 0, "end_us": 1_000_000},
+        }],
+    }
+
+
+def _enable_loaded_dialogue_casting(model: ApplicationViewModel, project_id: str) -> None:
+    model._replace_dialogue_casting({
+        "project_id": project_id,
+        "config": {"enabled": True},
+        "rows": [],
+    })
+
+
+def test_ocr_casting_waits_for_tts_idle_then_starts_exactly_once(monkeypatch) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model._set_backend_ready(True)
+    project = _ocr_casting_project("ocr-deferred")
+    model._apply_project(project)
+    _enable_loaded_dialogue_casting(model, "ocr-deferred")
+    calls = []
+    monkeypatch.setattr(
+        model.runtime,
+        "request",
+        lambda action, payload=None, context=None: calls.append((action, payload, context)),
+    )
+    model._set_tts_busy(True)
+    context = {
+        "ocr_completed": True,
+        "ocr_job_id": "ocr-busy",
+        "ocr_succeeded": True,
+        "project_id": "ocr-deferred",
+    }
+
+    model._action_succeeded("get_project", deepcopy(project), context)
+
+    assert model._pending_casting_after_ocr == {
+        "project_id": "ocr-deferred",
+        "ocr_job_id": "ocr-busy",
+    }
+    assert not any(call[0] in {"create_dialogue_casting_job", "create_tts_job"}
+                   for call in calls)
+
+    model._set_tts_busy(False)
+    model._set_tts_busy(False)
+
+    assert [call[0] for call in calls].count("create_dialogue_casting_job") == 1
+    assert not any(call[0] == "create_tts_job" for call in calls)
+    assert model._pending_casting_after_ocr is None
+
+
+def test_disabling_casting_drops_deferred_ocr_start(monkeypatch) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model._set_backend_ready(True)
+    project = _ocr_casting_project("ocr-disabled-later")
+    model._apply_project(project)
+    _enable_loaded_dialogue_casting(model, "ocr-disabled-later")
+    calls = []
+    monkeypatch.setattr(
+        model.runtime,
+        "request",
+        lambda action, payload=None, context=None: calls.append((action, payload, context)),
+    )
+    model._set_tts_busy(True)
+    model._action_succeeded("get_project", deepcopy(project), {
+        "ocr_completed": True,
+        "ocr_job_id": "ocr-disabled",
+        "ocr_succeeded": True,
+        "project_id": "ocr-disabled-later",
+    })
+    model.setDialogueCastingEnabled(False)
+
+    model._set_tts_busy(False)
+
+    assert not any(call[0] == "create_dialogue_casting_job" for call in calls)
+    assert model._pending_casting_after_ocr is None
+
+
+def test_ocr_casting_waits_for_existing_casting_to_finish(monkeypatch) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model._set_backend_ready(True)
+    project = _ocr_casting_project("ocr-after-casting")
+    model._apply_project(project)
+    _enable_loaded_dialogue_casting(model, "ocr-after-casting")
+    model._dialogue_casting_job_id = "existing-casting"
+    model._set_dialogue_casting_job_state("running")
+    calls = []
+    monkeypatch.setattr(
+        model.runtime,
+        "request",
+        lambda action, payload=None, context=None: calls.append((action, payload, context)),
+    )
+
+    model._action_succeeded("get_project", deepcopy(project), {
+        "ocr_completed": True,
+        "ocr_job_id": "newer-ocr",
+        "ocr_succeeded": True,
+        "project_id": "ocr-after-casting",
+    })
+
+    assert model._pending_casting_after_ocr == {
+        "project_id": "ocr-after-casting",
+        "ocr_job_id": "newer-ocr",
+    }
+    assert not any(call[0] == "create_dialogue_casting_job" for call in calls)
+
+    model._finish_dialogue_casting_job("existing-casting", "succeeded")
+    model._finish_dialogue_casting_job("existing-casting", "succeeded")
+
+    assert [call[0] for call in calls].count("create_dialogue_casting_job") == 1
+    assert model._pending_casting_after_ocr is None
+
+
+def test_switching_projects_clears_deferred_ocr_casting(monkeypatch) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model._set_backend_ready(True)
+    project_a = _ocr_casting_project("ocr-project-a")
+    model._apply_project(project_a)
+    _enable_loaded_dialogue_casting(model, "ocr-project-a")
+    calls = []
+    monkeypatch.setattr(
+        model.runtime,
+        "request",
+        lambda action, payload=None, context=None: calls.append((action, payload, context)),
+    )
+    model._set_tts_busy(True)
+    model._action_succeeded("get_project", deepcopy(project_a), {
+        "ocr_completed": True,
+        "ocr_job_id": "ocr-project-a-job",
+        "ocr_succeeded": True,
+        "project_id": "ocr-project-a",
+    })
+
+    model._apply_project(_ocr_casting_project("ocr-project-b"))
+
+    assert model.project_state.projectId == "ocr-project-b"
+    assert model._pending_casting_after_ocr is None
+    assert not any(call[0] == "create_dialogue_casting_job" for call in calls)
+
+
+@pytest.mark.parametrize(
+    ("context_project_id", "result_project_id"),
+    [("ocr-project-a", "ocr-project-a"), ("ocr-project-b", "ocr-project-a")],
+)
+def test_stale_ocr_completion_cannot_replace_current_project(
+    monkeypatch, context_project_id, result_project_id,
+) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model._set_backend_ready(True)
+    model._apply_project(_ocr_casting_project("ocr-project-b"))
+    calls = []
+    monkeypatch.setattr(
+        model.runtime,
+        "request",
+        lambda action, payload=None, context=None: calls.append((action, payload, context)),
+    )
+
+    model._action_succeeded("get_project", _ocr_casting_project(result_project_id), {
+        "ocr_completed": True,
+        "ocr_job_id": "stale-ocr",
+        "ocr_succeeded": True,
+        "project_id": context_project_id,
+    })
+
+    assert model.project_state.projectId == "ocr-project-b"
+    assert not any(call[0] == "create_dialogue_casting_job" for call in calls)
+
+
+def test_stale_casting_callbacks_cannot_mutate_active_automatic_tts(monkeypatch) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model.project_state.replace({"id": "project-b", "name": "B", "revision": 1})
+    model._dialogue_casting_job_id = "casting-b"
+    model._set_dialogue_casting_job_state("running")
+    model._dialogue_casting_auto_tts = True
+    model._dialogue_casting_auto_tts_job_id = "casting-b"
+    model._pending_tts_start = {
+        "params": {"project_id": "project-b"},
+        "context": {"tts_purpose": "production", "project_id": "project-b"},
+    }
+    model._set_tts_busy(True)
+    calls = []
+    monkeypatch.setattr(
+        model.runtime,
+        "request",
+        lambda action, payload=None, context=None: calls.append((action, payload, context)),
+    )
+    stale_context = {
+        "job_kind": "dialogue_casting",
+        "project_id": "project-a",
+        "job_id": "casting-a",
+    }
+
+    model._action_failed("start_job", {"message": "late failure"}, stale_context)
+    model._action_succeeded(
+        "retry_job",
+        {"id": "casting-a-retry"},
+        {**stale_context, "resume_dialogue_casting": True},
+    )
+
+    assert model._dialogue_casting_job_id == "casting-b"
+    assert model.dialogueCastingJobState == "running"
+    assert model._dialogue_casting_auto_tts_job_id == "casting-b"
+    assert model._pending_tts_start is not None
+    assert model.ttsBusy
+    assert calls == []
+
+
+@pytest.mark.parametrize("succeeded", [True, False])
+def test_stale_tts_create_callback_cannot_mutate_current_project(monkeypatch, succeeded) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model.project_state.replace({"id": "project-b", "name": "B", "revision": 1})
+    model._tts_job_id = "tts-b"
+    model._set_tts_job_state("running")
+    model._set_tts_busy(True)
+    model._pending_tts_start = {
+        "params": {"project_id": "project-b"},
+        "context": {"tts_purpose": "production", "project_id": "project-b"},
+    }
+    calls = []
+    monkeypatch.setattr(
+        model.runtime,
+        "request",
+        lambda action, payload=None, context=None: calls.append((action, payload, context)),
+    )
+
+    if succeeded:
+        model._action_succeeded(
+            "create_tts_job", {"id": "tts-a"},
+            {"tts_purpose": "production", "project_id": "project-a"},
+        )
+    else:
+        model._action_failed(
+            "create_tts_job", {"message": "late failure"},
+            {"tts_purpose": "production", "project_id": "project-a"},
+        )
+
+    assert model._tts_job_id == "tts-b"
+    assert model.ttsJobState == "running"
+    assert model.ttsBusy
+    assert model._pending_tts_start is not None
+    assert calls == []
+
+
+def test_common_voice_start_context_includes_project_identity(monkeypatch) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model._set_backend_ready(True)
+    model.project_state.replace({"id": "voice-project", "name": "Phim", "revision": 1})
+    model._selected_voice_id = "fixture-voice"
+    monkeypatch.setattr(model.voice_catalog, "find", lambda _voice_id: {
+        "voice_id": "fixture-voice",
+        "provider_id": "piper",
+        "installed": True,
+    })
+    calls = []
+    monkeypatch.setattr(
+        model.runtime,
+        "request",
+        lambda action, payload=None, context=None: calls.append((action, payload, context)),
+    )
+
+    model._start_voice_job("preview")
+
+    create_call = next(call for call in calls if call[0] == "create_tts_job")
+    assert create_call[2] == {"tts_purpose": "preview", "project_id": "voice-project"}
+
+
+def test_casting_control_contexts_include_project_and_job_identity(monkeypatch) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model.project_state.replace({"id": "casting-project", "name": "Phim", "revision": 1})
+    model._dialogue_casting_job_id = "casting-job"
+    calls = []
+    monkeypatch.setattr(
+        model.runtime,
+        "request",
+        lambda action, payload=None, context=None: calls.append((action, payload, context)),
+    )
+
+    model._set_dialogue_casting_job_state("running")
+    model.pauseDialogueCasting()
+    model._set_dialogue_casting_job_state("paused")
+    model.resumeDialogueCasting()
+    model._set_dialogue_casting_job_state("failed")
+    model.resumeDialogueCasting()
+    model._set_dialogue_casting_job_state("queued")
+    model.resumeDialogueCasting()
+    model._set_dialogue_casting_job_state("running")
+    model.cancelDialogueCasting()
+
+    controls = [call for call in calls if call[0] in {
+        "pause_job", "resume_job", "retry_job", "start_job", "cancel_job",
+    }]
+    assert [call[0] for call in controls] == [
+        "pause_job", "resume_job", "retry_job", "start_job", "cancel_job",
+    ]
+    for action, _payload, context in controls:
+        assert context["job_kind"] == "dialogue_casting", action
+        assert context["project_id"] == "casting-project", action
+        assert context["job_id"] == "casting-job", action
+
+
+def test_create_voice_joins_casting_already_started_after_ocr(monkeypatch):
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model._set_backend_ready(True)
+    model.project_state.replace({"id": "casting-join", "name": "Phim", "revision": 1})
+    voice = {"provider_id": "piper", "voice_id": "fixture-voice", "installed": True}
+    model._selected_voice_id = voice["voice_id"]
+    monkeypatch.setattr(model.voice_catalog, "find", lambda _id: voice)
+    model._dialogue_casting["config"] = {
+        "enabled": True, **{f"{role}_voice": voice for role in ("male", "female", "fallback")}}
+    model._dialogue_casting_job_id = "already-running"
+    model._set_dialogue_casting_job_state("running")
+    calls = []
+    monkeypatch.setattr(model.runtime, "request",
+                        lambda a, p=None, context=None: calls.append((a, p, context)))
+    model.startVoiceGeneration()
+    assert not calls, "Must join the existing analysis, not submit a duplicate"
+    assert model.ttsBusy
+    assert model._dialogue_casting_auto_tts_job_id == "already-running"
+    model._finish_dialogue_casting_job("already-running", "succeeded")
+    assert [c[0] for c in calls].count("create_tts_job") == 1
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_voice_waits_when_ocr_casting_request_has_not_returned_a_job_id(monkeypatch, failure):
+    QCoreApplication.instance() or QCoreApplication([])
+    MemorySettings.values = {}
+    monkeypatch.setattr(application_module, "QSettings", MemorySettings)
+    model = ApplicationViewModel()
+    model._set_backend_ready(True)
+    model.project_state.replace({"id": "casting-race", "name": "Phim", "revision": 1})
+    voice = {"provider_id": "piper", "voice_id": "fixture-voice", "installed": True}
+    model._selected_voice_id = voice["voice_id"]
+    monkeypatch.setattr(model.voice_catalog, "find", lambda _id: voice)
+    model._dialogue_casting["config"] = {
+        "enabled": True, **{f"{role}_voice": voice for role in ("male", "female", "fallback")}}
+    calls = []
+    monkeypatch.setattr(model.runtime, "request",
+                        lambda a, p=None, context=None: calls.append((a, p, context)))
+    monkeypatch.setattr(model, "_start_dialogue_casting_worker", lambda _id: None)
+    model.analyzeDialogueCasting()
+    context = calls[-1][2]
+    model.startVoiceGeneration()
+    assert len(calls) == 1
+    if failure:
+        model._action_failed("create_dialogue_casting_job", {"message": "runtime unavailable"},
+                             context)
+        assert not model.ttsBusy
+        assert model._pending_tts_start is None
+        assert model.ttsJobState == "failed"
+        return
+    model._action_succeeded("create_dialogue_casting_job", {"id": "ocr-cast", "state": "queued"},
+                            context)
+    assert model._dialogue_casting_auto_tts_job_id == "ocr-cast"
+    model._finish_dialogue_casting_job("ocr-cast", "succeeded")
+    assert [c[0] for c in calls].count("create_tts_job") == 1
 
 
 def test_manual_voice_rerun_releases_playback_and_removes_d1_before_job_creation(

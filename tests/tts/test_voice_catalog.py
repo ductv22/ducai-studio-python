@@ -8,7 +8,11 @@ from array import array
 from pathlib import Path
 
 import ducai_studio.providers.tts.vieneu as vieneu_module
-from ducai_studio.providers.tts.catalog import VoiceCatalog, VoiceRightsState
+from ducai_studio.providers.tts.catalog import (
+    VoiceCatalog,
+    VoiceRightsState,
+    inspect_voice_preview,
+)
 from ducai_studio.providers.tts.contracts import TtsCueRequest
 from ducai_studio.providers.tts.vieneu import VieNeuTtsProvider
 
@@ -122,6 +126,53 @@ def test_catalog_detects_installed_vieneu_assets_without_starting_cuda(tmp_path:
         encoding="utf-8",
     )
     assert VoiceCatalog(tmp_path).vieneu_runtime_installed() is False
+
+
+def test_catalog_lists_each_complete_clone_profile_in_stable_order(tmp_path: Path) -> None:
+    root = tmp_path / "vieneu_profiles"
+    root.mkdir()
+    for name in ("second", "first", "incomplete"):
+        (root / f"{name}.npz").write_bytes(name.encode())
+    for name in ("first", "second"):
+        (root / f"{name}.json").write_text("{}", encoding="utf-8")
+
+    assert [path.stem for path in VoiceCatalog(tmp_path).vieneu_profiles()] == [
+        "first",
+        "second",
+    ]
+
+
+def test_preview_inspection_rejects_silence_and_accepts_pcm_audio(tmp_path: Path) -> None:
+    silent = tmp_path / "silent.wav"
+    audible = tmp_path / "audible.wav"
+    for path, value in ((silent, 0), (audible, 1_000)):
+        with wave.open(str(path), "wb") as stream:
+            stream.setnchannels(1)
+            stream.setsampwidth(2)
+            stream.setframerate(16_000)
+            stream.writeframes(array("h", [value] * 1_600).tobytes())
+
+    assert inspect_voice_preview(silent)["valid"] is False
+    inspected = inspect_voice_preview(audible)
+    assert inspected["valid"] is True
+    assert inspected["duration_seconds"] == 0.1
+
+
+def test_preview_inspection_rejects_truncated_pcm_with_audible_prefix(tmp_path: Path) -> None:
+    source = tmp_path / "source.wav"
+    truncated = tmp_path / "truncated.wav"
+    with wave.open(str(source), "wb") as stream:
+        stream.setnchannels(1)
+        stream.setsampwidth(2)
+        stream.setframerate(16_000)
+        stream.writeframes(array("h", [1_000] * 32_000).tobytes())
+    payload = source.read_bytes()
+    truncated.write_bytes(payload[:-800])
+
+    inspected = inspect_voice_preview(truncated)
+
+    assert inspected["valid"] is False
+    assert inspected["non_silent"] is False
 
 
 def test_vieneu_provider_uses_preset_without_clone_profile(tmp_path: Path) -> None:

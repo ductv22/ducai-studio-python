@@ -146,6 +146,34 @@ def _project(tmp_path: Path) -> ProjectSnapshot:
     )
 
 
+@pytest.mark.parametrize("edited", [False, True])
+def test_plain_video_export_needs_no_subtitles_or_ai_stages(tmp_path, edited):
+    project = _project(tmp_path)
+    video = replace(project.tracks[0].clips[0], volume=0.8, link_group_id="source")
+    audio = replace(video, id="original", track_id="A1")
+    project = replace(
+        project,
+        tracks=(
+            replace(project.tracks[0], clips=(video,)),
+            TimelineTrack("A1", TrackKind.ORIGINAL_AUDIO, "Original", (audio,)),
+        ),
+        source_cues=(),
+        translated_cues=(),
+    )
+    if edited:
+        project = replace(project, timeline_edit=cut_state(
+            project, "remove_range", 2_000_000, 5_000_000))
+
+    snapshot = build_export_snapshot(project, settings=ExportSettings(), media_probe=Probe())
+
+    assert snapshot.timeline_end_us == (7_000_000 if edited else 10_000_000)
+    assert snapshot.subtitles == snapshot.scene_texts == snapshot.subtitle_blurs == ()
+    assert all(clip.track_kind == "original_audio" and clip.volume == 0.8
+               for clip in snapshot.audio)
+    assert len(snapshot.audio) == (2 if edited else 1)
+    assert snapshot.settings.subtitle_style.enabled is True
+
+
 def test_default_overlays_cover_full_video_and_logo_asset_can_be_replaced(
     tmp_path: Path,
 ) -> None:
@@ -177,7 +205,7 @@ def test_blur_background_without_project_overlay_matches_preview_fallback_radius
     snapshot = build_export_snapshot(_project(tmp_path), media_probe=Probe(),
         settings=ExportSettings(subtitle_style=SubtitleStyle(background_mode="blur")))
     assert len(snapshot.subtitle_blurs) == 1
-    assert snapshot.subtitle_blurs[0].blur_radius == 22
+    assert snapshot.subtitle_blurs[0].blur_radius == 46
 
 
 def test_voice_track_crossing_a_video_layer_keeps_its_full_range(tmp_path):
@@ -211,6 +239,47 @@ def test_effects_editor_supports_multiple_blur_regions_and_deletes_added_region(
     assert all(item.id != extra.id for item in removed.overlays)
     with pytest.raises(ValueError, match="disabled"):
         EffectsEditor(removed).delete_overlay(DEFAULT_BLUR_ID)
+
+
+def test_ocr_anchor_is_identical_in_preview_export_and_snapshot_roundtrip(tmp_path):
+    from PySide6.QtCore import QCoreApplication
+
+    from ducai_studio.providers.subtitle_artwork import artwork_payload, editor_payload
+    from ducai_studio.ui.viewmodels.project_job_models import ProjectStateModel
+
+    project = _project(tmp_path)
+    project = replace(project, translated_cues=(
+        replace(project.translated_cues[0], text_anchor=(.5, .335)),))
+    snapshot = build_export_snapshot(project, settings=ExportSettings(), media_probe=Probe())
+    assert snapshot.subtitles[0].text_anchor == (.5, .335)
+    assert decode_export_snapshot(json.loads(json.dumps(asdict(snapshot)))) == snapshot
+    QCoreApplication.instance() or QCoreApplication([])
+    model = ProjectStateModel()
+    model.replace(json.loads(json.dumps(asdict(project))))
+    cue = model.subtitle_cues.find("cue")
+    assert cue["text_anchor"] == [.5, .335]
+    assert editor_payload(cue, 1920, 1080, snapshot.settings.subtitle_style) == artwork_payload(
+        snapshot.subtitles[0], 1920, 1080, snapshot.settings.subtitle_style)
+
+
+def test_export_cannot_overwrite_a_secondary_video_layer(tmp_path):
+    from ducai_studio.job_manager.service import JobManagerService
+
+    project = _project(tmp_path)
+    layer_path = tmp_path / "second.mp4"
+    layer_path.write_bytes(b"preserve second source")
+    interval = TimeRange(2_000_000, 3_000_000)
+    layer = TimelineClip("second", "V2", interval, TimeRange(0, 1_000_000), "second")
+    project = replace(project,
+        media=(*project.media, MediaAsset("second", str(layer_path), MediaKind.VIDEO, 1_000_000)),
+        tracks=(*project.tracks, TimelineTrack("V2", TrackKind.VIDEO, "Layer", (layer,))))
+    service = JobManagerService(database_path=tmp_path / "state.db",
+                                artifact_root=tmp_path / "artifacts", media_probe=Probe())
+    service.projects.save(project_path=tmp_path / "project.ducai", snapshot=project)
+    with pytest.raises(ValueError, match="source"):
+        service.create_export_job(project_id=project.id, output_path=str(layer_path),
+                                  export_options={"overwrite": True})
+    assert layer_path.read_bytes() == b"preserve second source"
 
 
 def test_overlay_rejects_invalid_or_non_blur_concealment_mode() -> None:
@@ -1744,11 +1813,12 @@ def test_dynamic_subtitle_blur_groups_one_full_frame_source_per_radius(
     graph = plan.filter_script_path.read_text(encoding="utf-8")
 
     assert graph.count("boxblur=luma_radius=") == 2
-    assert graph.count("luma_power=1") == 2
-    assert "luma_power=2" not in graph
+    assert graph.count("luma_power=2") == 2
+    assert "luma_power=1" not in graph
     assert graph.count("drawbox=") == 0
-    assert graph.count("maskedmerge") == 2
-    assert graph.index("maskedmerge") < graph.index("null[vout]")
+    assert graph.count("alphamerge") == 2
+    assert graph.count("overlay=shortest=1") == 2
+    assert graph.index("alphamerge") < graph.index("null[vout]")
     mask_files = sorted((tmp_path / "dynamic-blur-work").glob("subtitle-mask-*.ass"))
     assert len(mask_files) == 2
     assert (

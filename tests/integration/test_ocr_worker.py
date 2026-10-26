@@ -465,6 +465,54 @@ def test_ocr_scene_cues_are_projected_to_a_separate_s2_track() -> None:
     assert updated.source_cues[1].fade_duration_ms == 300
 
 
+@pytest.mark.parametrize("region", [None, (0.45, 0.32, 0.10, 0.03),
+                                    (0.1, 0.2, 0.2, 0.04)])
+def test_ocr_dialogue_anchor_uses_frozen_region_not_crop_dimensions(region):
+    from ducai_studio.infrastructure.project_repository import decode_project_snapshot
+    from ducai_studio.job_manager.service import _translation_cue_payload
+    from ducai_studio.workers.translation_worker import _cue_from_config
+
+    interval = TimeRange(0, 1_000_000)
+    cue = SubtitleCue("c", 1, interval, "这一句话需要完整保留", "zh")
+    snapshot = ProjectSnapshot("p", "Position", 1, source_cues=(cue,),
+                               ocr_dialogue_region=(0.1, 0.7, 0.8, 0.1))
+    qa = {"cue_regions": [{"index": 1, "start_us": 0, "end_us": 1_000_000,
+                          "box": [0.46, 0.33, 0.08, 0.01], "role": "dialogue"}]}
+    # The immutable job region wins even if the project region changed later.
+    frozen = region or (0.06, 0.765, 0.88, 0.217)
+    updated = _apply_ocr_cue_regions(snapshot, qa, dialogue_region=frozen)
+    placed = updated.source_cues[0]
+
+    assert placed.text_anchor == pytest.approx((frozen[0] + frozen[2] / 2,
+                                               frozen[1] + frozen[3] / 2))
+    assert placed.panel_box is None
+    assert placed.text_font_size == 12
+    assert placed.visual_box == (0.46, 0.33, 0.08, 0.01)
+    assert _cue_from_config(_translation_cue_payload(placed)).text_anchor == placed.text_anchor
+    reopened = decode_project_snapshot(json.loads(json.dumps(asdict(updated))))
+    assert reopened.source_cues[0].text_anchor == placed.text_anchor
+
+
+def test_ocr_dialogue_default_anchor_and_scene_geometry_stay_separate():
+    interval = TimeRange(0, 1_000_000)
+    snapshot = ProjectSnapshot("p", "Position", 1, source_cues=(
+        SubtitleCue("d", 1, interval, "对白", "zh"),
+        SubtitleCue("s", 2, interval, "场景文字", "zh"),
+    ))
+    qa = {"cue_regions": [
+        {"index": index, "start_us": 0, "end_us": 1_000_000,
+         "box": [0.3, 0.4, 0.2, 0.04], "role": role}
+        for index, role in ((1, "dialogue"), (2, "scene_text"))
+    ]}
+    updated = _apply_ocr_cue_regions(snapshot, qa)
+    assert updated.source_cues[0].text_anchor == pytest.approx((0.5, 0.8735))
+    assert updated.source_cues[1].text_anchor is None
+    assert updated.source_cues[1].text_font_size == 40
+    qa["cue_regions"][0]["end_us"] = 900_000
+    stale = _apply_ocr_cue_regions(snapshot, qa)
+    assert stale.source_cues[0].text_anchor is None
+
+
 @pytest.mark.parametrize("font_size", [40, 73, 240])
 def test_ocr_qa_round_trip_preserves_scene_font_size(
     tmp_path: Path, monkeypatch, font_size: int,

@@ -92,7 +92,24 @@ def main() -> int:
         background_opacity_percent=100,
         source_blur_enabled=False,
     )
-    subtitle = RenderSubtitle("cue", 1, 0, 2_000_000, "Trần Trường An rất xuất sắc,", font_size=38)
+    fixed_wrap = os.environ.get("DUCAI_TEST_FIXED_WRAP") == "1"
+    subtitle = RenderSubtitle(
+        "cue",
+        1,
+        0,
+        2_000_000,
+        (
+            "Trần Trường An rất xuất sắc, nhưng vẫn cần thêm thời gian để hoàn thành."
+            if fixed_wrap
+            else "Trần Trường An rất xuất sắc,"
+        ),
+        font_size=38,
+        **(
+            {"panel_x": 0.08, "panel_y": 0.65, "panel_width": 0.36, "panel_height": 0.18}
+            if fixed_wrap
+            else {}
+        ),
+    )
     white_subtitle = RenderSubtitle(
         "white-cue",
         3,
@@ -104,7 +121,7 @@ def main() -> int:
         background_color="#000000",
         background_opacity_percent=100,
         panel_x=0.1,
-        panel_y=0.55,
+        panel_y=0.28 if fixed_wrap else 0.55,
         panel_width=0.65,
         panel_height=0.16,
     )
@@ -193,7 +210,7 @@ def main() -> int:
                 "schema": "ducai-export-ledger-v1",
                 "snapshot": asdict(snapshot),
                 "ffmpeg": probe_ffmpeg_capabilities(ffmpeg).version_line,
-                "render_contract": "subtitle-system-fonts-v4",
+                "render_contract": "cue-background-blur-v5",
                 "font_assets": font_assets,
             }
         )
@@ -301,6 +318,8 @@ Window {{ width: {width}; height: {height}; visible: true; color: "#808080"
             "preview_bounds": expected_bounds,
             "export_bounds": actual_bounds,
             "cover_rect": cover_pixels,
+            "subtitle_font_size": layout["font_size"],
+            "subtitle_text_height": layout["text_rect"][3],
         }
         color_counts = {}
         for cue, name in (

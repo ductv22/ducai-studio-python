@@ -16,11 +16,11 @@ def test_review_import_uses_declared_proof_policy_and_preserves_legacy_compatibi
     database_path = tmp_path / "state.db"
     artifact_root = tmp_path / "artifacts"
     service = JobManagerService(database_path=database_path, artifact_root=artifact_root)
-    snapshot = ProjectSnapshot("review", "Review", 1)
+    snapshot = ProjectSnapshot("review", "Review", 1, ocr_dialogue_region=(.1, .7, .8, .2))
     service.projects.save(project_path=tmp_path / "project.ducai", snapshot=snapshot)
     job = service.jobs.create(JobSpec(
         JobKind.OCR, snapshot.id, snapshot.revision, "paddle-fast", "1", "model",
-        "input", "settings", {},
+        "input", "settings", {"dialogue_region": [.2, .3, .5, .1]},
     ))
     review = service.checkpoints.staging_root / "review.srt.partial"
     full_text = "这里是散修们聚集的一处秘境"
@@ -76,6 +76,7 @@ def test_review_import_uses_declared_proof_policy_and_preserves_legacy_compatibi
     expected_texts = [full_text, partial_text] if strict and not has_proof else [full_text]
     assert [cue["text"] for cue in imported["source_cues"]] == expected_texts
     saved = service.projects.load(snapshot.id)
+    assert all(cue.text_anchor == pytest.approx((.45, .35)) for cue in saved.source_cues)
     reopened = JobManagerService(database_path=database_path, artifact_root=artifact_root)
     assert reopened.projects.load(snapshot.id) == saved
     if has_proof:

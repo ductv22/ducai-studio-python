@@ -399,7 +399,9 @@ def test_create_tts_job_excludes_scene_text_from_voice_requests(tmp_path: Path) 
     ]
 
 
-def test_create_tts_job_accepts_vieneu_preset_without_clone_profile(tmp_path: Path) -> None:
+def test_create_tts_job_accepts_vieneu_preset_with_normalized_empty_clone_options(
+    tmp_path: Path,
+) -> None:
     service = JobManagerService(
         database_path=tmp_path / "state.db",
         artifact_root=tmp_path / "artifacts",
@@ -408,18 +410,203 @@ def test_create_tts_job_accepts_vieneu_preset_without_clone_profile(tmp_path: Pa
     project_id = _project_with_translation(service, tmp_path)
     data_root = _vieneu_data_root(tmp_path)
 
+    for clone_options in (
+        {"profile_path": "not-a-preset-profile.npz"},
+        {"reference_audio_path": "not-a-preset-reference.wav"},
+        {"reference_text": "Nội dung chỉ hợp lệ cho giọng clone."},
+        {"reference_denoise": True},
+    ):
+        with pytest.raises(ValueError, match="VieNeu preset cannot use clone reference options"):
+            service.create_tts_job(
+                project_id=project_id,
+                provider_id="vieneu-3.8",
+                voice_id="preset:Mai Anh",
+                provider_options={"data_root": str(data_root), **clone_options},
+            )
+
     job = service.create_tts_job(
         project_id=project_id,
         provider_id="vieneu-3.8",
         voice_id="preset:Mai Anh",
-        provider_options={"data_root": str(data_root)},
+        provider_options={
+            "data_root": str(data_root),
+            "profile_path": "",
+            "reference_audio_path": "",
+            "reference_text": "",
+            "reference_denoise": False,
+        },
     )
     config = job["spec"]["provider_config"]
 
     assert config["voice_id"] == "preset:Mai Anh"
     assert config["profile_path"] == ""
     assert config["reference_audio_path"] == ""
+    assert config["reference_text"] == ""
+    assert config["reference_denoise"] is False
     assert config["voice_identity"].startswith("preset:Mai Anh:vieneu-3.8.1-preset-")
+
+
+def test_clone_preview_path_includes_resolved_reference_identity_and_denoise(
+    tmp_path: Path,
+) -> None:
+    service = JobManagerService(
+        database_path=tmp_path / "state.db",
+        artifact_root=tmp_path / "artifacts",
+        media_probe=FixtureProbe(),
+    )
+    project_id = _project_with_translation(service, tmp_path)
+    data_root = _vieneu_data_root(tmp_path)
+    first_reference = tmp_path / "first-reference.wav"
+    second_reference = tmp_path / "second-reference.wav"
+    first_reference.write_bytes(b"first-reference")
+    second_reference.write_bytes(b"second-reference")
+
+    def create_preview(reference: Path, *, denoise: bool) -> dict:
+        job = service.create_tts_job(
+            project_id=project_id,
+            provider_id="vieneu-3.8",
+            voice_id="clone",
+            provider_options={
+                "purpose": "preview",
+                "preview_text": "Cùng một câu nghe thử.",
+                "data_root": str(data_root),
+                "profile_path": "",
+                "reference_audio_path": str(reference),
+                "reference_text": "",
+                "reference_denoise": denoise,
+            },
+        )
+        service.jobs.transition(job["id"], JobState.START_REQUESTED)
+        service.jobs.transition(job["id"], JobState.RUNNING)
+        service.jobs.transition(job["id"], JobState.FAILED, error_code="fixture_complete")
+        return job
+
+    first = create_preview(first_reference, denoise=False)
+    second = create_preview(second_reference, denoise=False)
+    denoised = create_preview(second_reference, denoise=True)
+    first_config = first["spec"]["provider_config"]
+    second_config = second["spec"]["provider_config"]
+    denoised_config = denoised["spec"]["provider_config"]
+
+    assert first_config["profile_path"] != second_config["profile_path"]
+    assert second_config["profile_path"] == denoised_config["profile_path"]
+    assert second_config["voice_identity"] == denoised_config["voice_identity"]
+    assert len(
+        {
+            first_config["output_path"],
+            second_config["output_path"],
+            denoised_config["output_path"],
+        }
+    ) == 3
+
+
+def test_prepared_clone_preview_lookup_is_projectless_and_exact_identity(
+    tmp_path: Path,
+) -> None:
+    data_root = _vieneu_data_root(tmp_path)
+    profile_root = data_root / "vieneu_profiles"
+    profile_root.mkdir()
+    profiles = [profile_root / "clone-a.npz", profile_root / "clone-b.npz"]
+    for index, profile in enumerate(profiles, 1):
+        profile.write_bytes(f"profile-{index}".encode())
+        profile.with_suffix(".json").write_text(
+            json.dumps({"identity": {"profile": index}}),
+            encoding="utf-8",
+        )
+
+    def lookup(profile: Path, *, denoise: bool = False) -> dict:
+        return JobManagerService.get_tts_voice_preview(
+            provider_id="vieneu-3.8",
+            voice_id=profile.stem,
+            provider_options={
+                "purpose": "preview",
+                "preview_text": "Cùng một câu nghe thử.",
+                "batch_size": 1,
+                "data_root": str(data_root),
+                "profile_path": str(profile),
+                "reference_denoise": denoise,
+            },
+        )
+
+    first = lookup(profiles[0])
+    second = lookup(profiles[1])
+    denoised = lookup(profiles[1], denoise=True)
+
+    assert first["available"] is False
+    assert len({first["path"], second["path"], denoised["path"]}) == 3
+    prepared = Path(first["path"])
+    prepared.parent.mkdir(parents=True)
+    write_pcm16_mono(prepared, array("f", [0.1]) * 1_600, 16_000)
+    assert lookup(profiles[0]) == {**first, "available": True, "source": "cache"}
+
+    profiles[0].with_suffix(".json").write_text(
+        json.dumps({"identity": {"profile": "changed"}}),
+        encoding="utf-8",
+    )
+    changed = lookup(profiles[0])
+    assert changed["available"] is False
+    assert changed["path"] != first["path"]
+
+
+def test_newly_enrolled_reference_reuses_audition_only_for_exact_profile_and_wav(
+    tmp_path: Path,
+) -> None:
+    from ducai_studio.providers.tts.vieneu import profile_fingerprint
+
+    data_root = _vieneu_data_root(tmp_path)
+    reference = tmp_path / "new-reference.wav"
+    write_pcm16_mono(reference, array("f", [0.01]) * 1_600, 16_000)
+    options = {"data_root": str(data_root), "reference_audio_path": str(reference),
+               "purpose": "preview", "preview_text": "Câu mới để thử giọng."}
+
+    def lookup(**extra):
+        return JobManagerService.get_tts_voice_preview(
+            provider_id="vieneu-3.8", voice_id="clone", provider_options={**options, **extra})
+
+    first = lookup()
+    assert not first["available"]
+    prepared = Path(first["path"])
+    prepared.parent.mkdir(parents=True)
+    write_pcm16_mono(prepared, array("f", [0.1]) * 1_600, 16_000)
+    profile = Path(first["profile_path"])
+    profile.parent.mkdir(parents=True)
+    profile.write_bytes(b"enrolled-speaker-profile")
+    profile.with_suffix(".json").write_text('{"identity":{"model":"v3turbo"}}')
+    assert not lookup()["available"], "Legacy audio without profile evidence cannot be reused"
+    qa = {"status": "PASS", "preview_profile_fingerprint": profile_fingerprint(profile),
+          "output_sha256": file_sha256(prepared)}
+    prepared.with_name(prepared.stem + "_QA.json").write_text(json.dumps(qa))
+    after = lookup()
+    assert after["available"] and after["source"] == "cache"
+    assert after["path"] == first["path"]
+    assert after["voice_identity"] != first["voice_identity"]
+    assert not lookup(reference_denoise=True)["available"]
+    assert not lookup(preview_text="Câu khác.")["available"]
+    profile.write_bytes(b"different-profile")
+    assert not lookup()["available"]
+    profile.write_bytes(b"enrolled-speaker-profile")
+    prepared.write_bytes(b"changed-or-broken-audio")
+    assert not lookup()["available"]
+
+
+def test_prepared_preview_lookup_rejects_unvalidated_provider_options(tmp_path: Path) -> None:
+    data_root = _vieneu_data_root(tmp_path)
+    profile = data_root / "vieneu_profiles" / "clone.npz"
+    profile.parent.mkdir()
+    profile.write_bytes(b"profile")
+    profile.with_suffix(".json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Unknown TTS provider options"):
+        JobManagerService.get_tts_voice_preview(
+            provider_id="vieneu-3.8",
+            voice_id="clone",
+            provider_options={
+                "purpose": "preview",
+                "data_root": str(data_root),
+                "profile_path": str(profile),
+                "unvalidated": True,
+            },
+        )
 
 
 def test_production_tts_rerun_promotes_candidate_and_replaces_active_d1(

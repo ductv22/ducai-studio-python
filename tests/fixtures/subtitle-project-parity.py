@@ -41,7 +41,7 @@ def main():
     ffmpeg = shutil.which(sys.argv[2]) or sys.argv[2]
     runtime = sys.argv[3] if len(sys.argv) > 3 else sys.executable
     media, output = root / "source.mp4", root / "export.mp4"
-    width, height = 854, 480
+    width, height = json.loads(os.environ.get("DUCAI_TEST_CANVAS", "[854,480]"))
     subprocess.run([ffmpeg, "-v", "error", "-f", "lavfi", "-i",
                     f"color=c=0x808080:s={width}x{height}:r=24", "-t", "2",
                     "-c:v", "libx264", "-y", str(media)], check=True, capture_output=True)
@@ -59,8 +59,10 @@ def main():
                        "subtitleMarginBottom": 45, "subtitleBackgroundEnabled": False}.items():
         model.settings.setValue("export/" + key, value)
     timing = TimeRange(0, 2_000_000)
-    source = SubtitleCue("cue", 1, timing, "你我都年轻过", "zh")
-    translated = SubtitleCue("vi", 1, timing, "Cả hai chúng ta đều từng trẻ tuổi", "vi")
+    text_anchor = json.loads(os.environ.get("DUCAI_TEST_TEXT_ANCHOR", "null"))
+    source = SubtitleCue("cue", 1, timing, "你我都年轻过", "zh", text_anchor=text_anchor)
+    translated = SubtitleCue("vi", 1, timing, "Cả hai chúng ta đều từng trẻ tuổi", "vi",
+                             text_anchor=text_anchor)
     project = ProjectSnapshot("parity", "Parity", 1,
         media=(MediaAsset("m", str(media), MediaKind.VIDEO, timing.duration_us),),
         tracks=(TimelineTrack("V1", TrackKind.VIDEO, "Video", (
@@ -141,6 +143,7 @@ def main():
         assert all(abs(a - b) <= 1 for a, b in zip(*bounds, strict=True)), bounds
         iou = len(masks[0] & masks[1]) / max(1, len(masks[0] | masks[1]))
         report = {"iou": iou, "font": "Arial", "input_parity": True,
+                  "text_anchor": text_anchor,
                   "independent_title": title_mode,
                   "bounds": bounds,
                   "preview_pixels": len(masks[0]), "export_pixels": len(masks[1])}

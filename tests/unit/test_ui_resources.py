@@ -214,7 +214,7 @@ def test_every_integer_spinbox_is_editable_and_uses_the_shared_control() -> None
     assert not any(line.lstrip().startswith("SpinBox {") for line in export.splitlines())
     # Coordinate fields for logo/blur are intentionally removed. Geometry is
     # edited directly on the video preview to avoid pointer jumps.
-    assert export.count("DsSpinBox {") == 17
+    assert export.count("DsSpinBox {") == 16
     assert "editable: true" in control
     assert "selectByMouse: true" in control
     assert export.count("accessibleName:") >= export.count("DsSpinBox {")
@@ -517,7 +517,7 @@ def test_effects_screen_has_live_logo_and_blur_preview() -> None:
     assert "MultiEffect {" in preview
     assert "* root.subtitleScale()" in preview
     assert "? Math.SQRT2 : 1.0" in preview
-    assert 'root.blurOverlay.concealment_mode === "cover"' in preview
+    assert 'trackedBlurFrame.displayedOverlay.concealment_mode === "cover"' in preview
     assert "opacity: 0.90" in preview
     assert 'overlayFrame.overlay.concealment_mode === "cover"' in preview
     assert 'overlayFrame.overlay.tracking_mode === "ocr_watermark"' in preview
@@ -534,9 +534,14 @@ def test_effects_screen_has_live_logo_and_blur_preview() -> None:
     assert "sourceSubtitleRegionsAt(playhead)" in preview
     assert "const withinRange = root.appModel.playheadUs >= startUs" in preview
     assert "return Boolean(root.activeSubtitleRegions" in preview
-    assert "&& root.overlayActive(root.blurOverlay)" in preview
-    assert "? root.activeSubtitleRegions : []" in preview
-    assert "root.trackedSubtitleBlur(root.blurOverlay, modelData)" in preview
+    assert "root.overlayActive(root.blurOverlay)" in preview
+    assert "model: root.cueBlurItems" in preview
+    assert "root.trackedSubtitleBlur(modelData.overlay, modelData.cue)" in preview
+    toolbar = (root / "controls" / "SubtitleTextToolbar.qml").read_text(encoding="utf-8")
+    assert 'objectName: "subtitleBackgroundMode"' in toolbar
+    assert 'objectName: "textOutlineWidthSpin"' in toolbar
+    assert 'objectName: "subtitleBackgroundMode"' not in export
+    assert 'text: "Độ dày viền"' not in export
     assert "mediaSource(\n                            overlayFrame.overlay.asset_id" in preview
     assert "function captureCurrentGeometry()" in preview
     assert preview.index("const currentX = overlayFrame.x") < preview.index(
@@ -818,8 +823,10 @@ def test_timeline_voice_sync_uses_the_current_seek_anchor_and_skips_paused_playe
 
     assert "function expectedVoicePositionMs(descriptor, videoPositionMs)" in preview
     assert "videoPositionMs - descriptor.sourcePositionMs" in preview
-    assert "root.expectedVoicePositionMs(" in preview
-    assert "root.activeDescriptor, position" in preview
+    assert 'property var activeVoiceDescriptor: ({"voiceAvailable": false})' in preview
+    assert "const previous = root.activeVoiceDescriptor" in preview
+    assert "root.activeVoiceDescriptor = descriptor" in preview
+    assert "root.expectedVoicePositionMs(descriptor, videoPositionMs)" in preview
     assert "playbackState === MediaPlayer.PlayingState" in preview
     assert "voicePlayer.playbackState === MediaPlayer.PlayingState" in preview
     assert "Math.abs(voicePlayer.position - expectedVoiceMs) > 200" in preview

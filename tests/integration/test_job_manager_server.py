@@ -49,6 +49,39 @@ from ducai_studio.ui.viewmodels.application_view_model import _ProjectSnapshotDe
 from ducai_studio.workers.protocol import WorkerMessage
 
 
+def test_server_dispatches_read_only_tts_preview_lookup(tmp_path, monkeypatch) -> None:
+    QCoreApplication.instance() or QCoreApplication([])
+    service = JobManagerService(
+        database_path=tmp_path / "state.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+    calls = []
+    monkeypatch.setattr(
+        service,
+        "get_tts_voice_preview",
+        lambda **kwargs: calls.append(kwargs) or {"available": True, "path": "sample.wav"},
+    )
+    server = JobManagerServer(name=f"voice-preview-{uuid4()}", service=service)
+    try:
+        result = server._dispatch(
+            "get_tts_voice_preview",
+            {
+                "provider_id": "vieneu-3.8",
+                "voice_id": "preset:Mai Anh",
+                "provider_options": {"purpose": "preview", "batch_size": 1},
+            },
+        )
+    finally:
+        server.close()
+
+    assert result == {"available": True, "path": "sample.wav"}
+    assert calls == [{
+        "provider_id": "vieneu-3.8",
+        "voice_id": "preset:Mai Anh",
+        "provider_options": {"purpose": "preview", "batch_size": 1},
+    }]
+
+
 def test_server_dispatch_accepts_scissors_and_atomic_cue_deletion(tmp_path):
     QCoreApplication.instance() or QCoreApplication([])
     service = JobManagerService(database_path=tmp_path/'state.db',
@@ -2712,6 +2745,8 @@ def test_ocr_job_uses_external_runtime_and_imports_only_guarded_final_srt(
                     "timeline_continuity_passes": True,
                     "output_path": str(final),
                     "output_sha256": hashlib.sha256(final.read_bytes()).hexdigest(),
+                    "cue_regions": [{"index": 1, "start_us": 0, "end_us": 2_000_000,
+                                     "box": [.3, .8, .4, .05], "role": "dialogue"}],
                 },
                 ensure_ascii=False,
             ),
@@ -2722,6 +2757,7 @@ def test_ocr_job_uses_external_runtime_and_imports_only_guarded_final_srt(
 
         assert len(imported["source_cues"]) == 1
         assert imported["source_cues"][0]["text"] == "我要修炼成仙"
+        assert imported["source_cues"][0]["text_anchor"] == pytest.approx((.5, .8735))
         cue_id = imported["source_cues"][0]["id"]
         rescan = server._dispatch(
             "create_ocr_rescan_job",
@@ -2747,6 +2783,7 @@ def test_ocr_job_uses_external_runtime_and_imports_only_guarded_final_srt(
             "start_us": 0,
             "end_us": 2_000_000,
         }
+        assert rescanned["source_cues"][0]["text_anchor"] == pytest.approx((.5, .8735))
         with pytest.raises(ValueError, match="guarded final output"):
             service.import_final_ocr_srt(job["id"], str(video))
     finally:

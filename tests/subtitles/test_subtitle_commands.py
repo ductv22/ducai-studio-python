@@ -55,6 +55,19 @@ def test_single_text_edit_preserves_other_cue_objects_and_undo_snapshot() -> Non
     assert editor.redo().source_cues[1] is original.source_cues[1]
 
 
+def test_manual_dialogue_move_overrides_ocr_anchor_and_is_undoable():
+    cue = replace(_snapshot().source_cues[0], text_anchor=(.5, .335))
+    editor = SubtitleEditor(replace(_snapshot(), source_cues=(cue,), translated_cues=(
+        replace(cue, language="vi", text="Xin chào."),)))
+    moved = editor.transform_cue_geometry((cue.id,), delta_x=.05, delta_y=.1,
+                                         panel_seeds={cue.id: (.3, .3, .4, .07)})
+    for result in (moved.source_cues[0], moved.translated_cues[0]):
+        assert result.text_anchor is None
+        assert result.panel_box == pytest.approx((.35, .4, .4, .07))
+    assert editor.undo().source_cues[0].text_anchor == (.5, .335)
+    assert editor.redo().source_cues[0].panel_box == pytest.approx((.35, .4, .4, .07))
+
+
 def test_delete_removes_cue_despite_unrelated_existing_overlap() -> None:
     cues = tuple(SubtitleCue(f'c{i}', i, TimeRange(a, b), '字幕', 'zh')
                  for i, (a, b) in enumerate(((0, 100), (200, 500), (400, 600)), 1))
@@ -839,6 +852,19 @@ def test_dialogue_moved_to_s2_keeps_spoken_role() -> None:
     assert moved.source_cues[0].subtitle_track_id == "S2"
     assert moved.source_cues[0].role == "dialogue"
     assert dialogue_cues(moved.source_cues) == moved.source_cues
+
+
+def test_manual_dialogue_inherits_ocr_anchor_without_fitting_to_crop() -> None:
+    template = SubtitleCue("source", 1, TimeRange(0, 2_000_000), "你好", "zh",
+                           visual_box=(.45, .31, .1, .02), visual_box_source="ocr",
+                           text_anchor=(.5, .32), text_font_size=38)
+    editor = SubtitleEditor(ProjectSnapshot("p", "OCR anchor", 1, source_cues=(template,)))
+    result = editor.add_subtitle_cue(text="Một câu thoại dài hơn khung chữ gốc",
+                                   start_us=2_000_000, end_us=4_000_000, cue_role="dialogue")
+    created = next(cue for cue in result.source_cues if cue.id != "source")
+    assert created.text_anchor == template.text_anchor
+    assert created.panel_box is None
+    assert created.text_font_size == 38
 
 
 def test_manual_dialogue_inherits_nearest_style_and_uses_free_lane() -> None:

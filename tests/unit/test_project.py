@@ -1,5 +1,6 @@
 import pytest
 
+from ducai_studio.domain.effects import RenderSubtitle, RenderSubtitleBlur
 from ducai_studio.domain.project import (
     CUE_BACKGROUND_STYLES,
     MediaAsset,
@@ -37,6 +38,14 @@ def test_project_rejects_duplicate_media_ids() -> None:
     second = MediaAsset("media-1", "B.mp4", MediaKind.VIDEO, 20_000_000)
     with pytest.raises(ValueError, match="unique"):
         ProjectSnapshot("project", "Demo", 1, media=(first, second))
+
+
+@pytest.mark.parametrize("anchor", [[], [0.5], [0.5, 0.5, 0.1], [True, .5],
+                                    [float("nan"), .5], [.5, float("inf")],
+                                    [-.1, .5], [.5, 1.1], "0.5,0.5"])
+def test_cue_rejects_invalid_text_anchor(anchor):
+    with pytest.raises(ValueError, match="Text anchor"):
+        SubtitleCue("c", 1, TimeRange(0, 1_000_000), "你好", "zh", text_anchor=anchor)
 
 
 def test_track_rejects_clip_owned_by_another_track() -> None:
@@ -79,6 +88,8 @@ def test_subtitle_cue_requires_text_and_valid_confidence() -> None:
 
     assert {
         "solid",
+        "none",
+        "blur",
         "ink_splash",
         "ink_wash",
         "ink_cloud",
@@ -114,4 +125,24 @@ def test_subtitle_cue_requires_text_and_valid_confidence() -> None:
             "vi",
             background_style="photocopy",
         )
+
+
+def test_render_subtitle_background_style_supports_none_and_blur() -> None:
+    for background in ("none", "blur"):
+        rendered = RenderSubtitle("cue", 1, 0, 1_000_000, "Xin chào", background_style=background)
+        assert rendered.background_style == background
+
+    with pytest.raises(ValueError, match="background style"):
+        RenderSubtitle("cue", 1, 0, 1_000_000, "Xin chào", background_style="legacy")
+
+
+@pytest.mark.parametrize("duration_ms", [49, 2_001])
+def test_render_subtitle_blur_validates_fade_duration(duration_ms: int) -> None:
+    with pytest.raises(ValueError, match="fade duration"):
+        RenderSubtitleBlur("cue", 1, 0, 1_000_000, 0.1, 0.1, 0.8, 0.2,
+                           fade_duration_ms=duration_ms)
+
+    with pytest.raises(TypeError, match="fade flag"):
+        RenderSubtitleBlur("cue", 1, 0, 1_000_000, 0.1, 0.1, 0.8, 0.2,
+                           fade_enabled=1)
 
